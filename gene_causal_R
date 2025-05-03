@@ -1,0 +1,519 @@
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+BiocManager::install("TCGAbiolinks")
+BiocManager::install("DESeq2")
+
+library(TCGAbiolinks)
+library(DESeq2)
+
+# Step 1: Query the GDC for TCGA-BRCA data (Gene Expression Quantification)
+query <- GDCquery(
+  project = "TCGA-BRCA",                        # Breast cancer project
+  data.category = "Transcriptome Profiling",    # Data category
+  data.type = "Gene Expression Quantification"  # Data type
+)
+
+# Step 2: Download the data from GDC
+GDCdownload(query)
+
+# Step 3: Prepare the Data
+data <- GDCprepare(query)
+
+#Step 4: Preview the Data
+head(data)
+
+#Step 5: Extract Expression Matrix and Clinical Data
+expression_matrix <- assay(data)  # Extracts the gene expression matrix
+col_data <- colData(data)         # Extracts clinical metadata
+
+# Ensure you have the correct matrix or data structure.
+expression_matrix <- assay(data)  # Extract gene expression matrix
+col_data <- colData(data)         # Extract clinical data (e.g., condition, patient information)
+
+# No Weights
+# Load necessary libraries
+library(keras)
+library(randomForest)
+library(dplyr)
+library(ggplot2)
+library(copula)
+library(Hmisc)      # For C-statistics
+library(tidyr)      # For reshaping results
+
+# Step 1: Prepare the data
+colnames(col_data)
+str(col_data)
+head(col_data)
+
+col_data$race <- as.factor(col_data$race)
+col_data$vital_status <- as.numeric(col_data$vital_status)
+
+col_data <- col_data[col_data$race %in% c("black or african american", "white"), ]
+expression_matrix <- expression_matrix[, rownames(col_data)]
+
+race <- col_data$race
+outcome <- col_data$vital_status
+
+# PCA on filtered expression data
+expression_data <- as.matrix(t(expression_matrix))
+zero_variance_cols <- apply(expression_data, 2, function(x) var(x) == 0)
+expression_data_filtered <- expression_data[, !zero_variance_cols]
+pca_result <- prcomp(expression_data_filtered, center = TRUE, scale. = TRUE)
+reduced_data_matrix <- as.matrix(pca_result$x[, 1:6])
+
+# Reshape for LSTM/CNN-LSTM
+n_samples <- nrow(reduced_data_matrix)
+n_features <- ncol(reduced_data_matrix)
+copula_transformed_reshaped <- array(reduced_data_matrix, dim = c(n_samples, 1, n_features))
+
+# --- LSTM Model ---
+create_lstm_model <- function() {
+  model <- keras_model_sequential() %>%
+    layer_lstm(units = 64, input_shape = c(1, n_features), return_sequences = FALSE) %>%
+    layer_dense(units = 32, activation = "relu") %>%
+    layer_dense(units = 1)
+  return(model)
+}
+
+# --- CNN-LSTM Model ---
+create_cnn_lstm_model <- function() {
+  model <- keras_model_sequential() %>%
+    layer_conv_1d(filters = 64, kernel_size = 1, activation = "relu", input_shape = c(1, n_features)) %>%
+    layer_max_pooling_1d(pool_size = 1) %>%
+    layer_lstm(units = 64, return_sequences = FALSE) %>%
+    layer_dense(units = 32, activation = "relu") %>%
+    layer_dense(units = 1)
+  return(model)
+}
+
+# --- Copula-Based RF Model ---
+create_copula_rf_model <- function(data, outcome) {
+  fitted_copula <- fitCopula(normalCopula(dim = ncol(data)), pobs(data), method = "ml")
+  copula_transformed_data <- qnorm(pobs(data), mean = 0, sd = 1)
+  model <- randomForest(outcome ~ ., data = as.data.frame(copula_transformed_data), ntree = 100)
+  return(model)
+}
+
+# --- Model Training ---
+lstm_model <- create_lstm_model()
+lstm_model %>% compile(loss = 'mean_squared_error', optimizer = optimizer_adam())
+history_lstm <- lstm_model %>% fit(copula_transformed_reshaped, outcome, epochs = 20, batch_size = 32, validation_split = 0.2)
+
+cnn_lstm_model <- create_cnn_lstm_model()
+cnn_lstm_model %>% compile(loss = 'mean_squared_error', optimizer = optimizer_adam())
+history_cnn_lstm <- cnn_lstm_model %>% fit(copula_transformed_reshaped, outcome, epochs = 20, batch_size = 32, validation_split = 0.2)
+
+copula_rf_model <- create_copula_rf_model(reduced_data_matrix, outcome)
+
+# --- Predictions ---
+predictions_lstm <- lstm_model %>% predict(copula_transformed_reshaped)
+predictions_cnn_lstm <- cnn_lstm_model %>% predict(copula_transformed_reshaped)
+copula_rf_predictions <- predict(copula_rf_model, as.data.frame(reduced_data_matrix))
+
+# --- RMSE and MAE ---
+rmse_lstm <- sqrt(mean((predictions_lstm - outcome)^2))
+mae_lstm <- mean(abs(predictions_lstm - outcome))
+
+rmse_cnn_lstm <- sqrt(mean((predictions_cnn_lstm - outcome)^2))
+mae_cnn_lstm <- mean(abs(predictions_cnn_lstm - outcome))
+
+rmse_copula_rf <- sqrt(mean((copula_rf_predictions - outcome)^2))
+mae_copula_rf <- mean(abs(copula_rf_predictions - outcome))
+
+# --- C-statistics (Concordance Index) ---
+c_stat_lstm <- as.numeric(rcorr.cens(predictions_lstm, outcome)["C Index"])
+c_stat_cnn_lstm <- as.numeric(rcorr.cens(predictions_cnn_lstm, outcome)["C Index"])
+c_stat_copula_rf <- as.numeric(rcorr.cens(copula_rf_predictions, outcome)["C Index"])
+
+# --- HTE (ATE and CATE) ---
+calculate_treatment_effects_by_race <- function(predictions, race, reduced_data_matrix) {
+  black_indices <- which(race == "black or african american")
+  white_indices <- which(race == "white")
+  ate_black <- mean(predictions[black_indices])
+  ate_white <- mean(predictions[white_indices])
+  cate_black <- mean(predictions[black_indices & reduced_data_matrix[black_indices, 1] > 0])
+  cate_white <- mean(predictions[white_indices & reduced_data_matrix[white_indices, 1] > 0])
+  return(data.frame(
+    Race = c("Black or African American", "White"),
+    ATE = c(ate_black, ate_white),
+    CATE = c(cate_black, cate_white)
+  ))
+}
+
+hte_lstm_race <- calculate_treatment_effects_by_race(predictions_lstm, race, reduced_data_matrix)
+hte_cnn_lstm_race <- calculate_treatment_effects_by_race(predictions_cnn_lstm, race, reduced_data_matrix)
+hte_copula_rf_race <- calculate_treatment_effects_by_race(copula_rf_predictions, race, reduced_data_matrix)
+
+hte_results_all_models <- rbind(
+  cbind(hte_lstm_race, Model = "LSTM"),
+  cbind(hte_cnn_lstm_race, Model = "CNN-LSTM"),
+  cbind(hte_copula_rf_race, Model = "Copula-RF")
+)
+
+# --- Combine All Results ---
+model_names <- c("LSTM", "CNN-LSTM", "Copula-RF")
+rmse_values <- c(rmse_lstm, rmse_cnn_lstm, rmse_copula_rf)
+mae_values <- c(mae_lstm, mae_cnn_lstm, mae_copula_rf)
+cstat_values <- c(c_stat_lstm, c_stat_cnn_lstm, c_stat_copula_rf)
+
+results_table <- data.frame(
+  Model = model_names,
+  RMSE = rmse_values,
+  MAE = mae_values,
+  C_Statistic = cstat_values
+)
+
+final_results_table <- merge(results_table, hte_results_all_models, by = "Model", all = TRUE)
+
+# --- Print Results ---
+print(final_results_table)
+
+# --- Plotting ---
+results_long <- gather(final_results_table, key = "Metric", value = "Value", -Model, -Race)
+
+ggplot(results_long, aes(x = Model, y = Value, fill = Metric)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.8), width = 0.7) +
+  facet_wrap(~Race) +
+  labs(title = "Model Evaluation: RMSE, MAE, C-Statistic, ATE, and CATE by Race",
+       x = "Model", y = "Value") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+#############
+# HT weights
+#############
+
+library(keras)
+library(randomForest)
+library(dplyr)
+library(ggplot2)
+library(copula)
+library(Hmisc)
+library(tidyr)
+
+# Step 1: Prepare the data
+colnames(col_data)
+str(col_data)
+head(col_data)
+
+# Convert race to factor and ensure outcome is numeric
+col_data$race <- as.factor(col_data$race)
+col_data$vital_status <- as.numeric(col_data$vital_status)
+
+# Filter for 'Black or African American' and 'White' only
+col_data <- col_data[col_data$race %in% c("black or african american", "white"), ]
+
+# Update the expression matrix
+expression_matrix <- expression_matrix[, rownames(col_data)]
+
+# Assign HT Weights based on Race
+ht_weights <- ifelse(col_data$race == "black or african american", 5.605, 1.217)
+
+# PCA for dimensionality reduction
+expression_data <- as.matrix(t(expression_matrix))
+zero_variance_cols <- apply(expression_data, 2, function(x) var(x) == 0)
+expression_data_filtered <- expression_data[, !zero_variance_cols]
+pca_result <- prcomp(expression_data_filtered, center = TRUE, scale. = TRUE)
+reduced_data_matrix <- as.matrix(pca_result$x[, 1:6])
+
+# Reshape for deep learning models
+n_samples <- nrow(reduced_data_matrix)
+n_features <- ncol(reduced_data_matrix)
+copula_transformed_reshaped <- array(reduced_data_matrix, dim = c(n_samples, 1, n_features))
+
+# --- LSTM Model ---
+create_lstm_model <- function() {
+  model <- keras_model_sequential() %>%
+    layer_lstm(units = 64, input_shape = c(1, n_features), return_sequences = FALSE) %>%
+    layer_dense(units = 32, activation = "relu") %>%
+    layer_dense(units = 1)
+  return(model)
+}
+
+# --- CNN-LSTM Model ---
+create_cnn_lstm_model <- function() {
+  model <- keras_model_sequential() %>%
+    layer_conv_1d(filters = 64, kernel_size = 1, activation = "relu", input_shape = c(1, n_features)) %>%
+    layer_max_pooling_1d(pool_size = 1) %>%
+    layer_lstm(units = 64, return_sequences = FALSE) %>%
+    layer_dense(units = 32, activation = "relu") %>%
+    layer_dense(units = 1)
+  return(model)
+}
+
+# --- Copula-Based Random Forest Model ---
+create_copula_rf_model <- function(data, outcome) {
+  fitted_copula <- fitCopula(normalCopula(dim = ncol(data)), pobs(data), method = "ml")
+  copula_transformed_data <- qnorm(pobs(data), mean = 0, sd = 1)
+  model <- randomForest(outcome ~ ., data = as.data.frame(copula_transformed_data), ntree = 100)
+  return(model)
+}
+
+# --- Train Models ---
+lstm_model <- create_lstm_model()
+lstm_model %>% compile(loss = 'mean_squared_error', optimizer = optimizer_adam())
+history_lstm <- lstm_model %>% fit(copula_transformed_reshaped, outcome, epochs = 20, batch_size = 32, validation_split = 0.2)
+
+cnn_lstm_model <- create_cnn_lstm_model()
+cnn_lstm_model %>% compile(loss = 'mean_squared_error', optimizer = optimizer_adam())
+history_cnn_lstm <- cnn_lstm_model %>% fit(copula_transformed_reshaped, outcome, epochs = 20, batch_size = 32, validation_split = 0.2)
+
+copula_rf_model <- create_copula_rf_model(reduced_data_matrix, outcome)
+
+# --- Model Predictions ---
+predictions_lstm <- lstm_model %>% predict(copula_transformed_reshaped)
+predictions_cnn_lstm <- cnn_lstm_model %>% predict(copula_transformed_reshaped)
+copula_rf_predictions <- predict(copula_rf_model, as.data.frame(reduced_data_matrix))
+
+# --- Weighted RMSE and MAE ---
+weighted_rmse <- function(predictions) {
+  sqrt(sum(ht_weights * (predictions - outcome)^2) / sum(ht_weights))
+}
+weighted_mae <- function(predictions) {
+  sum(ht_weights * abs(predictions - outcome)) / sum(ht_weights)
+}
+
+rmse_lstm <- weighted_rmse(predictions_lstm)
+mae_lstm <- weighted_mae(predictions_lstm)
+
+rmse_cnn_lstm <- weighted_rmse(predictions_cnn_lstm)
+mae_cnn_lstm <- weighted_mae(predictions_cnn_lstm)
+
+rmse_copula_rf <- weighted_rmse(copula_rf_predictions)
+mae_copula_rf <- weighted_mae(copula_rf_predictions)
+
+# --- C-Statistics (Concordance Index) ---
+calculate_c_statistic <- function(predictions, outcome) {
+  rcorr.cens(predictions, outcome)[["C Index"]]
+}
+
+c_stat_lstm <- calculate_c_statistic(predictions_lstm, outcome)
+c_stat_cnn_lstm <- calculate_c_statistic(predictions_cnn_lstm, outcome)
+c_stat_copula_rf <- calculate_c_statistic(copula_rf_predictions, outcome)
+
+# --- HTE (ATE & CATE) with HT Weights ---
+calculate_weighted_ht_effects <- function(predictions, race, reduced_data_matrix, weights) {
+  black_indices <- which(race == "black or african american")
+  white_indices <- which(race == "white")
+
+  weighted_mean <- function(pred, indices) {
+    sum(weights[indices] * pred[indices]) / sum(weights[indices])
+  }
+
+  cate_filter <- reduced_data_matrix[, 1] > 0
+
+  ate_black <- weighted_mean(predictions, black_indices)
+  ate_white <- weighted_mean(predictions, white_indices)
+  cate_black <- weighted_mean(predictions, black_indices[cate_filter[black_indices]])
+  cate_white <- weighted_mean(predictions, white_indices[cate_filter[white_indices]])
+
+  return(data.frame(
+    Race = c("Black or African American", "White"),
+    ATE = c(ate_black, ate_white),
+    CATE = c(cate_black, cate_white)
+  ))
+}
+
+hte_lstm_race <- calculate_weighted_ht_effects(predictions_lstm, col_data$race, reduced_data_matrix, ht_weights)
+hte_cnn_lstm_race <- calculate_weighted_ht_effects(predictions_cnn_lstm, col_data$race, reduced_data_matrix, ht_weights)
+hte_copula_rf_race <- calculate_weighted_ht_effects(copula_rf_predictions, col_data$race, reduced_data_matrix, ht_weights)
+
+# --- Combine Results ---
+hte_results_all_models <- rbind(
+  cbind(hte_lstm_race, Model = "LSTM"),
+  cbind(hte_cnn_lstm_race, Model = "CNN-LSTM"),
+  cbind(hte_copula_rf_race, Model = "Copula-RF")
+)
+
+model_names <- c("LSTM", "CNN-LSTM", "Copula-RF")
+rmse_values <- c(rmse_lstm, rmse_cnn_lstm, rmse_copula_rf)
+mae_values <- c(mae_lstm, mae_cnn_lstm, mae_copula_rf)
+c_stat_values <- c(c_stat_lstm, c_stat_cnn_lstm, c_stat_copula_rf)
+
+results_table <- data.frame(
+  Model = model_names,
+  RMSE = rmse_values,
+  MAE = mae_values,
+  C_statistic = c_stat_values
+)
+
+final_results_table <- merge(results_table, hte_results_all_models, by = "Model", all = TRUE)
+print(final_results_table)
+
+# --- Plotting Weighted Results ---
+results_long <- gather(final_results_table, key = "Metric", value = "Value", -Model, -Race)
+
+ggplot(results_long, aes(x = Model, y = Value, fill = Metric)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.8), width = 0.7) +
+  facet_wrap(~Race, scales = "free_y") +
+  labs(title = "HT-Weighted Evaluation Metrics by Model and Race",
+       x = "Model",
+       y = "Value") +
+  theme_minimal() +
+theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+
+
+########################
+## IPTW 
+########################
+
+library(keras)
+library(randomForest)
+library(dplyr)
+library(ggplot2)
+library(copula)
+library(Hmisc)
+library(tidyr)
+
+# Step 1: Prepare the data
+col_data$race <- as.factor(col_data$race)
+col_data$vital_status <- as.numeric(col_data$vital_status)
+col_data <- col_data[col_data$race %in% c("black or african american", "white"), ]
+expression_matrix <- expression_matrix[, rownames(col_data)]
+
+# IPTW Weights
+n_black_alive <- 159
+n_black_dead <- 32
+n_white_alive <- 721
+n_white_dead <- 159
+
+p_black_alive <- n_black_alive / (n_black_alive + n_white_alive)
+p_black_dead <- n_black_dead / (n_black_dead + n_white_dead)
+p_white_alive <- n_white_alive / (n_black_alive + n_white_alive)
+p_white_dead <- n_white_dead / (n_black_dead + n_white_dead)
+
+iptw_black_alive <- 1 / p_black_alive
+iptw_black_dead <- 1 / p_black_dead
+iptw_white_alive <- 1 / p_white_alive
+iptw_white_dead <- 1 / p_white_dead
+
+iptw_weights <- ifelse(
+  col_data$race == "black or african american" & col_data$vital_status == 1, iptw_black_alive,
+  ifelse(col_data$race == "black or african american" & col_data$vital_status == 0, iptw_black_dead,
+    ifelse(col_data$race == "white" & col_data$vital_status == 1, iptw_white_alive, iptw_white_dead)
+  )
+)
+
+# PCA Dimensionality Reduction
+expression_data <- as.matrix(t(expression_matrix))
+zero_variance_cols <- apply(expression_data, 2, function(x) var(x) == 0)
+expression_data_filtered <- expression_data[, !zero_variance_cols]
+pca_result <- prcomp(expression_data_filtered, center = TRUE, scale. = TRUE)
+reduced_data_matrix <- as.matrix(pca_result$x[, 1:6])
+
+n_samples <- nrow(reduced_data_matrix)
+n_features <- ncol(reduced_data_matrix)
+copula_transformed_reshaped <- array(reduced_data_matrix, dim = c(n_samples, 1, n_features))
+
+# LSTM Model
+create_lstm_model <- function() {
+  keras_model_sequential() %>%
+    layer_lstm(units = 64, input_shape = c(1, n_features), return_sequences = FALSE) %>%
+    layer_dense(units = 32, activation = "relu") %>%
+    layer_dense(units = 1)
+}
+
+# CNN-LSTM Model
+create_cnn_lstm_model <- function() {
+  keras_model_sequential() %>%
+    layer_conv_1d(filters = 64, kernel_size = 1, activation = "relu", input_shape = c(1, n_features)) %>%
+    layer_max_pooling_1d(pool_size = 1) %>%
+    layer_lstm(units = 64, return_sequences = FALSE) %>%
+    layer_dense(units = 32, activation = "relu") %>%
+    layer_dense(units = 1)
+}
+
+# Copula-Based Random Forest Model
+create_copula_rf_model <- function(data, outcome) {
+  fitted_copula <- fitCopula(normalCopula(dim = ncol(data)), pobs(data), method = "ml")
+  copula_transformed_data <- qnorm(pobs(data), mean = 0, sd = 1)
+  randomForest(outcome ~ ., data = as.data.frame(copula_transformed_data), ntree = 100)
+}
+
+# Train Models
+lstm_model <- create_lstm_model()
+lstm_model %>% compile(loss = 'mean_squared_error', optimizer = optimizer_adam())
+history_lstm <- lstm_model %>% fit(copula_transformed_reshaped, col_data$vital_status, epochs = 20, batch_size = 32, validation_split = 0.2)
+
+cnn_lstm_model <- create_cnn_lstm_model()
+cnn_lstm_model %>% compile(loss = 'mean_squared_error', optimizer = optimizer_adam())
+history_cnn_lstm <- cnn_lstm_model %>% fit(copula_transformed_reshaped, col_data$vital_status, epochs = 20, batch_size = 32, validation_split = 0.2)
+
+copula_rf_model <- create_copula_rf_model(reduced_data_matrix, col_data$vital_status)
+
+# Model Predictions
+predictions_lstm <- lstm_model %>% predict(copula_transformed_reshaped)
+predictions_cnn_lstm <- cnn_lstm_model %>% predict(copula_transformed_reshaped)
+copula_rf_predictions <- predict(copula_rf_model, as.data.frame(reduced_data_matrix))
+
+# Weighted RMSE and MAE
+weighted_rmse <- function(predictions) {
+  sqrt(sum(iptw_weights * (predictions - col_data$vital_status)^2) / sum(iptw_weights))
+}
+weighted_mae <- function(predictions) {
+  sum(iptw_weights * abs(predictions - col_data$vital_status)) / sum(iptw_weights)
+}
+
+rmse_lstm <- weighted_rmse(predictions_lstm)
+mae_lstm <- weighted_mae(predictions_lstm)
+
+rmse_cnn_lstm <- weighted_rmse(predictions_cnn_lstm)
+mae_cnn_lstm <- weighted_mae(predictions_cnn_lstm)
+
+rmse_copula_rf <- weighted_rmse(copula_rf_predictions)
+mae_copula_rf <- weighted_mae(copula_rf_predictions)
+
+# Compute C-statistics
+cstat_lstm <- rcorr.cens(predictions_lstm, col_data$vital_status)["C Index"]
+cstat_cnn_lstm <- rcorr.cens(predictions_cnn_lstm, col_data$vital_status)["C Index"]
+cstat_copula_rf <- rcorr.cens(copula_rf_predictions, col_data$vital_status)["C Index"]
+
+# Weighted ATE & CATE
+calculate_weighted_iptw_effects <- function(predictions, race, reduced_data_matrix, weights) {
+  black_indices <- which(race == "black or african american")
+  white_indices <- which(race == "white")
+  
+  weighted_mean <- function(pred, indices) {
+    sum(weights[indices] * pred[indices]) / sum(weights[indices])
+  }
+  
+  ate_black <- weighted_mean(predictions, black_indices)
+  ate_white <- weighted_mean(predictions, white_indices)
+  cate_black <- weighted_mean(predictions, black_indices & reduced_data_matrix[black_indices, 1] > 0)
+  cate_white <- weighted_mean(predictions, white_indices & reduced_data_matrix[white_indices, 1] > 0)
+  
+  data.frame(
+    Race = c("Black or African American", "White"),
+    ATE = c(ate_black, ate_white),
+    CATE = c(cate_black, cate_white)
+  )
+}
+
+hte_lstm_race <- calculate_weighted_iptw_effects(predictions_lstm, col_data$race, reduced_data_matrix, iptw_weights)
+hte_cnn_lstm_race <- calculate_weighted_iptw_effects(predictions_cnn_lstm, col_data$race, reduced_data_matrix, iptw_weights)
+hte_copula_rf_race <- calculate_weighted_iptw_effects(copula_rf_predictions, col_data$race, reduced_data_matrix, iptw_weights)
+
+# Final Combined Table
+final_results_table <- data.frame(
+  Model = rep(c("LSTM", "CNN-LSTM", "Copula-RF"), each = 2),
+  Race = rep(c("Black or African American", "White"), times = 3),
+  RMSE = c(rmse_lstm, rmse_lstm, rmse_cnn_lstm, rmse_cnn_lstm, rmse_copula_rf, rmse_copula_rf),
+  MAE = c(mae_lstm, mae_lstm, mae_cnn_lstm, mae_cnn_lstm, mae_copula_rf, mae_copula_rf),
+  ATE = c(hte_lstm_race$ATE, hte_cnn_lstm_race$ATE, hte_copula_rf_race$ATE),
+  CATE = c(hte_lstm_race$CATE, hte_cnn_lstm_race$CATE, hte_copula_rf_race$CATE),
+  C_statistic = c(cstat_lstm, cstat_lstm, cstat_cnn_lstm, cstat_cnn_lstm, cstat_copula_rf, cstat_copula_rf)
+)
+
+print(final_results_table)
+
+# Plot Results
+results_long <- pivot_longer(final_results_table, cols = c(RMSE, MAE, ATE, CATE, C_statistic), names_to = "Metric", values_to = "Value")
+
+ggplot(results_long, aes(x = Model, y = Value, fill = Metric)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.8), width = 0.7) +
+  facet_wrap(~Race) +    
+  labs(title = " IPTW-Weighted Evaluation Metrics by Model and Race ",
+       x = "Model", y = "Value") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))

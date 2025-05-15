@@ -298,18 +298,9 @@ psm_model <- matchit(event_binary ~ age + sex + race + priors_count + decile_sco
 psm_matched_data <- match.data(psm_model)
 psm_ate <- mean(psm_matched_data$decile_score)
 
-# C-statistic for PSM
-library(Hmisc)
 
-psm_cstat_hmisc <- rcorr.cens(psm_probs, compas_data$event_binary)["C Index"]
-psm_cstat<-psm_cstat_hmisc[[1]]
-
-# Logistic regression C-statistic
+# Logistic regression 
 logit_preds <- predict(psm_model_multi, type = "probs")
-logit_cstat <- concordance.index(logit_preds[, 1],
-                                 surv.time = rep(1, length(logit_preds[, 1])),
-                                 surv.event = as.numeric(compas_data$is_recid) - 1,
-                                 method = "noether")$c.index
 
 # Causal Forest
 numeric_data <- compas_data %>%
@@ -338,17 +329,12 @@ psm_ate_ci <- bootstrap_ci(psm_matched_data$decile_score)
 logit_ate_ci <- bootstrap_ci(logit_preds[, 1])
 
 
-# 11. C-statistics
-c_stat_ht <- concordance.index(rnn_pred_ht, surv.time = y_train, surv.event = rep(1, length(y_train)))$c.index 
-c_stat_cf <- concordance.index(cf_pred, surv.time = y_train, surv.event = rep(1, length(y_train)))$c.index
-
-# 12. Summary Table
+# Summary Table
 ate_results <- data.frame(
   Method = c("Copula RNN with HT", "PSM", "Logistic Regression", "Causal Forest"),
   Estimate = c(rnn_ate_ht, psm_ate, mean(logit_prob), cf_ate),
   LowerCI = c(rnn_ate_ht_ci[1], psm_ate_ci[1], logit_ate_ci[1], cf_ate_ci[1]),
-  UpperCI = c(rnn_ate_ht_ci[2], psm_ate_ci[2], logit_ate_ci[2], cf_ate_ci[2]),
-  C_Statistic = c(c_stat_ht, psm_cstat, logit_c_stat, c_stat_cf)
+  UpperCI = c(rnn_ate_ht_ci[2], psm_ate_ci[2], logit_ate_ci[2], cf_ate_ci[2])
 )
 
 print(ate_results)

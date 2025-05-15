@@ -1,5 +1,5 @@
 ### Simulation with sensitivity analysis
-# Load necessary libraries
+# Load Required Libraries
 library(nnet)     # For multinomial logistic regression
 library(keras)    # For deep learning models
 library(tensorflow)  # For tensorflow backend
@@ -12,129 +12,101 @@ library(ggplot2)
 library(survcomp)  # For C-index calculation
 library(kableExtra)
 library(copula)    # For Gaussian copula transformation
+library(grf)       # For Causal Forest
 
 # 1. Generate Highly Correlated Synthetic Data
 set.seed(42)
-
-n_samples <- 1000  # Number of data points (rows)
-n_features <- 6    # Number of features (columns)
-
-base_corr <- 0.8  # Base correlation between features
-corr_matrix <- matrix(base_corr, nrow = n_features, ncol = n_features)  # Create correlation matrix
-diag(corr_matrix) <- 1  # Set diagonal elements to 1 (no self-correlation)
-
-mean_values <- rep(0, n_features)  # Mean of 0 for all features
-x_data <- mvrnorm(n = n_samples, mu = mean_values, Sigma = corr_matrix)  # Generate synthetic correlated data
-
-# Convert to data frame and label columns
+n_samples <- 1000
+n_features <- 6
+base_corr <- 0.8
+corr_matrix <- matrix(base_corr, nrow = n_features, ncol = n_features)
+diag(corr_matrix) <- 1
+mean_values <- rep(0, n_features)
+x_data <- mvrnorm(n = n_samples, mu = mean_values, Sigma = corr_matrix)
 x_data <- as.data.frame(x_data)
 colnames(x_data) <- paste0("X", 1:n_features)
 
-# 2. Add Nonlinear Transformations to Some Columns
+# 2. Add Nonlinear Transformations
 x_data$X101 <- sin(x_data$X1) * cos(x_data$X2)
 x_data$X102 <- log(abs(x_data$X3) + 1) * exp(-x_data$X4)
 x_data$X103 <- (x_data$X5)^2 + (x_data$X6)^3
 
-# 3. Generate Survival Data with Weibull Distribution
-shape_param <- 2  # Shape parameter for Weibull distribution
-scale_param <- exp(0.5 * x_data$X1 + 0.3 * x_data$X2)  # Scale parameter depends on X1 and X2
-
-survival_times <- rweibull(n_samples, shape = shape_param, scale = scale_param)  # Generate survival times
-event_prob <- runif(n_samples)  # Generate random probabilities for event type
-event_type <- ifelse(event_prob < 0.5, 1, 2)  # Assign event types (1 or 2)
-
-censoring_times <- runif(n_samples, min = 0, max = max(survival_times) * 0.8)  # Simulate censoring times
-observed_times <- pmin(survival_times, censoring_times)  # Observed time is the minimum of survival and censoring times
-observed_event <- ifelse(survival_times <= censoring_times, event_type, 0)  # Event indicator (0 if censored, 1 or 2 for events)
-
-synthetic_data <- cbind(x_data, time = observed_times, event = observed_event)  # Combine features and time/event data
+# 3. Generate Survival Data
+shape_param <- 2
+scale_param <- exp(0.5 * x_data$X1 + 0.3 * x_data$X2)
+survival_times <- rweibull(n_samples, shape = shape_param, scale = scale_param)
+event_prob <- runif(n_samples)
+event_type <- ifelse(event_prob < 0.5, 1, 2)
+censoring_times <- runif(n_samples, min = 0, max = max(survival_times) * 0.8)
+observed_times <- pmin(survival_times, censoring_times)
+observed_event <- ifelse(survival_times <= censoring_times, event_type, 0)
+synthetic_data <- cbind(x_data, time = observed_times, event = observed_event)
 synthetic_data <- as.data.frame(synthetic_data)
 
 # 4. Multinomial Logistic Regression for Propensity Scores
-synthetic_data$event <- as.factor(synthetic_data$event)  # Ensure event column is a factor
+synthetic_data$event <- as.factor(synthetic_data$event)
+psm_model_multi <- nnet::multinom(event ~ ., data = synthetic_data)
+prop_scores <- predict(psm_model_multi, type = "probs")
 
-psm_model_multi <- nnet::multinom(event ~ ., data = synthetic_data)  # Fit multinomial logistic regression for propensity scores
-prop_scores <- predict(psm_model_multi, type = "probs")  # Predict the propensity scores
-
-# 5. Inverse Probability Treatment Weights (IPTW) and Horvitz-Thompson (HT) Weights
+# 5. IPTW and HT Weights
 iptw_weights_1 <- 1 / prop_scores[, 1]
 iptw_weights_2 <- 1 / prop_scores[, 2]
+ht_weights <- 1 / (prop_scores[cbind(1:n_samples, synthetic_data$event)])
+sample_weights <- ifelse(synthetic_data$event == 1, iptw_weights_1, iptw_weights_2)
 
-ht_weights <- 1 / (prop_scores[cbind(1:n_samples, synthetic_data$event)])  # HT weights
-
-sample_weights <- ifelse(synthetic_data$event == 1, iptw_weights_1, iptw_weights_2)  # Sample weights for IPTW
-
-# 6. Prepare Data for Training
-X_train <- as.matrix(synthetic_data[, 1:n_features])  # Features
-y_train <- synthetic_data$time  # Survival times
+# 6. Prepare Data
+X_train <- as.matrix(synthetic_data[, 1:n_features])
+y_train <- synthetic_data$time
 
 # 7. Gaussian Copula Transformation
-copula_model <- normalCopula(dim = n_features, dispstr = "un")  # Define Gaussian copula
-pseudo_obs <- pobs(X_train)  # Transform features to pseudo-observations (uniform margins)
+copula_model <- normalCopula(dim = n_features, dispstr = "un")
+pseudo_obs <- pobs(X_train)
+fit_result <- fitCopula(copula_model, pseudo_obs, method = "ml")
+copula_transformed_features <- rCopula(n_samples, fit_result@copula)
+X_train_rnn <- array(copula_transformed_features, dim = c(n_samples, 1, n_features))
 
-fit_result <- fitCopula(copula_model, pseudo_obs, method = "ml")  # Fit the copula
-
-# Simulate Copula-Transformed Features
-copula_transformed_features <- rCopula(n_samples, fit_result@copula)  # Simulate from the fitted copula
-
-# Reshape for LSTM input
-X_train_rnn <- array(copula_transformed_features, dim = c(n_samples, 1, n_features))  # Timesteps = 1 for RNN
-
-# 8. Define and Train LSTM Model with HT Weights (Horvitz-Thompson Weights)
+# 8. Train LSTM with HT Weights
 rnn_model_ht <- keras_model_sequential() %>%
   layer_lstm(units = 64, return_sequences = FALSE, input_shape = c(1, n_features)) %>%
   layer_dense(units = 1, activation = "linear")
-
 rnn_model_ht %>% compile(loss = "mean_squared_error", optimizer = optimizer_adam(), metrics = c("mae"))
-
-# Train the LSTM model using the copula-transformed features and HT weights
 rnn_model_ht %>% fit(X_train_rnn, y_train, epochs = 10, batch_size = 64, sample_weight = ht_weights)
-
-# Get Treatment Effect Estimate from LSTM (HT)
 rnn_pred_ht <- predict(rnn_model_ht, X_train_rnn)
-rnn_ate_ht <- mean(rnn_pred_ht)  # Average of the predictions as the treatment effect estimate
+rnn_ate_ht <- mean(rnn_pred_ht)
 
-# 9. Define and Train LSTM Model with IPTW Weights (Inverse Probability of Treatment Weights)
+# 9. Train LSTM with IPTW Weights
 rnn_model_iptw <- keras_model_sequential() %>%
   layer_lstm(units = 64, return_sequences = FALSE, input_shape = c(1, n_features)) %>%
   layer_dense(units = 1, activation = "linear")
-
 rnn_model_iptw %>% compile(loss = "mean_squared_error", optimizer = optimizer_adam(), metrics = c("mae"))
-
-# Train the LSTM model using the copula-transformed features and IPTW weights
 rnn_model_iptw %>% fit(X_train_rnn, y_train, epochs = 10, batch_size = 64, sample_weight = sample_weights)
-
-# Get Treatment Effect Estimate from LSTM (IPTW)
 rnn_pred_iptw <- predict(rnn_model_iptw, X_train_rnn)
-rnn_ate_iptw <- mean(rnn_pred_iptw)  # Average of the predictions as the treatment effect estimate
+rnn_ate_iptw <- mean(rnn_pred_iptw)
 
-# 10. Propensity Score Matching (PSM) for Treatment Effect Estimate
-# Modify event variable to be binary (e.g., 1 for event type 1, and 0 for event type 2)
-synthetic_data$event_binary <- ifelse(synthetic_data$event == 1, 1, 0)  # Convert event to binary
+# 10. PSM
+synthetic_data$event_binary <- ifelse(synthetic_data$event == 1, 1, 0)
+psm_model <- matchit(event_binary ~ ., data = synthetic_data, method = "nearest")
+psm_matched_data <- match.data(psm_model)
+psm_ate <- mean(psm_matched_data$time)
 
-# Apply nearest neighbor matching
-psm_model <- matchit(event_binary ~ ., data = synthetic_data, method = "nearest")  # Apply nearest neighbor matching
-psm_matched_data <- match.data(psm_model)  # Get the matched data
-psm_ate <- mean(psm_matched_data$time)  # Average treatment effect from PSM
+# 11. Causal Forest
+numeric_data <- synthetic_data %>% mutate(across(where(is.factor), ~as.numeric(as.factor(.))))
+X_cf <- as.matrix(numeric_data[, 1:n_features])
+Y_cf <- synthetic_data$time
+W_cf <- as.numeric(synthetic_data$event_binary)
+cf_model <- causal_forest(X_cf, Y_cf, W = W_cf, num.trees = 2000, seed = 42)
+cf_pred <- predict(cf_model)$predictions
+cf_ate <- mean(cf_pred)
 
-# Function to calculate Bootstrap CI
-bootstrap_ci <- function(model_preds, n_bootstrap = 1000, conf_level = 0.95) {
-  bootstrap_samples <- replicate(n_bootstrap, sample(model_preds, replace = TRUE))
-  bootstrap_means <- apply(bootstrap_samples, 2, mean)
-  ci_lower <- quantile(bootstrap_means, (1 - conf_level) / 2)
-  ci_upper <- quantile(bootstrap_means, 1 - (1 - conf_level) / 2)
-  return(c(ci_lower, ci_upper))
+
+# 12. Bootstrap CI
+bootstrap_ci <- function(x, n_bootstrap = 1000, conf_level = 0.95) {
+  boot_samples <- replicate(n_bootstrap, mean(sample(x, replace = TRUE)))
+  alpha <- (1 - conf_level) / 2
+  quantile(boot_samples, probs = c(alpha, 1 - alpha))
 }
 
-# Calculate Confidence Intervals for the models
-rnn_ate_ht_ci <- bootstrap_ci(rnn_pred_ht)
-rnn_ate_iptw_ci <- bootstrap_ci(rnn_pred_iptw)
-psm_ate_ci <- bootstrap_ci(psm_matched_data$time)
-logit_preds <- predict(psm_model_multi, type = "probs")
-logit_ate_ci <- bootstrap_ci(logit_preds[, 1])  # For the first event
-
-
-# Function to perturb the data
+# --- Perturbation Function
 perturb_data <- function(data, perturb_rate = 0.1) {
   n_samples <- nrow(data)
   n_features <- ncol(data)
@@ -143,85 +115,122 @@ perturb_data <- function(data, perturb_rate = 0.1) {
   return(perturbed_data)
 }
 
-# Perturb the data with 10% perturbation
+# --- RNN Models on Perturbed Data
 X_train_perturbed <- perturb_data(X_train, perturb_rate = 0.1)
-X_train_rnn_perturbed <- array(perturb_data(copula_transformed_features, perturb_rate = 0.1), dim = c(n_samples, 1, n_features))
+n_samples <- nrow(X_train_perturbed)
+n_features <- ncol(X_train_perturbed)
+X_train_rnn_perturbed <- array(perturb_data(copula_transformed_features, perturb_rate = 0.1),
+                               dim = c(n_samples, 1, n_features))
 
-# Train LSTM Model with HT Weights on perturbed data
 rnn_model_ht %>% fit(X_train_rnn_perturbed, y_train, epochs = 10, batch_size = 64, sample_weight = ht_weights)
 rnn_pred_ht_perturbed <- predict(rnn_model_ht, X_train_rnn_perturbed)
-rnn_ate_ht_perturbed <- mean(rnn_pred_ht_perturbed)  # Average of the predictions as the treatment effect estimate
+rnn_ate_ht_perturbed <- mean(rnn_pred_ht_perturbed)
+rnn_ate_ht_perturbed_ci <- bootstrap_ci(rnn_pred_ht_perturbed)
 
-# Train LSTM Model with IPTW Weights on perturbed data
 rnn_model_iptw %>% fit(X_train_rnn_perturbed, y_train, epochs = 10, batch_size = 64, sample_weight = sample_weights)
 rnn_pred_iptw_perturbed <- predict(rnn_model_iptw, X_train_rnn_perturbed)
-rnn_ate_iptw_perturbed <- mean(rnn_pred_iptw_perturbed)  # Average of the predictions as the treatment effect estimate
+rnn_ate_iptw_perturbed <- mean(rnn_pred_iptw_perturbed)
+rnn_ate_iptw_perturbed_ci <- bootstrap_ci(rnn_pred_iptw_perturbed)
 
-# Propensity Score Matching (PSM) on perturbed data
+# --- PSM on Perturbed Data
 synthetic_data_perturbed <- synthetic_data
 synthetic_data_perturbed[, 1:n_features] <- perturb_data(synthetic_data[, 1:n_features], perturb_rate = 0.1)
 psm_model_perturbed <- matchit(event_binary ~ ., data = synthetic_data_perturbed, method = "nearest")
 psm_matched_data_perturbed <- match.data(psm_model_perturbed)
-psm_ate_perturbed <- mean(psm_matched_data_perturbed$time)  # Average treatment effect from PSM
+psm_ate_perturbed <- mean(psm_matched_data_perturbed$time)
+psm_ate_perturbed_ci <- bootstrap_ci(psm_matched_data_perturbed$time)
 
-# Logistic Regression on perturbed data
+# --- Logistic Regression on Perturbed Data
 psm_model_multi_perturbed <- nnet::multinom(event ~ ., data = synthetic_data_perturbed)
 logit_preds_perturbed <- predict(psm_model_multi_perturbed, type = "probs")
-logit_ate_perturbed <- mean(logit_preds_perturbed[, 1])  # For the first event
+logit_ate_perturbed <- mean(logit_preds_perturbed[, 1])
+logit_ate_perturbed_ci <- bootstrap_ci(logit_preds_perturbed[, 1])
 
-# Calculate Confidence Intervals for the perturbed models
-rnn_ate_ht_perturbed_ci <- bootstrap_ci(rnn_pred_ht_perturbed)
-rnn_ate_iptw_perturbed_ci <- bootstrap_ci(rnn_pred_iptw_perturbed)
-psm_ate_perturbed_ci <- bootstrap_ci(psm_matched_data_perturbed$time)
-logit_ate_perturbed_ci <- bootstrap_ci(logit_preds_perturbed[, 1])  # For the first event
+# --- Causal Forest on Perturbed Data
+X_cf_perturbed <- perturb_data(X_cf, perturb_rate = 0.1)
+cf_model_perturbed <- causal_forest(X_cf_perturbed, Y = Y_cf, W = W_cf, num.trees = 2000, seed = 42)
+cf_pred_perturbed <- predict(cf_model_perturbed)$predictions
+cf_ate_perturbed <- mean(cf_pred_perturbed)
+cf_ate_perturbed_ci <- bootstrap_ci(cf_pred_perturbed)
 
-# Print Results for Perturbed Models
+# --- Results for Perturbed Models
 ate_results_perturbed <- data.frame(
-  Method = c("Copula RNN with HT (Perturbed)", "Copula RNN with IPTW (Perturbed)", 
-             "PSM (Perturbed)", "Logistic Regression (Perturbed)"),
-  Estimate = c(rnn_ate_ht_perturbed, rnn_ate_iptw_perturbed, psm_ate_perturbed, logit_ate_perturbed),
-  LowerCI = c(rnn_ate_ht_perturbed_ci[1], rnn_ate_iptw_perturbed_ci[1], psm_ate_perturbed_ci[1], logit_ate_perturbed_ci[1]),
-  UpperCI = c(rnn_ate_ht_perturbed_ci[2], rnn_ate_iptw_perturbed_ci[2], psm_ate_perturbed_ci[2], logit_ate_perturbed_ci[2])
+  Method = c("Copula RNN with HT (Perturbed)", "Copula RNN with IPTW (Perturbed)",
+             "PSM (Perturbed)", "Logistic Regression (Perturbed)", "Causal Forest (Perturbed)"),
+  Estimate = c(rnn_ate_ht_perturbed, rnn_ate_iptw_perturbed,
+               psm_ate_perturbed, logit_ate_perturbed, cf_ate_perturbed),
+  LowerCI = c(rnn_ate_ht_perturbed_ci[1], rnn_ate_iptw_perturbed_ci[1],
+              psm_ate_perturbed_ci[1], logit_ate_perturbed_ci[1], cf_ate_perturbed_ci[1]),
+  UpperCI = c(rnn_ate_ht_perturbed_ci[2], rnn_ate_iptw_perturbed_ci[2],
+              psm_ate_perturbed_ci[2], logit_ate_perturbed_ci[2], cf_ate_perturbed_ci[2])
 )
 
-# Print Perturbed Results
-print(ate_results_perturbed)
-
-# Visualize Perturbed Results with Error Bars for CIs
+# --- Visualization: Perturbed ATE Estimates
 ggplot(ate_results_perturbed, aes(x = Method, y = Estimate)) +
-  geom_point() +  # Plot the point estimates
-  geom_errorbar(aes(ymin = LowerCI, ymax = UpperCI), width = 0.2) +  # Add error bars for the CI
-  labs(title = "Comparison of Treatment Effect Estimates (Perturbed Models) with Confidence Intervals",
-       y = "Estimated Treatment Effect (ATE)",
-       x = "Method") +
-theme_minimal()
+  geom_point() +
+  geom_errorbar(aes(ymin = LowerCI, ymax = UpperCI), width = 0.2) +
+  labs(title = "Comparison of Treatment Effect Estimates (Perturbed Models)",
+       y = "Estimated Treatment Effect (ATE)", x = "Method") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
 
-
-# Combine original and perturbed results into one data frame for tabular display
+# --- Combined Table of Original + Perturbed Results
 ate_results_combined <- data.frame(
-  Method = c("Copula RNN with HT", "Copula RNN with HT (Perturbed)", 
-             "Copula RNN with IPTW", "Copula RNN with IPTW (Perturbed)", 
-             "PSM", "PSM (Perturbed)", 
-             "Logistic Regression", "Logistic Regression (Perturbed)"),
-  Estimate = c(rnn_ate_ht, rnn_ate_ht_perturbed, 
-               rnn_ate_iptw, rnn_ate_iptw_perturbed, 
-               psm_ate, psm_ate_perturbed, 
-               logit_ate, logit_ate_perturbed),
-  LowerCI = c(rnn_ate_ht_ci[1], rnn_ate_ht_perturbed_ci[1], 
-              rnn_ate_iptw_ci[1], rnn_ate_iptw_perturbed_ci[1], 
-              psm_ate_ci[1], psm_ate_perturbed_ci[1], 
-              logit_ate_ci[1], logit_ate_perturbed_ci[1]),
-  UpperCI = c(rnn_ate_ht_ci[2], rnn_ate_ht_perturbed_ci[2], 
-              rnn_ate_iptw_ci[2], rnn_ate_iptw_perturbed_ci[2], 
-              psm_ate_ci[2], psm_ate_perturbed_ci[2], 
-              logit_ate_ci[2], logit_ate_perturbed_ci[2])
+  Method = c("Copula RNN with HT", "Copula RNN with HT (Perturbed)",
+             "Copula RNN with IPTW", "Copula RNN with IPTW (Perturbed)",
+             "PSM", "PSM (Perturbed)",
+             "Logistic Regression", "Logistic Regression (Perturbed)",
+             "Causal Forest", "Causal Forest (Perturbed)"),
+  Estimate = c(rnn_ate_ht, rnn_ate_ht_perturbed,
+               rnn_ate_iptw, rnn_ate_iptw_perturbed,
+               psm_ate, psm_ate_perturbed,
+               logit_ate, logit_ate_perturbed,
+               cf_ate, cf_ate_perturbed),
+  LowerCI = c(rnn_ate_ht_ci[1], rnn_ate_ht_perturbed_ci[1],
+              rnn_ate_iptw_ci[1], rnn_ate_iptw_perturbed_ci[1],
+              psm_ate_ci[1], psm_ate_perturbed_ci[1],
+              logit_ate_ci[1], logit_ate_perturbed_ci[1],
+              cf_ate_ci[1], cf_ate_perturbed_ci[1]),
+  UpperCI = c(rnn_ate_ht_ci[2], rnn_ate_ht_perturbed_ci[2],
+              rnn_ate_iptw_ci[2], rnn_ate_iptw_perturbed_ci[2],
+              psm_ate_ci[2], psm_ate_perturbed_ci[2],
+              logit_ate_ci[2], logit_ate_perturbed_ci[2],
+              cf_ate_ci[2], cf_ate_perturbed_ci[2])
 )
 
-# Display the table
+# --- Display Combined Table
 ate_results_combined %>%
   kable("html", caption = "Comparison of Treatment Effect Estimates (Original vs. Perturbed Models)") %>%
-kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
-ate_results_combined
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+
+print(ate_results_combined)
+
+
+# Factor levels for better ordering
+ate_results_combined$Method <- factor(ate_results_combined$Method, levels = rev(ate_results_combined$Method))
+
+# Highlight original vs. perturbed with color or linetype
+ate_results_combined <- ate_results_combined %>%
+  mutate(
+    ModelType = ifelse(grepl("Perturbed", Method), "Perturbed", "Original"),
+    BaseMethod = gsub(" \\(Perturbed\\)", "", Method)
+  )
+
+# Plot
+ggplot(ate_results_combined, aes(x = Estimate, y = Method, color = ModelType)) +
+  geom_point(size = 3) +
+  geom_errorbarh(aes(xmin = LowerCI, xmax = UpperCI), height = 0.25) +
+  scale_color_manual(values = c("Original" = "#1f78b4", "Perturbed" = "#e31a1c")) +
+  labs(
+    title = "Comparison of ATE Estimates: Original vs. Perturbed Models",
+    x = "Estimated Average Treatment Effect (ATE)",
+    y = "Method",
+    color = "Model Type"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "top")
+
+
 
 
 

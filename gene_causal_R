@@ -1,3 +1,6 @@
+# Mathematics 2025, 13(10), 1659; https://doi.org/10.3390/math13101659
+# https://www.mdpi.com/2227-7390/13/10/1659
+# Integrating Copula-Based Random Forest and Deep Learning Approaches for Analyzing Heterogeneous Treatment Effects in Survival Analysis
 if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
 BiocManager::install("TCGAbiolinks")
 BiocManager::install("DESeq2")

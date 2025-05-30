@@ -1,0 +1,1143 @@
+# Deep Learning-Based Survival Analysis with Copula-Based Activation Functions for Multivariate Response Prediction
+# Computation Statistics Under revision (05/30/2025)
+################################################
+### Simulated Data Analysis with CNN-LSTM Model
+################################################
+library(keras)
+library(tensorflow)
+library(dplyr)
+library(survival)
+library(survminer)
+library(ggplot2)
+library(tidyr)
+library(caret)         # For precision, recall, and F1 score
+
+# Set parameters
+timesteps <- 10  # Number of time steps (example, adjust as necessary)
+features <- 30   # Number of features (gene expression columns)
+n <- 1000        # Number of samples
+num_simulations <- 1  # Number of simulations
+
+# Clayton Copula activation function in TensorFlow (with learnable parameter)
+clayton_copula_activation_tf <- function(x, theta) {
+  u <- 0.5 * (1 + tf$math$erf(x / tf$math$sqrt(2.0)))  
+  copula_transformed <- tf$pow(u, -theta) - 1
+  copula_transformed <- tf$pow(copula_transformed, -1/theta)
+  return(copula_transformed)
+}
+
+# Gumbel Copula activation function in TensorFlow (with learnable parameter)
+gumbel_copula_activation_tf <- function(x, theta) {
+  u <- 0.5 * (1 + tf$math$erf(x / tf$math$sqrt(2.0)))
+  copula_transformed <- tf$math$exp(-tf$math$pow(-tf$math$log(u), theta))
+  return(copula_transformed)
+}
+
+# Clayton-Gumbel Copula Activation Function with Learnable Parameters
+clayton_gumbel_copula_activation_tf <- function(x, theta_clayton, theta_gumbel) {
+  # Clayton Copula Transformation
+  u_clayton <- 0.5 * (1 + tf$math$erf(x / tf$math$sqrt(2.0)))  
+  clayton_transformed <- tf$pow(u_clayton, -theta_clayton) - 1
+  clayton_transformed <- tf$pow(clayton_transformed, -1/theta_clayton)
+  
+  # Gumbel Copula Transformation
+  u_gumbel <- 0.5 * (1 + tf$math$erf(x / tf$math$sqrt(2.0)))
+  gumbel_transformed <- tf$math$exp(-tf$math$pow(-tf$math$log(u_gumbel), theta_gumbel))
+  
+  # Combine both transformations (e.g., using a weighted average or addition)
+  combined_transformed <- (clayton_transformed + gumbel_transformed) / 2  # Averaging both copulas
+  
+  return(combined_transformed)
+}
+
+# Combined Clayton Copula and ReLU activation function
+clayton_relu_activation_tf <- function(x, theta_clayton) {
+  # Apply Clayton Copula transformation
+  u_clayton <- 0.5 * (1 + tf$math$erf(x / tf$math$sqrt(2.0)))  
+  clayton_transformed <- tf$pow(u_clayton, -theta_clayton) - 1
+  clayton_transformed <- tf$pow(clayton_transformed, -1/theta_clayton)
+  
+  # Apply ReLU activation
+  relu_transformed <- tf$keras$activations$relu(clayton_transformed)
+  
+  return(relu_transformed)
+}
+
+# Sigmoid Activation Function in TensorFlow
+sigmoid_activation_tf <- function(x) {
+  return(tf$keras$activations$sigmoid(x))
+}
+
+generate_censored_data <- function(censoring_percentage, correlation_strength = 0.9, threshold = 5) {
+  shape_param <- 1.5  
+  scale_param <- 2    
+  
+  # Generate a primary response variable (time_data_1)
+  time_data_1 <- rweibull(n, shape = shape_param, scale = scale_param)
+  
+  # Create highly correlated responses by introducing linear dependencies with noise
+  time_data_2 <- time_data_1 * correlation_strength + rweibull(n, shape = shape_param, scale = scale_param) * (1 - correlation_strength)
+  time_data_3 <- time_data_1 * correlation_strength + rweibull(n, shape = shape_param, scale = scale_param) * (1 - correlation_strength)
+  
+  # Introduce additional noise for more variability
+  time_data_2 <- time_data_2 + rnorm(n, mean = 0, sd = 0.5)  # Adding noise to make it more realistic
+  time_data_3 <- time_data_3 + rnorm(n, mean = 0, sd = 0.5)
+  
+  # Convert time_data_2 to binary based on the threshold
+  time_data_2_binary <- ifelse(time_data_2 > threshold, 1, 0)
+  
+  # Convert time_data_3 to categorical data (e.g., Low, Medium, High)
+  time_data_3_categorical <- cut(time_data_3, 
+                                 breaks = c(-Inf, 2, 5, Inf),  # Define thresholds for categorization
+                                 labels = c("Low", "Medium", "High"))
+  
+  # Generate event/censoring indicator: 1 = event, 0 = censored
+  censoring_indicator <- sample(c(0, 1), n, replace = TRUE, prob = c(censoring_percentage, 1 - censoring_percentage))
+  
+  # Introduce right censoring by adjusting times for censored observations
+  time_data_1[censoring_indicator == 0] <- rexp(sum(censoring_indicator == 0), rate = 1 / 10)  # Randomly set censored times (e.g., after 10 units)
+  time_data_2[censoring_indicator == 0] <- rexp(sum(censoring_indicator == 0), rate = 1 / 10)
+  time_data_3[censoring_indicator == 0] <- rexp(sum(censoring_indicator == 0), rate = 1 / 10)
+  
+  # Combine event times and censoring indicator into a dataset
+  y_data_reshaped <- cbind(censoring_indicator, time_data_1, time_data_2_binary, time_data_3_categorical)
+  
+  return(y_data_reshaped)
+}
+
+# Example usage
+y_data_censored <- generate_censored_data(0.05)  # 5% censoring
+
+# Generate input features (x_data) for the CNN-LSTM model
+# Randomly generating data for x_data (shape: (n, timesteps, features))
+x_data <- array(runif(n * timesteps * features), dim = c(n, timesteps, features))
+
+# Define CNN-LSTM model for three response variables with different activation functions
+create_cnn_lstm_model <- function(activation_func, theta_clayton = NULL, theta_gumbel = NULL) {
+  keras_model_sequential() %>%
+    layer_conv_1d(filters = 32, kernel_size = 3, activation = "relu", input_shape = c(timesteps, features)) %>%
+    layer_max_pooling_1d(pool_size = 2) %>%
+    layer_conv_1d(filters = 64, kernel_size = 3, activation = "relu") %>%
+    layer_max_pooling_1d(pool_size = 2) %>%
+    layer_lstm(units = 64, return_sequences = TRUE, recurrent_dropout = 0.2) %>% 
+    layer_batch_normalization() %>% 
+    layer_lstm(units = 64, return_sequences = FALSE, recurrent_dropout = 0.2) %>%
+    layer_dropout(rate = 0.3) %>%
+    # Adjust activation function based on parameters
+    layer_dense(units = 3, activation = function(x) {
+      # Check if the activation function is ReLU (doesn't need parameters)
+      if (identical(activation_func, function(x) tf$keras$activations$relu(x))) {
+        return(tf$keras$activations$relu(x))  # For ReLU, no additional parameters
+      } else if (!is.null(theta_clayton) & !is.null(theta_gumbel)) {
+        # For Copula models that require both theta_clayton and theta_gumbel
+        return(activation_func(x, theta_clayton, theta_gumbel))
+      } else if (!is.null(theta_clayton)) {
+        # For models like Clayton Copula that require only theta_clayton
+        return(activation_func(x, theta_clayton))
+      } else if (!is.null(theta_gumbel)) {
+        # For models like Gumbel Copula that require only theta_gumbel
+        return(activation_func(x, theta_gumbel))
+      } else {
+        return(activation_func(x))
+      }
+    })
+}
+
+# Define parameters for Clayton and Gumbel
+theta_clayton <- tf$Variable(1.0, trainable = TRUE, dtype = tf$float32)  # Clayton parameter
+theta_gumbel <- tf$Variable(2.0, trainable = TRUE, dtype = tf$float32)  # Gumbel parameter
+
+# Create models with the required activation functions
+cnn_lstm_clayton <- create_cnn_lstm_model(clayton_copula_activation_tf, theta_clayton)
+cnn_lstm_relu <- create_cnn_lstm_model(function(x) tf$keras$activations$relu(x))  # ReLU doesn't need parameters
+cnn_lstm_gumbel <- create_cnn_lstm_model(gumbel_copula_activation_tf, theta_gumbel)
+cnn_lstm_clayton_gumbel <- create_cnn_lstm_model(clayton_gumbel_copula_activation_tf, theta_clayton, theta_gumbel)
+cnn_lstm_clayton_relu <- create_cnn_lstm_model(clayton_relu_activation_tf, theta_clayton)
+cnn_lstm_sigmoid <- create_cnn_lstm_model(sigmoid_activation_tf)
+
+# Define model names with the new sigmoid model
+model_names <- c("CNN-LSTM Clayton", "CNN-LSTM Gumbel", "CNN-LSTM Clayton-Gumbel", 
+                 "CNN-LSTM ReLU", "CNN-LSTM Clayton-ReLU", "CNN-LSTM Sigmoid")
+
+models <- list(cnn_lstm_clayton, cnn_lstm_gumbel, cnn_lstm_clayton_gumbel, 
+               cnn_lstm_relu, cnn_lstm_clayton_relu, cnn_lstm_sigmoid)
+
+# Function to calculate residuals
+calculate_residuals <- function(y_true, y_pred) {
+  residuals <- y_true - y_pred
+  residuals[is.nan(residuals)] <- 0
+  colnames(residuals) <- c("Response_1", "Response_2", "Response_3")  # Explicitly set column names for residuals
+  return(residuals)
+}
+
+
+# Function to create Shewhart control charts with out-of-control points
+create_control_chart <- function(residuals, response_names, model_name) {
+  mean_residual <- colMeans(residuals)
+  sd_residual <- apply(residuals, 2, sd)
+  
+  control_limits <- data.frame(
+    Variable = colnames(residuals),
+    Upper_Limit = mean_residual + 2 * sd_residual,
+    Lower_Limit = mean_residual - 2 * sd_residual
+  )
+  
+  arl <- sapply(1:ncol(residuals), function(i) {
+    res <- residuals[, i]
+    out_of_control <- which(res > control_limits$Upper_Limit[i] | res < control_limits$Lower_Limit[i])
+    if (length(out_of_control) > 0) {
+      return(mean(diff(c(0, out_of_control))))
+    } else {
+      return(NA)
+    }
+  })
+  
+  # Plot the control charts with out-of-control points
+  for (i in 1:ncol(residuals)) {
+    response_data <- data.frame(Sample = 1:nrow(residuals), Residuals = residuals[, i])
+    out_of_control_points <- which(residuals[, i] > control_limits$Upper_Limit[i] | residuals[, i] < control_limits$Lower_Limit[i])
+    
+    # Plot with red dots for out-of-control points
+    print(
+      ggplot(response_data, aes(x = Sample, y = Residuals)) +
+        geom_line(color = "blue") +
+        geom_hline(yintercept = mean_residual[i], color = "green", linetype = "dashed") +
+        geom_hline(yintercept = control_limits$Upper_Limit[i], color = "red", linetype = "dashed") +
+        geom_hline(yintercept = control_limits$Lower_Limit[i], color = "red", linetype = "dashed") +
+        geom_point(data = response_data[out_of_control_points, ], aes(x = Sample, y = Residuals), color = "red", size = 3) +  # Out-of-control points
+        labs(title = paste("Shewhart Control Chart -", response_names[i], "(", model_name, ")"),
+             x = "Sample", y = "Residuals") +
+        theme_minimal()
+    )
+  }
+  
+  return(list(control_limits = control_limits, ARL = arl))
+}
+
+# Ensure that the simulation results are correctly populated with residuals, MAE, and RMSE for three responses
+simulation_results <- list()
+
+for (sim in 1:num_simulations) {
+  cat("Running simulation", sim, "of", num_simulations, "\n")
+  
+  y_data_censored <- generate_censored_data(0.05)  # 5% censoring
+  y_labels <- y_data_censored[, 2:4]  # survival_time, event_status, response_3
+  x_data_reshaped <- (x_data - mean(x_data)) / sd(x_data)  # Normalize the data for the model
+  
+  for (i in 1:length(models)) {
+    model <- models[[i]]
+    
+    model %>% compile(loss = "mse", optimizer = optimizer_adam(learning_rate = 0.001))
+    model %>% fit(x_data_reshaped, y_labels, epochs = 30, batch_size = 32, verbose = 0, validation_split = 0.2)
+    
+    y_pred <- model %>% predict(x_data_reshaped)
+    residuals <- calculate_residuals(y_labels, y_pred)
+    
+    # Response names
+    response_names <- colnames(residuals)  # Ensure column names are set for the residuals
+    
+    # Calculate residuals statistics
+    mean_residual <- colMeans(residuals)
+    sd_residual <- apply(residuals, 2, sd)
+    
+    # Explicitly calculate control results
+    control_results <- create_control_chart(residuals, response_names, model_names[i])
+    
+    num_responses <- length(response_names)
+    
+    simulation_results[[length(simulation_results) + 1]] <- data.frame(
+      Simulation = rep(sim, num_responses),
+      Model = rep(model_names[i], num_responses),
+      Response = response_names,
+      Mean_Residual = mean_residual,
+      SD_Residual = sd_residual,
+      Mean_ARL = control_results$ARL,  
+      SD_ARL = rep(sd(control_results$ARL, na.rm = TRUE), num_responses)
+    )
+  }
+}
+
+# Combine all simulation results into a single data frame
+results_df <- do.call(rbind, simulation_results)
+results_df3<-results_df
+print(results_df3)
+View(results_df3)
+
+# Summarize Mean_Residual, SD_Residual, MAE, and RMSE
+summary_table <- results_df %>% 
+  group_by(Model, Response) %>% 
+  summarise(
+    Mean_Residual = mean(Mean_Residual, na.rm = TRUE),
+    SD_Residual = mean(SD_Residual, na.rm = TRUE),
+    .groups = "drop"  # This will remove the grouping after summarization
+  )
+
+# Print the summary table
+print(summary_table)
+
+# Reshape the data for ggplot
+filtered_df_long <- summary_table %>%
+  pivot_longer(cols = c(Mean_Residual, SD_Residual), 
+               names_to = "Metric", 
+               values_to = "Value")
+
+# Faceted Line Plot: Mean, SD Residuals, MAE, and RMSE Across Models
+ggplot(filtered_df_long, aes(x = Model, y = Value, group = Response, color = Response)) +
+  geom_line(aes(linetype = Response), linewidth = 1) +  # Use linewidth instead of size
+  geom_point(size = 3) +
+  facet_wrap(~Metric, scales = "free_y") +  
+  theme_minimal() +
+  labs(title = "Performance Metrics Comparison Across Models",
+       x = "Model", y = "Value") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Residual Boxplots for Each Model, Grouped by Response Variable
+ggplot(results_df, aes(x = Model, y = Mean_Residual, fill = Model)) +
+  geom_boxplot(outlier.shape = 16, outlier.colour = "red", outlier.size = 3) +  # Add outlier points
+  geom_jitter(width = 0.1, height = 0, size = 3, color = "blue", alpha = 0.6) +  # Add jittered points for outliers
+  facet_wrap(~Response) +  # Group by Response Variable (faceted by Response)
+  theme_minimal() +
+  labs(title = "Residual Boxplots for Each Response Variable",
+       x = "Model", y = "Mean Residual") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+################################################
+### Simulated Data Analysis with  LSTM Model
+################################################
+
+library(keras)
+library(tensorflow)
+library(dplyr)
+library(survival)
+library(survminer)
+library(ggplot2)
+library(tidyr)
+library(caret)         # For precision, recall, and F1 score
+
+# Set parameters
+timesteps <- 10  # Number of time steps (example, adjust as necessary)
+features <- 30   # Number of features (gene expression columns)
+n <- 2000        # Number of samples
+num_simulations <- 1  # Number of simulations
+
+# Clayton Copula activation function in TensorFlow (with learnable parameter)
+clayton_copula_activation_tf <- function(x, theta) {
+  u <- 0.5 * (1 + tf$math$erf(x / tf$math$sqrt(2.0)))  
+  copula_transformed <- tf$pow(u, -theta) - 1
+  copula_transformed <- tf$pow(copula_transformed, -1/theta)
+  return(copula_transformed)
+}
+
+# Gumbel Copula activation function in TensorFlow (with learnable parameter)
+gumbel_copula_activation_tf <- function(x, theta) {
+  u <- 0.5 * (1 + tf$math$erf(x / tf$math$sqrt(2.0)))
+  copula_transformed <- tf$math$exp(-tf$math$pow(-tf$math$log(u), theta))
+  return(copula_transformed)
+}
+
+# Clayton-Gumbel Copula Activation Function with Learnable Parameters
+clayton_gumbel_copula_activation_tf <- function(x, theta_clayton, theta_gumbel) {
+  # Clayton Copula Transformation
+  u_clayton <- 0.5 * (1 + tf$math$erf(x / tf$math$sqrt(2.0)))  
+  clayton_transformed <- tf$pow(u_clayton, -theta_clayton) - 1
+  clayton_transformed <- tf$pow(clayton_transformed, -1/theta_clayton)
+  
+  # Gumbel Copula Transformation
+  u_gumbel <- 0.5 * (1 + tf$math$erf(x / tf$math$sqrt(2.0)))
+  gumbel_transformed <- tf$math$exp(-tf$math$pow(-tf$math$log(u_gumbel), theta_gumbel))
+  
+  # Combine both transformations (e.g., using a weighted average or addition)
+  combined_transformed <- (clayton_transformed + gumbel_transformed) / 2  # Averaging both copulas
+  
+  return(combined_transformed)
+}
+
+# Combined Clayton Copula and ReLU activation function
+clayton_relu_activation_tf <- function(x, theta_clayton) {
+  # Apply Clayton Copula transformation
+  u_clayton <- 0.5 * (1 + tf$math$erf(x / tf$math$sqrt(2.0)))  
+  clayton_transformed <- tf$pow(u_clayton, -theta_clayton) - 1
+  clayton_transformed <- tf$pow(clayton_transformed, -1/theta_clayton)
+  
+  # Apply ReLU activation
+  relu_transformed <- tf$keras$activations$relu(clayton_transformed)
+  
+  return(relu_transformed)
+}
+
+# Sigmoid Activation Function in TensorFlow
+sigmoid_activation_tf <- function(x) {
+  return(tf$keras$activations$sigmoid(x))
+}
+
+generate_censored_data <- function(censoring_percentage, correlation_strength = 0.9, threshold = 5) {
+  shape_param <- 1.5  
+  scale_param <- 2    
+  
+  # Generate a primary response variable (time_data_1)
+  time_data_1 <- rweibull(n, shape = shape_param, scale = scale_param)
+  
+  # Create highly correlated responses by introducing linear dependencies with noise
+  time_data_2 <- time_data_1 * correlation_strength + rweibull(n, shape = shape_param, scale = scale_param) * (1 - correlation_strength)
+  time_data_3 <- time_data_1 * correlation_strength + rweibull(n, shape = shape_param, scale = scale_param) * (1 - correlation_strength)
+  
+  # Introduce additional noise for more variability
+  time_data_2 <- time_data_2 + rnorm(n, mean = 0, sd = 0.5)  # Adding noise to make it more realistic
+  time_data_3 <- time_data_3 + rnorm(n, mean = 0, sd = 0.5)
+  
+  # Convert time_data_2 to binary based on the threshold
+  time_data_2_binary <- ifelse(time_data_2 > threshold, 1, 0)
+  
+  # Convert time_data_3 to categorical data (e.g., Low, Medium, High)
+  time_data_3_categorical <- cut(time_data_3, 
+                                 breaks = c(-Inf, 2, 5, Inf),  # Define thresholds for categorization
+                                 labels = c("Low", "Medium", "High"))
+  
+  # Generate event/censoring indicator: 1 = event, 0 = censored
+  censoring_indicator <- sample(c(0, 1), n, replace = TRUE, prob = c(censoring_percentage, 1 - censoring_percentage))
+  
+  # Introduce right censoring by adjusting times for censored observations
+  time_data_1[censoring_indicator == 0] <- rexp(sum(censoring_indicator == 0), rate = 1 / 10)  # Randomly set censored times (e.g., after 10 units)
+  time_data_2[censoring_indicator == 0] <- rexp(sum(censoring_indicator == 0), rate = 1 / 10)
+  time_data_3[censoring_indicator == 0] <- rexp(sum(censoring_indicator == 0), rate = 1 / 10)
+  
+  # Combine event times and censoring indicator into a dataset
+  y_data_reshaped <- cbind(censoring_indicator, time_data_1, time_data_2_binary, time_data_3_categorical)
+  
+  return(y_data_reshaped)
+}
+
+# Example usage
+y_data_censored <- generate_censored_data(0.05)  # 5% censoring
+
+# Generate input features (x_data) for the LSTM model
+# Randomly generating data for x_data (shape: (n, timesteps, features))
+x_data <- array(runif(n * timesteps * features), dim = c(n, timesteps, features))
+
+# Define LSTM model for three response variables with different activation functions
+create_lstm_model <- function(activation_func, theta_clayton = NULL, theta_gumbel = NULL) {
+  keras_model_sequential() %>%
+    layer_lstm(units = 64, return_sequences = TRUE, input_shape = c(timesteps, features), recurrent_dropout = 0.2) %>% 
+    layer_batch_normalization() %>% 
+    layer_lstm(units = 64, return_sequences = FALSE, recurrent_dropout = 0.2) %>%
+    layer_dropout(rate = 0.3) %>%
+    # Adjust activation function based on parameters
+    layer_dense(units = 3, activation = function(x) {
+      # Check if the activation function is ReLU (doesn't need parameters)
+      if (identical(activation_func, function(x) tf$keras$activations$relu(x))) {
+        return(tf$keras$activations$relu(x))  # For ReLU, no additional parameters
+      } else if (!is.null(theta_clayton) & !is.null(theta_gumbel)) {
+        # For Copula models that require both theta_clayton and theta_gumbel
+        return(activation_func(x, theta_clayton, theta_gumbel))
+      } else if (!is.null(theta_clayton)) {
+        # For models like Clayton Copula that require only theta_clayton
+        return(activation_func(x, theta_clayton))
+      } else if (!is.null(theta_gumbel)) {
+        # For models like Gumbel Copula that require only theta_gumbel
+        return(activation_func(x, theta_gumbel))
+      } else {
+        return(activation_func(x))
+      }
+    })
+}
+
+# Define parameters for Clayton and Gumbel
+theta_clayton <- tf$Variable(1.0, trainable = TRUE, dtype = tf$float32)  # Clayton parameter
+theta_gumbel <- tf$Variable(2.0, trainable = TRUE, dtype = tf$float32)  # Gumbel parameter
+
+# Create models with the required activation functions
+lstm_clayton <- create_lstm_model(clayton_copula_activation_tf, theta_clayton)
+lstm_relu <- create_lstm_model(function(x) tf$keras$activations$relu(x))  # ReLU doesn't need parameters
+lstm_gumbel <- create_lstm_model(gumbel_copula_activation_tf, theta_gumbel)
+lstm_clayton_gumbel <- create_lstm_model(clayton_gumbel_copula_activation_tf, theta_clayton, theta_gumbel)
+lstm_clayton_relu <- create_lstm_model(clayton_relu_activation_tf, theta_clayton)
+lstm_sigmoid <- create_lstm_model(sigmoid_activation_tf)
+
+# Define model names with the new sigmoid model
+model_names <- c("LSTM Clayton", "LSTM Gumbel", "LSTM Clayton-Gumbel", 
+                 "LSTM ReLU", "LSTM Clayton-ReLU", "LSTM Sigmoid")
+
+models <- list(lstm_clayton, lstm_gumbel, lstm_clayton_gumbel, 
+               lstm_relu, lstm_clayton_relu, lstm_sigmoid)
+
+# Function to calculate residuals
+calculate_residuals <- function(y_true, y_pred) {
+  residuals <- y_true - y_pred
+  residuals[is.nan(residuals)] <- 0
+  colnames(residuals) <- c("Response_1", "Response_2", "Response_3")  # Explicitly set column names for residuals
+  return(residuals)
+}
+
+# Function to create Shewhart control charts with out-of-control points
+create_control_chart <- function(residuals, response_names, model_name) {
+  mean_residual <- colMeans(residuals)
+  sd_residual <- apply(residuals, 2, sd)
+  
+  control_limits <- data.frame(
+    Variable = colnames(residuals),
+    Upper_Limit = mean_residual + 2 * sd_residual,
+    Lower_Limit = mean_residual - 2 * sd_residual
+  )
+  
+  arl <- sapply(1:ncol(residuals), function(i) {
+    res <- residuals[, i]
+    out_of_control <- which(res > control_limits$Upper_Limit[i] | res < control_limits$Lower_Limit[i])
+    if (length(out_of_control) > 0) {
+      return(mean(diff(c(0, out_of_control))))
+    } else {
+      return(NA)
+    }
+  })
+  
+  # Plot the control charts with out-of-control points
+  for (i in 1:ncol(residuals)) {
+    response_data <- data.frame(Sample = 1:nrow(residuals), Residuals = residuals[, i])
+    out_of_control_points <- which(residuals[, i] > control_limits$Upper_Limit[i] | residuals[, i] < control_limits$Lower_Limit[i])
+    
+    # Plot with red dots for out-of-control points
+    print(
+      ggplot(response_data, aes(x = Sample, y = Residuals)) +
+        geom_line(color = "blue") +
+        geom_hline(yintercept = mean_residual[i], color = "green", linetype = "dashed") +
+        geom_hline(yintercept = control_limits$Upper_Limit[i], color = "red", linetype = "dashed") +
+        geom_hline(yintercept = control_limits$Lower_Limit[i], color = "red", linetype = "dashed") +
+        geom_point(data = response_data[out_of_control_points, ], aes(x = Sample, y = Residuals), color = "red", size = 3) +  # Out-of-control points
+        labs(title = paste("Shewhart Control Chart -", response_names[i], "(", model_name, ")"),
+             x = "Sample", y = "Residuals") +
+        theme_minimal()
+    )
+  }
+  
+  return(list(control_limits = control_limits, ARL = arl))
+}
+
+# Ensure that the simulation results are correctly populated with residuals, MAE, and RMSE for three responses
+simulation_results <- list()
+
+for (sim in 1:num_simulations) {
+  cat("Running simulation", sim, "of", num_simulations, "\n")
+  
+  y_data_censored <- generate_censored_data(0.05)  # 5% censoring
+  y_labels <- y_data_censored[, 2:4]  # survival_time, event_status, response_3
+  x_data_reshaped <- (x_data - mean(x_data)) / sd(x_data)  # Normalize the data for the model
+  
+  for (i in 1:length(models)) {
+    model <- models[[i]]
+    
+    model %>% compile(loss = "mse", optimizer = optimizer_adam(learning_rate = 0.001))
+    model %>% fit(x_data_reshaped, y_labels, epochs = 30, batch_size = 32, verbose = 0, validation_split = 0.2)
+    
+    y_pred <- model %>% predict(x_data_reshaped)
+    residuals <- calculate_residuals(y_labels, y_pred)
+    
+    # Response names
+    response_names <- colnames(residuals)  # Ensure column names are set for the residuals
+    
+    # Calculate residuals statistics
+    mean_residual <- colMeans(residuals)
+    sd_residual <- apply(residuals, 2, sd)
+    
+    # Explicitly calculate control results
+    control_results <- create_control_chart(residuals, response_names, model_names[i])
+    
+    num_responses <- length(response_names)
+    
+    simulation_results[[length(simulation_results) + 1]] <- data.frame(
+      Simulation = rep(sim, num_responses),
+      Model = rep(model_names[i], num_responses),
+      Response = response_names,
+      Mean_Residual = mean_residual,
+      SD_Residual = sd_residual,
+      Mean_ARL = control_results$ARL,  
+      SD_ARL = rep(sd(control_results$ARL, na.rm = TRUE), num_responses)
+    )
+  }
+}
+
+# Combine all simulation results into a single data frame
+results_df <- do.call(rbind, simulation_results)
+results_df4<-results_df
+print(results_df4)
+View(results_df4)
+
+# Summarize Mean_Residual, SD_Residual, MAE, and RMSE
+summary_table <- results_df %>% 
+  group_by(Model, Response) %>% 
+  summarise(
+    Mean_Residual = mean(Mean_Residual, na.rm = TRUE),
+    SD_Residual = mean(SD_Residual, na.rm = TRUE),
+    .groups = "drop"  # This will remove the grouping after summarization
+  )
+
+# Print the summary table
+print(summary_table)
+
+# Reshape the data for ggplot
+filtered_df_long <- summary_table %>%
+  pivot_longer(cols = c(Mean_Residual, SD_Residual), 
+               names_to = "Metric", 
+               values_to = "Value")
+
+# Faceted Line Plot: Mean, SD Residuals, MAE, and RMSE Across Models
+ggplot(filtered_df_long, aes(x = Model, y = Value, group = Response, color = Response)) +
+  geom_line(aes(linetype = Response), linewidth = 1) +  # Use linewidth instead of size
+  geom_point(size = 3) +
+  facet_wrap(~Metric, scales = "free_y") +  
+  theme_minimal() +
+  labs(title = "Performance Metrics Comparison Across Models",
+       x = "Model", y = "Value") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Residual Boxplots for Each Model, Grouped by Response Variable
+ggplot(results_df, aes(x = Model, y = Mean_Residual, fill = Model)) +
+  geom_boxplot(outlier.shape = 16, outlier.colour = "red", outlier.size = 3) +  # Add outlier points
+  geom_jitter(width = 0.1, height = 0, size = 3, color = "blue", alpha = 0.6) +  # Add jittered points for outliers
+  facet_wrap(~Response) +  # Group by Response Variable (faceted by Response)
+  theme_minimal() +
+  labs(title = "Residual Boxplots for Each Response Variable",
+       x = "Model", y = "Mean Residual") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+
+#########################################
+### Real Data Analysis with CNN-LSTM Model
+# https://www.kaggle.com/datasets/raghadalharbi/breast-cancer-gene-expression-profiles-metabric?resource=download
+#########################################
+
+library(keras)
+library(tensorflow)
+library(dplyr)
+library(survival)
+library(survminer)
+library(ggplot2)
+library(tidyr)
+library(caret)
+#library(summarytools)
+
+# Load the METABRIC data (clinical data)
+data_metabric <- read.csv("METABRIC_RNA_Mutation.csv")  # Adjust the path to your dataset
+
+# Check the actual column names in the dataset
+cat("Column names in the dataset:\n")
+#print(colnames(data_metabric))
+
+# Rename columns for consistency and clarity (Update with actual column names)
+data_metabric <- data_metabric %>%
+  rename(
+    survival_time = overall_survival_months,  # Replace with the actual column name for survival time
+    event_status = overall_survival,          # Replace with the actual column name for event status
+    age = age_at_diagnosis,                   # Replace with the actual column name for age
+    tumor_stage = tumor_stage,                # Replace with the actual column name for tumor stage
+    er_status = er_status,                    # Replace with the actual column name for ER status
+    her2_status = her2_status                 # Replace with the actual column name for HER2 status
+  )
+
+
+# Convert event status to binary (1 = dead, 0 = alive/censored)
+data_metabric <- data_metabric %>%
+  mutate(event_status = ifelse(event_status == "Dead", 1, 0))
+
+# Clean the dataset by removing rows with missing values
+data_metabric <- na.omit(data_metabric)
+
+
+
+# Set parameters
+timesteps <- 10  # Number of time steps (example, adjust as necessary)
+features <- ncol(data_metabric)  # Number of features (gene expression columns)
+n <- nrow(data_metabric)  # Number of samples
+num_simulations <- 1  # Number of simulations
+
+# Adjust the input data reshaping process to ensure it's 3D
+x_data <- array(runif(n * timesteps * features), dim = c(n, timesteps, features))
+
+# Normalize the data
+x_data_reshaped <- (x_data - mean(x_data)) / sd(x_data)
+
+# Reshape the data into 3D for CNN-LSTM
+x_data_reshaped <- array(x_data_reshaped, dim = c(n, timesteps, features))
+
+library(dplyr)
+
+# Prepare the output (survival time and event status) as labels
+y_labels <- data_metabric[, c("survival_time", "event_status")] %>%
+  as.matrix()
+
+
+
+# Clayton Copula activation function in TensorFlow (with learnable parameter)
+clayton_copula_activation_tf <- function(x, theta) {
+  u <- 0.5 * (1 + tf$math$erf(x / tf$math$sqrt(2.0)))  
+  copula_transformed <- tf$pow(u, -theta) - 1
+  copula_transformed <- tf$pow(copula_transformed, -1/theta)
+  return(copula_transformed)
+}
+
+# Gumbel Copula activation function in TensorFlow (with learnable parameter)
+gumbel_copula_activation_tf <- function(x, theta) {
+  u <- 0.5 * (1 + tf$math$erf(x / tf$math$sqrt(2.0)))
+  copula_transformed <- tf$math$exp(-tf$math$pow(-tf$math$log(u), theta))
+  return(copula_transformed)
+}
+
+# Sigmoid activation function (for use in the model)
+sigmoid_activation_tf <- function(x) {
+  return(tf$keras$activations$sigmoid(x))
+}
+
+# Combined Clayton Copula and ReLU activation function
+clayton_relu_activation_tf <- function(x, theta_clayton) {
+  # Apply Clayton Copula transformation
+  u_clayton <- 0.5 * (1 + tf$math$erf(x / tf$math$sqrt(2.0)))  
+  clayton_transformed <- tf$pow(u_clayton, -theta_clayton) - 1
+  clayton_transformed <- tf$pow(clayton_transformed, -1/theta_clayton)
+  
+  # Apply ReLU activation
+  relu_transformed <- tf$keras$activations$relu(clayton_transformed)
+  
+  return(relu_transformed)
+}
+
+# Function to create CNN-LSTM model with Copula or other activation functions
+create_cnn_lstm_model <- function(activation_func, theta_clayton = NULL, theta_gumbel = NULL) {
+  keras_model_sequential() %>%
+    layer_conv_1d(filters = 64, kernel_size = 3, activation = "relu", input_shape = c(timesteps, features)) %>%
+    layer_max_pooling_1d(pool_size = 2) %>%
+    layer_lstm(units = 64, return_sequences = TRUE, recurrent_dropout = 0.2) %>%
+    layer_batch_normalization() %>% 
+    layer_lstm(units = 64, return_sequences = FALSE, recurrent_dropout = 0.2) %>%
+    layer_dropout(rate = 0.3) %>%
+    # Adjust activation function based on parameters
+    layer_dense(units = 2, activation = function(x) {
+      if (!is.null(theta_clayton)) {
+        # For models like Clayton Copula that require only theta_clayton
+        return(activation_func(x, theta_clayton))
+      } else if (!is.null(theta_gumbel)) {
+        # For models like Gumbel Copula that require only theta_gumbel
+        return(activation_func(x, theta_gumbel))
+      } else {
+        return(activation_func(x))
+      }
+    })
+}
+
+# Define parameters for Clayton and Gumbel
+theta_clayton <- tf$Variable(1.0, trainable = TRUE, dtype = tf$float32)  # Clayton parameter
+theta_gumbel <- tf$Variable(2.0, trainable = TRUE, dtype = tf$float32)  # Gumbel parameter
+
+# Create CNN-LSTM models with the required activation functions
+cnn_lstm_clayton <- create_cnn_lstm_model(clayton_copula_activation_tf, theta_clayton)
+cnn_lstm_relu <- create_cnn_lstm_model(function(x) tf$keras$activations$relu(x))  # ReLU doesn't need parameters
+cnn_lstm_clayton_relu <- create_cnn_lstm_model(clayton_relu_activation_tf, theta_clayton)
+cnn_lstm_sigmoid <- create_cnn_lstm_model(sigmoid_activation_tf)  # Added Sigmoid model
+cnn_lstm_gumbel <- create_cnn_lstm_model(gumbel_copula_activation_tf, theta_gumbel)  # Added Gumbel model
+
+# Define model names
+model_names <- c("CNN-LSTM Clayton", "CNN-LSTM ReLU", "CNN-LSTM Clayton-ReLU", "CNN-LSTM Sigmoid", "CNN-LSTM Gumbel")
+
+models <- list(cnn_lstm_clayton, cnn_lstm_relu, cnn_lstm_clayton_relu, cnn_lstm_sigmoid, cnn_lstm_gumbel)
+
+# Function to calculate residuals
+calculate_residuals <- function(y_true, y_pred) {
+  residuals <- y_true - y_pred
+  residuals[is.nan(residuals)] <- 0
+  colnames(residuals) <- c("Response_1", "Response_2")  # Explicitly set column names for residuals
+  return(residuals)
+}
+
+# Function to create Shewhart control charts with out-of-control points
+create_control_chart <- function(residuals, response_names, model_name) {
+  mean_residual <- colMeans(residuals)
+  sd_residual <- apply(residuals, 2, sd)
+  
+  control_limits <- data.frame(
+    Variable = colnames(residuals),
+    Upper_Limit = mean_residual + 2 * sd_residual,
+    Lower_Limit = mean_residual - 2 * sd_residual
+  )
+  
+  arl <- sapply(1:ncol(residuals), function(i) {
+    res <- residuals[, i]
+    out_of_control <- which(res > control_limits$Upper_Limit[i] | res < control_limits$Lower_Limit[i])
+    if (length(out_of_control) > 0) {
+      return(mean(diff(c(0, out_of_control))))
+    } else {
+      return(NA)
+    }
+  })
+  
+  # Plot the control charts with out-of-control points
+  for (i in 1:ncol(residuals)) {
+    response_data <- data.frame(Sample = 1:nrow(residuals), Residuals = residuals[, i])
+    out_of_control_points <- which(residuals[, i] > control_limits$Upper_Limit[i] | residuals[, i] < control_limits$Lower_Limit[i])
+    
+    # Plot with red dots for out-of-control points
+    print(
+      ggplot(response_data, aes(x = Sample, y = Residuals)) +
+        geom_line(color = "blue") +
+        geom_hline(yintercept = mean_residual[i], color = "green", linetype = "dashed") +
+        geom_hline(yintercept = control_limits$Upper_Limit[i], color = "red", linetype = "dashed") +
+        geom_hline(yintercept = control_limits$Lower_Limit[i], color = "red", linetype = "dashed") +
+        geom_point(data = response_data[out_of_control_points, ], aes(x = Sample, y = Residuals), color = "red", size = 3) +  # Out-of-control points
+        labs(title = paste("Shewhart Control Chart -", response_names[i], "(", model_name, ")"),
+             x = "Sample", y = "Residuals") +
+        theme_minimal()
+    )
+  }
+  
+  return(list(control_limits = control_limits, ARL = arl))
+}
+
+# Ensure that the simulation results are correctly populated with residuals, MAE, and RMSE
+simulation_results <- list()
+
+for (sim in 1:num_simulations) {
+  cat("Running simulation", sim, "of", num_simulations, "\n")
+  
+  y_labels <- y_labels[, 1:2]  # Correct selection: event_status and survival_time
+  x_data_reshaped <- (x_data - mean(x_data)) / sd(x_data)  # Normalize the data for the model
+  
+  for (i in 1:length(models)) {
+    model <- models[[i]]
+    
+    model %>% compile(loss = "mse", optimizer = optimizer_adam(learning_rate = 0.001))
+    model %>% fit(x_data_reshaped, y_labels, epochs = 30, batch_size = 32, verbose = 0, validation_split = 0.2)
+    
+    y_pred <- model %>% predict(x_data_reshaped)
+    residuals <- calculate_residuals(y_labels, y_pred)
+    
+    # Response names
+    response_names <- colnames(residuals)  # Ensure column names are set for the residuals
+    
+    # Calculate residuals statistics
+    mean_residual <- colMeans(residuals)
+    sd_residual <- apply(residuals, 2, sd)
+    
+    # Explicitly calculate control results
+    control_results <- create_control_chart(residuals, response_names, model_names[i])
+    
+    num_responses <- length(response_names)
+    
+    simulation_results[[length(simulation_results) + 1]] <- data.frame(
+      Simulation = rep(sim, num_responses),
+      Model = rep(model_names[i], num_responses),
+      Response = response_names,
+      Mean_Residual = mean_residual,
+      SD_Residual = sd_residual,
+      Mean_ARL = control_results$ARL,  
+      SD_ARL = rep(sd(control_results$ARL, na.rm = TRUE), num_responses)
+    )
+  }
+}
+
+# Combine all simulation results into a single data frame
+results_df <- do.call(rbind, simulation_results)
+results_df1 <- results_df
+print(results_df1)
+View(results_df1)
+
+# Summarize Mean_Residual, SD_Residual, MAE, and RMSE
+summary_table <- results_df %>% 
+  group_by(Model, Response) %>% 
+  summarise(
+    Mean_Residual = mean(Mean_Residual, na.rm = TRUE),
+    SD_Residual = mean(SD_Residual, na.rm = TRUE),
+    .groups = "drop"  # This will remove the grouping after summarization
+  )
+
+# Print the summary table
+print(summary_table)
+
+# Reshape the data for ggplot
+filtered_df_long <- summary_table %>%
+  pivot_longer(cols = c(Mean_Residual, SD_Residual), 
+               names_to = "Metric", 
+               values_to = "Value")
+
+# Faceted Line Plot: Mean, SD Residuals, MAE, and RMSE Across Models
+ggplot(filtered_df_long, aes(x = Model, y = Value, group = Response, color = Response)) +
+  geom_line(aes(linetype = Response), linewidth = 1) +  # Use linewidth instead of size
+  geom_point(size = 3) +
+  facet_wrap(~Metric, scales = "free_y") +  
+  theme_minimal() +
+  labs(title = "Performance Metrics Comparison Across Models",
+       x = "Model", y = "Value") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Residual Boxplots for Each Model, Grouped by Response Variable
+ggplot(results_df, aes(x = Model, y = Mean_Residual, fill = Model)) +
+  geom_boxplot(outlier.shape = 16, outlier.colour = "red", outlier.size = 3) +  # Add outlier points
+  geom_jitter(width = 0.1, height = 0, size = 3, color = "blue", alpha = 0.6) +  # Add jittered points for outliers
+  facet_wrap(~Response) +  # Group by Response Variable (faceted by Response)
+  theme_minimal() +
+  labs(title = "Residual Boxplots for Each Response Variable",
+       x = "Model", y = "Mean Residual") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+########################################
+### Real Data Analysis with LSTM Model
+# https://www.kaggle.com/datasets/raghadalharbi/breast-cancer-gene-expression-profiles-metabric?resource=download
+########################################
+library(keras)
+library(tensorflow)
+library(dplyr)
+library(survival)
+library(survminer)
+library(ggplot2)
+library(tidyr)
+library(caret)
+
+# Load the METABRIC data (clinical data)
+data_metabric <- read.csv("METABRIC_RNA_Mutation.csv")  # Adjust the path to your dataset
+
+# Check the actual column names in the dataset
+cat("Column names in the dataset:\n")
+#print(colnames(data_metabric))
+
+# Rename columns for consistency and clarity (Update with actual column names)
+data_metabric <- data_metabric %>%
+  rename(
+    survival_time = overall_survival_months,  # Replace with the actual column name for survival time
+    event_status = overall_survival,          # Replace with the actual column name for event status
+    age = age_at_diagnosis,                   # Replace with the actual column name for age
+    tumor_stage = tumor_stage,                # Replace with the actual column name for tumor stage
+    er_status = er_status,                    # Replace with the actual column name for ER status
+    her2_status = her2_status                 # Replace with the actual column name for HER2 status
+  )
+
+# Convert event status to binary (1 = dead, 0 = alive/censored)
+data_metabric <- data_metabric %>%
+  mutate(event_status = ifelse(event_status == "Dead", 1, 0))
+
+# Clean the dataset by removing rows with missing values
+data_metabric <- na.omit(data_metabric)
+
+# Set parameters
+timesteps <- 10  # Number of time steps (example, adjust as necessary)
+features <- ncol(data_metabric)  # Number of features (gene expression columns)
+n <- nrow(data_metabric)  # Number of samples
+num_simulations <- 1  # Number of simulations
+
+# Adjust the input data reshaping process to ensure it's 3D
+x_data <- array(runif(n * timesteps * features), dim = c(n, timesteps, features))
+
+# Normalize the data
+x_data_reshaped <- (x_data - mean(x_data)) / sd(x_data)
+
+# Reshape the data into 3D for LSTM
+x_data_reshaped <- array(x_data_reshaped, dim = c(n, timesteps, features))
+
+# Prepare the output (survival time and event status) as labels
+y_labels <- data_metabric[, c("survival_time", "event_status")] %>%
+  as.matrix()
+
+
+# Clayton Copula activation function in TensorFlow (with learnable parameter)
+clayton_copula_activation_tf <- function(x, theta) {
+  u <- 0.5 * (1 + tf$math$erf(x / tf$math$sqrt(2.0)))  
+  copula_transformed <- tf$pow(u, -theta) - 1
+  copula_transformed <- tf$pow(copula_transformed, -1/theta)
+  return(copula_transformed)
+}
+
+# Gumbel Copula activation function in TensorFlow (with learnable parameter)
+gumbel_copula_activation_tf <- function(x, theta) {
+  u <- 0.5 * (1 + tf$math$erf(x / tf$math$sqrt(2.0)))
+  copula_transformed <- tf$math$exp(-tf$math$pow(-tf$math$log(u), theta))
+  return(copula_transformed)
+}
+
+# Sigmoid activation function (for use in the model)
+sigmoid_activation_tf <- function(x) {
+  return(tf$keras$activations$sigmoid(x))
+}
+
+# Combined Clayton Copula and ReLU activation function
+clayton_relu_activation_tf <- function(x, theta_clayton) {
+  # Apply Clayton Copula transformation
+  u_clayton <- 0.5 * (1 + tf$math$erf(x / tf$math$sqrt(2.0)))  
+  clayton_transformed <- tf$pow(u_clayton, -theta_clayton) - 1
+  clayton_transformed <- tf$pow(clayton_transformed, -1/theta_clayton)
+  
+  # Apply ReLU activation
+  relu_transformed <- tf$keras$activations$relu(clayton_transformed)
+  
+  return(relu_transformed)
+}
+
+# Function to create LSTM model with Gumbel Copula activation
+create_lstm_model <- function(activation_func, theta_clayton = NULL, theta_gumbel = NULL) {
+  keras_model_sequential() %>%
+    layer_lstm(units = 64, return_sequences = TRUE, input_shape = c(timesteps, features), recurrent_dropout = 0.2) %>%
+    layer_batch_normalization() %>% 
+    layer_lstm(units = 64, return_sequences = FALSE, recurrent_dropout = 0.2) %>%
+    layer_dropout(rate = 0.3) %>%
+    # Adjust activation function based on parameters
+    layer_dense(units = 2, activation = function(x) {
+      if (!is.null(theta_clayton)) {
+        # For models like Clayton Copula that require only theta_clayton
+        return(activation_func(x, theta_clayton))
+      } else if (!is.null(theta_gumbel)) {
+        # For models like Gumbel Copula that require only theta_gumbel
+        return(activation_func(x, theta_gumbel))
+      } else {
+        return(activation_func(x))
+      }
+    })
+}
+
+# Define parameters for Clayton and Gumbel
+theta_clayton <- tf$Variable(1.0, trainable = TRUE, dtype = tf$float32)  # Clayton parameter
+theta_gumbel <- tf$Variable(2.0, trainable = TRUE, dtype = tf$float32)  # Gumbel parameter
+
+# Create LSTM models with the required activation functions
+lstm_clayton <- create_lstm_model(clayton_copula_activation_tf, theta_clayton)
+lstm_relu <- create_lstm_model(function(x) tf$keras$activations$relu(x))  # ReLU doesn't need parameters
+lstm_clayton_relu <- create_lstm_model(clayton_relu_activation_tf, theta_clayton)
+lstm_sigmoid <- create_lstm_model(sigmoid_activation_tf)  # Added Sigmoid model
+lstm_gumbel <- create_lstm_model(gumbel_copula_activation_tf, theta_gumbel)  # Added Gumbel model
+
+# Define model names
+model_names <- c("LSTM Clayton", "LSTM ReLU", "LSTM Clayton-ReLU", "LSTM Sigmoid", "LSTM Gumbel")
+
+models <- list(lstm_clayton, lstm_relu, lstm_clayton_relu, lstm_sigmoid, lstm_gumbel)
+
+# Function to calculate residuals
+calculate_residuals <- function(y_true, y_pred) {
+  residuals <- y_true - y_pred
+  residuals[is.nan(residuals)] <- 0
+  colnames(residuals) <- c("Response_1", "Response_2")  # Explicitly set column names for residuals
+  return(residuals)
+}
+
+# Function to create Shewhart control charts with out-of-control points
+create_control_chart <- function(residuals, response_names, model_name) {
+  mean_residual <- colMeans(residuals)
+  sd_residual <- apply(residuals, 2, sd)
+  
+  control_limits <- data.frame(
+    Variable = colnames(residuals),
+    Upper_Limit = mean_residual + 2 * sd_residual,
+    Lower_Limit = mean_residual - 2 * sd_residual
+  )
+  
+  arl <- sapply(1:ncol(residuals), function(i) {
+    res <- residuals[, i]
+    out_of_control <- which(res > control_limits$Upper_Limit[i] | res < control_limits$Lower_Limit[i])
+    if (length(out_of_control) > 0) {
+      return(mean(diff(c(0, out_of_control))))
+    } else {
+      return(NA)
+    }
+  })
+  
+  # Plot the control charts with out-of-control points
+  for (i in 1:ncol(residuals)) {
+    response_data <- data.frame(Sample = 1:nrow(residuals), Residuals = residuals[, i])
+    out_of_control_points <- which(residuals[, i] > control_limits$Upper_Limit[i] | residuals[, i] < control_limits$Lower_Limit[i])
+    
+    # Plot with red dots for out-of-control points
+    print(
+      ggplot(response_data, aes(x = Sample, y = Residuals)) +
+        geom_line(color = "blue") +
+        geom_hline(yintercept = mean_residual[i], color = "green", linetype = "dashed") +
+        geom_hline(yintercept = control_limits$Upper_Limit[i], color = "red", linetype = "dashed") +
+        geom_hline(yintercept = control_limits$Lower_Limit[i], color = "red", linetype = "dashed") +
+        geom_point(data = response_data[out_of_control_points, ], aes(x = Sample, y = Residuals), color = "red", size = 3) +  # Out-of-control points
+        labs(title = paste("Shewhart Control Chart -", response_names[i], "(", model_name, ")"),
+             x = "Sample", y = "Residuals") +
+        theme_minimal()
+    )
+  }
+  
+  return(list(control_limits = control_limits, ARL = arl))
+}
+
+# Ensure that the simulation results are correctly populated with residuals, MAE, and RMSE
+simulation_results <- list()
+
+for (sim in 1:num_simulations) {
+  cat("Running simulation", sim, "of", num_simulations, "\n")
+  
+  y_labels <- y_labels[, 1:2]  # Correct selection: event_status and survival_time
+  x_data_reshaped <- (x_data - mean(x_data)) / sd(x_data)  # Normalize the data for the model
+  
+  for (i in 1:length(models)) {
+    model <- models[[i]]
+    
+    model %>% compile(loss = "mse", optimizer = optimizer_adam(learning_rate = 0.001))
+    model %>% fit(x_data_reshaped, y_labels, epochs = 30, batch_size = 32, verbose = 0, validation_split = 0.2)
+    
+    y_pred <- model %>% predict(x_data_reshaped)
+    residuals <- calculate_residuals(y_labels, y_pred)
+    
+    # Response names
+    response_names <- colnames(residuals)  # Ensure column names are set for the residuals
+    
+    # Calculate residuals statistics
+    mean_residual <- colMeans(residuals)
+    sd_residual <- apply(residuals, 2, sd)
+    
+    # Explicitly calculate control results
+    control_results <- create_control_chart(residuals, response_names, model_names[i])
+    
+    num_responses <- length(response_names)
+    
+    simulation_results[[length(simulation_results) + 1]] <- data.frame(
+      Simulation = rep(sim, num_responses),
+      Model = rep(model_names[i], num_responses),
+      Response = response_names,
+      Mean_Residual = mean_residual,
+      SD_Residual = sd_residual,
+      Mean_ARL = control_results$ARL,  
+      SD_ARL = rep(sd(control_results$ARL, na.rm = TRUE), num_responses)
+    )
+  }
+}
+
+# Combine all simulation results into a single data frame
+results_df <- do.call(rbind, simulation_results)
+results_df2 <- results_df
+print(results_df2)
+View(results_df2)
+
+# Summarize Mean_Residual, SD_Residual, MAE, and RMSE
+summary_table <- results_df %>% 
+  group_by(Model, Response) %>% 
+  summarise(
+    Mean_Residual = mean(Mean_Residual, na.rm = TRUE),
+    SD_Residual = mean(SD_Residual, na.rm = TRUE),
+    .groups = "drop"  # This will remove the grouping after summarization
+  )
+
+# Print the summary table
+print(summary_table)
+
+# Reshape the data for ggplot
+filtered_df_long <- summary_table %>%
+  pivot_longer(cols = c(Mean_Residual, SD_Residual), 
+               names_to = "Metric", 
+               values_to = "Value")
+
+# Faceted Line Plot: Mean, SD Residuals, MAE, and RMSE Across Models
+ggplot(filtered_df_long, aes(x = Model, y = Value, group = Response, color = Response)) +
+  geom_line(aes(linetype = Response), linewidth = 1) +  # Use linewidth instead of size
+  geom_point(size = 3) +
+  facet_wrap(~Metric, scales = "free_y") +  
+  theme_minimal() +
+  labs(title = "Performance Metrics Comparison Across Models",
+       x = "Model", y = "Value") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Residual Boxplots for Each Model, Grouped by Response Variable
+ggplot(results_df, aes(x = Model, y = Mean_Residual, fill = Model)) +
+  geom_boxplot(outlier.shape = 16, outlier.colour = "red", outlier.size = 3) +  # Add outlier points
+  geom_jitter(width = 0.1, height = 0, size = 3, color = "blue", alpha = 0.6) +  # Add jittered points for outliers
+  facet_wrap(~Response) +  # Group by Response Variable (faceted by Response)
+  theme_minimal() +
+  labs(title = "Residual Boxplots for Each Response Variable",
+       x = "Model", y = "Mean Residual") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+

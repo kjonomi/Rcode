@@ -1,0 +1,626 @@
+## Economics Letters under review (06/05/2025).
+## A novel procedure for volatility of spatial-temporal count data: Daily COVID-19 mortality counts across US regions
+## Posson GARCH Model
+# Required Libraries
+library(fGarch)
+library(ggplot2)
+
+# Load and prepare data
+setwd("C:/Users/kjono/Dropbox/Documents/My Paper/Integer valued GARCH with spatial component")
+data <- read.csv("uscovid3.csv", header = TRUE)
+dates <- as.Date(data$Date, format = "%m/%d/%Y")
+ts_data <- as.matrix(data[, -1])  # Remove date column
+n_days <- nrow(ts_data)
+n_loc <- ncol(ts_data)
+
+# State labels
+locations <- c("AK", "AL", "AR", "AZ", "CA", "CO", "CT", "DC", "DE", "FL", "GA", "HI", "IA", "ID", "IL", "IN",
+               "KS", "KY", "LA", "MA", "MD", "ME", "MI", "MN", "MO", "MS", "MT", "NC", "ND", "NE", "NH", "NJ",
+               "NM", "NV", "NY", "OH", "OK", "OR", "PA", "RI", "SC", "SD", "TN", "TX", "UT", "VA", "VT", "WA",
+               "WI", "WV", "WY")
+
+# Storage
+mean_mat <- matrix(NA, n_days, n_loc)
+vol_mat <- matrix(NA, n_days, n_loc)
+poisson_models <- list()
+model_stats <- data.frame(State = locations, AIC = NA, BIC = NA)
+
+# Fit Poisson GLM and GARCH on predicted values
+for (i in 1:n_loc) {
+  y <- ts_data[, i]
+  t <- 1:n_days
+  
+  if (var(y) == 0) {
+    mu_hat <- rep(mean(y), n_days)
+    vol_mat[, i] <- rep(0, n_days)
+    mean_mat[, i] <- mu_hat
+    poisson_models[[i]] <- NULL
+    model_stats$AIC[i] <- NA
+    model_stats$BIC[i] <- NA
+    next
+  }
+  
+  # Fit Poisson GLM
+  poisson_glm <- glm(y ~ t, family = poisson(link = "log"))
+  mu_hat <- fitted(poisson_glm)
+  mean_mat[, i] <- mu_hat
+  
+  # Store AIC and BIC
+  model_stats$AIC[i] <- AIC(poisson_glm)
+  model_stats$BIC[i] <- BIC(poisson_glm)
+  
+  # Fit GARCH(1,1) on fitted mean
+  garch_fit <- tryCatch({
+    garchFit(~ garch(1,1), data = mu_hat, trace = FALSE)
+  }, error = function(e) NULL)
+  
+  vol_mat[, i] <- if (!is.null(garch_fit)) {
+    fitted(garch_fit)
+  } else {
+    rep(mean(mu_hat), n_days)
+  }
+  
+  poisson_models[[i]] <- poisson_glm
+}
+
+# Mean volatility across time
+garch_volatility <- colMeans(vol_mat)
+
+# Create volatility dataframe
+volatility_df <- data.frame(Location = 1:n_loc, Volatility = garch_volatility, State = locations)
+
+# Save AIC and BIC results
+write.csv(model_stats, "poisson_model_aic_bic_by_state.csv", row.names = FALSE)
+
+print(head(model_stats[order(model_stats$AIC), ], 5))
+
+cat("\nTop 5 States by BIC:\n")
+print(head(model_stats[order(model_stats$BIC), ], 5))
+
+
+
+# Plot volatility across locations
+ggplot(volatility_df, aes(x = Location, y = Volatility)) +
+  geom_line(color = "blue") +
+  geom_point(color = "red") +
+  geom_text(aes(label = State), color = "black", vjust = -1, size = 3) +
+  labs(title = "Volatility Across Locations (GARCH on Poisson GLM Fitted Means)",
+       x = "Location", y = "Volatility") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+# --- Control Chart using Volatility across Locations ---
+vol_vals <- volatility_df$Volatility
+cl_upper <- mean(vol_vals) + 2 * sd(vol_vals)
+cl_lower <- mean(vol_vals) - 2 * sd(vol_vals)
+out_of_control <- which(vol_vals > cl_upper | vol_vals < cl_lower)
+
+control_chart <- ggplot(volatility_df, aes(x = Location, y = Volatility)) +
+  geom_line(color = "blue") +
+  geom_point(color = "black", size = 2) +
+  geom_point(data = volatility_df[out_of_control, ],
+             aes(x = Location, y = Volatility),
+             color = "red", size = 3) +
+  geom_hline(yintercept = cl_upper, linetype = "dashed", color = "darkgreen") +
+  geom_hline(yintercept = cl_lower, linetype = "dashed", color = "darkgreen") +
+  geom_text(aes(label = State), vjust = -1, size = 3) +
+  labs(title = "2-Sigma Control Chart Across Locations (Volatility) for GARCH on Poisson GLM Fitted Means",
+       subtitle = "Red = Out-of-Control Locations",
+       x = "Location", y = "Volatility") +
+  theme_minimal()
+
+print(control_chart)
+
+# --- K-means clustering of volatility ---
+num_clusters <- 3
+kmeans_result <- kmeans(volatility_df$Volatility, centers = num_clusters)
+volatility_df$Cluster <- as.factor(kmeans_result$cluster)
+
+# Cluster plot
+ggplot(volatility_df, aes(x = Location, y = Volatility, color = Cluster)) +
+  geom_point(size = 3) +
+  geom_text(aes(label = State), vjust = -1, size = 3, color = "black") +
+  labs(title = "K-Means Clustering of Location Volatility (GARCH on Poisson GLM Fitted Means)",
+       subtitle = paste("Clusters =", num_clusters),
+       x = "Location", y = "Volatility") +
+  scale_color_manual(values = c("red", "blue", "green")) +
+  theme_minimal()
+
+
+## FDA and Copula to Poisson GARCH 
+
+library(fGarch)        # for garchFit
+library(copula)        # for copula fitting and simulation
+library(fda)           # functional data analysis
+library(ggplot2)
+
+# --- Load and Prepare Data ---
+data <- read.csv("uscovid3.csv", header = TRUE)
+dates <- as.Date(data$Date, format = "%m/%d/%Y")
+ts_data <- as.matrix(data[, -1])
+n_days <- nrow(ts_data)
+n_loc <- ncol(ts_data)
+
+# --- Fit Poisson GLM only and collect predicted means ---
+mean_mat <- matrix(NA, n_days, n_loc)
+poisson_models <- vector("list", n_loc)
+
+for (i in 1:n_loc) {
+  y <- ts_data[, i]
+  t <- 1:n_days
+  
+  if (var(y) == 0) {
+    mu_hat <- rep(mean(y), n_days)
+    mean_mat[, i] <- mu_hat
+    poisson_models[[i]] <- NULL
+    next
+  }
+  
+  poisson_glm <- glm(y ~ t, family = poisson(link = "log"), control = glm.control(maxit = 100))
+  
+  mu_hat <- fitted(poisson_glm)
+  mean_mat[, i] <- mu_hat
+  poisson_models[[i]] <- poisson_glm
+}
+
+# --- Functional Data Analysis (FDA) ---
+
+# Define basis and smooth the data into functional data object
+p <- 2  # Number of FPCs/components to extract
+
+# Define basis (e.g., B-spline basis)
+basis <- create.bspline.basis(rangeval = c(1, n_days), nbasis = 15)
+
+# Smooth each location’s predicted means into functional data objects
+y_fd <- smooth.basis(argvals = 1:n_days, y = mean_mat, fdParobj = basis)
+
+# Compute mean function (mean_fd)
+mean_fd <- mean.fd(y_fd$fd)
+
+# Compute covariance and eigenfunctions (functional PCA)
+pca_res <- pca.fd(y_fd$fd, nharm = p)
+eigenfunctions <- pca_res$harmonics
+
+# Compute FPC scores matrix Z (p x n_loc)
+Z <- matrix(0, nrow = p, ncol = n_loc)
+for (i in 1:p) {
+  Z[i, ] <- sapply(1:n_loc, function(k) {
+    inprod(y_fd$fd[k], eigenfunctions[i]) - inprod(mean_fd, eigenfunctions[i])
+  })
+}
+
+# --- Copula-based spatial dependence modeling on FPC scores ---
+
+# Transform to pseudo-observations (rank-based uniform margins)
+u_data <- pobs(t(Z))  # transpose so rows are locations, cols are FPC scores
+
+# Fit Gaussian copula
+fit_gaussian <- fitCopula(normalCopula(dim = p), u_data, method = "ml")
+
+# Fit Clayton copula
+fit_clayton <- fitCopula(claytonCopula(dim = p), u_data, method = "ml")
+
+# Empirical copula
+emp_copula <- empCopula(u_data)
+
+# --- Simulate from fitted copulas ---
+num_sim <- n_loc  # number of simulations (same as number of locations)
+
+sim_gaussian <- rCopula(num_sim, fit_gaussian@copula)
+sim_clayton <- rCopula(num_sim, fit_clayton@copula)
+sim_empirical <- rCopula(num_sim, emp_copula)
+
+# Combine copula effects (average of first dimension simulations as example)
+combined_copula_effect <- rowMeans(cbind(sim_gaussian[,1], sim_clayton[,1], sim_empirical[,1]))
+
+# --- Use combined copula effect to adjust the predicted means for each location ---
+adjusted_mean_mat <- mean_mat
+for (i in 1:n_loc) {
+  adjusted_mean_mat[, i] <- mean_mat[, i] * combined_copula_effect[i]
+}
+
+# --- Fit GARCH(1,1) on adjusted means (copula transformed) ---
+vol_mat <- matrix(NA, n_days, n_loc)
+
+for (i in 1:n_loc) {
+  garch_fit <- tryCatch({
+    garchFit(~ garch(1,1), data = adjusted_mean_mat[, i], trace = FALSE)
+  }, error = function(e) NULL)
+  
+  vol_mat[, i] <- if (!is.null(garch_fit)) {
+    fitted(garch_fit)
+  } else {
+    rep(mean(adjusted_mean_mat[, i]), n_days)
+  }
+}
+
+# --- Calculate mean volatility across time ---
+garch_volatility <- colMeans(vol_mat)
+
+# --- Locations vector ---
+locations <- c("AK", "AL", "AR", "AZ", "CA", "CO", "CT", "DC", "DE", "FL", "GA", "HI", "IA", "ID", "IL", "IN",
+               "KS", "KY", "LA", "MA", "MD", "ME", "MI", "MN", "MO", "MS", "MT", "NC", "ND", "NE", "NH", "NJ",
+               "NM", "NV", "NY", "OH", "OK", "OR", "PA", "RI", "SC", "SD", "TN", "TX", "UT", "VA", "VT", "WA",
+               "WI", "WV", "WY")
+
+# --- Create volatility dataframe ---
+volatility_df <- data.frame(Location = 1:n_loc, Volatility = garch_volatility, State = locations)
+
+# --- Plot volatility ---
+ggplot(volatility_df, aes(x = Location, y = Volatility)) +
+  geom_line(color = "blue") +
+  geom_point(color = "red") +
+  geom_text(aes(label = State), color = "black", vjust = -1, size = 3) +
+  labs(title = "Volatility Across Locations (Poisson Based GARCH on Copula Adjusted Means)",
+       x = "Location", y = "Volatility") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+# --- Control chart ---
+vol_vals <- volatility_df$Volatility
+cl_upper <- mean(vol_vals) + 2 * sd(vol_vals)
+cl_lower <- mean(vol_vals) - 2 * sd(vol_vals)
+out_of_control <- which(vol_vals > cl_upper | vol_vals < cl_lower)
+
+control_chart <- ggplot(volatility_df, aes(x = Location, y = Volatility)) +
+  geom_line(color = "blue") +
+  geom_point(color = "black", size = 2) +
+  geom_point(data = volatility_df[out_of_control, ],
+             aes(x = Location, y = Volatility),
+             color = "red", size = 3) +
+  geom_hline(yintercept = cl_upper, linetype = "dashed", color = "darkgreen") +
+  geom_hline(yintercept = cl_lower, linetype = "dashed", color = "darkgreen") +
+  geom_text(aes(label = State), vjust = -1, size = 3) +
+  labs(title = "2-Sigma Control Chart Across Locations (Volatility) for Poisson Based GARCH on Copula Adjusted Means",
+       subtitle = "Red = Out-of-Control Locations",
+       x = "Location", y = "Volatility") +
+  theme_minimal()
+
+print(control_chart)
+
+# --- K-means clustering on volatility ---
+num_clusters <- 3
+kmeans_result <- kmeans(volatility_df$Volatility, centers = num_clusters)
+volatility_df$Cluster <- as.factor(kmeans_result$cluster)
+
+ggplot(volatility_df, aes(x = Location, y = Volatility, color = Cluster)) +
+  geom_point(size = 3) +
+  geom_text(aes(label = State), vjust = -1, size = 3, color = "black") +
+  labs(title = "K-Means Clustering of Location Volatility (Poisson Based GARCH on Copula Adjusted Means)",
+       subtitle = paste("Clusters =", num_clusters),
+       x = "Location", y = "Volatility") +
+  scale_color_manual(values = c("red", "blue", "green")) +
+  theme_minimal()
+
+#####################
+## NB-Garch model
+# --- Required Libraries ---
+library(MASS)        # For glm.nb
+library(fGarch)      # For GARCH fitting
+library(ggplot2)     # Plotting
+library(copula)      # For nonparametric copula
+library(VineCopula)  # For vine copula modeling
+library(corrplot)    # For correlation heatmap visualization
+
+# --- Load and Prepare Data ---
+data <- read.csv("uscovid3.csv", header = TRUE)
+dates <- as.Date(data$Date, format = "%m/%d/%Y")
+ts_data <- as.matrix(data[, -1])
+n_days <- nrow(ts_data)
+n_loc <- ncol(ts_data)
+
+# --- State Labels ---
+locations <- c("AK", "AL", "AR", "AZ", "CA", "CO", "CT", "DC", "DE", "FL", "GA", "HI", "IA", "ID", "IL", "IN",
+               "KS", "KY", "LA", "MA", "MD", "ME", "MI", "MN", "MO", "MS", "MT", "NC", "ND", "NE", "NH", "NJ",
+               "NM", "NV", "NY", "OH", "OK", "OR", "PA", "RI", "SC", "SD", "TN", "TX", "UT", "VA", "VT", "WA",
+               "WI", "WV", "WY")
+
+# --- Initialize Matrices and Lists ---
+mean_mat <- matrix(NA, n_days, n_loc)
+vol_mat <- matrix(NA, n_days, n_loc)
+nb_models <- list()
+model_stats <- data.frame(State = locations, AIC = NA, BIC = NA, Model = NA)
+
+# --- Fit NB or Poisson GLM + GARCH for each location ---
+for (i in 1:n_loc) {
+  y <- ts_data[, i]
+  t <- 1:n_days
+  
+  if (var(y) == 0) {
+    mu_hat <- rep(mean(y), n_days)
+    vol_mat[, i] <- rep(0, n_days)
+    mean_mat[, i] <- mu_hat
+    nb_models[[i]] <- NULL
+    model_stats$AIC[i] <- NA
+    model_stats$BIC[i] <- NA
+    model_stats$Model[i] <- "Constant"
+    next
+  }
+  
+  # Try NB GLM; fallback to Poisson if it fails
+  nb_glm <- tryCatch({
+    glm.nb(y ~ t, control = glm.control(maxit = 100))
+  }, error = function(e) {
+    glm(y ~ t, family = poisson(link = "log"))
+  })
+  
+  mu_hat <- fitted(nb_glm)
+  mean_mat[, i] <- mu_hat
+  
+  # Store AIC/BIC and model type
+  model_stats$AIC[i] <- AIC(nb_glm)
+  model_stats$BIC[i] <- BIC(nb_glm)
+  model_stats$Model[i] <- if ("theta" %in% names(nb_glm)) "NB" else "Poisson"
+  
+  # Variance estimate
+  if (!is.null(nb_glm$theta) && !is.na(nb_glm$theta) && nb_glm$theta < 1e6) {
+    theta <- nb_glm$theta
+    var_hat <- mu_hat + mu_hat^2 / theta
+  } else {
+    var_hat <- mu_hat
+  }
+  
+  # Fit GARCH(1,1) on mean predictions
+  garch_fit <- tryCatch({
+    garchFit(~ garch(1,1), data = mu_hat, trace = FALSE)
+  }, error = function(e) NULL)
+  
+  vol_mat[, i] <- if (!is.null(garch_fit)) {
+    fitted(garch_fit)
+  } else {
+    rep(mean(mu_hat), n_days)
+  }
+  
+  nb_models[[i]] <- nb_glm
+}
+
+# --- Mean Volatility Across Time ---
+garch_volatility <- colMeans(vol_mat)
+
+# --- Volatility DataFrame ---
+volatility_df <- data.frame(Location = 1:n_loc, Volatility = garch_volatility, State = locations)
+
+# --- Save Model Statistics ---
+write.csv(model_stats, "nb_or_poisson_model_aic_bic_by_state.csv", row.names = FALSE)
+
+# --- Display Top 5 by AIC and BIC ---
+cat("Top 5 States by AIC:\n")
+print(head(model_stats[order(model_stats$AIC), ], 5))
+
+cat("\nTop 5 States by BIC:\n")
+print(head(model_stats[order(model_stats$BIC), ], 5))
+
+# --- Optional Plot ---
+ggplot(model_stats, aes(x = reorder(State, AIC), y = AIC, fill = Model)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(title = "GLM AIC by State", x = "State", y = "AIC") +
+  theme_minimal()
+
+ggplot(model_stats, aes(x = reorder(State, BIC), y = BIC, fill = Model)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(title = "GLM BIC by State", x = "State", y = "BIC") +
+  theme_minimal()
+
+# --- Plot volatility across locations ---
+ggplot(volatility_df, aes(x = Location, y = Volatility)) +
+  geom_line(color = "blue") +
+  geom_point(color = "red") +
+  geom_text(aes(label = State), color = "black", vjust = -1, size = 3) +
+  labs(title = "Volatility Across Locations (GARCH on NB GLM Fitted Means)",
+       x = "Location", y = "Volatility") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+# --- Control chart for volatility ---
+vol_vals <- volatility_df$Volatility
+cl_upper <- mean(vol_vals) + 2 * sd(vol_vals)
+cl_lower <- mean(vol_vals) - 2 * sd(vol_vals)
+out_of_control <- which(vol_vals > cl_upper | vol_vals < cl_lower)
+
+control_chart <- ggplot(volatility_df, aes(x = Location, y = Volatility)) +
+  geom_line(color = "blue") +
+  geom_point(color = "black", size = 2) +
+  geom_point(data = volatility_df[out_of_control, ],
+             aes(x = Location, y = Volatility),
+             color = "red", size = 3) +
+  geom_hline(yintercept = cl_upper, linetype = "dashed", color = "darkgreen") +
+  geom_hline(yintercept = cl_lower, linetype = "dashed", color = "darkgreen") +
+  geom_text(aes(label = State), vjust = -1, size = 3) +
+  labs(title = "2-Sigma Control Chart Across Locations (Volatility) for GARCH on NB GLM Fitted Means",
+       subtitle = "Red = Out-of-Control Locations",
+       x = "Location", y = "Volatility") +
+  theme_minimal()
+
+print(control_chart)
+
+# --- K-means clustering on volatility ---
+num_clusters <- 3
+kmeans_result <- kmeans(volatility_df$Volatility, centers = num_clusters)
+volatility_df$Cluster <- as.factor(kmeans_result$cluster)
+
+ggplot(volatility_df, aes(x = Location, y = Volatility, color = Cluster)) +
+  geom_point(size = 3) +
+  geom_text(aes(label = State), vjust = -1, size = 3, color = "black") +
+  labs(title = "K-Means Clustering of Location Volatility (GARCH on NB GLM Fitted Means)",
+       subtitle = paste("Clusters =", num_clusters),
+       x = "Location", y = "Volatility") +
+  scale_color_manual(values = c("red", "blue", "green")) +
+  theme_minimal()
+
+
+
+
+### fpca and copula to NB Garch
+
+library(MASS)          # glm.nb
+library(fGarch)        # garchFit
+library(copula)        # for copula fitting and simulation
+library(fda)           # functional data analysis
+library(ggplot2)
+
+# --- Load and Prepare Data ---
+data <- read.csv("uscovid3.csv", header = TRUE)
+dates <- as.Date(data$Date, format = "%m/%d/%Y")
+ts_data <- as.matrix(data[, -1])
+n_days <- nrow(ts_data)
+n_loc <- ncol(ts_data)
+
+# --- Fit NB GLM (or Poisson fallback) and collect predicted means ---
+mean_mat <- matrix(NA, n_days, n_loc)
+nb_models <- vector("list", n_loc)
+
+for (i in 1:n_loc) {
+  y <- ts_data[, i]
+  t <- 1:n_days
+  
+  if (var(y) == 0) {
+    mu_hat <- rep(mean(y), n_days)
+    mean_mat[, i] <- mu_hat
+    nb_models[[i]] <- NULL
+    next
+  }
+  
+  nb_glm <- tryCatch({
+    glm.nb(y ~ t, control = glm.control(maxit = 100))
+  }, error = function(e) {
+    glm(y ~ t, family = poisson(link = "log"))
+  })
+  
+  mu_hat <- fitted(nb_glm)
+  mean_mat[, i] <- mu_hat
+  nb_models[[i]] <- nb_glm
+}
+
+# --- Functional Data Analysis (FDA) ---
+
+# Define basis and smooth the data into functional data object
+library(fda)
+p <- 2  # Number of FPCs/components to extract
+
+# Define basis (e.g., B-spline basis)
+basis <- create.bspline.basis(rangeval = c(1, n_days), nbasis = 15)
+
+# Smooth each location’s predicted means into functional data objects
+y_fd <- smooth.basis(argvals = 1:n_days, y = mean_mat, fdParobj = basis)
+
+# Compute mean function (mean_fd)
+mean_fd <- mean.fd(y_fd$fd)
+
+# Compute covariance and eigenfunctions (functional PCA)
+pca_res <- pca.fd(y_fd$fd, nharm = p)
+eigenfunctions <- pca_res$harmonics
+
+# Compute FPC scores matrix Z (p x n_loc)
+Z <- matrix(0, nrow = p, ncol = n_loc)
+for (i in 1:p) {
+  Z[i, ] <- sapply(1:n_loc, function(k) {
+    inprod(y_fd$fd[k], eigenfunctions[i]) - inprod(mean_fd, eigenfunctions[i])
+  })
+}
+
+# --- Copula-based spatial dependence modeling on FPC scores ---
+
+# Transform to pseudo-observations (rank-based uniform margins)
+u_data <- pobs(t(Z))  # transpose so rows are locations, cols are FPC scores
+
+# Fit Gaussian copula
+fit_gaussian <- fitCopula(normalCopula(dim = p), u_data, method = "ml")
+
+# Fit Clayton copula
+fit_clayton <- fitCopula(claytonCopula(dim = p), u_data, method = "ml")
+
+# Empirical copula
+emp_copula <- empCopula(u_data)
+
+# --- Simulate from fitted copulas ---
+num_sim <- n_loc  # number of simulations (same as number of locations)
+
+sim_gaussian <- rCopula(num_sim, fit_gaussian@copula)
+sim_clayton <- rCopula(num_sim, fit_clayton@copula)
+sim_empirical <- rCopula(num_sim, emp_copula)
+
+# Combine copula effects (average of first dimension simulations as example)
+combined_copula_effect <- rowMeans(cbind(sim_gaussian[,1], sim_clayton[,1], sim_empirical[,1]))
+
+# --- Use combined copula effect to adjust the predicted means for each location ---
+# For simplicity, adjust mean_mat columns by scaling with combined copula effect
+
+adjusted_mean_mat <- mean_mat
+for (i in 1:n_loc) {
+  adjusted_mean_mat[, i] <- mean_mat[, i] * combined_copula_effect[i]
+}
+
+# --- Fit GARCH(1,1) on adjusted means (copula transformed) ---
+vol_mat <- matrix(NA, n_days, n_loc)
+
+for (i in 1:n_loc) {
+  garch_fit <- tryCatch({
+    garchFit(~ garch(1,1), data = adjusted_mean_mat[, i], trace = FALSE)
+  }, error = function(e) NULL)
+  
+  vol_mat[, i] <- if (!is.null(garch_fit)) {
+    fitted(garch_fit)
+  } else {
+    rep(mean(adjusted_mean_mat[, i]), n_days)
+  }
+}
+
+# --- Calculate mean volatility across time ---
+garch_volatility <- colMeans(vol_mat)
+
+# --- Locations vector ---
+locations <- c("AK", "AL", "AR", "AZ", "CA", "CO", "CT", "DC", "DE", "FL", "GA", "HI", "IA", "ID", "IL", "IN",
+               "KS", "KY", "LA", "MA", "MD", "ME", "MI", "MN", "MO", "MS", "MT", "NC", "ND", "NE", "NH", "NJ",
+               "NM", "NV", "NY", "OH", "OK", "OR", "PA", "RI", "SC", "SD", "TN", "TX", "UT", "VA", "VT", "WA",
+               "WI", "WV", "WY")
+
+# --- Create volatility dataframe ---
+volatility_df <- data.frame(Location = 1:n_loc, Volatility = garch_volatility, State = locations)
+
+# --- Plot volatility ---
+ggplot(volatility_df, aes(x = Location, y = Volatility)) +
+  geom_line(color = "blue") +
+  geom_point(color = "red") +
+  geom_text(aes(label = State), color = "black", vjust = -1, size = 3) +
+  labs(title = "Volatility Across Locations (NB Based GARCH on Copula Adjusted Means)",
+       x = "Location", y = "Volatility") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+# --- Control chart ---
+vol_vals <- volatility_df$Volatility
+cl_upper <- mean(vol_vals) + 2 * sd(vol_vals)
+cl_lower <- mean(vol_vals) - 2 * sd(vol_vals)
+out_of_control <- which(vol_vals > cl_upper | vol_vals < cl_lower)
+
+control_chart <- ggplot(volatility_df, aes(x = Location, y = Volatility)) +
+  geom_line(color = "blue") +
+  geom_point(color = "black", size = 2) +
+  geom_point(data = volatility_df[out_of_control, ],
+             aes(x = Location, y = Volatility),
+             color = "red", size = 3) +
+  geom_hline(yintercept = cl_upper, linetype = "dashed", color = "darkgreen") +
+  geom_hline(yintercept = cl_lower, linetype = "dashed", color = "darkgreen") +
+  geom_text(aes(label = State), vjust = -1, size = 3) +
+  labs(title = "2-Sigma Control Chart Across Locations (Volatility) for (NB Based GARCH on Copula Adjusted Means)",
+       subtitle = "Red = Out-of-Control Locations",
+       x = "Location", y = "Volatility") +
+  theme_minimal()
+
+print(control_chart)
+
+# --- K-means clustering on volatility ---
+num_clusters <- 3
+kmeans_result <- kmeans(volatility_df$Volatility, centers = num_clusters)
+volatility_df$Cluster <- as.factor(kmeans_result$cluster)
+
+ggplot(volatility_df, aes(x = Location, y = Volatility, color = Cluster)) +
+  geom_point(size = 3) +
+  geom_text(aes(label = State), vjust = -1, size = 3, color = "black") +
+  labs(title = "K-Means Clustering of Location Volatility (NB Based GARCH on Copula Adjusted Means)",
+       subtitle = paste("Clusters =", num_clusters),
+       x = "Location", y = "Volatility") +
+  scale_color_manual(values = c("red", "blue", "green")) +
+  theme_minimal()

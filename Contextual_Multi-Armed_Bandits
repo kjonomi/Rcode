@@ -1,0 +1,535 @@
+## Mathematics Journal under Review (06/10/2025)
+## Title: Gaussian Process Modeling with Vine Copula-Based Context Modeling for Contextual Multi-Armed Bandits
+
+####################################
+## Simulated Data Analysis
+####################################
+library(MASS)
+library(copula)
+library(VineCopula)
+library(laGP)
+library(progress)
+library(ggplot2)
+library(dplyr)
+
+run_bandit_simulation <- function(seed = 42,
+                                  T = 1000L,
+                                  n_ctx = 15L,
+                                  n_arms = 10L,
+                                  train_prop = 0.8,
+                                  rho_within = 0.6,
+                                  rho_between = 0.2,
+                                  block_size = 5L,
+                                  epsilon = 0.1) {
+  
+  set.seed(seed)
+  train_size <- as.integer(T * train_prop)
+  
+  # --- Generate correlated context via Gaussian copula ---
+  block_cor <- function(p, within, between, blk_size) {
+    M <- matrix(between, p, p)
+    for (b in seq(1, p, blk_size)) {
+      idx <- b:min(b + blk_size - 1L, p)
+      M[idx, idx] <- within
+    }
+    diag(M) <- 1
+    M
+  }
+  
+  Sigma_ctx <- block_cor(n_ctx, rho_within, rho_between, block_size)
+  if (any(eigen(Sigma_ctx)$values <= 0)) stop("Sigma_ctx is not positive definite")
+  
+  param_vec <- tryCatch(P2p(Sigma_ctx), error = function(e) stop("P2p failed:", e$message))
+  cop <- normalCopula(param = param_vec, dim = n_ctx, dispstr = "un")
+  U_ctx <- rCopula(T, cop)
+  
+  n_cores <- max(1L, parallel::detectCores() - 1L)
+  vine_fit <- tryCatch(
+    RVineStructureSelect(U_ctx, familyset = c(1, 3, 4, 5), type = 0, cores = n_cores),
+    error = function(e) {
+      message("Vine copula fit failed: ", e$message)
+      NULL
+    })
+  
+  U_vine <- if (is.null(vine_fit)) U_ctx else RVinePIT(U_ctx, vine_fit)
+  
+  # --- Simulate rewards using Beta distribution ---
+  reward_mat <- qbeta(U_vine[, 1:n_arms], shape1 = 2, shape2 = 5)
+  colnames(reward_mat) <- paste0("reward_", seq_len(n_arms))
+  
+  # --- Train/test split ---
+  X <- U_vine
+  X_train <- X[1:train_size, , drop = FALSE]
+  X_test  <- X[(train_size + 1):T, , drop = FALSE]
+  Y_train <- reward_mat[1:train_size, ]
+  Y_test  <- reward_mat[(train_size + 1):T, ]
+  
+  # --- Fit GP models ---
+  fit_gp <- function(Xtr, ytr) {
+    tryCatch(
+      laGP::newGPsep(Xtr, ytr, d = 0.5, g = 1e-6, dK = TRUE),
+      error = function(e) {
+        message("GP fit failed: ", e$message)
+        NULL
+      })
+  }
+  
+  gp_models <- lapply(seq_len(n_arms), function(j) fit_gp(X_train, Y_train[, j]))
+  
+  # --- Policy functions ---
+  thompson_sampling <- function(x_row, t = NULL) {
+    preds <- vapply(gp_models, function(gp) {
+      if (is.null(gp)) return(-Inf)
+      p <- tryCatch(laGP::predGPsep(gp, matrix(x_row, 1)), error = function(e) NULL)
+      if (is.null(p) || is.null(p$mean) || is.null(p$s2) || p$s2 <= 0) return(-Inf)
+      rnorm(1L, as.numeric(p$mean), sqrt(as.numeric(p$s2)))
+    }, numeric(1))
+    if (all(is.infinite(preds))) sample.int(n_arms, 1L) else which.max(preds)
+  }
+  
+  epsilon_greedy <- function(x_row, t) {
+    if (runif(1) < epsilon || t <= n_arms) return(sample.int(n_arms, 1L))
+    preds <- vapply(gp_models, function(gp) {
+      p <- tryCatch(laGP::predGPsep(gp, matrix(x_row, 1)), error = function(e) NULL)
+      if (is.null(p) || is.null(p$mean)) return(-Inf)
+      as.numeric(p$mean)
+    }, numeric(1))
+    if (all(is.infinite(preds))) sample.int(n_arms, 1L) else which.max(preds)
+  }
+  
+  ucb_policy <- function(x_row, t) {
+    preds <- vapply(gp_models, function(gp) {
+      p <- tryCatch(laGP::predGPsep(gp, matrix(x_row, 1)), error = function(e) NULL)
+      if (is.null(p) || is.null(p$mean) || is.null(p$s2)) return(-Inf)
+      as.numeric(p$mean) + sqrt(2 * log(t) * as.numeric(p$s2))
+    }, numeric(1))
+    if (all(is.infinite(preds))) sample.int(n_arms, 1L) else which.max(preds)
+  }
+  
+  # --- Simulation runner with regret calculation ---
+  simulate_policy <- function(policy_func, name) {
+    sel_arms <- integer(T - train_size)
+    rewards <- numeric(T - train_size)
+    optimal_rewards <- numeric(T - train_size)
+    
+    for (t in seq_len(T - train_size)) {
+      a <- policy_func(X_test[t, ], t)
+      sel_arms[t] <- a
+      rewards[t] <- Y_test[t, a]
+      # Oracle (optimal) arm reward at this step
+      optimal_rewards[t] <- max(Y_test[t, ])
+    }
+    
+    cum_rewards <- cumsum(rewards)
+    cum_optimal <- cumsum(optimal_rewards)
+    regret <- cum_optimal - cum_rewards
+    
+    data.frame(time = (train_size + 1):T,
+               cum_rewards = cum_rewards,
+               cum_optimal = cum_optimal,
+               regret = regret,
+               policy = name)
+  }
+  
+  # --- Run policies ---
+  message("Running Thompson Sampling...")
+  thomp_df <- simulate_policy(thompson_sampling, "Thompson Sampling")
+  
+  message("Running Epsilon-Greedy...")
+  eps_df <- simulate_policy(epsilon_greedy, "Epsilon-Greedy")
+  
+  message("Running UCB...")
+  ucb_df <- simulate_policy(ucb_policy, "UCB")
+  
+  # --- Combine and plot cumulative rewards and regret ---
+  df_all_rewards <- rbind(thomp_df, eps_df, ucb_df)
+  
+  p_rewards <- ggplot(df_all_rewards, aes(time, cum_rewards, color = policy)) +
+    geom_line(linewidth = 1) +
+    labs(title = "Cumulative Reward Comparison of Bandit Policies",
+         x = "Time step", y = "Cumulative Reward") +
+    theme_minimal(base_size = 14) +
+    scale_color_manual(values = c("steelblue", "darkorange", "forestgreen"))
+  
+  p_regret <- ggplot(df_all_rewards, aes(time, regret, color = policy)) +
+    geom_line(linewidth = 1) +
+    labs(title = "Cumulative Regret Comparison of Bandit Policies",
+         x = "Time step", y = "Cumulative Regret") +
+    theme_minimal(base_size = 14) +
+    scale_color_manual(values = c("steelblue", "darkorange", "forestgreen"))
+  
+  print(p_rewards)
+  print(p_regret)
+  
+  # --- Summary Table ---
+  summary_table <- df_all_rewards |>
+    group_by(policy) |>
+    summarise(
+      Final_Cumulative_Reward = round(last(cum_rewards), 2),
+      Final_Cumulative_Regret = round(last(regret), 2),
+      Mean_Cumulative_Reward = round(mean(cum_rewards), 2),
+      Mean_Cumulative_Regret = round(mean(regret), 2),
+      SD_Cumulative_Reward = round(sd(cum_rewards), 2),
+      SD_Cumulative_Regret = round(sd(regret), 2),
+      .groups = "drop"
+    )
+  
+  print(summary_table)
+  
+  return(list(plot_rewards = p_rewards,
+              plot_regret = p_regret,
+              data = df_all_rewards,
+              summary = summary_table))
+}
+
+# --- Run the simulation ---
+result <- run_bandit_simulation()
+
+print(as.data.frame(result$summary))
+
+
+
+
+####################################
+## Wine Quality Real Data Analysis
+####################################
+
+library(data.table)   # for fread
+library(copula)
+library(VineCopula)
+library(laGP)
+library(progress)
+library(ggplot2)
+library(dplyr)
+
+set.seed(123)
+
+# --- Load Wine Quality dataset ---
+wine_url <- "https://archive.ics.uci.edu/ml/machine-learning-databases/wine-quality/winequality-red.csv"
+wine <- fread(wine_url, sep = ";")
+
+# Context variables: all except "quality"
+context_vars <- setdiff(names(wine), "quality")
+X_real <- as.matrix(wine[, ..context_vars])  # numeric matrix of predictors
+T_real <- nrow(X_real)
+n_ctx_real <- ncol(X_real)
+
+# Scale context variables
+X_scaled <- scale(X_real)
+
+# Discretize "quality" into 3 classes (arms) based on tertiles
+Y_raw <- wine$quality
+cut_points <- quantile(Y_raw, probs = c(1/3, 2/3))
+Y_arm <- cut(Y_raw, breaks = c(-Inf, cut_points, Inf), labels = FALSE)
+n_arms <- length(unique(Y_arm))
+
+# One-hot encode rewards matrix
+reward_mat <- matrix(0, nrow = length(Y_arm), ncol = n_arms)
+for (i in seq_along(Y_arm)) {
+  reward_mat[i, Y_arm[i]] <- 1
+}
+
+# --- Train-test split ---
+train_index <- sample(seq_len(T_real), size = floor(0.7 * T_real))  # 70% train
+X_train <- X_scaled[train_index, ]
+X_test <- X_scaled[-train_index, ]
+Y_train <- reward_mat[train_index, ]
+Y_test <- reward_mat[-train_index, ]
+
+T_test <- nrow(X_test)
+
+# --- Convert contexts to uniforms via normal CDF (probability integral transform) ---
+U_train <- pnorm(X_train)
+U_test <- pnorm(X_test)
+
+# --- Fit Vine copula on training context ---
+n_cores <- max(1L, parallel::detectCores() - 1L)
+vine_fit <- tryCatch(
+  RVineStructureSelect(U_train, familyset = c(1, 3, 4, 5), type = 0, cores = n_cores),
+  error = function(e) {
+    message("Vine copula fit failed: ", e$message)
+    NULL
+  })
+
+U_test_vine <- if (is.null(vine_fit)) U_test else RVinePIT(U_test, vine_fit)
+
+# --- Fit GP models for each arm ---
+fit_gp <- function(Xtr, ytr) {
+  tryCatch(
+    laGP::newGPsep(Xtr, ytr, d = 0.5, g = 1e-6, dK = TRUE),
+    error = function(e) {
+      message("GP fit failed: ", e$message)
+      NULL
+    })
+}
+
+gp_models <- lapply(seq_len(n_arms), function(j) fit_gp(U_train, Y_train[, j]))
+
+# --- Define Bandit Policies ---
+
+thompson_sampling <- function(x_row, t = NULL) {
+  preds <- vapply(gp_models, function(gp) {
+    if (is.null(gp)) return(-Inf)
+    p <- tryCatch(laGP::predGPsep(gp, matrix(x_row, 1)), error = function(e) NULL)
+    if (is.null(p) || is.null(p$mean) || is.null(p$s2) || p$s2 <= 0) return(-Inf)
+    rnorm(1L, as.numeric(p$mean), sqrt(as.numeric(p$s2)))
+  }, numeric(1))
+  if (all(is.infinite(preds))) sample.int(n_arms, 1L) else which.max(preds)
+}
+
+epsilon <- 0.1
+epsilon_greedy <- function(x_row, t) {
+  if (runif(1) < epsilon || t <= n_arms) return(sample.int(n_arms, 1L))
+  preds <- vapply(gp_models, function(gp) {
+    p <- tryCatch(laGP::predGPsep(gp, matrix(x_row, 1)), error = function(e) NULL)
+    if (is.null(p) || is.null(p$mean)) return(-Inf)
+    as.numeric(p$mean)
+  }, numeric(1))
+  if (all(is.infinite(preds))) sample.int(n_arms, 1L) else which.max(preds)
+}
+
+ucb_policy <- function(x_row, t) {
+  preds <- vapply(gp_models, function(gp) {
+    p <- tryCatch(laGP::predGPsep(gp, matrix(x_row, 1)), error = function(e) NULL)
+    if (is.null(p) || is.null(p$mean) || is.null(p$s2)) return(-Inf)
+    as.numeric(p$mean) + sqrt(2 * log(t) * as.numeric(p$s2))
+  }, numeric(1))
+  if (all(is.infinite(preds))) sample.int(n_arms, 1L) else which.max(preds)
+}
+
+# --- Simulation with cumulative reward and regret ---
+simulate_policy <- function(policy_func, name) {
+  sel_arms <- integer(T_test)
+  rewards <- numeric(T_test)
+  optimal_rewards <- numeric(T_test)
+  
+  for (t in seq_len(T_test)) {
+    a <- policy_func(U_test_vine[t, ], t)
+    sel_arms[t] <- a
+    rewards[t] <- Y_test[t, a]
+    optimal_rewards[t] <- max(Y_test[t, ])
+  }
+  
+  cum_rewards <- cumsum(rewards)
+  cum_optimal <- cumsum(optimal_rewards)
+  regret <- cum_optimal - cum_rewards
+  
+  data.frame(time = seq_len(T_test),
+             cum_rewards = cum_rewards,
+             cum_optimal = cum_optimal,
+             regret = regret,
+             policy = name)
+}
+
+# --- Run bandit policies ---
+message("Running Thompson Sampling...")
+thomp_df <- simulate_policy(thompson_sampling, "Thompson Sampling")
+
+message("Running Epsilon-Greedy...")
+eps_df <- simulate_policy(epsilon_greedy, "Epsilon-Greedy")
+
+message("Running UCB...")
+ucb_df <- simulate_policy(ucb_policy, "UCB")
+
+# --- Combine and plot results ---
+df_all_rewards <- rbind(thomp_df, eps_df, ucb_df)
+
+p_rewards <- ggplot(df_all_rewards, aes(time, cum_rewards, color = policy)) +
+  geom_line(linewidth = 1) +
+  labs(title = "Cumulative Reward Comparison of Bandit Policies (Wine Quality Data)",
+       x = "Time step", y = "Cumulative Reward") +
+  theme_minimal(base_size = 14) +
+  scale_color_manual(values = c("steelblue", "darkorange", "forestgreen"))
+
+p_regret <- ggplot(df_all_rewards, aes(time, regret, color = policy)) +
+  geom_line(linewidth = 1) +
+  labs(title = "Cumulative Regret Comparison of Bandit Policies (Wine Quality Data)",
+       x = "Time step", y = "Cumulative Regret") +
+  theme_minimal(base_size = 14) +
+  scale_color_manual(values = c("steelblue", "darkorange", "forestgreen"))
+
+print(p_rewards)
+print(p_regret)
+
+# --- Summary Table ---
+summary_table <- df_all_rewards |>
+  group_by(policy) |>
+  summarise(
+    Final_Cumulative_Reward = round(last(cum_rewards), 2),
+    Final_Cumulative_Regret = round(last(regret), 2),
+    Mean_Cumulative_Reward = round(mean(cum_rewards), 2),
+    Mean_Cumulative_Regret = round(mean(regret), 2),
+    SD_Cumulative_Reward = round(sd(cum_rewards), 2),
+    SD_Cumulative_Regret = round(sd(regret), 2),
+    .groups = "drop"
+  )
+print(as.data.frame(result$summary))
+
+####################################
+## Boston Housing Real Data Analysis
+####################################
+library(MASS)
+library(copula)
+library(VineCopula)
+library(laGP)
+library(progress)
+library(ggplot2)
+library(dplyr)
+
+set.seed(123)
+
+# --- Data prep: Boston housing ---
+X <- scale(as.matrix(Boston[, -14]))  # scale all predictors except target
+Y_raw <- Boston$medv                  # continuous target variable
+
+# Discretize target into 3 arms based on tertiles
+cut_points <- quantile(Y_raw, probs = c(1/3, 2/3))
+Y_arm <- cut(Y_raw, breaks = c(-Inf, cut_points, Inf), labels = FALSE)
+n_arms <- length(unique(Y_arm))
+
+# Create reward matrix: one-hot encoding of arms
+reward_mat <- matrix(0, nrow = length(Y_arm), ncol = n_arms)
+for (i in seq_along(Y_arm)) {
+  reward_mat[i, Y_arm[i]] <- 1
+}
+
+# --- Train-test split ---
+train_index <- sample(seq_len(nrow(X)), size = 350)
+X_train_raw <- X[train_index, ]
+X_test_raw <- X[-train_index, ]
+Y_train_raw <- reward_mat[train_index, ]
+Y_test_raw <- reward_mat[-train_index, ]
+
+T_test <- nrow(X_test_raw)
+n_ctx <- ncol(X_train_raw)
+
+# --- Transform contexts to uniforms via normal CDF ---
+U_train <- pnorm(X_train_raw)
+U_test <- pnorm(X_test_raw)
+
+# --- Fit Vine copula on training context ---
+n_cores <- max(1L, parallel::detectCores() - 1L)
+vine_fit <- tryCatch(
+  RVineStructureSelect(U_train, familyset = c(1, 3, 4, 5), type = 0, cores = n_cores),
+  error = function(e) {
+    message("Vine copula fit failed: ", e$message)
+    NULL
+  })
+
+# Apply probability integral transform on test contexts using vine copula
+U_test_vine <- if (is.null(vine_fit)) U_test else RVinePIT(U_test, vine_fit)
+
+# --- Fit Gaussian Process (GP) models per arm ---
+fit_gp <- function(Xtr, ytr) {
+  tryCatch(
+    laGP::newGPsep(Xtr, ytr, d = 0.5, g = 1e-6, dK = TRUE),
+    error = function(e) {
+      message("GP fit failed: ", e$message)
+      NULL
+    })
+}
+
+gp_models <- lapply(seq_len(n_arms), function(j) fit_gp(U_train, Y_train_raw[, j]))
+
+# --- Define Bandit policies ---
+
+thompson_sampling <- function(x_row, t = NULL) {
+  preds <- vapply(gp_models, function(gp) {
+    if (is.null(gp)) return(-Inf)
+    p <- tryCatch(laGP::predGPsep(gp, matrix(x_row, 1)), error = function(e) NULL)
+    if (is.null(p) || is.null(p$mean) || is.null(p$s2) || p$s2 <= 0) return(-Inf)
+    rnorm(1L, as.numeric(p$mean), sqrt(as.numeric(p$s2)))
+  }, numeric(1))
+  if (all(is.infinite(preds))) sample.int(n_arms, 1L) else which.max(preds)
+}
+
+epsilon <- 0.1
+epsilon_greedy <- function(x_row, t) {
+  if (runif(1) < epsilon || t <= n_arms) return(sample.int(n_arms, 1L))
+  preds <- vapply(gp_models, function(gp) {
+    p <- tryCatch(laGP::predGPsep(gp, matrix(x_row, 1)), error = function(e) NULL)
+    if (is.null(p) || is.null(p$mean)) return(-Inf)
+    as.numeric(p$mean)
+  }, numeric(1))
+  if (all(is.infinite(preds))) sample.int(n_arms, 1L) else which.max(preds)
+}
+
+ucb_policy <- function(x_row, t) {
+  preds <- vapply(gp_models, function(gp) {
+    p <- tryCatch(laGP::predGPsep(gp, matrix(x_row, 1)), error = function(e) NULL)
+    if (is.null(p) || is.null(p$mean) || is.null(p$s2)) return(-Inf)
+    as.numeric(p$mean) + sqrt(2 * log(t) * as.numeric(p$s2))
+  }, numeric(1))
+  if (all(is.infinite(preds))) sample.int(n_arms, 1L) else which.max(preds)
+}
+
+# --- Simulation for cumulative rewards and regrets ---
+simulate_policy <- function(policy_func, name) {
+  sel_arms <- integer(T_test)
+  rewards <- numeric(T_test)
+  optimal_rewards <- numeric(T_test)
+  
+  for (t in seq_len(T_test)) {
+    a <- policy_func(U_test_vine[t, ], t)
+    sel_arms[t] <- a
+    rewards[t] <- Y_test_raw[t, a]
+    optimal_rewards[t] <- max(Y_test_raw[t, ])
+  }
+  
+  cum_rewards <- cumsum(rewards)
+  cum_optimal <- cumsum(optimal_rewards)
+  regret <- cum_optimal - cum_rewards
+  
+  data.frame(time = seq_len(T_test),
+             cum_rewards = cum_rewards,
+             cum_optimal = cum_optimal,
+             regret = regret,
+             policy = name)
+}
+
+# --- Run policies ---
+message("Running Thompson Sampling...")
+thomp_df <- simulate_policy(thompson_sampling, "Thompson Sampling")
+
+message("Running Epsilon-Greedy...")
+eps_df <- simulate_policy(epsilon_greedy, "Epsilon-Greedy")
+
+message("Running UCB...")
+ucb_df <- simulate_policy(ucb_policy, "UCB")
+
+# --- Combine results ---
+df_all_rewards <- rbind(thomp_df, eps_df, ucb_df)
+
+# --- Plot cumulative rewards ---
+p_rewards <- ggplot(df_all_rewards, aes(time, cum_rewards, color = policy)) +
+  geom_line(linewidth = 1) +
+  labs(title = "Cumulative Reward Comparison of Bandit Policies (Boston Housing)",
+       x = "Time step", y = "Cumulative Reward") +
+  theme_minimal(base_size = 14) +
+  scale_color_manual(values = c("steelblue", "darkorange", "forestgreen"))
+
+# --- Plot cumulative regret ---
+p_regret <- ggplot(df_all_rewards, aes(time, regret, color = policy)) +
+  geom_line(linewidth = 1) +
+  labs(title = "Cumulative Regret Comparison of Bandit Policies (Boston Housing)",
+       x = "Time step", y = "Cumulative Regret") +
+  theme_minimal(base_size = 14) +
+  scale_color_manual(values = c("steelblue", "darkorange", "forestgreen"))
+
+print(p_rewards)
+print(p_regret)
+
+# --- Summary statistics ---
+summary_table <- df_all_rewards %>%
+  group_by(policy) %>%
+  summarise(
+    Final_Cumulative_Reward = round(last(cum_rewards), 2),
+    Final_Cumulative_Regret = round(last(regret), 2),
+    Mean_Cumulative_Reward = round(mean(cum_rewards), 2),
+    Mean_Cumulative_Regret = round(mean(regret), 2),
+    SD_Cumulative_Reward = round(sd(cum_rewards), 2),
+    SD_Cumulative_Regret = round(sd(regret), 2),
+    .groups = "drop"
+  )
+
+print(as.data.frame(result$summary))

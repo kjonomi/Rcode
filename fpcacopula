@@ -1,0 +1,228 @@
+library(fdapace)
+library(cluster)
+library(copula)
+library(factoextra)
+library(tidyverse)
+library(randomForest)
+library(vars)
+library(VineCopula)
+library(reshape2)
+
+# ---- LOAD & PREPARE DATA ----
+data <- read.csv("KOSPI_15min_RV_data_updated.csv")
+data_matrix <- as.matrix(data)
+data_matrix_t <- t(data_matrix)  # Rows = time, Cols = days
+
+# ---- TIME GRID ----
+time_grid <- seq(from = as.POSIXct("09:15:00", format = "%H:%M:%S"),
+                 to = as.POSIXct("15:30:00", format = "%H:%M:%S"),
+                 by = "15 min")
+time_numeric <- as.numeric(difftime(time_grid, min(time_grid), units = "mins"))
+
+# ---- FUNCTIONAL PCA ----
+Lt <- replicate(ncol(data_matrix_t), time_numeric, simplify = FALSE)
+Ly <- lapply(1:ncol(data_matrix_t), function(i) data_matrix_t[, i])
+fpca_res <- FPCA(Ly = Ly, Lt = Lt, list(dataType = 'Dense', maxK = 5, nRegGrid = 51))
+scores <- fpca_res$xiEst
+
+# ---- PART A: K-MEANS CLUSTERING ON FPC SCORES ----
+set.seed(123)
+fpc_features <- scores[, 1:3]
+kmeans_res <- kmeans(fpc_features, centers = 3, nstart = 25)
+cluster_labels <- kmeans_res$cluster
+num_clusters <- 3
+
+fviz_cluster(list(data = fpc_features, cluster = cluster_labels),
+             geom = "point", ellipse.type = "norm",
+             main = "Clustering of Days (FPC1 vs FPC2)",
+             xlab = "FPC1", ylab = "FPC2")
+
+# ---- Plot Mean Curves by K-Means Cluster (Base R) ----
+par(mfrow = c(1, num_clusters))
+for (k in 1:num_clusters) {
+  idx <- which(cluster_labels == k)
+  avg_curve <- rowMeans(data_matrix_t[, idx, drop = FALSE])
+  plot(time_numeric, avg_curve, type = "l", lwd = 2,
+       main = paste("Cluster", k, "- Mean Volatility"),
+       xlab = "Time (mins from 9:15)", ylab = "Volatility")
+}
+par(mfrow = c(1, 1))
+
+# ---- PART B: COPULA MODELING ON FPC SCORES ----
+u1 <- rank(scores[,1]) / (length(scores[,1]) + 1)
+u2 <- rank(scores[,2]) / (length(scores[,2]) + 1)
+u_data <- cbind(u1, u2)
+
+cop_gauss <- fitCopula(normalCopula(dim=2), u_data, method="ml")
+cop_clayton <- fitCopula(claytonCopula(dim=2), u_data, method="ml")
+logLik(cop_gauss); logLik(cop_clayton)
+
+# ---- Plot Copula Contours ----
+cop_plot <- function(fit, title) {
+  contour(fit@copula, main = title, dCopula, n.grid = 50,
+          xlab = "u1 (FPC1)", ylab = "u2 (FPC2)")
+  points(u1, u2, col = rgb(0,0,1,0.3), pch = 20)
+}
+par(mfrow = c(1, 2))
+cop_plot(cop_gauss, "Gaussian Copula")
+cop_plot(cop_clayton, "Clayton Copula")
+par(mfrow = c(1, 1))
+
+# ---- PART C: REGIME CLASSIFICATION (RANDOM FOREST) ----
+df_class <- data.frame(FPC1 = scores[,1], FPC2 = scores[,2], FPC3 = scores[,3], 
+                       Regime = as.factor(cluster_labels))
+set.seed(123)
+train_idx <- sample(1:nrow(df_class), 0.8 * nrow(df_class))
+train_data <- df_class[train_idx, ]
+test_data <- df_class[-train_idx, ]
+
+rf_model <- randomForest(Regime ~ ., data = train_data, ntree = 100)
+preds <- predict(rf_model, test_data)
+cat("Accuracy: ", mean(preds == test_data$Regime), "\n")
+table(Predicted = preds, Actual = test_data$Regime)
+
+# ---- PART D: FORECASTING FPC SCORES & RECONSTRUCTION ----
+var_data <- as.data.frame(scores[, 1:3])
+colnames(var_data) <- c("FPC1", "FPC2", "FPC3")
+var_model <- VAR(var_data, p = 1, type = "const")
+forecast_scores <- predict(var_model, n.ahead = 1)$fcst
+fpc_forecast <- c(forecast_scores$FPC1[1],
+                  forecast_scores$FPC2[1],
+                  forecast_scores$FPC3[1])
+reconstructed <- fpc_forecast %*% t(fpca_res$phi[, 1:3])
+
+plot(fpca_res$workGrid, reconstructed,
+     type = "l", col = "darkred", lwd = 2,
+     main = "Forecasted Intraday Volatility Curve",
+     xlab = "Time (mins from 9:15)", ylab = "Volatility")
+
+# ---- PART E: CLUSTERING USING VINE COPULA DISTANCES ----
+U_data <- pobs(scores[, 1:3])  # Uniform pseudo-observations
+
+vine_fit <- RVineStructureSelect(U_data, familyset = c(1, 3, 4, 5), indeptest = TRUE)
+
+n <- nrow(U_data)
+copula_dist <- matrix(0, n, n)
+for (i in 1:(n - 1)) {
+  for (j in (i + 1):n) {
+    dist_ij <- sum((U_data[i, ] - U_data[j, ])^2)
+    copula_dist[i, j] <- dist_ij
+    copula_dist[j, i] <- dist_ij
+  }
+}
+copula_dist_obj <- as.dist(copula_dist)
+
+# PAM clustering with Vine Copula distances
+pam_fit <- pam(copula_dist_obj, k = num_clusters, diss = TRUE)
+copula_clusters_pam <- pam_fit$clustering
+
+# Hierarchical clustering
+hc <- hclust(copula_dist_obj, method = "complete")
+copula_clusters_hc <- cutree(hc, k = num_clusters)
+
+# ---- Plot Mean Curves (Base R) for PAM, K-means, Hierarchical ----
+plot_cluster_means <- function(cluster_labels, method_name, data_matrix_t, time_numeric) {
+  num_clusters <- length(unique(cluster_labels))
+  par(mfrow = c(1, num_clusters))
+  for (k in 1:num_clusters) {
+    idx <- which(cluster_labels == k)
+    cluster_curves <- data_matrix_t[, idx, drop = FALSE]
+    mean_curve <- rowMeans(cluster_curves)
+    
+    matplot(time_numeric, cluster_curves, type = "l", lty = 1,
+            col = rgb(0.6, 0.6, 0.6, 0.3),
+            main = paste(method_name, "- Cluster", k),
+            xlab = "Time (mins from 9:15)", ylab = "Volatility")
+    lines(time_numeric, mean_curve, col = "blue", lwd = 2)
+  }
+  par(mfrow = c(1, 1))
+}
+
+plot_cluster_means(copula_clusters_pam, "PAM", data_matrix_t, time_numeric)
+plot_cluster_means(cluster_labels, "K-means", data_matrix_t, time_numeric)
+plot_cluster_means(copula_clusters_hc, "Hierarchical", data_matrix_t, time_numeric)
+
+# ---- ggplot2: Compare Mean Curves Across Clustering Methods ----
+df_long <- melt(data_matrix_t)
+colnames(df_long) <- c("TimeIndex", "Sample", "Volatility")
+df_long$Time <- time_numeric[df_long$TimeIndex]
+df_long$KMeans <- factor(cluster_labels[df_long$Sample])
+df_long$PAM <- factor(copula_clusters_pam[df_long$Sample])
+df_long$Hierarchical <- factor(copula_clusters_hc[df_long$Sample])
+
+df_long_melted <- df_long %>%
+  pivot_longer(cols = c("KMeans", "PAM", "Hierarchical"),
+               names_to = "Method", values_to = "Cluster")
+
+ggplot(df_long_melted, aes(x = Time, y = Volatility, group = Sample)) +
+  geom_line(alpha = 0.1, color = "gray") +
+  stat_summary(aes(group = Cluster), fun = mean, geom = "line",
+               color = "blue", linewidth = 1.2) +
+  facet_grid(Method ~ Cluster) +
+  labs(title = "Mean Volatility Curves by Clustering Method",
+       x = "Time (mins from 9:15)", y = "Volatility") +
+  theme_minimal(base_size = 13)
+
+# ---- SUMMARY TABLES ----
+
+# 1. K-means cluster sizes and centers (mean FPC scores)
+kmeans_summary <- data.frame(
+  Cluster = 1:num_clusters,
+  Size = as.vector(table(cluster_labels)),
+  FPC1_Mean = numeric(num_clusters),
+  FPC2_Mean = numeric(num_clusters),
+  FPC3_Mean = numeric(num_clusters)
+)
+for (k in 1:num_clusters) {
+  idx <- which(cluster_labels == k)
+  kmeans_summary$FPC1_Mean[k] <- mean(scores[idx, 1])
+  kmeans_summary$FPC2_Mean[k] <- mean(scores[idx, 2])
+  kmeans_summary$FPC3_Mean[k] <- mean(scores[idx, 3])
+}
+
+print(kmeans_summary)
+
+# 2. PAM cluster sizes and medoid sample indices
+pam_summary <- data.frame(
+  Cluster = 1:num_clusters,
+  Size = as.vector(table(copula_clusters_pam)),
+  Medoid_Sample = pam_fit$medoids
+)
+print(pam_summary)
+
+# 3. Random Forest confusion matrix and accuracy
+conf_mat <- table(Predicted = preds, Actual = test_data$Regime)
+accuracy <- mean(preds == test_data$Regime)
+cat("\nRandom Forest Classification Confusion Matrix:\n")
+print(conf_mat)
+cat(sprintf("\nRandom Forest Classification Accuracy: %.4f\n", accuracy))
+
+# Optional: return a list of all summaries if you want to save or use later
+results_list <- list(
+  kmeans_summary = kmeans_summary,
+  pam_summary = pam_summary,
+  rf_confusion_matrix = conf_mat,
+  rf_accuracy = accuracy
+)
+
+print(results_list)
+
+# ---- Hierarchical Clustering Summary ----
+hc_summary <- data.frame(
+  Cluster = 1:num_clusters,
+  Size = as.vector(table(copula_clusters_hc)),
+  FPC1_Mean = numeric(num_clusters),
+  FPC2_Mean = numeric(num_clusters),
+  FPC3_Mean = numeric(num_clusters)
+)
+
+# Calculate mean FPC scores per cluster
+for (k in 1:num_clusters) {
+  idx <- which(copula_clusters_hc == k)
+  hc_summary$FPC1_Mean[k] <- mean(scores[idx, 1])
+  hc_summary$FPC2_Mean[k] <- mean(scores[idx, 2])
+  hc_summary$FPC3_Mean[k] <- mean(scores[idx, 3])
+}
+
+# Print the summary table
+print(hc_summary)

@@ -1,0 +1,888 @@
+#################
+## Real Data
+#################
+## ZIP
+library(keras)
+library(tensorflow)
+library(dplyr)
+library(survival)
+library(survcomp)
+library(ggplot2)
+library(gridExtra)
+library(fda)
+
+# --- Load COMPAS Data ---
+# You can download compas-scores.csv from https://github.com/kjonomi/data/blob/main/compas-scores.csv
+compas_data <- read.csv("compas-scores.csv")
+
+# --- Preprocessing ---
+compas_data$c_jail_in <- as.Date(compas_data$c_jail_in)
+compas_data$c_jail_out <- as.Date(compas_data$c_jail_out)
+compas_data$days_in_jail <- as.numeric(compas_data$c_jail_out - compas_data$c_jail_in)
+
+features <- c("age", "sex", "race", "priors_count", "decile_score", "days_in_jail")
+compas_data <- compas_data[complete.cases(compas_data[, features]), ]
+compas_data <- compas_data[!is.na(compas_data$is_recid), ]
+
+compas_data$is_recid <- ifelse(compas_data$is_recid == 1, 1, 0)
+
+compas_data$surv_time <- abs(as.numeric(compas_data$days_b_screening_arrest))
+fallback_time <- as.numeric(Sys.Date() - compas_data$c_jail_out)
+compas_data$surv_time[is.na(compas_data$surv_time) | compas_data$surv_time < 0] <- fallback_time[is.na(compas_data$surv_time) | compas_data$surv_time < 0]
+compas_data$event_surv <- ifelse(compas_data$is_recid == 1, 1, 0)
+compas_data$event_surv[is.na(compas_data$event_surv)] <- 0
+
+# --- Summary Statistics for COMPAS Data ---
+
+library(knitr)
+
+# Select variables for summary
+summary_vars <- compas_data %>%
+  select(age, sex, race, priors_count, decile_score, days_in_jail, surv_time, event_surv, is_recid)
+
+# Numerical Summary
+numerical_vars <- summary_vars %>%
+  select_if(is.numeric)
+
+numerical_summary <- numerical_vars %>%
+  summary()
+
+# Categorical Summary
+categorical_summary <- summary_vars %>%
+  select_if(~!is.numeric(.)) %>%
+  lapply(table)
+
+# Print Summary
+cat("\n--- Numerical Variable Summary ---\n")
+print(numerical_summary)
+
+cat("\n--- Categorical Variable Summary ---\n")
+for (name in names(categorical_summary)) {
+  cat("\n", name, ":\n", sep = "")
+  print(categorical_summary[[name]])
+}
+
+Y_surv <- cbind(compas_data$surv_time, compas_data$event_surv)
+
+# --- Functional Basis Expansion ---
+X <- scale(model.matrix(~ . - 1, data = compas_data[, features]))
+n <- nrow(X)
+timesteps <- ncol(X)
+
+# Basis representation
+time_grid <- seq(0, 1, length.out = timesteps)
+nbasis <- 15
+basis <- create.bspline.basis(c(0, 1), nbasis = nbasis)
+fdParobj <- fdPar(basis, Lfdobj = 2, lambda = 1e-2)
+
+coef_mat <- matrix(NA, nrow = n, ncol = nbasis)
+for (i in 1:n) {
+  y_i <- as.numeric(X[i, ])
+  smoothed_fd <- smooth.basis(argvals = time_grid, y = y_i, fdParobj = fdParobj)
+  coef_mat[i, ] <- smoothed_fd$fd$coefs
+}
+
+X_fd <- coef_mat
+treatment <- compas_data$is_recid
+Y_zip1 <- compas_data$priors_count
+Y_zip2 <- compas_data$days_in_jail
+
+X_tensor <- array(0, dim = c(n, nbasis, 2))
+X_tensor[,,1] <- X_fd
+X_tensor[,,2] <- matrix(treatment, nrow = n, ncol = nbasis, byrow = TRUE)
+
+# --- ZIP Loss ---
+zip_loss <- function(y_true, y_pred) {
+  lambda <- tf$exp(y_pred[, 1])
+  pi <- tf$math$sigmoid(y_pred[, 2])
+  y_true <- tf$cast(y_true, tf$float32)
+  
+  zero_mask <- tf$cast(tf$equal(y_true, 0), tf$float32)
+  nonzero_mask <- tf$cast(tf$greater(y_true, 0), tf$float32)
+  
+  log_p_zero <- tf$math$log(pi + (1 - pi) * tf$exp(-lambda) + 1e-8)
+  log_p_nonzero <- tf$math$log(1 - pi + 1e-8) +
+    y_true * tf$math$log(lambda + 1e-8) - lambda - tf$math$lgamma(y_true + 1)
+  
+  loss <- - (zero_mask * log_p_zero + nonzero_mask * log_p_nonzero)
+  tf$reduce_mean(loss)
+}
+
+# --- Cox Loss ---
+cox_loss <- function(y_true, y_pred) {
+  event <- y_true[, 2]
+  time <- tf$cast(y_true[, 1], tf$float32)
+  order <- tf$argsort(time, direction = 'DESCENDING')
+  pred_sorted <- tf$gather(y_pred, order)
+  event_sorted <- tf$gather(event, order)
+  exp_pred <- tf$exp(pred_sorted)
+  log_risk <- tf$math$log(tf$math$cumsum(exp_pred))
+  partial_ll <- (pred_sorted - log_risk) * event_sorted
+  -tf$reduce_mean(partial_ll)
+}
+
+# --- CNN-LSTM Model ---
+build_model <- function(timesteps) {
+  input_layer <- layer_input(shape = c(timesteps, 2))
+  shared <- input_layer %>%
+    layer_conv_1d(filters = 16, kernel_size = 5, activation = 'relu', padding = 'same') %>%
+    layer_max_pooling_1d(pool_size = 2) %>%
+    layer_lstm(units = 32, return_sequences = FALSE) %>%
+    layer_dropout(rate = 0.3) %>%
+    layer_dense(units = 32, activation = 'relu')
+  
+  zip1_out <- shared %>% layer_dense(units = 2, activation = 'linear', name = 'priors_count')
+  zip2_out <- shared %>% layer_dense(units = 2, activation = 'linear', name = 'days_in_jail')
+  surv_out <- shared %>% layer_dense(units = 1, activation = 'linear', name = 'surv_risk')
+  
+  model <- keras_model(inputs = input_layer,
+                       outputs = list(priors_count = zip1_out,
+                                      days_in_jail = zip2_out,
+                                      surv_risk = surv_out))
+  model %>% compile(
+    optimizer = 'adam',
+    loss = list(priors_count = zip_loss, days_in_jail = zip_loss, surv_risk = cox_loss)
+  )
+  model
+}
+
+# --- Train Model ---
+model <- build_model(nbasis)
+model %>% fit(
+  x = X_tensor,
+  y = list(priors_count = Y_zip1, days_in_jail = Y_zip2, surv_risk = Y_surv),
+  epochs = 100,
+  batch_size = 64,
+  verbose = 1
+)
+
+# --- Counterfactual ATE/CATE ---
+X_tensor_cf_treat <- X_tensor; X_tensor_cf_treat[,,2] <- 1
+X_tensor_cf_ctrl  <- X_tensor; X_tensor_cf_ctrl[,,2] <- 0
+
+preds_treat <- model %>% predict(X_tensor_cf_treat)
+preds_ctrl  <- model %>% predict(X_tensor_cf_ctrl)
+
+CATE_zip1 <- preds_treat$priors_count[,1] - preds_ctrl$priors_count[,1]
+CATE_zip2 <- preds_treat$days_in_jail[,1] - preds_ctrl$days_in_jail[,1]
+CATE_surv <- preds_treat$surv_risk[,1] - preds_ctrl$surv_risk[,1]
+
+ATE_zip1 <- mean(CATE_zip1)
+ATE_zip2 <- mean(CATE_zip2)
+ATE_surv <- mean(CATE_surv)
+
+cat("=== ATE Estimates ===\n")
+cat(sprintf("Priors Count: %.3f\n", ATE_zip1))
+cat(sprintf("Days in Jail: %.3f\n", ATE_zip2))
+cat(sprintf("Survival Risk: %.3f\n", ATE_surv))
+
+# --- Bootstrap CI ---
+bootstrap_ate <- function(CATE, R = 1000, conf_level = 0.95) {
+  n <- length(CATE)
+  boot_ates <- replicate(R, mean(sample(CATE, replace = TRUE)))
+  ci <- quantile(boot_ates, probs = c((1-conf_level)/2, 1 - (1-conf_level)/2))
+  list(mean = mean(CATE), lower = ci[1], upper = ci[2])
+}
+
+ci1 <- bootstrap_ate(CATE_zip1)
+ci2 <- bootstrap_ate(CATE_zip2)
+ci3 <- bootstrap_ate(CATE_surv)
+
+cat("\n=== 95% Bootstrap CI for ATE ===\n")
+cat(sprintf("Priors Count: %.3f (%.3f, %.3f)\n", ci1$mean, ci1$lower, ci1$upper))
+cat(sprintf("Days in Jail: %.3f (%.3f, %.3f)\n", ci2$mean, ci2$lower, ci2$upper))
+cat(sprintf("Survival Risk: %.3f (%.3f, %.3f)\n", ci3$mean, ci3$lower, ci3$upper))
+
+# --- Formal t-test for ATE = 0 ---
+cat("\n=== T-Tests for ATE = 0 ===\n")
+print(t.test(CATE_zip1, mu = 0))
+print(t.test(CATE_zip2, mu = 0))
+print(t.test(CATE_surv, mu = 0))
+
+# --- CATE Plots ---
+p1 <- ggplot(data.frame(CATE = CATE_zip1), aes(x = CATE)) +
+  geom_histogram(bins = 30, fill = "skyblue", color = "black") +
+  labs(title = "CATE: Priors Count (ZIP)", x = "CATE", y = "Frequency") + theme_minimal()
+
+p2 <- ggplot(data.frame(CATE = CATE_zip2), aes(x = CATE)) +
+  geom_histogram(bins = 30, fill = "orange", color = "black") +
+  labs(title = "CATE: Jail Days (ZIP)", x = "CATE", y = "Frequency") + theme_minimal()
+
+p3 <- ggplot(data.frame(CATE = CATE_surv), aes(x = CATE)) +
+  geom_histogram(bins = 30, fill = "forestgreen", color = "black") +
+  labs(title = "CATE: Survival Risk", x = "CATE", y = "Frequency") + theme_minimal()
+
+grid.arrange(p1, p2, p3, ncol = 1)
+
+# --- Evaluate Model Fit Metrics ---
+evaluate_model <- function(model, X_tensor, y_zip1, y_zip2, y_surv, data) {
+  preds <- model %>% predict(X_tensor)
+  
+  # Extract predicted lambda from ZIP outputs (first column), ignore pi for deviance here
+  pred_zip1_lambda <- exp(preds$priors_count[,1]) 
+  pred_zip2_lambda <- exp(preds$days_in_jail[,1])
+  
+  # RMSE for days_in_jail (treated here as continuous for RMSE)
+  rmse_zip2 <- sqrt(mean((y_zip2 - pred_zip2_lambda)^2))
+  
+  # Poisson deviance for ZIP outcomes (using predicted lambda only)
+  dev_zip1 <- 2 * sum(y_zip1 * log(pmax(y_zip1 / pred_zip1_lambda, 1e-8)) - (y_zip1 - pred_zip1_lambda))
+  dev_zip2 <- 2 * sum(y_zip2 * log(pmax(y_zip2 / pred_zip2_lambda, 1e-8)) - (y_zip2 - pred_zip2_lambda))
+  
+  # Concordance index for survival
+  c_index <- concordance(Surv(data$surv_time, data$event_surv) ~ preds$surv_risk[,1])$concordance
+  
+  cat("=== Model Fit Metrics ===\n")
+  cat(sprintf("Poisson Deviance (Priors Count): %.2f\n", dev_zip1))
+  cat(sprintf("Poisson Deviance (Days in Jail): %.2f\n", dev_zip2))
+  cat(sprintf("RMSE (Days in Jail): %.3f\n", rmse_zip2))
+  cat(sprintf("Concordance Index (Survival): %.3f\n\n", c_index))
+  
+  list(
+    poisson_deviance_priors = dev_zip1,
+    poisson_deviance_jail = dev_zip2,
+    rmse_jail = rmse_zip2,
+    concordance_index = c_index
+  )
+}
+
+# --- Run evaluation after training ---
+metrics <- evaluate_model(model, X_tensor, Y_zip1, Y_zip2, Y_surv, compas_data)
+
+## Poisson
+library(keras)
+library(tensorflow)
+library(dplyr)
+library(survival)
+library(survcomp)
+library(ggplot2)
+library(gridExtra)
+library(fda)
+
+# --- Load COMPAS Data ---
+compas_data <- read.csv("compas-scores.csv")
+
+# --- Preprocessing ---
+compas_data$c_jail_in <- as.Date(compas_data$c_jail_in)
+compas_data$c_jail_out <- as.Date(compas_data$c_jail_out)
+compas_data$days_in_jail <- as.numeric(compas_data$c_jail_out - compas_data$c_jail_in)
+
+features <- c("age", "sex", "race", "priors_count", "decile_score", "days_in_jail")
+compas_data <- compas_data[complete.cases(compas_data[, features]), ]
+compas_data <- compas_data[!is.na(compas_data$is_recid), ]
+
+# Treatment
+compas_data$is_recid <- ifelse(compas_data$is_recid == 1, 1, 0)
+
+# Survival outcome
+compas_data$surv_time <- abs(as.numeric(compas_data$days_b_screening_arrest))
+fallback_time <- as.numeric(Sys.Date() - compas_data$c_jail_out)
+compas_data$surv_time[is.na(compas_data$surv_time) | compas_data$surv_time < 0] <- fallback_time[is.na(compas_data$surv_time) | compas_data$surv_time < 0]
+compas_data$event_surv <- ifelse(compas_data$is_recid == 1, 1, 0)
+compas_data$event_surv[is.na(compas_data$event_surv)] <- 0
+
+Y_surv <- cbind(compas_data$surv_time, compas_data$event_surv)
+
+# --- Functional Representation ---
+X <- model.matrix(~ . -1, data = compas_data[, features])
+X_scaled <- scale(X)
+n <- nrow(X_scaled)
+p <- ncol(X_scaled)
+
+# B-spline basis
+time_grid <- seq(0, 1, length.out = p)
+nbasis <- 15
+basis_obj <- create.bspline.basis(rangeval = c(0, 1), nbasis = nbasis)
+fdParobj <- fdPar(basis_obj, Lfdobj = int2Lfd(2), lambda = 1e-2)
+
+# Functional smoothing
+coef_mat <- matrix(NA, nrow = n, ncol = nbasis)
+for (i in 1:n) {
+  y_i <- as.numeric(X_scaled[i, ])
+  smooth_result <- smooth.basis(argvals = time_grid, y = y_i, fdParobj)
+  coef_mat[i, ] <- smooth_result$fd$coefs
+}
+
+# --- CNN-LSTM Input ---
+timesteps <- ncol(coef_mat)
+X_tensor <- array(0, dim = c(n, timesteps, 2))
+X_tensor[,,1] <- coef_mat
+X_tensor[,,2] <- matrix(compas_data$is_recid, nrow = n, ncol = timesteps, byrow = TRUE)
+
+# Outcomes
+Y_zip1 <- compas_data$priors_count
+Y_zip2 <- compas_data$days_in_jail
+
+# --- Custom Cox Loss ---
+cox_loss <- function(y_true, y_pred) {
+  event <- y_true[, 2]
+  time <- tf$cast(y_true[, 1], tf$float32)
+  order <- tf$argsort(time, direction = 'DESCENDING')
+  pred_sorted <- tf$gather(y_pred, order)
+  event_sorted <- tf$gather(event, order)
+  exp_pred <- tf$exp(pred_sorted)
+  log_risk <- tf$math$log(tf$math$cumsum(exp_pred))
+  partial_ll <- (pred_sorted - log_risk) * event_sorted
+  -tf$reduce_mean(partial_ll)
+}
+
+# --- CNN-LSTM Model ---
+build_model <- function(timesteps) {
+  input_layer <- layer_input(shape = c(timesteps, 2))
+  
+  shared <- input_layer %>%
+    layer_conv_1d(filters = 16, kernel_size = 5, activation = 'relu', padding = 'same') %>%
+    layer_max_pooling_1d(pool_size = 2) %>%
+    layer_lstm(units = 32, return_sequences = FALSE) %>%
+    layer_dropout(rate = 0.3) %>%
+    layer_dense(units = 32, activation = 'relu')
+  
+  priors_out <- shared %>% layer_dense(units = 1, activation = 'exponential', name = 'priors_count')
+  jail_out   <- shared %>% layer_dense(units = 1, activation = 'exponential', name = 'days_in_jail')
+  surv_out   <- shared %>% layer_dense(units = 1, activation = 'linear', name = 'surv_risk')
+  
+  model <- keras_model(inputs = input_layer, 
+                       outputs = list(priors_count = priors_out,
+                                      days_in_jail = jail_out,
+                                      surv_risk = surv_out))
+  
+  model %>% compile(
+    optimizer = 'adam',
+    loss = list(
+      priors_count = loss_poisson(),
+      days_in_jail = loss_poisson(),
+      surv_risk = cox_loss
+    )
+  )
+  model
+}
+
+# --- Train Model ---
+model <- build_model(timesteps)
+model %>% fit(
+  x = X_tensor,
+  y = list(priors_count = Y_zip1, days_in_jail = Y_zip2, surv_risk = Y_surv),
+  epochs = 100,
+  batch_size = 64,
+  verbose = 1
+)
+
+# --- Evaluate Model ---
+evaluate_model <- function(model, X_tensor, y_zip1, y_zip2, y_surv, data) {
+  preds <- model %>% predict(X_tensor)
+  zip1_pred <- preds$priors_count[, 1]
+  zip2_pred <- preds$days_in_jail[, 1]
+  surv_pred <- preds$surv_risk[, 1]
+  
+  dev_zip1 <- sum(2 * (y_zip1 * log(pmax(y_zip1 / zip1_pred, 1e-8)) - (y_zip1 - zip1_pred)))
+  dev_zip2 <- sum(2 * (y_zip2 * log(pmax(y_zip2 / zip2_pred, 1e-8)) - (y_zip2 - zip2_pred)))
+  c_index <- concordance(Surv(data$surv_time, data$event_surv) ~ surv_pred)$concordance
+  
+  cat("=== Evaluation ===\n")
+  cat("Poisson Dev (Priors):", round(dev_zip1, 2), "\n")
+  cat("Poisson Dev (Jail Days):", round(dev_zip2, 2), "\n")
+  cat("C-index (Survival):", round(c_index, 3), "\n\n")
+  
+  list(zip1_pred = zip1_pred, zip2_pred = zip2_pred, surv_pred = surv_pred)
+}
+
+preds_obs <- evaluate_model(model, X_tensor, Y_zip1, Y_zip2, Y_surv, compas_data)
+
+# --- Counterfactuals ---
+X_tensor_cf_treat <- X_tensor; X_tensor_cf_treat[,,2] <- 1
+X_tensor_cf_ctrl  <- X_tensor; X_tensor_cf_ctrl[,,2] <- 0
+
+preds_treat <- model %>% predict(X_tensor_cf_treat)
+preds_ctrl  <- model %>% predict(X_tensor_cf_ctrl)
+
+CATE_zip1 <- preds_treat$priors_count[,1] - preds_ctrl$priors_count[,1]
+CATE_zip2 <- preds_treat$days_in_jail[,1] - preds_ctrl$days_in_jail[,1]
+CATE_surv <- preds_treat$surv_risk[,1] - preds_ctrl$surv_risk[,1]
+
+ATE_zip1 <- mean(CATE_zip1)
+ATE_zip2 <- mean(CATE_zip2)
+ATE_surv <- mean(CATE_surv)
+
+cat("=== ATE ===\n")
+cat(sprintf("Priors Count ATE: %.3f\n", ATE_zip1))
+cat(sprintf("Jail Days ATE: %.3f\n", ATE_zip2))
+cat(sprintf("Survival Risk ATE: %.3f\n\n", ATE_surv))
+
+# --- Plot CATE ---
+p1 <- ggplot(data.frame(CATE = CATE_zip1), aes(x = CATE)) +
+  geom_histogram(bins = 30, fill = "skyblue", color = "black") +
+  labs(title = "CATE: Priors Count (Poisson)", x = "CATE", y = "Frequency") + theme_minimal()
+
+p2 <- ggplot(data.frame(CATE = CATE_zip2), aes(x = CATE)) +
+  geom_histogram(bins = 30, fill = "orange", color = "black") +
+  labs(title = "CATE: Jail Days (Poisson)", x = "CATE", y = "Frequency") + theme_minimal()
+
+p3 <- ggplot(data.frame(CATE = CATE_surv), aes(x = CATE)) +
+  geom_histogram(bins = 30, fill = "darkgreen", color = "black") +
+  labs(title = "CATE: Survival Risk", x = "CATE", y = "Frequency") + theme_minimal()
+
+grid.arrange(p1, p2, p3, ncol = 1)
+
+# --- Bootstrap CI ---
+bootstrap_ate <- function(CATE, R = 1000, conf_level = 0.95) {
+  n <- length(CATE)
+  boot_ates <- replicate(R, mean(sample(CATE, replace = TRUE), na.rm = TRUE))
+  ci <- quantile(boot_ates, probs = c((1-conf_level)/2, 1 - (1-conf_level)/2))
+  list(mean = mean(CATE, na.rm = TRUE), lower = ci[1], upper = ci[2])
+}
+
+ci_zip1 <- bootstrap_ate(CATE_zip1)
+ci_zip2 <- bootstrap_ate(CATE_zip2)
+ci_surv <- bootstrap_ate(CATE_surv)
+
+cat("=== 95% Bootstrap CI for ATE ===\n")
+cat(sprintf("Priors Count: %.3f (%.3f, %.3f)\n", ci_zip1$mean, ci_zip1$lower, ci_zip1$upper))
+cat(sprintf("Jail Days: %.3f (%.3f, %.3f)\n", ci_zip2$mean, ci_zip2$lower, ci_zip2$upper))
+cat(sprintf("Survival Risk: %.3f (%.3f, %.3f)\n", ci_surv$mean, ci_surv$lower, ci_surv$upper))
+
+# --- Formal Statistical Tests on ATEs ---
+
+# 1. One-sample t-test
+t_zip1 <- t.test(CATE_zip1)
+t_zip2 <- t.test(CATE_zip2)
+t_surv <- t.test(CATE_surv)
+
+cat("=== One-sample t-tests ===\n")
+cat(sprintf("Priors Count ATE: t=%.3f, p=%.4f\n", t_zip1$statistic, t_zip1$p.value))
+cat(sprintf("Jail Days ATE: t=%.3f, p=%.4f\n", t_zip2$statistic, t_zip2$p.value))
+cat(sprintf("Survival Risk ATE: t=%.3f, p=%.4f\n\n", t_surv$statistic, t_surv$p.value))
+
+
+# 2. Bootstrap p-value (two-sided test)
+bootstrap_pval <- function(CATE, R = 1000) {
+  obs_mean <- mean(CATE, na.rm = TRUE)
+  centered_samples <- replicate(R, {
+    samp <- sample(CATE, replace = TRUE)
+    mean(samp - mean(samp, na.rm = TRUE), na.rm = TRUE)
+  })
+  pval <- mean(abs(centered_samples) >= abs(obs_mean))
+  return(pval)
+}
+
+bpval_zip1 <- bootstrap_pval(CATE_zip1)
+bpval_zip2 <- bootstrap_pval(CATE_zip2)
+bpval_surv <- bootstrap_pval(CATE_surv)
+
+cat("=== Bootstrap p-values ===\n")
+cat(sprintf("Priors Count ATE: p=%.4f\n", bpval_zip1))
+cat(sprintf("Jail Days ATE: p=%.4f\n", bpval_zip2))
+cat(sprintf("Survival Risk ATE: p=%.4f\n", bpval_surv))
+
+## ZINB
+
+# --- Libraries ---
+library(keras)
+library(tensorflow)
+library(dplyr)
+library(survival)
+library(survcomp)
+library(ggplot2)
+library(gridExtra)
+library(fda)
+
+# --- Load COMPAS Data ---
+compas_data <- read.csv("compas-scores.csv")
+
+# --- Preprocessing ---
+compas_data$c_jail_in <- as.Date(compas_data$c_jail_in)
+compas_data$c_jail_out <- as.Date(compas_data$c_jail_out)
+compas_data$days_in_jail <- as.numeric(compas_data$c_jail_out - compas_data$c_jail_in)
+
+features <- c("age", "sex", "race", "priors_count", "decile_score", "days_in_jail")
+compas_data <- compas_data[complete.cases(compas_data[, features]), ]
+compas_data <- compas_data[!is.na(compas_data$is_recid), ]
+
+# Treatment
+compas_data$is_recid <- ifelse(compas_data$is_recid == 1, 1, 0)
+
+# Survival outcome
+compas_data$surv_time <- abs(as.numeric(compas_data$days_b_screening_arrest))
+fallback_time <- as.numeric(Sys.Date() - compas_data$c_jail_out)
+compas_data$surv_time[is.na(compas_data$surv_time) | compas_data$surv_time < 0] <- fallback_time[is.na(compas_data$surv_time) | compas_data$surv_time < 0]
+compas_data$event_surv <- ifelse(compas_data$is_recid == 1, 1, 0)
+compas_data$event_surv[is.na(compas_data$event_surv)] <- 0
+
+Y_surv <- cbind(compas_data$surv_time, compas_data$event_surv)
+
+# --- Functional Representation of Features ---
+X <- model.matrix(~ . -1, data = compas_data[, features])
+X_scaled <- scale(X)
+n <- nrow(X_scaled)
+p <- ncol(X_scaled)
+
+time_grid <- seq(0, 1, length.out = p)
+nbasis <- 15
+basis_obj <- create.bspline.basis(rangeval = c(0, 1), nbasis = nbasis)
+fdParobj <- fdPar(basis_obj, Lfdobj = int2Lfd(2), lambda = 1e-2)
+
+coef_mat <- matrix(NA, nrow = n, ncol = nbasis)
+for (i in 1:n) {
+  y_i <- as.numeric(X_scaled[i, ])
+  smooth_result <- smooth.basis(argvals = time_grid, y = y_i, fdParobj)
+  coef_mat[i, ] <- smooth_result$fd$coefs
+}
+
+# Convert to tensor for CNN-LSTM
+timesteps <- ncol(coef_mat)
+X_tensor <- array(0, dim = c(n, timesteps, 2))
+X_tensor[,,1] <- coef_mat
+X_tensor[,,2] <- matrix(compas_data$is_recid, nrow = n, ncol = timesteps, byrow = TRUE)
+
+Y_zip1 <- compas_data$priors_count
+Y_zip2 <- compas_data$days_in_jail
+
+# --- Custom Cox and ZINB Loss ---
+cox_loss <- function(y_true, y_pred) {
+  event <- y_true[, 2]
+  time <- tf$cast(y_true[, 1], tf$float32)
+  order <- tf$argsort(time, direction = 'DESCENDING')
+  pred_sorted <- tf$gather(y_pred, order)
+  event_sorted <- tf$gather(event, order)
+  exp_pred <- tf$exp(pred_sorted)
+  log_risk <- tf$math$log(tf$math$cumsum(exp_pred))
+  partial_ll <- (pred_sorted - log_risk) * event_sorted
+  -tf$reduce_mean(partial_ll)
+}
+
+zinb_loss <- function() {
+  function(y_true, y_pred) {
+    y_true <- tf$cast(y_true, tf$float32)
+    
+    mu <- k_clip(y_pred, 1e-5, Inf)
+    theta <- tf$constant(1.0, dtype = tf$float32)
+    pi <- tf$constant(0.2, dtype = tf$float32)  # dropout prob
+    
+    zero_case <- -k_log(pi + (1 - pi) * tf$pow(theta / (mu + theta), theta))
+    pos_case <- -k_log(1 - pi) +
+      tf$math$lgamma(y_true + theta) -
+      tf$math$lgamma(theta) -
+      tf$math$lgamma(y_true + 1.0) +
+      theta * k_log(theta / (mu + theta)) +
+      y_true * k_log(mu / (mu + theta))
+    
+    loss <- tf$where(tf$equal(y_true, 0), zero_case, pos_case)
+    k_mean(loss)
+  }
+}
+
+# --- CNN-LSTM Model ---
+build_model <- function(timesteps) {
+  input_layer <- layer_input(shape = c(timesteps, 2))
+  
+  shared <- input_layer %>%
+    layer_conv_1d(filters = 16, kernel_size = 5, activation = 'relu', padding = 'same') %>%
+    layer_max_pooling_1d(pool_size = 2) %>%
+    layer_lstm(units = 32, return_sequences = FALSE) %>%
+    layer_dropout(rate = 0.3) %>%
+    layer_dense(units = 32, activation = 'relu')
+  
+  priors_out <- shared %>% layer_dense(units = 1, activation = 'exponential', name = 'priors_count')
+  jail_out   <- shared %>% layer_dense(units = 1, activation = 'exponential', name = 'days_in_jail')
+  surv_out   <- shared %>% layer_dense(units = 1, activation = 'linear', name = 'surv_risk')
+  
+  model <- keras_model(inputs = input_layer, 
+                       outputs = list(priors_count = priors_out,
+                                      days_in_jail = jail_out,
+                                      surv_risk = surv_out))
+  
+  model %>% compile(
+    optimizer = 'adam',
+    loss = list(
+      priors_count = zinb_loss(),
+      days_in_jail = zinb_loss(),
+      surv_risk = cox_loss
+    )
+  )
+  model
+}
+
+# --- Train Model ---
+model <- build_model(timesteps)
+model %>% fit(
+  x = X_tensor,
+  y = list(priors_count = Y_zip1, days_in_jail = Y_zip2, surv_risk = Y_surv),
+  epochs = 100,
+  batch_size = 64,
+  verbose = 1
+)
+
+# --- Evaluate Model ---
+evaluate_model <- function(model, X_tensor, y_zip1, y_zip2, y_surv, data) {
+  preds <- model %>% predict(X_tensor)
+  zip1_pred <- preds$priors_count[, 1]
+  zip2_pred <- preds$days_in_jail[, 1]
+  surv_pred <- preds$surv_risk[, 1]
+  
+  dev_zip1 <- sum(2 * (y_zip1 * log(pmax(y_zip1 / zip1_pred, 1e-8)) - (y_zip1 - zip1_pred)))
+  dev_zip2 <- sum(2 * (y_zip2 * log(pmax(y_zip2 / zip2_pred, 1e-8)) - (y_zip2 - zip2_pred)))
+  c_index <- concordance(Surv(data$surv_time, data$event_surv) ~ surv_pred)$concordance
+  
+  cat("=== Evaluation ===\n")
+  cat("ZINB Deviance (Priors Count):", round(dev_zip1, 2), "\n")
+  cat("ZINB Deviance (Jail Days):", round(dev_zip2, 2), "\n")
+  cat("Concordance Index (Survival):", round(c_index, 3), "\n\n")
+  
+  list(zip1_pred = zip1_pred, zip2_pred = zip2_pred, surv_pred = surv_pred)
+}
+
+preds_obs <- evaluate_model(model, X_tensor, Y_zip1, Y_zip2, Y_surv, compas_data)
+
+# --- Counterfactuals for ATE/CATE ---
+X_tensor_cf_treat <- X_tensor; X_tensor_cf_treat[,,2] <- 1
+X_tensor_cf_ctrl  <- X_tensor; X_tensor_cf_ctrl[,,2] <- 0
+
+preds_treat <- model %>% predict(X_tensor_cf_treat)
+preds_ctrl  <- model %>% predict(X_tensor_cf_ctrl)
+
+CATE_zip1 <- preds_treat$priors_count[,1] - preds_ctrl$priors_count[,1]
+CATE_zip2 <- preds_treat$days_in_jail[,1] - preds_ctrl$days_in_jail[,1]
+CATE_surv <- preds_treat$surv_risk[,1] - preds_ctrl$surv_risk[,1]
+
+ATE_zip1 <- mean(CATE_zip1)
+ATE_zip2 <- mean(CATE_zip2)
+ATE_surv <- mean(CATE_surv)
+
+cat("=== ATE ===\n")
+cat(sprintf("Priors Count ATE: %.3f\n", ATE_zip1))
+cat(sprintf("Jail Days ATE: %.3f\n", ATE_zip2))
+cat(sprintf("Survival Risk ATE: %.3f\n\n", ATE_surv))
+
+# --- Bootstrap CI for ATE ---
+bootstrap_ate <- function(CATE, R = 1000, conf_level = 0.95) {
+  n <- length(CATE)
+  boot_ates <- replicate(R, mean(sample(CATE, replace = TRUE), na.rm = TRUE))
+  ci <- quantile(boot_ates, probs = c((1-conf_level)/2, 1 - (1-conf_level)/2))
+  list(mean = mean(CATE, na.rm = TRUE), lower = ci[1], upper = ci[2])
+}
+
+ci_zip1 <- bootstrap_ate(CATE_zip1)
+ci_zip2 <- bootstrap_ate(CATE_zip2)
+ci_surv <- bootstrap_ate(CATE_surv)
+
+cat("=== 95% Bootstrap CI for ATE ===\n")
+cat(sprintf("Priors Count: %.3f (%.3f, %.3f)\n", ci_zip1$mean, ci_zip1$lower, ci_zip1$upper))
+cat(sprintf("Jail Days: %.3f (%.3f, %.3f)\n", ci_zip2$mean, ci_zip2$lower, ci_zip2$upper))
+cat(sprintf("Survival Risk: %.3f (%.3f, %.3f)\n", ci_surv$mean, ci_surv$lower, ci_surv$upper))
+
+# --- Visualize CATE ---
+p1 <- ggplot(data.frame(CATE = CATE_zip1), aes(x = CATE)) +
+  geom_histogram(bins = 30, fill = "skyblue", color = "black") +
+  labs(title = "CATE: Priors Count (ZINB)", x = "CATE", y = "Frequency") + theme_minimal()
+
+p2 <- ggplot(data.frame(CATE = CATE_zip2), aes(x = CATE)) +
+  geom_histogram(bins = 30, fill = "orange", color = "black") +
+  labs(title = "CATE: Jail Days (ZINB)", x = "CATE", y = "Frequency") + theme_minimal()
+
+p3 <- ggplot(data.frame(CATE = CATE_surv), aes(x = CATE)) +
+  geom_histogram(bins = 30, fill = "darkgreen", color = "black") +
+  labs(title = "CATE: Survival Risk", x = "CATE", y = "Frequency") + theme_minimal()
+
+grid.arrange(p1, p2, p3, ncol = 1)
+
+
+## NB
+# --- Libraries ---
+library(keras)
+library(tensorflow)
+library(dplyr)
+library(survival)
+library(survcomp)
+library(ggplot2)
+library(gridExtra)
+library(fda)
+
+# --- Load COMPAS Data ---
+compas_data <- read.csv("compas-scores.csv")
+
+# --- Preprocessing ---
+compas_data$c_jail_in <- as.Date(compas_data$c_jail_in)
+compas_data$c_jail_out <- as.Date(compas_data$c_jail_out)
+compas_data$days_in_jail <- as.numeric(compas_data$c_jail_out - compas_data$c_jail_in)
+
+features <- c("age", "sex", "race", "priors_count", "decile_score", "days_in_jail")
+compas_data <- compas_data[complete.cases(compas_data[, features]), ]
+compas_data <- compas_data[!is.na(compas_data$is_recid), ]
+
+# Treatment
+compas_data$is_recid <- ifelse(compas_data$is_recid == 1, 1, 0)
+
+# Survival outcome
+compas_data$surv_time <- abs(as.numeric(compas_data$days_b_screening_arrest))
+fallback_time <- as.numeric(Sys.Date() - compas_data$c_jail_out)
+compas_data$surv_time[is.na(compas_data$surv_time) | compas_data$surv_time < 0] <- fallback_time[is.na(compas_data$surv_time) | compas_data$surv_time < 0]
+compas_data$event_surv <- ifelse(compas_data$is_recid == 1, 1, 0)
+compas_data$event_surv[is.na(compas_data$event_surv)] <- 0
+
+Y_surv <- cbind(compas_data$surv_time, compas_data$event_surv)
+
+# --- Functional Representation of Features ---
+X <- model.matrix(~ . -1, data = compas_data[, features])
+X_scaled <- scale(X)
+n <- nrow(X_scaled)
+p <- ncol(X_scaled)
+
+# Create time grid and B-spline basis
+time_grid <- seq(0, 1, length.out = p)
+nbasis <- 15
+basis_obj <- create.bspline.basis(rangeval = c(0, 1), nbasis = nbasis)
+fdParobj <- fdPar(basis_obj, Lfdobj = int2Lfd(2), lambda = 1e-2)
+
+# Fit basis coefficients per subject
+coef_mat <- matrix(NA, nrow = n, ncol = nbasis)
+for (i in 1:n) {
+  y_i <- as.numeric(X_scaled[i, ])
+  smooth_result <- smooth.basis(argvals = time_grid, y = y_i, fdParobj)
+  coef_mat[i, ] <- smooth_result$fd$coefs
+}
+
+# Convert to 3D input for CNN-LSTM
+timesteps <- ncol(coef_mat)
+X_tensor <- array(0, dim = c(n, timesteps, 2))
+X_tensor[,,1] <- coef_mat
+X_tensor[,,2] <- matrix(compas_data$is_recid, nrow = n, ncol = timesteps, byrow = TRUE)
+
+# Outcomes
+Y_zip1 <- compas_data$priors_count
+Y_zip2 <- compas_data$days_in_jail
+
+# --- Custom Losses ---
+cox_loss <- function(y_true, y_pred) {
+  event <- y_true[, 2]
+  time <- tf$cast(y_true[, 1], tf$float32)
+  order <- tf$argsort(time, direction = 'DESCENDING')
+  pred_sorted <- tf$gather(y_pred, order)
+  event_sorted <- tf$gather(event, order)
+  exp_pred <- tf$exp(pred_sorted)
+  log_risk <- tf$math$log(tf$math$cumsum(exp_pred))
+  partial_ll <- (pred_sorted - log_risk) * event_sorted
+  -tf$reduce_mean(partial_ll)
+}
+
+neg_binom_loss <- function() {
+  function(y_true, y_pred) {
+    y_true <- tf$cast(y_true, tf$float32)
+    theta <- tf$constant(1.0, dtype = tf$float32)
+    mu <- k_clip(y_pred, 1e-5, Inf)
+    loss <- - (y_true * k_log(mu / (mu + theta)) + theta * k_log(theta / (mu + theta)))
+    k_mean(loss)
+  }
+}
+
+# --- CNN-LSTM Model ---
+build_model <- function(timesteps) {
+  input_layer <- layer_input(shape = c(timesteps, 2))
+  
+  shared <- input_layer %>%
+    layer_conv_1d(filters = 16, kernel_size = 5, activation = 'relu', padding = 'same') %>%
+    layer_max_pooling_1d(pool_size = 2) %>%
+    layer_lstm(units = 32, return_sequences = FALSE) %>%
+    layer_dropout(rate = 0.3) %>%
+    layer_dense(units = 32, activation = 'relu')
+  
+  priors_out <- shared %>% layer_dense(units = 1, activation = 'exponential', name = 'priors_count')
+  jail_out   <- shared %>% layer_dense(units = 1, activation = 'exponential', name = 'days_in_jail')
+  surv_out   <- shared %>% layer_dense(units = 1, activation = 'linear', name = 'surv_risk')
+  
+  model <- keras_model(inputs = input_layer, 
+                       outputs = list(priors_count = priors_out,
+                                      days_in_jail = jail_out,
+                                      surv_risk = surv_out))
+  
+  model %>% compile(
+    optimizer = 'adam',
+    loss = list(
+      priors_count = neg_binom_loss(),
+      days_in_jail = neg_binom_loss(),
+      surv_risk = cox_loss
+    )
+  )
+  model
+}
+
+# --- Train Model ---
+model <- build_model(timesteps)
+model %>% fit(
+  x = X_tensor,
+  y = list(priors_count = Y_zip1, days_in_jail = Y_zip2, surv_risk = Y_surv),
+  epochs = 100,
+  batch_size = 64,
+  verbose = 1
+)
+
+# --- Evaluate Model ---
+evaluate_model <- function(model, X_tensor, y_zip1, y_zip2, y_surv, data) {
+  preds <- model %>% predict(X_tensor)
+  zip1_pred <- preds$priors_count[, 1]
+  zip2_pred <- preds$days_in_jail[, 1]
+  surv_pred <- preds$surv_risk[, 1]
+  
+  dev_zip1 <- sum(2 * (y_zip1 * log(pmax(y_zip1 / zip1_pred, 1e-8)) - (y_zip1 - zip1_pred)))
+  dev_zip2 <- sum(2 * (y_zip2 * log(pmax(y_zip2 / zip2_pred, 1e-8)) - (y_zip2 - zip2_pred)))
+  c_index <- concordance(Surv(data$surv_time, data$event_surv) ~ surv_pred)$concordance
+  
+  cat("=== Evaluation ===\n")
+  cat("Poisson Dev (Priors):", round(dev_zip1, 2), "\n")
+  cat("Poisson Dev (Jail Days):", round(dev_zip2, 2), "\n")
+  cat("C-index (Survival):", round(c_index, 3), "\n\n")
+  
+  list(zip1_pred = zip1_pred, zip2_pred = zip2_pred, surv_pred = surv_pred)
+}
+
+preds_obs <- evaluate_model(model, X_tensor, Y_zip1, Y_zip2, Y_surv, compas_data)
+
+# --- Counterfactuals for ATE/CATE ---
+X_tensor_cf_treat <- X_tensor; X_tensor_cf_treat[,,2] <- 1
+X_tensor_cf_ctrl  <- X_tensor; X_tensor_cf_ctrl[,,2] <- 0
+
+preds_treat <- model %>% predict(X_tensor_cf_treat)
+preds_ctrl  <- model %>% predict(X_tensor_cf_ctrl)
+
+CATE_zip1 <- preds_treat$priors_count[,1] - preds_ctrl$priors_count[,1]
+CATE_zip2 <- preds_treat$days_in_jail[,1] - preds_ctrl$days_in_jail[,1]
+CATE_surv <- preds_treat$surv_risk[,1] - preds_ctrl$surv_risk[,1]
+
+ATE_zip1 <- mean(CATE_zip1)
+ATE_zip2 <- mean(CATE_zip2)
+ATE_surv <- mean(CATE_surv)
+
+cat("=== ATE ===\n")
+cat(sprintf("Priors Count ATE: %.3f\n", ATE_zip1))
+cat(sprintf("Jail Days ATE: %.3f\n", ATE_zip2))
+cat(sprintf("Survival Risk ATE: %.3f\n\n", ATE_surv))
+
+# --- Plot CATE ---
+p1 <- ggplot(data.frame(CATE = CATE_zip1), aes(x = CATE)) +
+  geom_histogram(bins = 30, fill = "skyblue", color = "black") +
+  labs(title = "CATE: Priors Count (NB)", x = "CATE", y = "Frequency") + theme_minimal()
+
+p2 <- ggplot(data.frame(CATE = CATE_zip2), aes(x = CATE)) +
+  geom_histogram(bins = 30, fill = "orange", color = "black") +
+  labs(title = "CATE: Jail Days (NB)", x = "CATE", y = "Frequency") + theme_minimal()
+
+p3 <- ggplot(data.frame(CATE = CATE_surv), aes(x = CATE)) +
+  geom_histogram(bins = 30, fill = "darkgreen", color = "black") +
+  labs(title = "CATE: Survival Risk", x = "CATE", y = "Frequency") + theme_minimal()
+
+grid.arrange(p1, p2, p3, ncol = 1)
+
+# --- Bootstrap CI ---
+bootstrap_ate <- function(CATE, R = 1000, conf_level = 0.95) {
+  n <- length(CATE)
+  boot_ates <- replicate(R, mean(sample(CATE, replace = TRUE), na.rm = TRUE))
+  ci <- quantile(boot_ates, probs = c((1-conf_level)/2, 1 - (1-conf_level)/2))
+  list(mean = mean(CATE, na.rm = TRUE), lower = ci[1], upper = ci[2])
+}
+
+ci_zip1 <- bootstrap_ate(CATE_zip1)
+ci_zip2 <- bootstrap_ate(CATE_zip2)
+ci_surv <- bootstrap_ate(CATE_surv)
+
+cat("=== 95% Bootstrap CI for ATE ===\n")
+cat(sprintf("Priors Count: %.3f (%.3f, %.3f)\n", ci_zip1$mean, ci_zip1$lower, ci_zip1$upper))
+cat(sprintf("Jail Days: %.3f (%.3f, %.3f)\n", ci_zip2$mean, ci_zip2$lower, ci_zip2$upper))
+cat(sprintf("Survival Risk: %.3f (%.3f, %.3f)\n", ci_surv$mean, ci_surv$lower, ci_surv$upper))

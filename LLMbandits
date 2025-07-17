@@ -1,351 +1,206 @@
+# mathematics-3772632 (July 17, 2025)	
+# Title: LLM-Guided Ensemble Learning for Contextual Bandits with Copula and Gaussian Process Models
+# --- Required Libraries ---
 library(rugarch)      # for fGARCH simulation
-    library(copula)       # copula modeling
-    library(VineCopula)   # vine copula fitting
-    library(laGP)         # Gaussian Process reward models
-    library(dplyr)
-    library(ggplot2)
-    library(httr)
-    library(jsonlite)
-    library(knitr)
-    library(DT)
-    
-    # --- Cache Environments ---
-    .llm_reward_cache <- new.env(parent = emptyenv())
-    .llm_policy_cache <- new.env(parent = emptyenv())
-    
-    # --- LLM Reward Prediction Function ---
-    query_llm_reward <- function(x_row, arm_idx, history_text = "", 
-                                 api_key = Sys.getenv("OPENAI_API_KEY"), 
-                                 mock = TRUE, model = "gpt-4") {
-      key <- paste0(paste(round(x_row, 3), collapse = ","), "_arm", arm_idx, "_hist", substr(history_text, 1, 30))
-      if (exists(key, envir = .llm_reward_cache)) return(get(key, envir = .llm_reward_cache))
-      
-      if (mock) {
-        pred <- runif(1, 0, 1)
-      } else {
-        prompt <- paste0(
-          "Given context vector: ", paste(round(x_row, 3), collapse = ", "),
-          ", arm: ", arm_idx, ". ", history_text,
-          " Predict a reward between 0 and 1."
-        )
-        pred <- tryCatch({
-          response <- POST(
-            url = "https://api.openai.com/v1/chat/completions",
-            add_headers(Authorization = paste("Bearer", api_key),
-                        `Content-Type` = "application/json"),
-            body = toJSON(list(
-              model = model,
-              messages = list(
-                list(role = "system", content = "You are a reward prediction assistant."),
-                list(role = "user", content = prompt)
-              ),
-              temperature = 0.3
-            ), auto_unbox = TRUE)
-          )
-          cont <- content(response, as = "parsed", type = "application/json")
-          raw_val <- cont$choices[[1]]$message$content
-          # Extract numeric value more robustly
-          val <- suppressWarnings(as.numeric(gsub("[^0-9\\.]", "", raw_val)))
-          if (is.na(val)) val <- runif(1, 0, 1)
-          # Clamp between 0 and 1
-          val <- min(max(val, 0), 1)
-          val
-        }, error = function(e) {
-          message("⚠️ LLM reward error: ", e$message)
-          runif(1, 0, 1)
-        })
-      }
-      
-      assign(key, pred, envir = .llm_reward_cache)
-      return(pred)
-    }
-    
-    # --- LLM Policy Selector Function ---
-    query_llm_policy <- function(summary_text, 
-                                 api_key = Sys.getenv("OPENAI_API_KEY"), 
-                                 mock = TRUE, model = "gpt-4") {
-      key <- paste0("policy_", substr(summary_text, 1, 100))
-      if (exists(key, envir = .llm_policy_cache)) return(get(key, envir = .llm_policy_cache))
-      
-      if (mock) {
-        chosen <- sample(c("thompson", "ucb", "epsilon-greedy", "ensemble"), 1)
-      } else {
-        prompt <- paste0(
-          "Given recent history:\n", summary_text,
-          "\nChoose one policy from: thompson, ucb, epsilon-greedy, ensemble. Respond with only the name."
-        )
-        chosen <- tryCatch({
-          response <- POST(
-            url = "https://api.openai.com/v1/chat/completions",
-            add_headers(Authorization = paste("Bearer", api_key),
-                        `Content-Type` = "application/json"),
-            body = toJSON(list(
-              model = model,
-              messages = list(
-                list(role = "system", content = "You are a bandit policy selector."),
-                list(role = "user", content = prompt)
-              ),
-              temperature = 0.2
-            ), auto_unbox = TRUE)
-          )
-          cont <- content(response, as = "parsed", type = "application/json")
-          val <- trimws(cont$choices[[1]]$message$content)
-          if (!val %in% c("thompson", "ucb", "epsilon-greedy", "ensemble")) "thompson" else val
-        }, error = function(e) {
-          message("⚠️ LLM policy error: ", e$message)
-          "thompson"
-        })
-      }
-      
-      assign(key, chosen, envir = .llm_policy_cache)
-      return(chosen)
-    }
-    
-    # --- GP Model Fitting ---
-    fit_gp <- function(X, y) {
-      tryCatch(laGP::newGPsep(X, y, d = 0.5, g = 1e-6, dK = TRUE), error = function(e) NULL)
-    }
-    
-    # --- Bandit Policies ---
-    thompson_sampling <- function(x_row, gp_models) {
-      preds <- sapply(gp_models, function(gp) {
-        p <- tryCatch(predGPsep(gp, matrix(x_row, 1)), error = function(e) NULL)
-        if (is.null(p) || is.null(p$mean) || is.null(p$s2) || p$s2 <= 0) return(-Inf)
-        val <- rnorm(1, p$mean, sqrt(p$s2))
-        # Clamp to [0,1]
-        val <- min(max(val, 0), 1)
-        val
-      })
-      which.max(preds)
-    }
-    
-    epsilon_greedy_policy <- function(x_row, t, gp_models, epsilon, n_arms) {
-      if (runif(1) < epsilon || t <= n_arms) return(sample(1:n_arms, 1))
-      preds <- sapply(gp_models, function(gp) {
-        p <- tryCatch(predGPsep(gp, matrix(x_row, 1)), error = function(e) NULL)
-        if (is.null(p) || is.null(p$mean)) return(-Inf)
-        p$mean
-      })
-      which.max(preds)
-    }
-    
-    ucb_policy <- function(x_row, t, gp_models) {
-      preds <- sapply(gp_models, function(gp) {
-        p <- tryCatch(predGPsep(gp, matrix(x_row, 1)), error = function(e) NULL)
-        if (is.null(p) || is.null(p$mean) || is.null(p$s2) || p$s2 <= 0) return(-Inf)
-        p$mean + sqrt(2 * log(t + 1) * p$s2)
-      })
-      which.max(preds)
-    }
-    
-    ensemble_policy <- function(x_row, t, gp_models, n_arms, llm_weight, history_text, mock_llm) {
-      gp_preds <- sapply(gp_models, function(gp) {
-        p <- tryCatch(predGPsep(gp, matrix(x_row, 1)), error = function(e) NULL)
-        if (is.null(p) || is.null(p$mean)) return(NA_real_)
-        p$mean
-      })
-      llm_preds <- sapply(1:n_arms, function(a) {
-        query_llm_reward(as.numeric(x_row), a, history_text, mock = mock_llm)
-      })
-      gp_preds[is.na(gp_preds)] <- 0
-      gp_preds <- pmin(pmax(gp_preds, 0), 1)
-      llm_preds <- pmin(pmax(llm_preds, 0), 1)
-      blended <- (1 - llm_weight) * gp_preds + llm_weight * llm_preds
-      which.max(blended)
-    }
-    
-    # --- Bandit Simulation ---
-    run_bandit_simulation <- function(seed = 42, T = 300, n_ctx = 10, n_arms = 3,
-                                      epsilon = 0.1, llm_weight = 0.5, mock_llm = TRUE, model = "gpt-4") {
-      set.seed(seed)
-      
-      # GARCH spec
-      spec <- ugarchspec(
-        variance.model = list(model = "sGARCH", garchOrder = c(1,1)),
-        mean.model = list(armaOrder = c(0,0), include.mean = FALSE),
-        distribution.model = "norm",
-        fixed.pars = list(omega = 0.1, alpha1 = 0.15, beta1 = 0.7)
-      )
-      
-      vol_matrix <- matrix(NA, nrow = T, ncol = n_ctx)
-      innovations <- matrix(rnorm(T * n_ctx), nrow = T)
-      for (j in 1:n_ctx) {
-        sim <- ugarchpath(spec, n.sim = T)
-        vol_matrix[, j] <- sim@path$sigmaSim
-      }
-      hetero_contexts <- innovations * vol_matrix
-      
-      # Transform ranks for copula
-      U_ctx <- apply(hetero_contexts, 2, function(x) rank(x) / (length(x) + 1))
-      
-      # Fit vine copula
-      vine_fit <- RVineStructureSelect(U_ctx, familyset = c(1, 3, 4, 5), cores = 2)
-      U_trans <- RVinePIT(U_ctx, vine_fit)
-      
-      # Reward matrix (Beta distributed)
-      reward_mat <- qbeta(U_trans[, 1:n_arms], shape1 = 2, shape2 = 5)
-      
-      # Train/Test split
-      train_idx <- 1:floor(0.7 * T)
-      X_train <- U_trans[train_idx, ]
-      Y_train <- reward_mat[train_idx, ]
-      X_test <- U_trans[-train_idx, ]
-      Y_test <- reward_mat[-train_idx, ]
-      T_test <- nrow(X_test)
-      
-      # Fit GP models per arm
-      gp_models <- lapply(1:n_arms, function(j) fit_gp(X_train, Y_train[, j]))
-      
-      # Initialize result vectors
-      rewards <- numeric(T_test)
-      regrets <- numeric(T_test)
-      policy_choices <- character(T_test)
-      chosen_arms <- integer(T_test)
-      history_regrets <- c()
-      
-      for (t in 1:T_test) {
-        x <- X_test[t, , drop = FALSE]
-        optimal_reward <- max(Y_test[t, ])
-        
-        history_text <- if (length(history_regrets) >= 10) {
-          paste0("Recent regret mean: ", round(mean(tail(history_regrets, 10)), 3))
-        } else ""
-        
-        # Policy selection: Use LLM after 10 steps, else Thompson
-        chosen_policy <- if (t > 10) {
-          summary_text <- paste(capture.output(print(tail(data.frame(
-            Reward = rewards, Regret = regrets, Policy = policy_choices, Arm = chosen_arms
-          ), 10))), collapse = "\n")
-          query_llm_policy(summary_text, mock = mock_llm, model = model)
-        } else "thompson"
-        
-        # Select arm based on chosen policy
-        arm <- switch(chosen_policy,
-                      "thompson" = thompson_sampling(x, gp_models),
-                      "ucb" = ucb_policy(x, t, gp_models),
-                      "epsilon-greedy" = epsilon_greedy_policy(x, t, gp_models, epsilon, n_arms),
-                      "ensemble" = ensemble_policy(x, t, gp_models, n_arms, llm_weight, history_text, mock_llm),
-                      sample(1:n_arms, 1))
-        
-        reward <- Y_test[t, arm]
-        rewards[t] <- reward
-        regrets[t] <- ifelse(t == 1, optimal_reward - reward, regrets[t - 1] + (optimal_reward - reward))
-        policy_choices[t] <- chosen_policy
-        chosen_arms[t] <- arm
-        history_regrets <- c(history_regrets, regrets[t])
-        
-        message(sprintf("t=%3d | Policy=%-12s | Arm=%d | Reward=%.3f | CumRegret=%.2f",
-                        t, chosen_policy, arm, reward, regrets[t]))
-      }
-      
-      data.frame(time = 1:T_test, reward = rewards, regret = regrets, policy = policy_choices, arm = chosen_arms)
-    }
-    
-    # --- Run Replications ---
-    run_multiple_reps <- function(n_reps = 1, ...) {
-      all_results <- vector("list", n_reps)
-      for (i in 1:n_reps) {
-        message("▶️ Replication ", i)
-        all_results[[i]] <- run_bandit_simulation(seed = 100 + i, ...)
-      }
-      combined_df <- bind_rows(all_results, .id = "rep")
-      
-      summary_df <- combined_df %>%
-        group_by(time) %>%
-        summarise(
-          mean_regret = mean(regret),
-          sd_regret = sd(regret),
-          n = n(),
-          ci_lower = mean_regret - 1.96 * sd_regret / sqrt(n),
-          ci_upper = mean_regret + 1.96 * sd_regret / sqrt(n),
-          .groups = "drop"
-        )
-      
-      # Plot mean cumulative regret with 95% CI ribbon
-      p <- ggplot(summary_df, aes(time, mean_regret)) +
-        geom_line(color = "blue") +
-        geom_ribbon(aes(ymin = ci_lower, ymax = ci_upper), fill = "lightblue", alpha = 0.3) +
-        labs(title = paste0("Cumulative Regret ± 95% CI (", n_reps, " rep)"),
-             x = "Time", y = "Cumulative Regret") +
-        theme_minimal(base_size = 14)
-      print(p)
-      
-      list(raw = all_results, summary = summary_df, combined = combined_df)
-    }
-    
-    # --- Example Run ---
-    # Make sure your OPENAI_API_KEY is set in environment variables before setting mock_llm = FALSE
-    # Sys.setenv(OPENAI_API_KEY = "sk-...")  # Do NOT hardcode in script
-    
-    results <- run_multiple_reps(n_reps = 100, T = 100, n_ctx = 10, n_arms = 3,
-                                 epsilon = 0.1, llm_weight = 0.4,
-                                 mock_llm = TRUE, model = "gpt-4")
-    
-    all_df <- results$combined
-    
-    # Cumulative regret plot per policy over all reps
-    ggplot(all_df, aes(x = time, y = regret, color = policy, group = interaction(rep, policy))) +
-      geom_line(alpha = 0.4) +
-      stat_summary(fun = mean, geom = "line", aes(group = policy), linewidth = 1.5) +
-      labs(title = "Cumulative Regret over Time by Policy",
-           subtitle = "Bold lines show mean across reps",
-           x = "Time", y = "Cumulative Regret") +
-      theme_minimal(base_size = 14)
-    
-    # Regret summary by policy
-    regret_summary <- all_df %>%
-      group_by(policy) %>%
-      summarise(
-        mean_final_regret = mean(regret[time == max(time)]),
-        sd_final_regret = sd(regret[time == max(time)]),
-        .groups = "drop"
-      )
-    kable(regret_summary, digits = 3, caption = "Final Regret Summary by Policy")
-    
-    # Reward over time plot
-    ggplot(all_df, aes(x = time, y = reward, color = policy, group = interaction(rep, policy))) +
-      geom_line(alpha = 0.3) +
-      stat_summary(fun = mean, geom = "line", aes(group = policy), linewidth = 1.5) +
-      labs(title = "Reward over Time by Policy",
-           subtitle = "Bold lines show average across replications",
-           x = "Time", y = "Observed Reward") +
-      theme_minimal(base_size = 14)
-    
-    # Final reward summary
-    reward_summary <- all_df %>%
-      group_by(policy) %>%
-      summarise(
-        mean_final_reward = mean(reward[time == max(time)]),
-        sd_final_reward = sd(reward[time == max(time)]),
-        .groups = "drop"
-      )
-    kable(reward_summary, digits = 3, caption = "Final Reward Summary by Policy")
-    
-    # Cumulative reward per policy and replication
-    all_df <- all_df %>%
-      group_by(rep, policy) %>%
-      mutate(cum_reward = cumsum(reward)) %>%
-      ungroup()
-    
-    ggplot(all_df, aes(x = time, y = cum_reward, color = policy, group = interaction(rep, policy))) +
-      geom_line(alpha = 0.3) +
-      stat_summary(fun = mean, geom = "line", aes(group = policy), linewidth = 1.5) +
-      labs(title = "Cumulative Reward Over Time by Policy",
-           subtitle = "Bold lines show mean across replications",
-           x = "Time", y = "Cumulative Reward") +
-      theme_minimal(base_size = 14)
-    
-    # Policy usage proportion over time
-    policy_switch_df <- all_df %>%
-      group_by(time, policy) %>%
-      summarise(n = n(), .groups = "drop") %>%
-      group_by(time) %>%
-      mutate(prop = n / sum(n))
-    
-    ggplot(policy_switch_df, aes(x = time, y = prop, fill = policy)) +
-      geom_area(alpha = 0.7, color = "black", linewidth = 0.1) +
-      labs(title = "Policy Switching Over Time",
-           x = "Time", y = "Proportion of Policy Usage") +
-      theme_minimal(base_size = 14) +
-      scale_y_continuous(labels = scales::percent_format())
-    
+library(copula)       # copula modeling
+library(VineCopula)   # vine copula fitting
+library(laGP)         # Gaussian Process reward models
+library(dplyr)
+library(ggplot2)
+library(httr)
+library(jsonlite)
+library(knitr)
+library(DT)
+
+# --- Cache Environments ---
+.llm_reward_cache <- new.env(parent = emptyenv())
+.llm_policy_cache <- new.env(parent = emptyenv())
+
+# --- GP Model Fitting ---
+fit_gp <- function(X, y) {
+  tryCatch(laGP::newGPsep(X, y, d = 0.5, g = 1e-6, dK = TRUE), error = function(e) NULL)
+}
+
+# --- Bandit Policies ---
+thompson_sampling <- function(x_row, gp_models) {
+  preds <- sapply(gp_models, function(gp) {
+    p <- tryCatch(predGPsep(gp, matrix(x_row, 1)), error = function(e) NULL)
+    if (is.null(p) || is.null(p$mean) || is.null(p$s2) || p$s2 <= 0) return(-Inf)
+    val <- rnorm(1, p$mean, sqrt(p$s2))
+    min(max(val, 0), 1)
+  })
+  which.max(preds)
+}
+
+epsilon_greedy_policy <- function(x_row, t, gp_models, epsilon, n_arms) {
+  if (runif(1) < epsilon || t <= n_arms) return(sample(1:n_arms, 1))
+  preds <- sapply(gp_models, function(gp) {
+    p <- tryCatch(predGPsep(gp, matrix(x_row, 1)), error = function(e) NULL)
+    if (is.null(p) || is.null(p$mean)) return(-Inf)
+    p$mean
+  })
+  which.max(preds)
+}
+
+ucb_policy <- function(x_row, t, gp_models) {
+  preds <- sapply(gp_models, function(gp) {
+    p <- tryCatch(predGPsep(gp, matrix(x_row, 1)), error = function(e) NULL)
+    if (is.null(p) || is.null(p$mean) || is.null(p$s2) || p$s2 <= 0) return(-Inf)
+    p$mean + sqrt(2 * log(t + 1) * p$s2)
+  })
+  which.max(preds)
+}
+
+# --- LLM Reward and Policy ---
+query_llm_reward <- function(x_row, arm_idx, history_text = "", api_key = Sys.getenv("OPENAI_API_KEY"), mock = TRUE) {
+  key <- paste0(paste(round(x_row, 3), collapse = ","), "_arm", arm_idx)
+  if (exists(key, envir = .llm_reward_cache)) return(get(key, envir = .llm_reward_cache))
+  pred <- if (mock) runif(1, 0, 1) else NA  # Placeholder for real API call
+  assign(key, pred, envir = .llm_reward_cache)
+  return(pred)
+}
+
+query_llm_policy <- function(summary_text, api_key = Sys.getenv("OPENAI_API_KEY"), mock = TRUE) {
+  key <- paste0("policy_", substr(summary_text, 1, 100))
+  if (exists(key, envir = .llm_policy_cache)) return(get(key, envir = .llm_policy_cache))
+  choice <- if (mock) sample(c("thompson", "ucb", "epsilon-greedy", "llm-reward"), 1) else "thompson"
+  assign(key, choice, envir = .llm_policy_cache)
+  return(choice)
+}
+
+# --- Simulated Data Generation ---
+generate_simulated_data <- function(T = 300, n_ctx = 10, n_arms = 3) {
+  spec <- ugarchspec(
+    variance.model = list(model = "sGARCH", garchOrder = c(1,1)),
+    mean.model = list(armaOrder = c(0,0), include.mean = FALSE),
+    distribution.model = "norm",
+    fixed.pars = list(omega = 0.1, alpha1 = 0.15, beta1 = 0.7)
+  )
+  vol_matrix <- matrix(NA, nrow = T, ncol = n_ctx)
+  innovations <- matrix(rnorm(T * n_ctx), nrow = T)
+  for (j in 1:n_ctx) vol_matrix[, j] <- ugarchpath(spec, n.sim = T)@path$sigmaSim
+  hetero_contexts <- innovations * vol_matrix
+  U_ctx <- apply(hetero_contexts, 2, function(x) rank(x) / (length(x) + 1))
+  vine_fit <- RVineStructureSelect(U_ctx, familyset = c(1, 3, 4, 5), cores = 2)
+  U_trans <- RVinePIT(U_ctx, vine_fit)
+#  reward_mat <- qbeta(U_trans[, 1:n_arms], shape1 = 2, shape2 = 5)
+  reward_mat <- qbeta(U_trans[, 1:n_arms], shape1 = 5, shape2 = 2)
+  list(X = U_trans, Y = reward_mat)
+}
+
+# --- Simulation Runner ---
+run_bandit_simulation <- function(X, Y, epsilon = 0.1, mock = TRUE) {
+  T_test <- nrow(X)
+  n_arms <- ncol(Y)
+  train_idx <- 1:floor(0.7 * T_test)
+  test_idx <- (max(train_idx) + 1):T_test
+  
+  gp_models <- lapply(1:n_arms, function(j) fit_gp(X[train_idx, ], Y[train_idx, j]))
+  X_test <- X[test_idx, ]
+  Y_test <- Y[test_idx, ]
+  T_test <- nrow(X_test)
+  
+  rewards <- regrets <- numeric(T_test)
+  policies <- character(T_test)
+  arms <- integer(T_test)
+  history_regrets <- c()
+  
+  for (t in 1:T_test) {
+    x <- X_test[t, , drop = FALSE]
+    best_reward <- max(Y_test[t, ])
+    summary_text <- paste("t =", t, "| rewards:", paste(round(tail(rewards[1:(t - 1)], 5), 2), collapse = ", "))
+    policy <- if (t > 10) query_llm_policy(summary_text, mock = mock) else "thompson"
+    arm <- switch(policy,
+                  "thompson" = thompson_sampling(x, gp_models),
+                  "ucb" = ucb_policy(x, t, gp_models),
+                  "epsilon-greedy" = epsilon_greedy_policy(x, t, gp_models, epsilon, n_arms),
+                  "llm-reward" = which.max(sapply(1:n_arms, function(a) query_llm_reward(x, a, mock = mock))),
+                  sample(1:n_arms, 1))
+    reward <- Y_test[t, arm]
+    rewards[t] <- reward
+    regrets[t] <- ifelse(t == 1, best_reward - reward, regrets[t - 1] + (best_reward - reward))
+    policies[t] <- policy
+    arms[t] <- arm
+    history_regrets <- c(history_regrets, regrets[t])
+  }
+  
+  data.frame(time = 1:T_test, reward = rewards, regret = regrets, policy = policies, arm = arms)
+}
+
+# --- Wrapper for Replication ---
+run_multiple_reps <- function(n_reps = 10000, T = 100, n_ctx = 10, n_arms = 3, ...) {
+  sim_data <- generate_simulated_data(T = T, n_ctx = n_ctx, n_arms = n_arms)
+  results <- lapply(seq_len(n_reps), function(i) {
+    message("▶️ Replication ", i)
+    run_bandit_simulation(sim_data$X, sim_data$Y, ...)
+  })
+  bind_rows(results, .id = "rep")
+}
+
+# --- Run simulation ---
+set.seed(123)
+all_results <- run_multiple_reps(
+  n_reps = 10000, T = 100, n_ctx = 10, n_arms = 3,
+  epsilon = 0.1, mock = TRUE
+)
+
+n_reps <- length(unique(all_results$rep))
+final_time <- max(all_results$time)
+
+# --- Summarize and CI function ---
+summarize_with_ci <- function(df, value_col) {
+  df %>%
+    group_by(time, policy) %>%
+    summarise(
+      mean = mean(.data[[value_col]]),
+      sd = sd(.data[[value_col]]),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      ci_lower = mean - 1.96 * sd / sqrt(n_reps),
+      ci_upper = mean + 1.96 * sd / sqrt(n_reps)
+    )
+}
+
+# --- Regret and Reward summaries ---
+summary_regret <- summarize_with_ci(all_results, "regret")
+summary_reward <- summarize_with_ci(all_results, "reward")
+
+# --- Plotting helper ---
+plot_ci <- function(summary_df, y_var, y_label, title) {
+  ggplot(summary_df, aes(x = time, y = .data[[y_var]], color = policy, fill = policy)) +
+    geom_line(linewidth = 1) +
+    geom_ribbon(aes(ymin = ci_lower, ymax = ci_upper), alpha = 0.2, color = NA) +
+    labs(title = title, x = "Time", y = y_label) +
+    theme_minimal(base_size = 14)
+}
+
+# --- CI Plots ---
+print(plot_ci(summary_regret, "mean", "Cumulative Regret", "Cumulative Regret Over Time (Mean ± 95% CI)"))
+print(plot_ci(summary_reward, "mean", "Reward", "Average Reward Over Time (Mean ± 95% CI)"))
+
+# --- SD Plots ---
+plot_sd <- function(summary_df, sd_col, y_label, title) {
+  ggplot(summary_df, aes(x = time, y = .data[[sd_col]], color = policy)) +
+    geom_line(linewidth = 1) +
+    labs(title = title, x = "Time", y = y_label) +
+    theme_minimal(base_size = 14)
+}
+
+print(plot_sd(summary_regret, "sd", "Regret SD", "Regret Standard Deviation Over Time by Policy"))
+print(plot_sd(summary_reward, "sd", "Reward SD", "Reward Standard Deviation Over Time by Policy"))
+
+# --- Final-time summary table ---
+summary_final_stats <- all_results %>%
+  filter(time == final_time) %>%
+  group_by(policy) %>%
+  summarise(
+    mean_reward = mean(reward),
+    sd_reward = sd(reward),
+    mean_regret = mean(regret),
+    sd_regret = sd(regret),
+    .groups = "drop"
+  ) %>%
+  arrange(mean_regret)
+
+print(summary_final_stats)

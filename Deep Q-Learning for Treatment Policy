@@ -1,3 +1,7 @@
+################################
+## Univariate Outcomes R code
+################################
+
 # Boston Housing dataset
 # --- Libraries ---
 library(MASS)       
@@ -354,3 +358,568 @@ ggplot(q_df, aes(x = Q0, y = Q1, color = action)) +
   geom_point(alpha = 0.6, size = 3) +
   labs(title = "Q-values per state under learned policy", x = "Q0", y = "Q1") +
   theme_minimal()
+
+################################
+## Multivariate Outcomes R code
+################################
+
+## Boston Housing
+# --- Libraries ---
+library(MASS)
+library(keras)
+library(tensorflow)
+library(tidyverse)
+library(ggplot2)
+
+# --- Parameters ---
+T_steps <- 10
+n <- 200
+epsilon <- 1.0
+epsilon_decay <- 0.99
+epsilon_min <- 0.1
+episodes <- 150
+gamma <- 0.95
+alpha <- 0.001
+
+# --- Prepare Data ---
+data("Boston")
+df <- Boston
+p <- ncol(df)
+set.seed(123)
+df_sampled <- df[sample(1:nrow(df), n, replace = TRUE), ]
+
+# --- Simulate temporal structure ---
+X_long <- array(0, dim = c(n, T_steps, p))
+for (t in 1:T_steps) {
+  noise <- matrix(rnorm(n * p, 0, 0.01), nrow = n)
+  X_long[, t, ] <- as.matrix(df_sampled) + noise
+}
+X_scaled <- X_long
+for (j in 1:p) {
+  for (t in 1:T_steps) {
+    mu <- mean(X_scaled[, t, j])
+    sigma <- sd(X_scaled[, t, j])
+    X_scaled[, t, j] <- (X_scaled[, t, j] - mu) / sigma
+  }
+}
+
+# --- Simulate Treatment Assignment ---
+rm_avg <- apply(X_scaled[, , which(colnames(df) == "rm")], 1, mean)
+W <- rbinom(n, 1, plogis(5 * (rm_avg - 0.5)))
+
+# --- Simulate 8 Outcomes ---
+set.seed(123)
+Y_list <- list()
+for (k in 1:6) {
+  base_k <- apply(X_scaled[, , (k %% p + 1):(k %% p + 3)], 1, mean) + rnorm(n, 0, 0.1)
+  effect_k <- runif(1, 1.5, 3.5) * apply(X_scaled[, , which(colnames(df) == "lstat")], 1, mean)
+  Y0_k <- base_k
+  Y1_k <- base_k + effect_k
+  Y_list[[k]] <- list(Y0 = Y0_k, Y1 = Y1_k)
+}
+
+# --- Stack and Transform Outcomes ---
+Y0_mat <- do.call(cbind, lapply(Y_list, function(y) y$Y0))
+Y1_mat <- do.call(cbind, lapply(Y_list, function(y) y$Y1))
+
+# --- Apply Empirical Copula Transformation ---
+empirical_copula <- function(Y_mat) {
+  apply(Y_mat, 2, function(col) {
+    rank(col, ties.method = "average") / length(col)
+  })
+}
+Y0_copula <- empirical_copula(Y0_mat)
+Y1_copula <- empirical_copula(Y1_mat)
+
+# --- Observed Copula-Transformed Outcomes by Action ---
+Y_obs_all <- matrix(0, n, 6)
+for (i in 1:n) {
+  Y_obs_all[i, ] <- if (W[i] == 1) Y1_copula[i, ] else Y0_copula[i, ]
+}
+
+# --- Train/Test Split ---
+train_idx <- sample(1:n, floor(0.7 * n))
+test_idx <- setdiff(1:n, train_idx)
+X_train <- X_scaled[train_idx, , ]
+X_test <- X_scaled[test_idx, , ]
+Y0_test <- Y0_copula[test_idx, ]
+Y1_test <- Y1_copula[test_idx, ]
+
+# --- Q-Network ---
+create_dqn_model <- function(input_shape) {
+  keras_model_sequential() %>%
+    layer_conv_1d(filters = 32, kernel_size = 3, activation = 'relu',
+                  input_shape = input_shape) %>%
+    layer_max_pooling_1d(pool_size = 2) %>%
+    layer_lstm(units = 32, return_sequences = FALSE) %>%
+    layer_dense(units = 32, activation = 'relu') %>%
+    layer_dense(units = 2, activation = 'linear') %>%
+    compile(loss = 'mse', optimizer = optimizer_adam(learning_rate = alpha))
+}
+
+model <- create_dqn_model(c(T_steps, p))
+
+# --- Training Loop ---
+for (i in 1:episodes) {
+  idx <- sample(1:dim(X_train)[1], 1)
+  state <- array_reshape(X_train[idx, , ], dim = c(1, T_steps, p))
+  
+  if (runif(1) < epsilon) {
+    action <- sample(0:1, 1)
+  } else {
+    q_values <- model %>% predict(state, verbose = 0)
+    action <- which.max(q_values) - 1
+  }
+  
+  reward_vec <- if (action == 1) Y1_copula[train_idx[idx], ] else Y0_copula[train_idx[idx], ]
+  reward_total <- mean(reward_vec)
+  
+  q_vals <- model %>% predict(state, verbose = 0)
+  q_vals[1, action + 1] <- reward_total
+  model %>% fit(state, q_vals, verbose = 0, epochs = 1)
+  
+  epsilon <- max(epsilon * epsilon_decay, epsilon_min)
+}
+
+# --- Evaluation ---
+q_preds <- model %>% predict(X_test, verbose = 0)
+policy_actions <- apply(q_preds, 1, which.max) - 1
+
+regret_vec <- numeric(6)
+reward_vec <- numeric(6)
+for (k in 1:6) {
+  R_policy <- ifelse(policy_actions == 1, Y1_test[, k], Y0_test[, k])
+  R_opt <- pmax(Y0_test[, k], Y1_test[, k])
+  regret_vec[k] <- mean(R_opt - R_policy)
+  reward_vec[k] <- mean(R_policy)
+}
+
+# --- Optimize Weights for Equal Regret ---
+fair_loss <- function(w) {
+  w <- pmax(w, 0)
+  w <- w / sum(w)
+  sum((w * regret_vec - mean(w * regret_vec))^2)
+}
+
+opt_fair <- optim(par = rep(1, 6), fn = fair_loss, method = "L-BFGS-B", lower = 0.01, upper = 5)
+w_opt <- opt_fair$par / sum(opt_fair$par)
+
+weighted_reward <- sum(w_opt * reward_vec)
+weighted_regret <- sum(w_opt * regret_vec)
+
+cat("\n--- Multi-Outcome Evaluation (Empirical Copula) ---\n")
+cat("Optimized Weights (Equal Regret):\n")
+print(round(w_opt, 3))
+cat("Weighted Reward:", round(weighted_reward, 4), "\n")
+cat("Weighted Regret:", round(weighted_regret, 4), "\n")
+
+# --- Save Results ---
+result_summary <- data.frame(
+  Outcome = paste0("Y", 1:6),
+  Reward = round(reward_vec, 3),
+  Regret = round(regret_vec, 3),
+  Weight = round(w_opt, 3)
+)
+print(result_summary)
+
+
+
+gg1 <- ggplot(result_summary, aes(x = Outcome, y = Reward)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  ylim(0, 1) + theme_minimal() + ggtitle("Per-Outcome Rewards")
+
+gg2 <- ggplot(result_summary, aes(x = Outcome, y = Regret)) +
+  geom_bar(stat = "identity", fill = "darkred") +
+  ylim(0, 1) + theme_minimal() + ggtitle("Per-Outcome Regrets")
+
+gg3 <- ggplot(result_summary, aes(x = Outcome, y = Weight)) +
+  geom_bar(stat = "identity", fill = "darkgreen") +
+  ylim(0, 1) + theme_minimal() + ggtitle("Optimized Weights")
+
+
+#install.packages("patchwork")  # Only if not yet installed
+library(patchwork)
+
+gg1 + gg2 + gg3 + plot_layout(nrow = 1)
+
+
+# --- DAG Visualization of Outcome Dependencies ---
+colnames(Y_obs_all) <- paste0("Y", 1:6)  # Add dimnames so cor() result is labeled
+node_names <- paste0("Y", 1:6)
+edges <- combn(node_names, 2, simplify = FALSE)
+weights <- abs(cor(Y_obs_all))  # Now 'weights' has dimnames
+edge_weights <- sapply(edges, function(e) weights[e[1], e[2]])
+edge_df <- do.call(rbind, lapply(1:length(edges), function(i) {
+  cbind(from = edges[[i]][1], to = edges[[i]][2], weight = edge_weights[i])
+}))
+
+G <- graph_from_data_frame(as.data.frame(edge_df), directed = FALSE)
+plot(G, edge.width = E(G)$width,
+     edge.color = E(G)$color,
+     vertex.size = 30, vertex.size = 30, vertex.label.cex = 1.2,
+     main = "Acyclic Graph of Outcome Dependencies (Empirical Copula Scale)")
+
+library(RColorBrewer)
+
+edge_df <- as.data.frame(edge_df)
+edge_df$weight <- as.numeric(edge_df$weight)
+
+G <- graph_from_data_frame(edge_df, directed = FALSE)
+
+E(G)$width <- edge_df$weight * 5
+E(G)$color <- brewer.pal(9, "Reds")[cut(edge_df$weight, breaks = 9, labels = FALSE)]
+
+plot(G, edge.width = E(G)$width,
+     edge.color = E(G)$color,
+     vertex.size = 30,
+     vertex.label.cex = 1.2,
+     main = "DAG of Outcome Dependencies (Empirical Copula Scale)")
+
+library(igraph)
+library(RColorBrewer)
+
+colnames(Y_obs_all) <- paste0("Y", 1:6)  # Add dimnames so cor() result is labeled
+node_names <- paste0("Y", 1:6)
+edges <- combn(node_names, 2, simplify = FALSE)
+weights <- abs(cor(Y_obs_all))  # Now 'weights' has dimnames
+edge_weights <- sapply(edges, function(e) weights[e[1], e[2]])
+
+edge_df <- do.call(rbind, lapply(1:length(edges), function(i) {
+  from_node <- edges[[i]][1]
+  to_node <- edges[[i]][2]
+  # Ensure direction from lower index to higher index, e.g. Y1->Y2 but not Y2->Y1
+  if (as.numeric(sub("Y", "", from_node)) > as.numeric(sub("Y", "", to_node))) {
+    temp <- from_node
+    from_node <- to_node
+    to_node <- temp
+  }
+  cbind(from = from_node, to = to_node, weight = edge_weights[i])
+}))
+
+edge_df <- as.data.frame(edge_df)
+edge_df$weight <- as.numeric(edge_df$weight)
+
+G <- graph_from_data_frame(edge_df, directed = TRUE)
+
+E(G)$width <- edge_df$weight * 5
+E(G)$color <- brewer.pal(9, "Reds")[cut(edge_df$weight, breaks = 9, labels = FALSE)]
+
+plot(G, edge.width = E(G)$width,
+     edge.color = E(G)$color,
+     vertex.size = 30,
+     vertex.label.cex = 1.2,
+     edge.arrow.size = 0.5,  # smaller arrows
+     main = "Directed Acyclic Graph of Outcome Dependencies (Empirical Copula Scale)")
+
+# label edges with numerical values indicating positive effect, negative effect, or no effect
+# Full correlation matrix (signed)
+cor_mat <- cor(Y_obs_all)
+
+# Build edges with direction (from lower to higher index)
+edge_df <- do.call(rbind, lapply(1:length(edges), function(i) {
+  from_node <- edges[[i]][1]
+  to_node <- edges[[i]][2]
+  
+  # Ensure direction from lower to higher index
+  if (as.numeric(sub("Y", "", from_node)) > as.numeric(sub("Y", "", to_node))) {
+    temp <- from_node
+    from_node <- to_node
+    to_node <- temp
+  }
+  
+  weight <- cor_mat[from_node, to_node]
+  cbind(from = from_node, to = to_node, weight = weight)
+}))
+
+edge_df <- as.data.frame(edge_df)
+edge_df$weight <- as.numeric(edge_df$weight)
+
+threshold <- 0.1
+edge_df$effect_label <- ifelse(abs(edge_df$weight) < threshold, "0", 
+                               ifelse(edge_df$weight > 0, 
+                                      sprintf("+%.2f", edge_df$weight),
+                                      sprintf("%.2f", edge_df$weight)))
+
+library(igraph)
+library(RColorBrewer)
+
+G <- graph_from_data_frame(edge_df, directed = TRUE)
+
+E(G)$width <- abs(edge_df$weight) * 5
+E(G)$color <- brewer.pal(10, "RdBu")[cut(edge_df$weight, breaks = 10, labels = FALSE)]
+
+plot(G, edge.width = E(G)$width,
+     edge.color = E(G)$color,
+     vertex.size = 30,
+     vertex.label.cex = 1.2,
+     edge.arrow.size = 0.3,  
+     edge.label = edge_df$effect_label,
+     edge.label.cex = 0.8,
+     edge.label.color = "black",
+     main = "Directed Acyclic Graph of Outcome Dependencies with Effect Labels")
+
+
+
+# --- Categorize Edge Effects ---
+edge_df$effect_type <- ifelse(abs(edge_df$weight) < threshold, "No Effect",
+                              ifelse(edge_df$weight > 0, "Positive Effect", "Negative Effect"))
+
+# --- Count Table of Effects ---
+effect_summary <- edge_df %>%
+  group_by(effect_type) %>%
+  summarise(Count = n(), .groups = "drop")
+
+print(effect_summary)
+
+# Table of outcome correlations
+cor_mat <- round(cor(Y_obs_all), 2)
+print(cor_mat)
+
+# Heatmap
+library(tidyr)
+cor_mat_df <- as.data.frame(cor_mat)
+cor_melt <- cor_mat_df %>%
+  pivot_longer(everything(), names_to = "Var2", values_to = "value") %>%
+  mutate(Var1 = rep(rownames(cor_mat_df), ncol(cor_mat_df)))
+
+ggplot(cor_melt, aes(Var1, Var2, fill = value)) +
+  geom_tile() +
+  geom_text(aes(label = round(value, 2)), color = "white") +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0.5) +
+  theme_minimal() + ggtitle("Outcome Correlation Heatmap (Copula Scale)")
+
+q_pred_df <- data.frame(Action = policy_actions)
+ggplot(q_pred_df, aes(x = as.factor(Action))) +
+  geom_bar(fill = "skyblue") +
+  labs(title = "Distribution of Chosen Actions", x = "Action", y = "Count") +
+  theme_minimal()
+
+ggplot(result_summary, aes(x = Reward, y = Regret, label = Outcome)) +
+  geom_point(color = "purple", size = 3) +
+  geom_text(nudge_y = 0.02, size = 3) +
+  theme_minimal() + ggtitle("Reward vs Regret per Outcome")
+
+## Wine Quality Data
+# --- Libraries ---
+library(keras)
+library(tensorflow)
+library(tidyverse)
+library(igraph)
+library(RColorBrewer)
+library(patchwork)
+
+# --- Parameters ---
+T_steps <- 10
+n <- 200
+epsilon <- 1.0
+epsilon_decay <- 0.99
+epsilon_min <- 0.1
+episodes <- 150
+gamma <- 0.95
+alpha <- 0.001
+
+# --- Load Wine Quality Data ---
+wine_url <- "https://archive.ics.uci.edu/ml/machine-learning-databases/wine-quality/winequality-red.csv"
+df <- read.csv(wine_url, sep = ";")
+df$quality <- NULL  # remove quality column
+p <- ncol(df)
+
+# --- Sample Data ---
+set.seed(123)
+df_sampled <- df[sample(1:nrow(df), n, replace = TRUE), ]
+
+# --- Simulate Temporal Structure ---
+X_long <- array(0, dim = c(n, T_steps, p))
+for (t in 1:T_steps) {
+  noise <- matrix(rnorm(n * p, 0, 0.01), nrow = n)
+  X_long[, t, ] <- as.matrix(df_sampled) + noise
+}
+
+# --- Scale ---
+X_scaled <- X_long
+for (j in 1:p) {
+  for (t in 1:T_steps) {
+    mu <- mean(X_scaled[, t, j])
+    sigma <- sd(X_scaled[, t, j])
+    X_scaled[, t, j] <- (X_scaled[, t, j] - mu) / sigma
+  }
+}
+
+# --- Simulate Treatment Assignment ---
+volatile_col <- "alcohol"  # replace with feature of interest
+W <- rbinom(n, 1, plogis(5 * (apply(X_scaled[, , which(colnames(df) == volatile_col)], 1, mean) - 0.5)))
+
+# --- Simulate 6 Outcomes ---
+set.seed(123)
+Y_list <- list()
+for (k in 1:5) {
+  base_k <- apply(X_scaled[, , (k %% p + 1):(k %% p + 3)], 1, mean) + rnorm(n, 0, 0.1)
+  effect_k <- runif(1, 1.5, 3.5) * apply(X_scaled[, , which(colnames(df) == "citric.acid")], 1, mean)
+  Y0_k <- base_k
+  Y1_k <- base_k + effect_k
+  Y_list[[k]] <- list(Y0 = Y0_k, Y1 = Y1_k)
+}
+
+# --- Stack and Transform Outcomes ---
+Y0_mat <- do.call(cbind, lapply(Y_list, function(y) y$Y0))
+Y1_mat <- do.call(cbind, lapply(Y_list, function(y) y$Y1))
+
+empirical_copula <- function(Y_mat) {
+  apply(Y_mat, 2, function(col) rank(col, ties.method = "average") / length(col))
+}
+
+Y0_copula <- empirical_copula(Y0_mat)
+Y1_copula <- empirical_copula(Y1_mat)
+
+# --- Observed Outcomes by Action ---
+Y_obs_all <- matrix(0, n, 5)
+for (i in 1:n) {
+  Y_obs_all[i, ] <- if (W[i] == 1) Y1_copula[i, ] else Y0_copula[i, ]
+}
+
+# --- Train/Test Split ---
+train_idx <- sample(1:n, floor(0.7 * n))
+test_idx <- setdiff(1:n, train_idx)
+X_train <- X_scaled[train_idx, , ]
+X_test <- X_scaled[test_idx, , ]
+Y0_test <- Y0_copula[test_idx, ]
+Y1_test <- Y1_copula[test_idx, ]
+
+# --- Q-Network ---
+create_dqn_model <- function(input_shape) {
+  keras_model_sequential() %>%
+    layer_conv_1d(filters = 32, kernel_size = 3, activation = 'relu',
+                  input_shape = input_shape) %>%
+    layer_max_pooling_1d(pool_size = 2) %>%
+    layer_lstm(units = 32, return_sequences = FALSE) %>%
+    layer_dense(units = 32, activation = 'relu') %>%
+    layer_dense(units = 2, activation = 'linear') %>%
+    compile(loss = 'mse', optimizer = optimizer_adam(learning_rate = alpha))
+}
+
+model <- create_dqn_model(c(T_steps, p))
+
+# --- Training Loop ---
+for (i in 1:episodes) {
+  idx <- sample(1:dim(X_train)[1], 1)
+  state <- array_reshape(X_train[idx, , ], dim = c(1, T_steps, p))
+  
+  if (runif(1) < epsilon) {
+    action <- sample(0:1, 1)
+  } else {
+    q_values <- model %>% predict(state, verbose = 0)
+    action <- which.max(q_values) - 1
+  }
+  
+  reward_vec <- if (action == 1) Y1_copula[train_idx[idx], ] else Y0_copula[train_idx[idx], ]
+  reward_total <- mean(reward_vec)
+  
+  q_vals <- model %>% predict(state, verbose = 0)
+  q_vals[1, action + 1] <- reward_total
+  model %>% fit(state, q_vals, verbose = 0, epochs = 1)
+  
+  epsilon <- max(epsilon * epsilon_decay, epsilon_min)
+}
+
+# --- Evaluation ---
+q_preds <- model %>% predict(X_test, verbose = 0)
+policy_actions <- apply(q_preds, 1, which.max) - 1
+
+regret_vec <- numeric(5)
+reward_vec <- numeric(5)
+for (k in 1:5) {
+  R_policy <- ifelse(policy_actions == 1, Y1_test[, k], Y0_test[, k])
+  R_opt <- pmax(Y0_test[, k], Y1_test[, k])
+  regret_vec[k] <- mean(R_opt - R_policy)
+  reward_vec[k] <- mean(R_policy)
+}
+
+# --- Optimize Weights for Equal Regret ---
+fair_loss <- function(w) {
+  w <- pmax(w, 0)
+  w <- w / sum(w)
+  sum((w * regret_vec - mean(w * regret_vec))^2)
+}
+opt_fair <- optim(par = rep(1, 5), fn = fair_loss, method = "L-BFGS-B", lower = 0.01, upper = 5)
+w_opt <- opt_fair$par / sum(opt_fair$par)
+weighted_reward <- sum(w_opt * reward_vec)
+weighted_regret <- sum(w_opt * regret_vec)
+
+cat("\n--- Multi-Outcome Evaluation (Empirical Copula) ---\n")
+cat("Optimized Weights (Equal Regret):\n")
+print(round(w_opt, 3))
+cat("Weighted Reward:", round(weighted_reward, 4), "\n")
+cat("Weighted Regret:", round(weighted_regret, 4), "\n")
+
+# --- Results Summary ---
+result_summary <- data.frame(
+  Outcome = paste0("Y", 1:5),
+  Reward = round(reward_vec, 3),
+  Regret = round(regret_vec, 3),
+  Weight = round(w_opt, 3)
+)
+print(result_summary)
+
+# --- Visualization ---
+gg1 <- ggplot(result_summary, aes(x = Outcome, y = Reward)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  ylim(0, 1) + theme_minimal() + ggtitle("Per-Outcome Rewards")
+
+gg2 <- ggplot(result_summary, aes(x = Outcome, y = Regret)) +
+  geom_bar(stat = "identity", fill = "darkred") +
+  ylim(0, 1) + theme_minimal() + ggtitle("Per-Outcome Regrets")
+
+gg3 <- ggplot(result_summary, aes(x = Outcome, y = Weight)) +
+  geom_bar(stat = "identity", fill = "darkgreen") +
+  ylim(0, 1) + theme_minimal() + ggtitle("Optimized Weights")
+
+gg1 + gg2 + gg3 + plot_layout(nrow = 1)
+
+# --- DAG Visualization of Outcome Dependencies ---
+colnames(Y_obs_all) <- paste0("Y", 1:5)
+node_names <- colnames(Y_obs_all)
+edges <- combn(node_names, 2, simplify = FALSE)
+cor_mat <- cor(Y_obs_all)
+
+edge_df <- do.call(rbind, lapply(1:length(edges), function(i) {
+  from_node <- edges[[i]][1]
+  to_node <- edges[[i]][2]
+  if (as.numeric(sub("Y", "", from_node)) > as.numeric(sub("Y", "", to_node))) {
+    temp <- from_node; from_node <- to_node; to_node <- temp
+  }
+  weight <- cor_mat[from_node, to_node]
+  cbind(from = from_node, to = to_node, weight = weight)
+}))
+edge_df <- as.data.frame(edge_df)
+edge_df$weight <- as.numeric(edge_df$weight)
+
+threshold <- 0.1
+edge_df$effect_label <- ifelse(abs(edge_df$weight) < threshold, "0", 
+                               ifelse(edge_df$weight > 0, 
+                                      sprintf("+%.2f", edge_df$weight),
+                                      sprintf("%.2f", edge_df$weight)))
+
+G <- graph_from_data_frame(edge_df, directed = TRUE)
+E(G)$width <- abs(edge_df$weight) * 5
+E(G)$color <- brewer.pal(10, "RdBu")[cut(edge_df$weight, breaks = 10, labels = FALSE)]
+
+plot(G, edge.width = E(G)$width,
+     edge.color = E(G)$color,
+     vertex.size = 30,
+     vertex.label.cex = 1.2,
+     edge.arrow.size = 0.3,
+     edge.label = edge_df$effect_label,
+     edge.label.cex = 0.8,
+     edge.label.color = "black",
+     main = "DAG of Outcome Dependencies with Effect Labels")
+
+# --- Categorize Edge Effects ---
+edge_df$effect_type <- ifelse(abs(edge_df$weight) < threshold, "No Effect",
+                              ifelse(edge_df$weight > 0, "Positive Effect", "Negative Effect"))
+
+# --- Count Table of Effects ---
+effect_summary <- edge_df %>%
+  group_by(effect_type) %>%
+  summarise(Count = n(), .groups = "drop")
+
+print(effect_summary)

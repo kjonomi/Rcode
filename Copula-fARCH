@@ -1,0 +1,943 @@
+
+# ==========================
+#  Simulation + Estimation
+# ==========================
+
+# --- Clean Environment ---
+rm(list = ls())
+gc()
+# --- Load Libraries ---
+library(sde)
+library(fda)
+library(fdapace)
+library(MASS)
+library(ggplot2)
+library(copula)
+library(forecast)
+library(DEoptim)
+library(Matrix)
+library(tseries)
+library(reshape2)
+
+# --- Parameters ---
+L <- 350          # Intraday points per day
+N <- 100           # Number of days
+h <- 1            # Lag
+p <- 2            # Number of FPCs
+nbasis <- 15      # Number of B-spline basis functions
+norder <- 4       # Basis order
+lambda <- 1e-4    # Smoothing parameter
+itermax <- 200
+
+# --- Simulate High Volatility with GARCH-like Structure ---
+set.seed(123)
+volatility <- numeric(L + h)
+volatility[1] <- 0.5
+
+alpha0 <- 0.001
+alpha1 <- 0.25
+beta1  <- 0.74
+shock_scale <- 0.6
+
+for (t in 2:(L + h)) {
+  shock <- rnorm(1, mean = 0, sd = shock_scale)
+  volatility[t] <- sqrt(pmax(alpha0 + alpha1 * volatility[t - 1]^2 + beta1 * shock^2, 1e-6))
+}
+
+# --- Simulate High Autocorrelation Returns ---
+ar_coef <- 0.95
+returns <- matrix(0, nrow = L + h, ncol = N)
+for (i in 1:N) {
+  ar_process <- numeric(L + h)
+  ar_process[1] <- rnorm(1, sd = volatility[1])
+  for (t in 2:(L + h)) {
+    epsilon <- rnorm(1, sd = volatility[t])
+    ar_process[t] <- ar_coef * ar_process[t - 1] + epsilon
+  }
+  returns[, i] <- ar_process
+}
+
+returns_use <- returns[-1, ]  # Remove 1st row for lag consistency
+
+
+# ====================================
+# --- fARCH Estimation Function ---
+# ====================================
+estimate_farch <- function(y_old, L, p, nbasis = 15, norder = 4) {
+  N <- ncol(y_old)
+  sigma_out_squared <- matrix(0, N - 2, L)
+  basis <- create.bspline.basis(rangeval = c(0, 1), nbasis = nbasis, norder = norder)
+  fd_par_obj <- fdPar(basis, lambda = 1e-4, Lfdobj = 2)
+  times <- seq(0, 1, length.out = L)
+  
+  for (out in 2:(N - 1)) {
+    cat("Estimating fARCH Day:", out, "/", N - 1, "\n")
+    y <- y_old[, -out, drop = FALSE]
+    y_sq_fdsmooth <- smooth.basis(times, y^2, fdParobj = fd_par_obj)
+    functional_y_squared <- y_sq_fdsmooth$fd
+    principal_components <- pca.fd(fdobj = functional_y_squared, nharm = p)
+    eigenfunctions <- principal_components$harmonics
+    mean_fd <- mean.fd(functional_y_squared)
+    
+    Z <- matrix(0, p, ncol(y))
+    for (i in 1:p) {
+      for (k in 1:ncol(y)) {
+        Z[i, k] <- inprod(fd(coef = functional_y_squared$coefs[, k, drop = FALSE], basisobj = basis), eigenfunctions[i]) -
+          inprod(mean_fd, eigenfunctions[i])
+      }
+    }
+    
+    part1 <- part2 <- matrix(0, p, p)
+    for (k in 2:ncol(Z)) {
+      part1 <- part1 + Z[, k] %*% t(Z[, k - 1])
+      part2 <- part2 + Z[, k - 1] %*% t(Z[, k - 1])
+    }
+    M <- part1 %*% solve(part2)
+    
+    eigenvector <- lapply(1:p, function(i) eval.fd(times, eigenfunctions[i]))
+    beta_matrix_estimated <- Reduce(`+`, lapply(1:p, function(k) {
+      Reduce(`+`, lapply(1:p, function(ell) {
+        M[k, ell] * eigenvector[[k]] %*% t(eigenvector[[ell]])
+      }))
+    }))
+    
+    beta_hat <- function(x) t(beta_matrix_estimated %*% t(x)) / L
+    m_hat <- t(as.matrix(eval.fd(times, mean_fd)))
+    estimated_delta <- m_hat - beta_hat(m_hat)
+    
+    y_test <- matrix(y_old[, out - 1]^2, nrow = 1)
+    sigma_out_squared[out - 1, ] <- estimated_delta + beta_hat(y_test)
+  }
+  return(sigma_out_squared)
+}
+
+
+# =========================================
+# --- Copula-fARCH Estimation Function ---
+# =========================================
+estimate_cfarch <- function(y_old, L, p, nbasis = 15, norder = 4, lambda = 1e-4) {
+  set.seed(123)
+  N <- ncol(y_old)
+  sigma_out_squared <- matrix(0, N - 2, L)
+  basis <- create.bspline.basis(c(0, 1), nbasis = nbasis, norder = norder)
+  fd_par_obj <- fdPar(basis, lambda = lambda, Lfdobj = 2)
+  times <- seq(0, 1, length.out = L)
+  
+  for (out in 2:(N - 1)) {
+    cat("Estimating Copula-fARCH Day:", out, "/", N - 1, "\n")
+    y <- y_old[, -out, drop = FALSE]
+    
+    y_sq_fdsmooth <- smooth.basis(times, y^2, fdParobj = fd_par_obj)
+    functional_y_squared <- y_sq_fdsmooth$fd
+    mean_fd <- mean.fd(functional_y_squared)
+    pca_obj <- pca.fd(fdobj = functional_y_squared, nharm = p)
+    eigenfunctions <- pca_obj$harmonics
+    
+    Z <- matrix(0, p, ncol(y))
+    for (i in 1:p) {
+      for (k in 1:ncol(y)) {
+        Z[i, k] <- inprod(fd(coef = functional_y_squared$coefs[, k, drop = FALSE], basisobj = basis), eigenfunctions[i]) -
+          inprod(mean_fd, eigenfunctions[i])
+      }
+    }
+    
+    # Apply Copula to simulate improved scores
+    u_data <- pobs(t(Z))
+    sims_list <- list()
+    n_sim <- ncol(Z)
+    
+    for (cop_type in c("gaussian", "clayton")) {
+      fit_cop <- tryCatch({
+        cop_obj <- switch(cop_type,
+                          "gaussian" = normalCopula(dim = p, dispstr = "un"),
+                          "clayton" = claytonCopula(dim = p))
+        fitCopula(cop_obj, u_data, method = "ml")
+      }, error = function(e) NULL)
+      
+      if (!is.null(fit_cop)) {
+        sim_cop <- rCopula(n_sim, fit_cop@copula)
+        sims_list[[length(sims_list) + 1]] <- qnorm(sim_cop)
+      }
+    }
+    
+    Z_used <- if (length(sims_list) > 0) {
+      t(Reduce("+", sims_list) / length(sims_list))
+    } else {
+      t(Z)
+    }
+    
+    part1 <- part2 <- matrix(0, p, p)
+    for (k in 2:ncol(Z_used)) {
+      part1 <- part1 + Z_used[, k] %*% t(Z_used[, k - 1])
+      part2 <- part2 + Z_used[, k - 1] %*% t(Z_used[, k - 1])
+    }
+    M <- part1 %*% solve(part2)
+    
+    eigenvector <- lapply(1:p, function(i) eval.fd(times, eigenfunctions[i]))
+    beta_matrix_estimated <- Reduce(`+`, lapply(1:p, function(k) {
+      Reduce(`+`, lapply(1:p, function(ell) {
+        M[k, ell] * eigenvector[[k]] %*% t(eigenvector[[ell]])
+      }))
+    }))
+    
+    beta_hat <- function(x) t(beta_matrix_estimated %*% t(x)) / L
+    m_hat <- t(as.matrix(eval.fd(times, mean_fd)))
+    estimated_delta <- m_hat - beta_hat(m_hat)
+    
+    y_test <- matrix(y_old[, out - 1]^2, nrow = 1)
+    sigma_out_squared[out - 1, ] <- estimated_delta + beta_hat(y_test)
+  }
+  
+  return(sigma_out_squared)
+}
+
+
+# ==========================================
+# --- fGARCH Loss Function ---
+# ==========================================
+fgarch_loss_fn <- function(params, y_proj, p) {
+  d_hat <- params[1:p]
+  A_hat <- matrix(params[(p + 1):(p + p^2)], p, p)
+  B_hat <- matrix(params[(p + p^2 + 1):(p + 2 * p^2)], p, p)
+  
+  n_obs <- ncol(y_proj)
+  loss <- 0
+  for (t in 3:n_obs) {
+    log_mu_t <- d_hat + A_hat %*% y_proj[, t - 1] + B_hat %*% y_proj[, t - 2]
+    mu_t <- exp(log_mu_t)
+    loss <- loss + sum((y_proj[, t] - mu_t)^2)
+  }
+  return(loss)
+}
+
+# ==========================================
+# --- fGARCH Estimation Function ---
+# ==========================================
+fgarch_sim_estimation <- function(y, p, L, nbasis = 15, norder = 4, lambda = 1e-4, itermax = 200) {
+  N <- ncol(y)
+  sigma_out_squared <- matrix(NA, N - 2, L)
+  basis <- create.bspline.basis(c(0, 1), nbasis = nbasis, norder = norder)
+  fd_par_obj <- fdPar(basis, lambda = lambda, Lfdobj = 2)
+  times <- seq(0, 1, length.out = L)
+  
+  for (out in 2:(N - 1)) {
+    cat("Estimating fGARCH Day:", out, "/", N - 1, "\n")
+    y_train <- y[, -out, drop = FALSE]
+    y_test <- y[, out - 1]^2
+    
+    y_sq_fdsmooth <- smooth.basis(times, y_train^2, fdParobj = fd_par_obj)
+    functional_y_squared <- y_sq_fdsmooth$fd
+    mean_fd <- mean.fd(functional_y_squared)
+    pca_obj <- pca.fd(fdobj = functional_y_squared, nharm = p)
+    eigenfunctions <- pca_obj$harmonics
+    
+    ortho_basis_matrix <- sapply(1:p, function(i) eval.fd(times, eigenfunctions[i]))
+    y_squared_proj_coefs <- matrix(0, p, ncol(y_train))
+    for (i in 1:ncol(y_train)) {
+      for (j in 1:p) {
+        y_squared_proj_coefs[j, i] <- mean(y_train[, i]^2 * ortho_basis_matrix[, j])
+      }
+    }
+    
+    lower <- c(rep(-4, p + p^2), rep(-1, p^2))
+    upper <- c(rep(4, p + p^2), rep(1, p^2))
+    
+    res <- DEoptim(fn = fgarch_loss_fn, lower = lower, upper = upper,
+                   control = DEoptim.control(itermax = itermax, trace = FALSE),
+                   y_proj = y_squared_proj_coefs, p = p)
+    
+    best_params <- res$optim$bestmem
+    d_hat <- best_params[1:p]
+    A_hat <- matrix(best_params[(p + 1):(p + p^2)], p, p)
+    B_hat <- matrix(best_params[(p + p^2 + 1):(p + 2 * p^2)], p, p)
+    
+    alpha_M <- beta_M <- matrix(0, L, L)
+    for (i in 1:L) {
+      for (j in 1:L) {
+        alpha_M[i, j] <- sum(sapply(1:p, function(k) sum(A_hat[k, ] * ortho_basis_matrix[i, k] * ortho_basis_matrix[j, ])))
+        beta_M[i, j]  <- sum(sapply(1:p, function(k) sum(B_hat[k, ] * ortho_basis_matrix[i, k] * ortho_basis_matrix[j, ])))
+      }
+    }
+    
+    m_2 <- rowMeans(y_train^2)
+    delta_hat <- m_2 - rowMeans(alpha_M %*% m_2) - rowMeans(beta_M %*% m_2)
+    sigma_est <- delta_hat + alpha_M %*% y_test + beta_M %*% m_2
+    
+    sigma_out_squared[out - 1, ] <- pmax(as.vector(sigma_est), 1e-6)
+  }
+  
+  return(sigma_out_squared)
+}
+
+
+# ==========================================
+# --- Copula-fGARCH Estimation Function ---
+# ==========================================
+fgarch_sim_copula_estimation <- function(y, p, L, nbasis = 15, norder = 4, lambda = 1e-4, itermax = 200) {
+  N <- ncol(y)
+  sigma_out_squared <- matrix(NA, N - 2, L)
+  basis <- create.bspline.basis(c(0, 1), nbasis = nbasis, norder = norder)
+  fd_par_obj <- fdPar(basis, lambda = lambda, Lfdobj = 2)
+  times <- seq(0, 1, length.out = L)
+  
+  for (out in 2:(N - 1)) {
+    cat("Estimating Copula-fGARCH Day:", out, "/", N - 1, "\n")
+    y_train <- y[, -out, drop = FALSE]
+    y_test <- y[, out - 1]^2
+    
+    y_sq_fdsmooth <- smooth.basis(times, y_train^2, fdParobj = fd_par_obj)
+    functional_y_squared <- y_sq_fdsmooth$fd
+    mean_fd <- mean.fd(functional_y_squared)
+    pca_obj <- pca.fd(fdobj = functional_y_squared, nharm = p)
+    eigenfunctions <- pca_obj$harmonics
+    
+    Z <- matrix(NA, p, ncol(y_train))
+    for (i in 1:p) {
+      Z[i, ] <- sapply(1:ncol(y_train), function(k) {
+        inprod(fd(coef = functional_y_squared$coefs[, k], basisobj = basis), eigenfunctions[i]) -
+          inprod(mean_fd, eigenfunctions[i])
+      })
+    }
+    
+    u_data <- pobs(t(Z))
+    sims_list <- list()
+    n_sim <- ncol(Z)
+    
+    for (cop_type in c("gaussian", "clayton")) {
+      fit_cop <- tryCatch({
+        cop_obj <- switch(cop_type,
+                          "gaussian" = normalCopula(dim = p, dispstr = "un"),
+                          "clayton" = claytonCopula(dim = p))
+        fitCopula(cop_obj, u_data, method = "ml")
+      }, error = function(e) NULL)
+      
+      if (!is.null(fit_cop)) {
+        sim_cop <- rCopula(n_sim, fit_cop@copula)
+        sims_list[[length(sims_list) + 1]] <- qnorm(sim_cop)
+      }
+    }
+    
+    ortho_basis_matrix <- sapply(1:p, function(i) eval.fd(times, eigenfunctions[i]))
+    y_squared_proj_coefs <- matrix(0, p, ncol(y_train))
+    for (i in 1:ncol(y_train)) {
+      for (j in 1:p) {
+        y_squared_proj_coefs[j, i] <- mean(y_train[, i]^2 * ortho_basis_matrix[, j])
+      }
+    }
+    
+    lower <- c(rep(-4, p + p^2), rep(-1, p^2))
+    upper <- c(rep(4, p + p^2), rep(1, p^2))
+    
+    res <- DEoptim(fn = fgarch_loss_fn, lower = lower, upper = upper,
+                   control = DEoptim.control(itermax = itermax, trace = FALSE),
+                   y_proj = y_squared_proj_coefs, p = p)
+    
+    best_params <- res$optim$bestmem
+    d_hat <- best_params[1:p]
+    A_hat <- matrix(best_params[(p + 1):(p + p^2)], p, p)
+    B_hat <- matrix(best_params[(p + p^2 + 1):(p + 2 * p^2)], p, p)
+    
+    alpha_M <- beta_M <- matrix(0, L, L)
+    for (i in 1:L) {
+      for (j in 1:L) {
+        alpha_M[i, j] <- sum(sapply(1:p, function(k) sum(A_hat[k, ] * ortho_basis_matrix[i, k] * ortho_basis_matrix[j, ])))
+        beta_M[i, j]  <- sum(sapply(1:p, function(k) sum(B_hat[k, ] * ortho_basis_matrix[i, k] * ortho_basis_matrix[j, ])))
+      }
+    }
+    
+    m_2 <- rowMeans(y_train^2)
+    delta_hat <- m_2 - rowMeans(alpha_M %*% m_2) - rowMeans(beta_M %*% m_2)
+    sigma_est <- delta_hat + alpha_M %*% y_test + beta_M %*% m_2
+    
+    sigma_out_squared[out - 1, ] <- pmax(as.vector(sigma_est), 1e-6)
+  }
+  
+  return(sigma_out_squared)
+}
+
+# =====================
+# --- Run Estimations ---
+# =====================
+sigma_farch  <- estimate_farch(returns_use, L, p, nbasis, norder)
+sigma_cfarch <- estimate_cfarch(returns_use, L, p, nbasis, norder, lambda)
+sigma_fgarch  <- fgarch_sim_estimation(returns_use, p, L, nbasis, norder, lambda, itermax)
+sigma_cfgarch <- fgarch_sim_copula_estimation(returns_use, p, L, nbasis, norder, lambda, itermax)
+
+
+##
+
+# ============================
+# --- True Proxy Volatility
+# ============================
+# Use squared returns as proxy for true volatility
+true_vol <- t(returns_use^2)               # Dimensions: (N × L)
+pred_farch  <- sigma_farch                 # Dimensions: (N-2 × L)
+pred_cfarch <- sigma_cfarch                 # Dimensions: (N-2 × L)
+
+# Align proxy true volatility for the estimation window (day 2 to N−1)
+true_vol_eval <- true_vol[2:(nrow(true_vol) - 1), ]
+
+# ============================
+# --- Compute MAE and RMSE
+# ============================
+mae <- function(x, y) mean(abs(x - y))
+rmse <- function(x, y) sqrt(mean((x - y)^2))
+
+mae_farch  <- mae(pred_farch, true_vol_eval)
+mae_cfarch <- mae(pred_cfarch, true_vol_eval)
+
+rmse_farch  <- rmse(pred_farch, true_vol_eval)
+rmse_cfarch <- rmse(pred_cfarch, true_vol_eval)
+
+cat("\n--- Error Comparison ---\n")
+cat(sprintf("MAE  (fARCH):        %.5f\n", mae_farch))
+cat(sprintf("MAE  (Copula-fARCH): %.5f\n", mae_cfarch))
+cat(sprintf("RMSE (fARCH):        %.5f\n", rmse_farch))
+cat(sprintf("RMSE (Copula-fARCH): %.5f\n", rmse_cfarch))
+
+
+# ============================
+# --- Volatility Surface Plot for a Sample Day
+# ============================
+day_idx <- 60  # Choose a day index in 1:(N-2)
+
+df_plot <- data.frame(
+  Time = 1:L,
+  True = true_vol_eval[day_idx, ],
+  fARCH = pred_farch[day_idx, ],
+  Copula_fARCH = pred_cfarch[day_idx, ]
+)
+
+df_plot_melt <- melt(df_plot, id.vars = "Time")
+
+ggplot(df_plot_melt, aes(x = Time, y = value, color = variable, linetype = variable)) +
+  geom_line(linewidth = 1) +
+  labs(title = paste("Volatility Surface Comparison - Day", day_idx),
+       y = "Volatility",
+       x = "Time (Intraday Index)") +
+  theme_minimal() +
+  theme(legend.title = element_blank())
+
+
+# ============================
+# --- Statistical Evaluation: Error Distributions
+# ============================
+# Compute squared and absolute errors
+squared_error_farch  <- (pred_farch - true_vol_eval)^2
+squared_error_cfarch <- (pred_cfarch - true_vol_eval)^2
+
+absolute_error_farch  <- abs(pred_farch - true_vol_eval)
+absolute_error_cfarch <- abs(pred_cfarch - true_vol_eval)
+
+# Paired t-test on squared errors
+t_result <- t.test(as.vector(squared_error_farch),
+                   as.vector(squared_error_cfarch),
+                   paired = TRUE)
+
+cat("\n--- Paired t-test on Squared Errors ---\n")
+print(t_result)
+
+
+# ============================
+# --- Boxplot of Absolute Errors
+# ============================
+errors_df <- data.frame(
+  fARCH = as.vector(absolute_error_farch),
+  Copula_fARCH = as.vector(absolute_error_cfarch)
+)
+
+errors_melt <- melt(errors_df, measure.vars = c("fARCH", "Copula_fARCH"))
+
+ggplot(errors_melt, aes(x = variable, y = value, fill = variable)) +
+  geom_boxplot(outlier.shape = NA) +
+  coord_cartesian(ylim = quantile(errors_melt$value, c(0.01, 0.99))) +  # trim extreme outliers
+  labs(title = "Absolute Prediction Error Distribution",
+       x = "Model",
+       y = "Absolute Error") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+
+
+## Real Data Analysis
+# --- Load Required Libraries ---
+library(sde)
+library(fda)
+library(fdapace)
+library(MASS)
+library(copula)
+library(ggplot2)
+library(forecast)
+library(DEoptim)
+library(Matrix)
+library(tseries)  # for dm.test
+
+# --- Parameters ---
+L <- 345     # Intraday observations per day
+N <- 1349    # Number of days
+h <- 5       # Lag
+p <- 2       # Number of FPCs
+nbasis <- 64
+norder <- 5
+lambda <- 1e-4
+
+# --- Load Data ---
+data <- as.matrix(read.table("http://facultypages.morris.umn.edu/~jongmink/research/kospi.txt"))
+dim(data) <- c(L + h, N)
+log_data <- 100*log(data)
+returns <- t(log_data[(h+1):(L+h), ] - log_data[1:L, ])
+returns <- returns[, colSums(is.na(returns)) == 0]
+N <- ncol(returns)
+
+# --- Proxy Volatility ---
+proxy_vol <- returns[-1, ]^2
+
+
+
+# --- fARCH Estimation Function ---
+estimate_farch <- function(y_old, L, p, nbasis = 15, norder = 4) {
+  N <- nrow(y_old)
+  sigma_out_squared <- matrix(0, N - 2, L)
+  basis <- create.bspline.basis(rangeval = c(0, 1), nbasis = nbasis, norder = norder)
+  
+  for (out in 2:(N - 1)) {
+    cat("Estimating fARCH Day:", out, "/", N - 1, "\n")
+    y <- y_old[-out, , drop = FALSE]
+    y_sq_fdsmooth <- smooth.basis(seq(0, 1, length.out = L), t(y^2), fdParobj = basis)
+    functional_y_squared <- y_sq_fdsmooth$fd
+    principal_components <- pca.fd(fdobj = functional_y_squared, nharm = p)
+    eigenfunctions <- principal_components$harmonics
+    mean_fd <- mean.fd(functional_y_squared)
+    
+    Z <- matrix(0, p, ncol(y))
+    for (i in 1:p) {
+      for (k in 1:ncol(y)) {
+        Z[i, k] <- inprod(fd(coef = functional_y_squared$coefs[, k, drop = FALSE], basisobj = basis), eigenfunctions[i]) -
+          inprod(mean_fd, eigenfunctions[i])
+      }
+    }
+    
+    part1 <- part2 <- matrix(0, p, p)
+    for (k in 2:ncol(Z)) {
+      part1 <- part1 + Z[, k] %*% t(Z[, k - 1])
+      part2 <- part2 + Z[, k - 1] %*% t(Z[, k - 1])
+    }
+    M <- part1 %*% solve(part2)
+    
+    eigenvector <- lapply(1:p, function(i) eval.fd(seq(0, 1, length.out = L), eigenfunctions[i]))
+    beta_matrix_estimated <- Reduce(`+`, lapply(1:p, function(k) {
+      Reduce(`+`, lapply(1:p, function(ell) {
+        M[k, ell] * eigenvector[[k]] %*% t(eigenvector[[ell]])
+      }))
+    }))
+    
+    beta_hat <- function(x) t(beta_matrix_estimated %*% t(x)) / L
+    m_hat <- t(as.matrix(eval.fd(seq(0, 1, length.out = L), mean_fd)))
+    estimated_delta <- m_hat - beta_hat(m_hat)
+    sigma_out_squared[out - 1, ] <- estimated_delta + beta_hat(t(y_old[out - 1, ]^2))
+  }
+  return(sigma_out_squared)
+}
+
+# --- Copula-fARCH Estimation Function ---
+estimate_cfarch <- function(y_old, L, p, nbasis = 15, norder = 4, lambda = 1e-4) {
+  set.seed(123)  # For reproducibility
+  N <- nrow(y_old)
+  sigma_out_squared <- matrix(0, N - 2, L)
+  basis <- create.bspline.basis(c(0, 1), nbasis = nbasis, norder = norder)
+  fd_par_obj <- fdPar(basis, lambda = lambda, Lfdobj = 2)
+  times <- seq(0, 1, length.out = L)
+  
+  for (out in 2:(N - 1)) {
+    cat("Estimating Copula-fARCH Day:", out, "/", N - 1, "\n")
+    y <- y_old[-out, , drop = FALSE]
+    
+    # Smooth and compute FPCA
+    y_sq_fdsmooth <- smooth.basis(times, t(y^2), fdParobj = fd_par_obj)
+    functional_y_squared <- y_sq_fdsmooth$fd
+    mean_fd <- mean.fd(functional_y_squared)
+    pca_obj <- pca.fd(fdobj = functional_y_squared, nharm = p)
+    eigenfunctions <- pca_obj$harmonics
+    
+    # Project scores Z
+    Z <- matrix(0, p, ncol(y))
+    for (i in 1:p) {
+      for (k in 1:ncol(y)) {
+        Z[i, k] <- inprod(fd(coef = functional_y_squared$coefs[, k, drop = FALSE], basisobj = basis), eigenfunctions[i]) -
+          inprod(mean_fd, eigenfunctions[i])
+      }
+    }
+    
+    # --- Apply Copula to Simulate Improved Scores ---
+    u_data <- pobs(t(Z))
+    sims_list <- list()
+    n_sim <- ncol(Z)
+    
+    for (cop_type in c("gaussian", "clayton")) {
+      fit_cop <- tryCatch({
+        cop_obj <- switch(cop_type,
+                          "gaussian" = normalCopula(dim = p, dispstr = "un"),
+                          "clayton" = claytonCopula(dim = p))
+        fitCopula(cop_obj, u_data, method = "ml")
+      }, error = function(e) NULL)
+      
+      if (!is.null(fit_cop)) {
+        sim_cop <- rCopula(n_sim, fit_cop@copula)
+        sims_list[[length(sims_list) + 1]] <- qnorm(sim_cop)
+      }
+    }
+    
+    Z_used <- if (length(sims_list) > 0) {
+      t(Reduce("+", sims_list) / length(sims_list))
+    } else {
+      t(Z)
+    }
+    
+    # Estimate transition matrix M
+    part1 <- part2 <- matrix(0, p, p)
+    for (k in 2:ncol(Z_used)) {
+      part1 <- part1 + Z_used[, k] %*% t(Z_used[, k - 1])
+      part2 <- part2 + Z_used[, k - 1] %*% t(Z_used[, k - 1])
+    }
+    M <- part1 %*% solve(part2)
+    
+    # Reconstruct volatility surface
+    eigenvector <- lapply(1:p, function(i) eval.fd(times, eigenfunctions[i]))
+    beta_matrix_estimated <- Reduce(`+`, lapply(1:p, function(k) {
+      Reduce(`+`, lapply(1:p, function(ell) {
+        M[k, ell] * eigenvector[[k]] %*% t(eigenvector[[ell]])
+      }))
+    }))
+    
+    beta_hat <- function(x) t(beta_matrix_estimated %*% t(x)) / L
+    m_hat <- t(as.matrix(eval.fd(times, mean_fd)))
+    estimated_delta <- m_hat - beta_hat(m_hat)
+    
+    sigma_out_squared[out - 1, ] <- estimated_delta + beta_hat(t(y_old[out - 1, ]^2))
+  }
+  
+  return(sigma_out_squared)
+}
+
+
+# ==========================================
+# --- fGARCH Loss Function ---
+# ==========================================
+fgarch_loss_fn <- function(params, y_proj, p) {
+  d_hat <- params[1:p]
+  A_hat <- matrix(params[(p + 1):(p + p^2)], p, p)
+  B_hat <- matrix(params[(p + p^2 + 1):(p + 2 * p^2)], p, p)
+  
+  n_obs <- ncol(y_proj)
+  loss <- 0
+  for (t in 3:n_obs) {
+    log_mu_t <- d_hat + A_hat %*% y_proj[, t - 1] + B_hat %*% y_proj[, t - 2]
+    mu_t <- exp(log_mu_t)
+    loss <- loss + sum((y_proj[, t] - mu_t)^2)
+  }
+  return(loss)
+}
+
+# ==========================================
+# --- fGARCH Estimation Function ---
+# ==========================================
+fgarch_sim_estimation <- function(y, p, L, nbasis = 15, norder = 4, lambda = 1e-4, itermax = 200) {
+  N <- ncol(y)
+  sigma_out_squared <- matrix(NA, N - 2, L)
+  basis <- create.bspline.basis(c(0, 1), nbasis = nbasis, norder = norder)
+  fd_par_obj <- fdPar(basis, lambda = lambda, Lfdobj = 2)
+  times <- seq(0, 1, length.out = L)
+  
+  for (out in 2:(N - 1)) {
+    cat("Estimating fGARCH Day:", out, "/", N - 1, "\n")
+    y_train <- y[, -out, drop = FALSE]
+    y_test <- y[, out - 1]^2
+    
+    y_sq_fdsmooth <- smooth.basis(times, y_train^2, fdParobj = fd_par_obj)
+    functional_y_squared <- y_sq_fdsmooth$fd
+    mean_fd <- mean.fd(functional_y_squared)
+    pca_obj <- pca.fd(fdobj = functional_y_squared, nharm = p)
+    eigenfunctions <- pca_obj$harmonics
+    
+    ortho_basis_matrix <- sapply(1:p, function(i) eval.fd(times, eigenfunctions[i]))
+    y_squared_proj_coefs <- matrix(0, p, ncol(y_train))
+    for (i in 1:ncol(y_train)) {
+      for (j in 1:p) {
+        y_squared_proj_coefs[j, i] <- mean(y_train[, i]^2 * ortho_basis_matrix[, j])
+      }
+    }
+    
+    lower <- c(rep(-4, p + p^2), rep(-1, p^2))
+    upper <- c(rep(4, p + p^2), rep(1, p^2))
+    
+    res <- DEoptim(fn = fgarch_loss_fn, lower = lower, upper = upper,
+                   control = DEoptim.control(itermax = itermax, trace = FALSE),
+                   y_proj = y_squared_proj_coefs, p = p)
+    
+    best_params <- res$optim$bestmem
+    d_hat <- best_params[1:p]
+    A_hat <- matrix(best_params[(p + 1):(p + p^2)], p, p)
+    B_hat <- matrix(best_params[(p + p^2 + 1):(p + 2 * p^2)], p, p)
+    
+    alpha_M <- beta_M <- matrix(0, L, L)
+    for (i in 1:L) {
+      for (j in 1:L) {
+        alpha_M[i, j] <- sum(sapply(1:p, function(k) sum(A_hat[k, ] * ortho_basis_matrix[i, k] * ortho_basis_matrix[j, ])))
+        beta_M[i, j]  <- sum(sapply(1:p, function(k) sum(B_hat[k, ] * ortho_basis_matrix[i, k] * ortho_basis_matrix[j, ])))
+      }
+    }
+    
+    m_2 <- rowMeans(y_train^2)
+    delta_hat <- m_2 - rowMeans(alpha_M %*% m_2) - rowMeans(beta_M %*% m_2)
+    sigma_est <- delta_hat + alpha_M %*% y_test + beta_M %*% m_2
+    
+    sigma_out_squared[out - 1, ] <- pmax(as.vector(sigma_est), 1e-6)
+  }
+  
+  return(sigma_out_squared)
+}
+
+
+# ==========================================
+# --- Copula-fGARCH Estimation Function ---
+# ==========================================
+fgarch_sim_copula_estimation <- function(y, p, L, nbasis = 15, norder = 4, lambda = 1e-4, itermax = 200) {
+  N <- ncol(y)
+  sigma_out_squared <- matrix(NA, N - 2, L)
+  basis <- create.bspline.basis(c(0, 1), nbasis = nbasis, norder = norder)
+  fd_par_obj <- fdPar(basis, lambda = lambda, Lfdobj = 2)
+  times <- seq(0, 1, length.out = L)
+  
+  for (out in 2:(N - 1)) {
+    cat("Estimating Copula-fGARCH Day:", out, "/", N - 1, "\n")
+    y_train <- y[, -out, drop = FALSE]
+    y_test <- y[, out - 1]^2
+    
+    y_sq_fdsmooth <- smooth.basis(times, y_train^2, fdParobj = fd_par_obj)
+    functional_y_squared <- y_sq_fdsmooth$fd
+    mean_fd <- mean.fd(functional_y_squared)
+    pca_obj <- pca.fd(fdobj = functional_y_squared, nharm = p)
+    eigenfunctions <- pca_obj$harmonics
+    
+    Z <- matrix(NA, p, ncol(y_train))
+    for (i in 1:p) {
+      Z[i, ] <- sapply(1:ncol(y_train), function(k) {
+        inprod(fd(coef = functional_y_squared$coefs[, k], basisobj = basis), eigenfunctions[i]) -
+          inprod(mean_fd, eigenfunctions[i])
+      })
+    }
+    
+    u_data <- pobs(t(Z))
+    sims_list <- list()
+    n_sim <- ncol(Z)
+    
+    for (cop_type in c("gaussian", "clayton")) {
+      fit_cop <- tryCatch({
+        cop_obj <- switch(cop_type,
+                          "gaussian" = normalCopula(dim = p, dispstr = "un"),
+                          "clayton" = claytonCopula(dim = p))
+        fitCopula(cop_obj, u_data, method = "ml")
+      }, error = function(e) NULL)
+      
+      if (!is.null(fit_cop)) {
+        sim_cop <- rCopula(n_sim, fit_cop@copula)
+        sims_list[[length(sims_list) + 1]] <- qnorm(sim_cop)
+      }
+    }
+    
+    ortho_basis_matrix <- sapply(1:p, function(i) eval.fd(times, eigenfunctions[i]))
+    y_squared_proj_coefs <- matrix(0, p, ncol(y_train))
+    for (i in 1:ncol(y_train)) {
+      for (j in 1:p) {
+        y_squared_proj_coefs[j, i] <- mean(y_train[, i]^2 * ortho_basis_matrix[, j])
+      }
+    }
+    
+    lower <- c(rep(-4, p + p^2), rep(-1, p^2))
+    upper <- c(rep(4, p + p^2), rep(1, p^2))
+    
+    res <- DEoptim(fn = fgarch_loss_fn, lower = lower, upper = upper,
+                   control = DEoptim.control(itermax = itermax, trace = FALSE),
+                   y_proj = y_squared_proj_coefs, p = p)
+    
+    best_params <- res$optim$bestmem
+    d_hat <- best_params[1:p]
+    A_hat <- matrix(best_params[(p + 1):(p + p^2)], p, p)
+    B_hat <- matrix(best_params[(p + p^2 + 1):(p + 2 * p^2)], p, p)
+    
+    alpha_M <- beta_M <- matrix(0, L, L)
+    for (i in 1:L) {
+      for (j in 1:L) {
+        alpha_M[i, j] <- sum(sapply(1:p, function(k) sum(A_hat[k, ] * ortho_basis_matrix[i, k] * ortho_basis_matrix[j, ])))
+        beta_M[i, j]  <- sum(sapply(1:p, function(k) sum(B_hat[k, ] * ortho_basis_matrix[i, k] * ortho_basis_matrix[j, ])))
+      }
+    }
+    
+    m_2 <- rowMeans(y_train^2)
+    delta_hat <- m_2 - rowMeans(alpha_M %*% m_2) - rowMeans(beta_M %*% m_2)
+    sigma_est <- delta_hat + alpha_M %*% y_test + beta_M %*% m_2
+    
+    sigma_out_squared[out - 1, ] <- pmax(as.vector(sigma_est), 1e-6)
+  }
+  
+  return(sigma_out_squared)
+}
+
+
+# --- Run All Estimations ---
+sigma_farch   <- estimate_farch(returns, L, p)
+sigma_cfarch  <- estimate_cfarch(returns, L, p, nbasis, norder, lambda)
+sigma_fgarch  <- fgarch_sim_estimation(t(returns), p, L, nbasis, norder, lambda, itermax)
+sigma_cfgarch <- fgarch_sim_copula_estimation(t(returns), p, L, nbasis, norder, lambda, itermax)
+
+# --- Evaluation Function ---
+evaluate_model <- function(est, proxy) {
+  proxy_sub <- proxy[1:nrow(est), ]
+  error <- est - proxy_sub
+  
+  rmse <- sqrt(mean(error^2, na.rm = TRUE))
+  mse  <- mean(error^2, na.rm = TRUE)
+  mae  <- mean(abs(error), na.rm = TRUE)
+  
+  # Avoid division by zero for MAPE
+  mape <- mean(abs((proxy_sub - est) / ifelse(proxy_sub == 0, NA, proxy_sub)), na.rm = TRUE) * 100
+  
+  # MSLE: Mean Squared Logarithmic Error
+  log_est <- log1p(pmax(est, 0))
+  log_proxy <- log1p(pmax(proxy_sub, 0))
+  msle <- mean((log_est - log_proxy)^2, na.rm = TRUE)
+  
+  corr <- mean(sapply(1:nrow(est), function(i) cor(est[i, ], proxy_sub[i, ], use = "complete.obs")), na.rm = TRUE)
+  
+  return(list(RMSE = rmse, MSE = mse, MAE = mae, MAPE = mape, MSLE = msle, Corr = corr))
+}
+
+# --- Evaluate All Models ---
+eval_cfarch  <- evaluate_model(sigma_cfarch, proxy_vol)
+eval_farch   <- evaluate_model(sigma_farch, proxy_vol)
+eval_fgarch  <- evaluate_model(sigma_fgarch, proxy_vol)
+eval_cfgarch <- evaluate_model(sigma_cfgarch, proxy_vol)
+
+# --- Log-likelihood Function ---
+loglik_fun <- function(est, proxy) {
+  sigma_eps <- sd(proxy[1:nrow(est), ] - est, na.rm = TRUE)
+  sum(dnorm(as.vector(proxy[1:nrow(est), ]), mean = as.vector(est), sd = sigma_eps, log = TRUE), na.rm = TRUE)
+}
+
+# --- Compute Log-likelihoods ---
+loglik_cfarch  <- loglik_fun(sigma_cfarch, proxy_vol)
+loglik_farch   <- loglik_fun(sigma_farch, proxy_vol)
+loglik_fgarch  <- loglik_fun(sigma_fgarch, proxy_vol)
+loglik_cfgarch <- loglik_fun(sigma_cfgarch, proxy_vol)
+
+# --- AIC / BIC ---
+k <- p  # Number of parameters (approx)
+n <- nrow(proxy_vol)
+aic <- function(ll, k) -2 * ll + 2 * k
+bic <- function(ll, k, n) -2 * ll + log(n) * k
+
+# --- Compute AIC / BIC ---
+aic_cfarch  <- aic(loglik_cfarch, k)
+bic_cfarch  <- bic(loglik_cfarch, k, n)
+aic_farch   <- aic(loglik_farch, k)
+bic_farch   <- bic(loglik_farch, k, n)
+aic_fgarch  <- aic(loglik_fgarch, k)
+bic_fgarch  <- bic(loglik_fgarch, k, n)
+aic_cfgarch <- aic(loglik_cfgarch, k)
+bic_cfgarch <- bic(loglik_cfgarch, k, n)
+
+# --- Summary Table ---
+result_table <- data.frame(
+  Model = c("Copula-fARCH", "fARCH", "fGARCH", "Copula-fGARCH"),
+  RMSE = c(eval_cfarch$RMSE, eval_farch$RMSE, eval_fgarch$RMSE, eval_cfgarch$RMSE),
+  MSE = c(eval_cfarch$MSE, eval_farch$MSE, eval_fgarch$MSE, eval_cfgarch$MSE),
+  MAE = c(eval_cfarch$MAE, eval_farch$MAE, eval_fgarch$MAE, eval_cfgarch$MAE),
+  MAPE = c(eval_cfarch$MAPE, eval_farch$MAPE, eval_fgarch$MAPE, eval_cfgarch$MAPE),
+  MSLE = c(eval_cfarch$MSLE, eval_farch$MSLE, eval_fgarch$MSLE, eval_cfgarch$MSLE),
+  Correlation = c(eval_cfarch$Corr, eval_farch$Corr, eval_fgarch$Corr, eval_cfgarch$Corr),
+  LogLikelihood = c(loglik_cfarch, loglik_farch, loglik_fgarch, loglik_cfgarch),
+  AIC = c(aic_cfarch, aic_farch, aic_fgarch, aic_cfgarch),
+  BIC = c(bic_cfarch, bic_farch, bic_fgarch, bic_cfgarch)
+)
+
+# --- Print Results ---
+print(result_table)
+
+
+# ============================
+# --- True Proxy Volatility
+# ============================
+# Use squared returns as proxy for true volatility
+true_vol <- returns^2               # Dimensions: (N × L)
+pred_farch  <- sigma_farch                 # Dimensions: (N-2 × L)
+pred_cfarch <- sigma_cfarch                 # Dimensions: (N-2 × L)
+pred_fgarch  <- sigma_fgarch                 # Dimensions: (N-2 × L)
+pred_cfgarch <- sigma_cfgarch                 # Dimensions: (N-2 × L)
+
+# Align proxy true volatility for the estimation window (day 2 to N−1)
+true_vol_eval <- true_vol[2:(nrow(true_vol) - 1), ]
+
+
+# ============================
+# --- Volatility Surface Plot for a Sample Day
+# ============================
+day_idx <- 60  # Choose a day index in 1:(N-2)
+
+df_plot <- data.frame(
+  Time = 1:L,
+  True = true_vol_eval[day_idx, ],
+  fARCH = pred_farch[day_idx, ],
+  Copula_fARCH = pred_cfarch[day_idx, ],
+  fGARCH = pred_fgarch[day_idx, ],
+  Copula_fGARCH = pred_cfgarch[day_idx, ]
+)
+
+df_plot_melt <- melt(df_plot, id.vars = "Time")
+
+ggplot(df_plot_melt, aes(x = Time, y = value, color = variable, linetype = variable)) +
+  geom_line(linewidth = 1) +
+  labs(title = paste("KOSPI Volatility Surface Comparison - Day", day_idx),
+       y = "Volatility",
+       x = "Time (Intraday Index)") +
+  theme_minimal() +
+  theme(legend.title = element_blank())
+
+
+df_plot <- data.frame(
+  Time = 1:L,
+  True = true_vol_eval[day_idx, ],
+  fARCH = pred_farch[day_idx, ],
+  Copula_fARCH = pred_cfarch[day_idx, ]
+  #  fGARCH = pred_fgarch[day_idx, ],
+  #  Copula_fGARCH = pred_cfgarch[day_idx, ]
+)
+
+df_plot_melt <- melt(df_plot, id.vars = "Time")
+
+ggplot(df_plot_melt, aes(x = Time, y = value, color = variable, linetype = variable)) +
+  geom_line(linewidth = 1) +
+  labs(title = paste("KOSPI Volatility Surface Comparison - Day", day_idx),
+       y = "Volatility",
+       x = "Time (Intraday Index)") +
+  theme_minimal() +
+  theme(legend.title = element_blank())
+
+
+# --- Diebold-Mariano test for MSE comparison ---
+mse_cfarch_vec  <- rowMeans((sigma_cfarch - proxy_vol[1:nrow(sigma_cfarch), ])^2)
+mse_farch_vec   <- rowMeans((sigma_farch - proxy_vol[1:nrow(sigma_farch), ])^2)
+mse_fgarch_vec  <- rowMeans((sigma_fgarch - proxy_vol[1:nrow(sigma_fgarch), ])^2)
+mse_cfgarch_vec <- rowMeans((sigma_cfgarch - proxy_vol[1:nrow(sigma_cfgarch), ])^2)
+
+dm_cfarch_farch   <- dm.test(mse_cfarch_vec, mse_farch_vec, alternative = "two.sided", h = 1)
+dm_cfarch_fgarch  <- dm.test(mse_cfarch_vec, mse_fgarch_vec, alternative = "two.sided", h = 1)
+dm_cfarch_cfgarch <- dm.test(mse_cfarch_vec, mse_cfgarch_vec, alternative = "two.sided", h = 1)
+
+cat("\nDiebold-Mariano Tests (Copula-fARCH vs. Others):\n")
+print(dm_cfarch_farch)
+print(dm_cfarch_fgarch)
+print(dm_cfarch_cfgarch)
+
+
+
+

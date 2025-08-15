@@ -1,3 +1,6 @@
+# Statistics A Journal of Theoretical and Applied Statistics Volume 58, 2024 - Issue 3, Pages 749-769
+# https://www.tandfonline.com/doi/full/10.1080/02331888.2024.2364688
+# Copula deep learning control chart for multivariate zero inflated count response variables
 library(neuralnet)
 library(copula)
 
@@ -5873,5 +5876,6 @@ q1 = cusum(vinenn1.Y1_r_out[1:300], newdata=vinenn1.Y1_r_out[301:400],
 q2 = cusum(vinedl1.Y2_r_out[1:300], newdata=vinedl1.Y2_r_out[301:400],
            add.stats=FALSE,
            title="Vine Copula Neural Network of Y2", xlab="", ylab="")
+
 
 

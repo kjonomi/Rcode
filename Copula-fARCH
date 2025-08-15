@@ -364,8 +364,6 @@ sigma_fgarch  <- fgarch_sim_estimation(returns_use, p, L, nbasis, norder, lambda
 sigma_cfgarch <- fgarch_sim_copula_estimation(returns_use, p, L, nbasis, norder, lambda, itermax)
 
 
-##
-
 # ============================
 # --- True Proxy Volatility
 # ============================
@@ -373,42 +371,54 @@ sigma_cfgarch <- fgarch_sim_copula_estimation(returns_use, p, L, nbasis, norder,
 true_vol <- t(returns_use^2)               # Dimensions: (N × L)
 pred_farch  <- sigma_farch                 # Dimensions: (N-2 × L)
 pred_cfarch <- sigma_cfarch                 # Dimensions: (N-2 × L)
+pred_fgarch  <- sigma_fgarch                 # Dimensions: (N-2 × L)
+pred_cfgarch <- sigma_cfgarch                 # Dimensions: (N-2 × L)
 
-# Align proxy true volatility for the estimation window (day 2 to N−1)
+
+# Align proxy true volatility to match prediction days (2 to N-1)
 true_vol_eval <- true_vol[2:(nrow(true_vol) - 1), ]
-
-# ============================
-# --- Compute MAE and RMSE
-# ============================
-mae <- function(x, y) mean(abs(x - y))
-rmse <- function(x, y) sqrt(mean((x - y)^2))
-
-mae_farch  <- mae(pred_farch, true_vol_eval)
-mae_cfarch <- mae(pred_cfarch, true_vol_eval)
-
-rmse_farch  <- rmse(pred_farch, true_vol_eval)
-rmse_cfarch <- rmse(pred_cfarch, true_vol_eval)
-
-cat("\n--- Error Comparison ---\n")
-cat(sprintf("MAE  (fARCH):        %.5f\n", mae_farch))
-cat(sprintf("MAE  (Copula-fARCH): %.5f\n", mae_cfarch))
-cat(sprintf("RMSE (fARCH):        %.5f\n", rmse_farch))
-cat(sprintf("RMSE (Copula-fARCH): %.5f\n", rmse_cfarch))
 
 
 # ============================
 # --- Volatility Surface Plot for a Sample Day
 # ============================
 day_idx <- 60  # Choose a day index in 1:(N-2)
+df_plot <- data.frame(
+  Time = 1:L,
+  True = true_vol_eval[day_idx, ],
+  fARCH = pred_farch[day_idx, ],
+  Copula_fARCH = pred_cfarch[day_idx, ],
+  fGARCH = pred_fgarch[day_idx, ],
+  Copula_fGARCH = pred_cfgarch[day_idx, ]
+  )
 
+df_plot_melt <- reshape2::melt(df_plot, id.vars = "Time")
+
+ggplot(df_plot_melt, aes(x = Time, y = value, color = variable, linetype = variable)) +
+  geom_line(linewidth = 1) +
+  labs(title = paste("Volatility Surface Comparison - Day", day_idx),
+       y = "Volatility",
+       x = "Time (Intraday Index)") +
+  theme_minimal() +
+  theme(legend.title = element_blank())
+
+df_plot_melt <- reshape2::melt(df_plot, id.vars = "Time")
+
+
+# ============================
+# --- Volatility Surface Plot for a Sample Day
+# ============================
+day_idx <- 60  # Choose a day index in 1:(N-2)
 df_plot <- data.frame(
   Time = 1:L,
   True = true_vol_eval[day_idx, ],
   fARCH = pred_farch[day_idx, ],
   Copula_fARCH = pred_cfarch[day_idx, ]
+#  fGARCH = pred_fgarch[day_idx, ],
+#  Copula_fGARCH = pred_cfgarch[day_idx, ]
 )
 
-df_plot_melt <- melt(df_plot, id.vars = "Time")
+df_plot_melt <- reshape2::melt(df_plot, id.vars = "Time")
 
 ggplot(df_plot_melt, aes(x = Time, y = value, color = variable, linetype = variable)) +
   geom_line(linewidth = 1) +
@@ -420,20 +430,37 @@ ggplot(df_plot_melt, aes(x = Time, y = value, color = variable, linetype = varia
 
 
 # ============================
-# --- Statistical Evaluation: Error Distributions
+# --- Compute MAE and RMSE
 # ============================
-# Compute squared and absolute errors
-squared_error_farch  <- (pred_farch - true_vol_eval)^2
-squared_error_cfarch <- (pred_cfarch - true_vol_eval)^2
+mae <- function(x, y) mean(abs(x - y))
+rmse <- function(x, y) sqrt(mean((x - y)^2))
 
-absolute_error_farch  <- abs(pred_farch - true_vol_eval)
-absolute_error_cfarch <- abs(pred_cfarch - true_vol_eval)
+mae_fgarch  <- mae(pred_fgarch, true_vol_eval)
+mae_cfgarch <- mae(pred_cfgarch, true_vol_eval)
 
-# Paired t-test on squared errors
-t_result <- t.test(as.vector(squared_error_farch),
-                   as.vector(squared_error_cfarch),
-                   paired = TRUE)
+rmse_fgarch  <- rmse(pred_fgarch, true_vol_eval)
+rmse_cfgarch <- rmse(pred_cfgarch, true_vol_eval)
 
+cat("\n--- Error Comparison ---\n")
+cat("MAE  (fGARCH):        ", round(mae_fgarch, 5), "\n")
+cat("MAE  (Copula-fGARCH): ", round(mae_cfgarch, 5), "\n")
+cat("RMSE (fGARCH):        ", round(rmse_fgarch, 5), "\n")
+cat("RMSE (Copula-fGARCH): ", round(rmse_cfgarch, 5), "\n")
+
+
+# ============================
+# --- Statistical Evaluation
+# ============================
+
+# --- Compute Squared and Absolute Errors ---
+squared_error_fgarch  <- as.vector((pred_fgarch - true_vol_eval)^2)
+squared_error_cfgarch <- as.vector((pred_cfgarch - true_vol_eval)^2)
+
+absolute_error_fgarch  <- as.vector(abs(pred_fgarch - true_vol_eval))
+absolute_error_cfgarch <- as.vector(abs(pred_cfgarch - true_vol_eval))
+
+# --- Paired t-test on Squared Errors ---
+t_result <- t.test(squared_error_fgarch, squared_error_cfgarch, paired = TRUE)
 cat("\n--- Paired t-test on Squared Errors ---\n")
 print(t_result)
 
@@ -441,16 +468,17 @@ print(t_result)
 # ============================
 # --- Boxplot of Absolute Errors
 # ============================
+
 errors_df <- data.frame(
-  fARCH = as.vector(absolute_error_farch),
-  Copula_fARCH = as.vector(absolute_error_cfarch)
+  fGARCH = absolute_error_fgarch,
+  Copula_fGARCH = absolute_error_cfgarch
 )
 
-errors_melt <- melt(errors_df, measure.vars = c("fARCH", "Copula_fARCH"))
+errors_melt <- reshape2::melt(errors_df, measure.vars = c("fGARCH", "Copula_fGARCH"))
 
 ggplot(errors_melt, aes(x = variable, y = value, fill = variable)) +
   geom_boxplot(outlier.shape = NA) +
-  coord_cartesian(ylim = quantile(errors_melt$value, c(0.01, 0.99))) +  # trim extreme outliers
+  coord_cartesian(ylim = quantile(errors_melt$value, c(0.01, 0.99))) +  # Optional: remove extreme outliers
   labs(title = "Absolute Prediction Error Distribution",
        x = "Model",
        y = "Absolute Error") +
@@ -458,8 +486,103 @@ ggplot(errors_melt, aes(x = variable, y = value, fill = variable)) +
   theme(legend.position = "none")
 
 
+# --- Summary Statistics Function ---
+summary_stats <- function(x) {
+  c(
+    Mean   = mean(x, na.rm = TRUE),
+    Median = median(x, na.rm = TRUE),
+    SD     = sd(x, na.rm = TRUE),
+    Min    = min(x, na.rm = TRUE),
+    Max    = max(x, na.rm = TRUE),
+    IQR    = IQR(x, na.rm = TRUE)
+  )
+}
 
-## Real Data Analysis
+# Apply to all models
+summary_df <- sapply(errors_df, summary_stats)
+summary_df <- round(as.data.frame(t(summary_df)), 6)
+summary_df
+
+# --- Proxy Volatility ---
+proxy_vol <- t(returns_use^2)  # N × L
+
+# --- Evaluation Function ---
+evaluate_model <- function(est, proxy) {
+  proxy_sub <- proxy[1:nrow(est), ]
+  error <- est - proxy_sub
+  
+  rmse <- sqrt(mean(error^2, na.rm = TRUE))
+  mse  <- mean(error^2, na.rm = TRUE)
+  mae  <- mean(abs(error), na.rm = TRUE)
+  
+  # Avoid division by zero for MAPE
+  mape <- mean(abs((proxy_sub - est) / ifelse(proxy_sub == 0, NA, proxy_sub)), na.rm = TRUE) * 100
+  
+  # MSLE: Mean Squared Logarithmic Error
+  log_est <- log1p(pmax(est, 0))
+  log_proxy <- log1p(pmax(proxy_sub, 0))
+  msle <- mean((log_est - log_proxy)^2, na.rm = TRUE)
+  
+  corr <- mean(sapply(1:nrow(est), function(i) cor(est[i, ], proxy_sub[i, ], use = "complete.obs")), na.rm = TRUE)
+  
+  return(list(RMSE = rmse, MSE = mse, MAE = mae, MAPE = mape, MSLE = msle, Corr = corr))
+}
+
+# --- Evaluate All Models ---
+eval_cfarch  <- evaluate_model(sigma_cfarch, proxy_vol)
+eval_farch   <- evaluate_model(sigma_farch, proxy_vol)
+eval_fgarch  <- evaluate_model(sigma_fgarch, proxy_vol)
+eval_cfgarch <- evaluate_model(sigma_cfgarch, proxy_vol)
+
+# --- Log-likelihood Function ---
+loglik_fun <- function(est, proxy) {
+  sigma_eps <- sd(proxy[1:nrow(est), ] - est, na.rm = TRUE)
+  sum(dnorm(as.vector(proxy[1:nrow(est), ]), mean = as.vector(est), sd = sigma_eps, log = TRUE), na.rm = TRUE)
+}
+
+# --- Compute Log-likelihoods ---
+loglik_cfarch  <- loglik_fun(sigma_cfarch, proxy_vol)
+loglik_farch   <- loglik_fun(sigma_farch, proxy_vol)
+loglik_fgarch  <- loglik_fun(sigma_fgarch, proxy_vol)
+loglik_cfgarch <- loglik_fun(sigma_cfgarch, proxy_vol)
+
+# --- AIC / BIC ---
+k <- p  # Number of parameters (approx)
+n <- nrow(proxy_vol)
+aic <- function(ll, k) -2 * ll + 2 * k
+bic <- function(ll, k, n) -2 * ll + log(n) * k
+
+# --- Compute AIC / BIC ---
+aic_cfarch  <- aic(loglik_cfarch, k)
+bic_cfarch  <- bic(loglik_cfarch, k, n)
+aic_farch   <- aic(loglik_farch, k)
+bic_farch   <- bic(loglik_farch, k, n)
+aic_fgarch  <- aic(loglik_fgarch, k)
+bic_fgarch  <- bic(loglik_fgarch, k, n)
+aic_cfgarch <- aic(loglik_cfgarch, k)
+bic_cfgarch <- bic(loglik_cfgarch, k, n)
+
+# --- Summary Table ---
+result_table <- data.frame(
+  Model = c("Copula-fARCH", "fARCH", "fGARCH", "Copula-fGARCH"),
+  RMSE = c(eval_cfarch$RMSE, eval_farch$RMSE, eval_fgarch$RMSE, eval_cfgarch$RMSE),
+  MSE = c(eval_cfarch$MSE, eval_farch$MSE, eval_fgarch$MSE, eval_cfgarch$MSE),
+  MAE = c(eval_cfarch$MAE, eval_farch$MAE, eval_fgarch$MAE, eval_cfgarch$MAE),
+  MAPE = c(eval_cfarch$MAPE, eval_farch$MAPE, eval_fgarch$MAPE, eval_cfgarch$MAPE),
+  MSLE = c(eval_cfarch$MSLE, eval_farch$MSLE, eval_fgarch$MSLE, eval_cfgarch$MSLE),
+  Correlation = c(eval_cfarch$Corr, eval_farch$Corr, eval_fgarch$Corr, eval_cfgarch$Corr),
+  LogLikelihood = c(loglik_cfarch, loglik_farch, loglik_fgarch, loglik_cfgarch),
+  AIC = c(aic_cfarch, aic_farch, aic_fgarch, aic_cfgarch),
+  BIC = c(bic_cfarch, bic_farch, bic_fgarch, bic_cfgarch)
+)
+
+# --- Print Results ---
+print(result_table)
+
+
+##################################
+###### Real Data Analysis
+##################################
 # --- Load Required Libraries ---
 library(sde)
 library(fda)

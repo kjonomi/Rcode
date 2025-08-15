@@ -1,4 +1,5 @@
 # mathematics-3772632 (August 04, 2025) Accepted by Mathematics Journal.	
+# https://www.mdpi.com/2227-7390/13/15/2523
 # Title: LLM-Guided Ensemble Learning for Contextual Bandits with Copula and Gaussian Process Models
 # --- Required Libraries ---
 library(rugarch)      # for fGARCH simulation

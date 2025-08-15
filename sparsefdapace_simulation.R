@@ -1,3 +1,6 @@
+# Applied Economics Letters  Volume 31, 2024 - Issue 12, Pages 1142-1149.
+# https://www.tandfonline.com/doi/full/10.1080/13504851.2023.2176440
+# Finding hidden structure of sparse longitudinal data via functional Eigenfunctions
 library(sde)
 library(fda)
 library(fdapace)
@@ -142,5 +145,6 @@ vuong$p.value.Schwarz
 
 plot(RVM)
 plot(CVM)
+
 
 

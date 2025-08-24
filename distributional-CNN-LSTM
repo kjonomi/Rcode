@@ -1,0 +1,1381 @@
+
+##################################
+## Bivariate Case
+##################################
+
+## Binodal distribution
+rm(list = ls())  # clears entire workspace
+
+# =========================================
+# Libraries
+# =========================================
+library(keras)
+library(tensorflow)
+library(MASS)       # mvrnorm
+library(copula)
+library(mvtnorm)
+library(stats)
+library(ellipse)
+
+set.seed(123)
+tf$random$set_seed(123L)
+
+# =========================================
+# 1) Simulate binodal (mixture of two Gaussians) + measurement error
+# =========================================
+n <- 2000
+
+# First mode
+mu1 <- c(-2, -2)
+Sigma1 <- matrix(c(1, 0.6, 0.6, 1), 2, 2)
+
+# Second mode
+mu2 <- c(2, 2)
+Sigma2 <- matrix(c(1, -0.6, -0.6, 1), 2, 2)
+
+# Mixture weights
+p <- 0.5   # 50% each mode
+
+# Sample component labels
+comp <- rbinom(n, 1, p)
+
+# Generate latent data
+latent <- matrix(0, n, 2)
+latent[comp == 0, ] <- mvrnorm(sum(comp == 0), mu = mu1, Sigma = Sigma1)
+latent[comp == 1, ] <- mvrnorm(sum(comp == 1), mu = mu2, Sigma = Sigma2)
+
+# Add measurement error
+err_sd <- c(0.55, 0.65)
+obs <- latent + matrix(rnorm(n * 2, sd = rep(err_sd, each = n)), ncol = 2)
+
+# =========================================
+# Visualization
+# =========================================
+plot(obs, col = rgb(0.2, 0.4, 0.6, 0.4), pch = 16, xlab = "X1", ylab = "X2",
+     main = "Binodal (Two-Mode) Distribution with Noise")
+
+
+rm(list = ls())  # clears entire workspace
+
+# =========================================
+# Libraries
+# =========================================
+library(keras)
+library(tensorflow)
+library(MASS)       # mvrnorm
+library(copula)
+library(mvtnorm)
+library(stats)
+library(ellipse)
+library(grf)
+library(ggplot2)
+library(gridExtra)
+library(grid)
+library(knitr)
+
+set.seed(123)
+tf$random$set_seed(123L)
+
+# =========================================
+# 1) Simulate asymmetric, wide-spread binodal distribution
+# =========================================
+n <- 2000
+mu1 <- c(-4, -1)
+Sigma1 <- matrix(c(3, 1.8, 1.8, 2), 2,2)
+mu2 <- c(5, 3)
+Sigma2 <- matrix(c(4, -1.2, -1.2, 3), 2,2)
+p <- 0.6
+comp <- rbinom(n, 1, p)
+latent <- matrix(0, n, 2)
+latent[comp==0, ] <- mvrnorm(sum(comp==0), mu1, Sigma1)
+latent[comp==1, ] <- mvrnorm(sum(comp==1), mu2, Sigma2)
+err_sd <- c(0.55, 0.65)
+obs <- latent + matrix(rnorm(n*2, sd=rep(err_sd, each=n)), ncol=2)
+
+plot(obs, col = rgb(0.2, 0.4, 0.6, 0.4), pch = 16, xlab = "X1", ylab = "X2",
+     main = "Binodal (Two-Mode) Distribution with Noise")
+
+
+rm(list = ls())  # clears entire workspace
+
+# =========================================
+# 1) Simulate asymmetric, wide-spread three-mode distribution
+# =========================================
+n <- 2000
+
+# Component 1
+mu1 <- c(-4, -1)
+Sigma1 <- matrix(c(3, 1.8, 1.8, 2), 2, 2)
+
+# Component 2
+mu2 <- c(5, 3)
+Sigma2 <- matrix(c(4, -1.2, -1.2, 3), 2, 2)
+
+# Component 3
+mu3 <- c(0, 5)
+Sigma3 <- matrix(c(2, 0.5, 0.5, 1.5), 2, 2)
+
+# Mixing probabilities (sum = 1)
+p <- c(0.4, 0.35, 0.25)
+
+# Sample component assignments
+comp <- sample(1:3, size = n, replace = TRUE, prob = p)
+
+# Generate latent data
+latent <- matrix(0, n, 2)
+latent[comp == 1, ] <- mvrnorm(sum(comp == 1), mu1, Sigma1)
+latent[comp == 2, ] <- mvrnorm(sum(comp == 2), mu2, Sigma2)
+latent[comp == 3, ] <- mvrnorm(sum(comp == 3), mu3, Sigma3)
+
+# Add observation noise
+err_sd <- c(0.55, 0.65)
+obs <- latent + matrix(rnorm(n*2, sd=rep(err_sd, each=n)), ncol=2)
+
+# Plot
+plot(obs, col = rgb(0.2, 0.4, 0.6, 0.4), pch = 16,
+     xlab = "X1", ylab = "X2",
+     main = "Trimodal (Three-Mode) Distribution with Noise")
+
+
+rm(list = ls())  # clears entire workspace
+
+# =========================================
+# 1) Simulate asymmetric, wide-spread four-mode distribution
+# =========================================
+n <- 2000
+
+# Component 1
+mu1 <- c(-4, -1)
+Sigma1 <- matrix(c(3, 1.8, 1.8, 2), 2, 2)
+
+# Component 2
+mu2 <- c(5, 3)
+Sigma2 <- matrix(c(4, -1.2, -1.2, 3), 2, 2)
+
+# Component 3
+mu3 <- c(0, 5)
+Sigma3 <- matrix(c(2, 0.5, 0.5, 1.5), 2, 2)
+
+# Component 4
+mu4 <- c(6, -3)
+Sigma4 <- matrix(c(3, -0.8, -0.8, 2.5), 2, 2)
+
+# Mixing probabilities (sum = 1)
+p <- c(0.3, 0.25, 0.25, 0.20)
+
+# Sample component assignments
+comp <- sample(1:4, size = n, replace = TRUE, prob = p)
+
+# Generate latent data
+latent <- matrix(0, n, 2)
+latent[comp == 1, ] <- mvrnorm(sum(comp == 1), mu1, Sigma1)
+latent[comp == 2, ] <- mvrnorm(sum(comp == 2), mu2, Sigma2)
+latent[comp == 3, ] <- mvrnorm(sum(comp == 3), mu3, Sigma3)
+latent[comp == 4, ] <- mvrnorm(sum(comp == 4), mu4, Sigma4)
+
+# Add observation noise
+err_sd <- c(0.55, 0.65)
+obs <- latent + matrix(rnorm(n * 2, sd = rep(err_sd, each = n)), ncol = 2)
+
+# Plot with color by component
+cols <- c("#1f77b430", "#ff7f0e40", "#2ca02c40", "#d6272840") # transparent colors
+plot(obs, col = cols[comp], pch = 16,
+     xlab = "X1", ylab = "X2",
+     main = "Four-Mode Distribution with Noise")
+
+
+
+
+## Computation Code
+# Train/validation/test split
+n_tr <- floor(0.7*n)
+n_val <- floor(0.15*n)
+perm <- sample.int(n)
+tr_idx <- perm[1:n_tr]; val_idx <- perm[(n_tr+1):(n_tr+n_val)]; te_idx <- perm[(n_tr+n_val+1):n]
+obs_tr <- obs[tr_idx, ]; obs_val <- obs[val_idx, ]; obs_te <- obs[te_idx, ]
+
+timesteps <- 2
+X_tr <- array(rep(obs_tr, each=timesteps), dim=c(nrow(obs_tr), timesteps, 2))
+X_val <- array(rep(obs_val, each=timesteps), dim=c(nrow(obs_val), timesteps,2))
+X_te  <- array(rep(obs_te, each=timesteps), dim=c(nrow(obs_te), timesteps,2))
+
+# =========================================
+# 2) CNN-LSTM distributional model
+# =========================================
+inp <- layer_input(shape=c(timesteps,2))
+backbone <- inp %>%
+  layer_conv_1d(filters=16, kernel_size=1, activation="relu") %>%
+  layer_lstm(units=64, return_sequences=FALSE)
+dist_head <- backbone %>%
+  layer_dense(units=32, activation="relu") %>%
+  layer_dense(units=5, name="dist_params")
+
+nll_loss <- function(y_true, y_pred){
+  mu1 <- y_pred[,1]; mu2 <- y_pred[,2]
+  s1 <- tf$nn$softplus(y_pred[,3])+1e-6
+  s2 <- tf$nn$softplus(y_pred[,4])+1e-6
+  rho <- tf$tanh(y_pred[,5])*0.99
+  y1 <- y_true[,1]; y2 <- y_true[,2]
+  z1 <- (y1-mu1)/s1; z2 <- (y2-mu2)/s2
+  one_minus_r2 <- 1 - rho^2 + 1e-6
+  log_det <- tf$math$log(s1)+tf$math$log(s2)+0.5*tf$math$log(one_minus_r2)
+  quad <- (z1^2 - 2*rho*z1*z2 + z2^2)/(2*one_minus_r2)
+  nll <- log(2*pi) + log_det + quad
+  tf$reduce_mean(nll)
+}
+
+model <- keras_model(inputs=inp, outputs=dist_head)
+model %>% compile(optimizer=optimizer_adam(1e-3), loss=nll_loss)
+
+history <- model %>% fit(
+  x=X_tr, y=obs_tr,
+  validation_data=list(X_val, obs_val),
+  epochs=200, batch_size=64,
+  callbacks=list(
+    callback_reduce_lr_on_plateau(monitor="val_loss", patience=5, factor=0.5, verbose=1),
+    callback_early_stopping(monitor="val_loss", patience=10, restore_best_weights=TRUE, verbose=1)
+  ),
+  verbose=2
+)
+
+# =========================================
+# 3) Inference on test set
+# =========================================
+params_te <- model %>% predict(X_te)
+mu1_te <- params_te[,1]; mu2_te <- params_te[,2]
+s1_te  <- tf$nn$softplus(params_te[,3])$numpy()+1e-6
+s2_te  <- tf$nn$softplus(params_te[,4])$numpy()+1e-6
+rho_te <- tanh(params_te[,5])*0.99
+
+bvnorm_density <- function(y, mu1, mu2, s1, s2, rho){
+  e1 <- y[,1]-mu1; e2 <- y[,2]-mu2
+  one_minus_r2 <- 1 - rho^2
+  z1 <- e1/s1; z2 <- e2/s2
+  log_det <- log(s1)+log(s2)+0.5*log(pmax(one_minus_r2,1e-9))
+  quad <- (z1^2 - 2*rho*z1*z2 + z2^2)/(2*pmax(one_minus_r2,1e-9))
+  logdens <- -(log(2*pi)+log_det+quad)
+  exp(logdens)
+}
+dens_dl_te <- bvnorm_density(obs_te, mu1_te, mu2_te, s1_te, s2_te, rho_te)
+loglik_dl_mean <- mean(log(pmax(dens_dl_te,1e-12)))
+
+# =========================================
+# 4) KDE baseline
+# =========================================
+kde_grid <- MASS::kde2d(obs_tr[,1], obs_tr[,2], n=200)
+bilinear_kde_eval <- function(kde, pts){
+  x <- kde$x; y <- kde$y; z <- kde$z
+  px <- pmin(pmax(pts[,1], min(x)), max(x))
+  py <- pmin(pmax(pts[,2], min(y)), max(y))
+  ix <- findInterval(px,x,all.inside=TRUE); iy <- findInterval(py,y,all.inside=TRUE)
+  ix <- pmin(ix,length(x)-1L); iy <- pmin(iy,length(y)-1L)
+  x1 <- x[ix]; x2 <- x[ix+1]; y1 <- y[iy]; y2 <- y[iy+1]
+  z11 <- z[cbind(ix,iy)]; z21 <- z[cbind(ix+1,iy)]; z12 <- z[cbind(ix,iy+1)]; z22 <- z[cbind(ix+1,iy+1)]
+  tx <- (px-x1)/(x2-x1+1e-12); ty <- (py-y1)/(y2-y1+1e-12)
+  z_interp <- (1-tx)*(1-ty)*z11 + tx*(1-ty)*z21 + (1-tx)*ty*z12 + tx*ty*z22
+  pmax(z_interp,1e-12)
+}
+dens_kde_te <- bilinear_kde_eval(kde_grid, obs_te)
+loglik_kde_mean <- mean(log(dens_kde_te))
+
+# Evaluate KDE at training points for causal sampling
+dens_kde_tr <- bilinear_kde_eval(kde_grid, obs_tr)
+
+# =========================================
+# 5) Gaussian Copula baseline
+# =========================================
+u_tr <- pobs(obs_tr)
+cop_start <- normalCopula(param=0.0, dim=2)
+fit_cop <- fitCopula(cop_start, u_tr, method="ml", estimate.variance=TRUE)
+rho_est <- coef(fit_cop)[[1]]
+cop_est <- normalCopula(param=rho_est, dim=2)
+m1 <- list(mean=mean(obs_tr[,1]), sd=sd(obs_tr[,1]))
+m2 <- list(mean=mean(obs_tr[,2]), sd=sd(obs_tr[,2]))
+dcop_obs <- function(points){
+  u <- cbind(pnorm((points[,1]-m1$mean)/m1$sd),
+             pnorm((points[,2]-m2$mean)/m2$sd))
+  as.numeric(dCopula(u, cop_est)) * dnorm(points[,1], m1$mean, m1$sd) * dnorm(points[,2], m2$mean, m2$sd)
+}
+dens_cop_te <- pmax(dcop_obs(obs_te),1e-12)
+loglik_cop_mean <- mean(log(dens_cop_te))
+
+
+# =========================================
+# 6) 90% Coverage
+# =========================================
+chi2_90 <- qchisq(0.90, df=2)
+
+cov90_dl <- mean(sapply(seq_len(nrow(obs_te)), function(i){
+  S <- matrix(c(s1_te[i]^2, rho_te[i]*s1_te[i]*s2_te[i],
+                rho_te[i]*s1_te[i]*s2_te[i], s2_te[i]^2),2,2)
+  e <- obs_te[i,]-c(mu1_te[i], mu2_te[i])
+  t(e) %*% solve(S) %*% e <= chi2_90
+})) * 100
+
+mu_kde <- colMeans(obs_tr); S_kde <- cov(obs_tr)
+cov90_kde <- mean(sapply(seq_len(nrow(obs_te)), function(i){
+  d2 <- t(obs_te[i,]-mu_kde) %*% solve(S_kde) %*% (obs_te[i,]-mu_kde)
+  d2 <= chi2_90
+})) * 100
+
+S_cop <- matrix(c(m1$sd^2, rho_est*m1$sd*m2$sd,
+                  rho_est*m1$sd*m2$sd, m2$sd^2),2,2)
+cov90_cop <- mean(sapply(seq_len(nrow(obs_te)), function(i){
+  d2 <- t(obs_te[i,]-c(m1$mean,m2$mean)) %*% solve(S_cop) %*% (obs_te[i,]-c(m1$mean,m2$mean))
+  d2 <= chi2_90
+})) * 100
+
+# =========================================
+# 7) Causal inference (CATE RMSE)
+# =========================================
+tau_te <- rnorm(nrow(obs_te))
+W_te_cf <- rbinom(nrow(obs_te),1,0.5)
+Y_te_cf <- tau_te * W_te_cf + rnorm(nrow(obs_te))
+
+# Sample features for CF
+n_draws <- 10
+X_te_dl <- t(sapply(1:nrow(obs_te), function(i){
+  mu <- c(mu1_te[i], mu2_te[i]); s <- c(s1_te[i], s2_te[i]); rho <- rho_te[i]
+  mvrnorm(n_draws, mu=mu, Sigma=matrix(c(s[1]^2, rho*s[1]*s[2], rho*s[1]*s[2], s[2]^2),2,2))[1,]
+}))
+
+# KDE counterfactual sampling fix
+idx_kde <- sample(1:nrow(obs_tr), nrow(obs_te), replace=TRUE, prob=dens_kde_tr)
+X_te_kde <- obs_tr[idx_kde, ]
+
+# Gaussian Copula counterfactual sampling
+X_te_cop <- mvrnorm(nrow(obs_te), mu=c(m1$mean, m2$mean),
+                    Sigma=S_cop)
+
+# =========================================
+# Simple oracle CATE estimates
+# =========================================
+cate_dl  <- X_te_dl[,1] - X_te_dl[,2]  # placeholder
+cate_kde <- X_te_kde[,1] - X_te_kde[,2]
+cate_cop <- X_te_cop[,1] - X_te_cop[,2]
+
+# RMSE
+rmse_dl  <- sqrt(mean((cate_dl - tau_te)^2))
+rmse_kde <- sqrt(mean((cate_kde - tau_te)^2))
+rmse_cop <- sqrt(mean((cate_cop - tau_te)^2))
+
+# CATE Bias (mean error)
+bias_dl  <- mean(cate_dl - tau_te)
+bias_kde <- mean(cate_kde - tau_te)
+bias_cop <- mean(cate_cop - tau_te)
+
+
+# =========================================
+# 8) Comparison table
+# =========================================
+comparison_table <- data.frame(
+  Model = c("Distributional CNN-LSTM","KDE (obs)","Gaussian Copula (obs)"),
+  MeanLogLik = c(round(loglik_dl_mean,4), round(loglik_kde_mean,4), round(loglik_cop_mean,4)),
+  Coverage90 = c(round(cov90_dl,2), round(cov90_kde,2), round(cov90_cop,2)),
+  CATE_RMSE = c(round(rmse_dl,4), round(rmse_kde,4), round(rmse_cop,4)),
+  CATE_Bias = c(round(bias_dl,4), round(bias_kde,4), round(bias_cop,4))
+)
+
+metrics_grob <- tableGrob(comparison_table, rows=NULL, theme=ttheme_default(base_size=10))
+comparison_table
+
+# =========================================
+# 9) Multi-panel figure with ellipses + CATE
+# =========================================
+subset_idx <- sample(nrow(obs_te), min(50, nrow(obs_te)))
+ell_dl_list <- lapply(subset_idx, function(i){
+  S <- matrix(c(s1_te[i]^2, rho_te[i]*s1_te[i]*s2_te[i],
+                rho_te[i]*s1_te[i]*s2_te[i], s2_te[i]^2),2,2)
+  df <- as.data.frame(ellipse(S, centre=c(mu1_te[i], mu2_te[i]), level=0.90, npoints=50))
+  df$CATE <- cate_dl[i]; df$idx <- i; df
+})
+ell_dl_df <- do.call(rbind, ell_dl_list)
+p_dl <- ggplot() +
+  geom_path(data=ell_dl_df, aes(x=x, y=y, group=idx, color=CATE), size=1, alpha=0.7) +
+  geom_point(data=as.data.frame(obs_te[subset_idx,]), aes(x=V1, y=V2), color="black", alpha=0.3) +
+  scale_color_viridis_c(name="CATE") +
+  ggtitle("CNN-LSTM Ellipses + CATE") + xlab("Y1") + ylab("Y2") + theme_minimal()
+
+ell_kde_list <- lapply(subset_idx, function(i){
+  df <- as.data.frame(ellipse(S_kde, centre=mu_kde, level=0.90, npoints=50))
+  df$CATE <- cate_kde[i]; df$idx <- i; df
+})
+ell_kde_df <- do.call(rbind, ell_kde_list)
+p_kde <- ggplot() +
+  geom_path(data=ell_kde_df, aes(x=x, y=y, group=idx, color=CATE), size=1, alpha=0.7) +
+  geom_point(data=as.data.frame(obs_te[subset_idx,]), aes(x=V1, y=V2), color="black", alpha=0.3) +
+  scale_color_viridis_c(name="CATE") +
+  ggtitle("KDE Ellipses + CATE") + xlab("Y1") + ylab("Y2") + theme_minimal()
+
+ell_cop_list <- lapply(subset_idx, function(i){
+  df <- as.data.frame(ellipse(S_cop, centre=c(m1$mean,m2$mean), level=0.90, npoints=50))
+  df$CATE <- cate_cop[i]; df$idx <- i; df
+})
+ell_cop_df <- do.call(rbind, ell_cop_list)
+p_cop <- ggplot() +
+  geom_path(data=ell_cop_df, aes(x=x, y=y, group=idx, color=CATE), size=1, alpha=0.7) +
+  geom_point(data=as.data.frame(obs_te[subset_idx,]), aes(x=V1, y=V2), color="black", alpha=0.3) +
+  scale_color_viridis_c(name="CATE") +
+  ggtitle("Gaussian Copula Ellipses + CATE") + xlab("Y1") + ylab("Y2") + theme_minimal()
+
+# Arrange figure + table
+grid.arrange(p_dl, p_kde, p_cop, metrics_grob,
+             ncol=2, nrow=2,
+             layout_matrix=rbind(c(1,2), c(3,4)))
+
+################################################
+#### Three Variables Case
+################################################
+
+## 2 components
+
+rm(list = ls())  # clear workspace
+
+# =========================================
+# Libraries
+# =========================================
+library(MASS)
+library(ggplot2)
+library(ellipse)
+
+set.seed(123)
+
+# =========================================
+# 1) Define mixture components (3 variables, 2 components)
+# =========================================
+mu_list <- list(
+  c(-4, -1, 0),
+  c(5, 3, 1)
+)
+
+Sigma_list <- list(
+  matrix(c(3, 1.8, 0.5,
+           1.8, 2, 0.4,
+           0.5, 0.4, 1), 3, 3),
+  matrix(c(4, -1.2, 0.3,
+           -1.2, 3, 0.7,
+           0.3, 0.7, 2), 3, 3)
+)
+
+weights <- c(0.5, 0.5)  # equal mixture weights
+
+# =========================================
+# 2) Sample from mixture
+# =========================================
+n <- 2000
+comp <- sample(1:2, n, replace = TRUE, prob = weights)
+
+X <- matrix(0, n, 3)
+for (i in 1:n) {
+  X[i, ] <- mvrnorm(1, mu_list[[comp[i]]], Sigma_list[[comp[i]]])
+}
+
+X <- as.data.frame(X)
+colnames(X) <- c("X1", "X2", "X3")
+X$comp <- as.factor(comp)
+
+obs <- as.matrix(X[, 1:3])  # numeric copy for modeling
+
+# =========================================
+# 3) Plot pairwise 2D projections with 90% ellipses
+# =========================================
+plot_pairs <- function(df, mu_list, Sigma_list) {
+  combos <- list(c(1,2), c(1,3), c(2,3))
+  titles <- c("X1 vs X2", "X1 vs X3", "X2 vs X3")
+  
+  for (j in seq_along(combos)) {
+    x_idx <- combos[[j]][1]
+    y_idx <- combos[[j]][2]
+    
+    g <- ggplot(df, aes_string(x = colnames(df)[x_idx],
+                               y = colnames(df)[y_idx],
+                               color = "comp")) +
+      geom_point(alpha = 0.4) +
+      theme_minimal() +
+      labs(title = paste("Projection:", titles[j])) +
+      theme(legend.position = "top")
+    
+    for (k in 1:length(mu_list)) {
+      ell <- ellipse(Sigma_list[[k]][c(x_idx,y_idx), c(x_idx,y_idx)],
+                     centre = mu_list[[k]][c(x_idx,y_idx)],
+                     level = 0.9)
+      g <- g + geom_path(data = as.data.frame(ell), aes(x = x, y = y),
+                         color = "black", linetype = 2)
+    }
+    print(g)
+  }
+}
+
+plot_pairs(X, mu_list, Sigma_list)
+
+
+## 3 components
+
+rm(list = ls())  # clear workspace
+
+# =========================================
+# Libraries
+# =========================================
+library(MASS)
+library(ggplot2)
+library(ellipse)
+
+set.seed(123)
+
+# =========================================
+# 1) Define mixture components (3 variables, 3 components)
+# =========================================
+mu_list <- list(
+  c(-4, -1, 0),
+  c(5, 3, 1),
+  c(0, 7, -2)
+)
+
+Sigma_list <- list(
+  matrix(c(3, 1.8, 0.5,
+           1.8, 2, 0.4,
+           0.5, 0.4, 1), 3, 3),
+  matrix(c(4, -1.2, 0.3,
+           -1.2, 3, 0.7,
+           0.3, 0.7, 2), 3, 3),
+  matrix(c(2, 0.5, -0.6,
+           0.5, 2.5, 0.8,
+           -0.6, 0.8, 3), 3, 3)
+)
+
+weights <- c(0.33, 0.33, 0.34)  # mixture weights
+
+# =========================================
+# 2) Sample from mixture
+# =========================================
+n <- 2000
+comp <- sample(1:3, n, replace = TRUE, prob = weights)
+
+X <- matrix(0, n, 3)
+for (i in 1:n) {
+  X[i, ] <- mvrnorm(1, mu_list[[comp[i]]], Sigma_list[[comp[i]]])
+}
+
+X <- as.data.frame(X)
+colnames(X) <- c("X1", "X2", "X3")
+X$comp <- as.factor(comp)
+
+obs <- as.matrix(X[, 1:3])  # numeric copy for modeling
+
+# =========================================
+# 3) Plot pairwise 2D projections with 90% ellipses
+# =========================================
+plot_pairs <- function(df, mu_list, Sigma_list) {
+  combos <- list(c(1,2), c(1,3), c(2,3))
+  titles <- c("X1 vs X2", "X1 vs X3", "X2 vs X3")
+  
+  for (j in seq_along(combos)) {
+    x_idx <- combos[[j]][1]
+    y_idx <- combos[[j]][2]
+    
+    g <- ggplot(df, aes_string(x = colnames(df)[x_idx],
+                               y = colnames(df)[y_idx],
+                               color = "comp")) +
+      geom_point(alpha = 0.4) +
+      theme_minimal() +
+      labs(title = paste("Projection:", titles[j])) +
+      theme(legend.position = "top")
+    
+    for (k in 1:length(mu_list)) {
+      ell <- ellipse(Sigma_list[[k]][c(x_idx,y_idx), c(x_idx,y_idx)],
+                     centre = mu_list[[k]][c(x_idx,y_idx)],
+                     level = 0.9)
+      g <- g + geom_path(data = as.data.frame(ell), aes(x = x, y = y),
+                         color = "black", linetype = 2)
+    }
+    print(g)
+  }
+}
+
+plot_pairs(X, mu_list, Sigma_list)
+
+## 4 components
+
+rm(list = ls())  # clear workspace
+
+# =========================================
+# Libraries
+# =========================================
+library(MASS)
+library(ggplot2)
+library(ellipse)
+
+set.seed(123)
+
+# =========================================
+# 1) Define mixture components (3 variables, 4 components)
+# =========================================
+mu_list <- list(
+  c(-4, -1, 0),
+  c(5, 3, 1),
+  c(0, 7, -2),
+  c(3, -5, 2)
+)
+
+Sigma_list <- list(
+  matrix(c(3, 1.8, 0.5,
+           1.8, 2, 0.4,
+           0.5, 0.4, 1), 3, 3),
+  matrix(c(4, -1.2, 0.3,
+           -1.2, 3, 0.7,
+           0.3, 0.7, 2), 3, 3),
+  matrix(c(2, 0.5, -0.6,
+           0.5, 2.5, 0.8,
+           -0.6, 0.8, 3), 3, 3),
+  matrix(c(3.5, 1, -0.4,
+           1, 2.8, 0.6,
+           -0.4, 0.6, 2.5), 3, 3)
+)
+
+weights <- rep(0.25, 4)  # equal mixture weights
+
+# =========================================
+# 2) Sample from mixture
+# =========================================
+n <- 2000
+comp <- sample(1:4, n, replace = TRUE, prob = weights)
+
+X <- matrix(0, n, 3)
+for (i in 1:n) {
+  X[i, ] <- mvrnorm(1, mu_list[[comp[i]]], Sigma_list[[comp[i]]])
+}
+
+X <- as.data.frame(X)
+colnames(X) <- c("X1", "X2", "X3")
+X$comp <- as.factor(comp)
+
+obs <- as.matrix(X[, 1:3])  # numeric copy for modeling
+
+# =========================================
+# 3) Plot pairwise 2D projections with 90% ellipses
+# =========================================
+plot_pairs <- function(df, mu_list, Sigma_list) {
+  combos <- list(c(1,2), c(1,3), c(2,3))
+  titles <- c("X1 vs X2", "X1 vs X3", "X2 vs X3")
+  
+  for (j in seq_along(combos)) {
+    x_idx <- combos[[j]][1]
+    y_idx <- combos[[j]][2]
+    
+    g <- ggplot(df, aes_string(x = colnames(df)[x_idx],
+                               y = colnames(df)[y_idx],
+                               color = "comp")) +
+      geom_point(alpha = 0.4) +
+      theme_minimal() +
+      labs(title = paste("Projection:", titles[j])) +
+      theme(legend.position = "top")
+    
+    for (k in 1:length(mu_list)) {
+      ell <- ellipse(Sigma_list[[k]][c(x_idx,y_idx), c(x_idx,y_idx)],
+                     centre = mu_list[[k]][c(x_idx,y_idx)],
+                     level = 0.9)
+      g <- g + geom_path(data = as.data.frame(ell), aes(x = x, y = y),
+                         color = "black", linetype = 2)
+    }
+    print(g)
+  }
+}
+
+plot_pairs(X, mu_list, Sigma_list)
+
+
+rm(list = ls())  # clear workspace
+
+# =========================================
+# Libraries
+# =========================================
+library(MASS)
+library(ggplot2)
+library(ellipse)
+
+set.seed(123)
+
+# =========================================
+# 1) Define mixture components (3 variables, 5 components)
+# =========================================
+mu_list <- list(
+  c(-4, -1, 0),
+  c(5, 3, 1),
+  c(0, 7, -2),
+  c(3, -5, 2),
+  c(-2, 2, 3)      # new 5th component
+)
+
+Sigma_list <- list(
+  matrix(c(3, 1.8, 0.5,
+           1.8, 2, 0.4,
+           0.5, 0.4, 1), 3, 3),
+  matrix(c(4, -1.2, 0.3,
+           -1.2, 3, 0.7,
+           0.3, 0.7, 2), 3, 3),
+  matrix(c(2, 0.5, -0.6,
+           0.5, 2.5, 0.8,
+           -0.6, 0.8, 3), 3, 3),
+  matrix(c(3.5, 1, -0.4,
+           1, 2.8, 0.6,
+           -0.4, 0.6, 2.5), 3, 3),
+  matrix(c(2.5, 0.6, 0.2,
+           0.6, 2.2, -0.3,
+           0.2, -0.3, 1.5), 3, 3)   # new 5th component
+)
+
+weights <- rep(1/5, 5)  # equal mixture weights for 5 components
+
+# =========================================
+# 2) Sample from mixture
+# =========================================
+n <- 2000
+comp <- sample(1:5, n, replace = TRUE, prob = weights)
+
+X <- matrix(0, n, 3)
+for (i in 1:n) {
+  X[i, ] <- mvrnorm(1, mu_list[[comp[i]]], Sigma_list[[comp[i]]])
+}
+
+X <- as.data.frame(X)
+colnames(X) <- c("X1", "X2", "X3")
+X$comp <- as.factor(comp)
+
+obs <- as.matrix(X[, 1:3])  # numeric copy for modeling
+
+# =========================================
+# 3) Plot pairwise 2D projections with 90% ellipses
+# =========================================
+plot_pairs <- function(df, mu_list, Sigma_list) {
+  combos <- list(c(1,2), c(1,3), c(2,3))
+  titles <- c("X1 vs X2", "X1 vs X3", "X2 vs X3")
+  
+  for (j in seq_along(combos)) {
+    x_idx <- combos[[j]][1]
+    y_idx <- combos[[j]][2]
+    
+    g <- ggplot(df, aes_string(x = colnames(df)[x_idx],
+                               y = colnames(df)[y_idx],
+                               color = "comp")) +
+      geom_point(alpha = 0.4) +
+      theme_minimal() +
+      labs(title = paste("Projection:", titles[j])) +
+      theme(legend.position = "top")
+    
+    for (k in 1:length(mu_list)) {
+      ell <- ellipse(Sigma_list[[k]][c(x_idx,y_idx), c(x_idx,y_idx)],
+                     centre = mu_list[[k]][c(x_idx,y_idx)],
+                     level = 0.9)
+      g <- g + geom_path(data = as.data.frame(ell), aes(x = x, y = y),
+                         color = "black", linetype = 2)
+    }
+    print(g)
+  }
+}
+
+plot_pairs(X, mu_list, Sigma_list)
+
+
+rm(list = ls())  # clear workspace
+
+# =========================================
+# Libraries
+# =========================================
+library(MASS)
+library(ggplot2)
+library(ellipse)
+
+set.seed(123)
+
+# =========================================
+# 1) Define mixture components (3 variables, 6 components)
+# =========================================
+mu_list <- list(
+  c(-4, -1, 0),
+  c(5, 3, 1),
+  c(0, 7, -2),
+  c(3, -5, 2),
+  c(-2, 2, 3),
+  c(4, -3, -1)       # new 6th component
+)
+
+Sigma_list <- list(
+  matrix(c(3, 1.8, 0.5,
+           1.8, 2, 0.4,
+           0.5, 0.4, 1), 3, 3),
+  matrix(c(4, -1.2, 0.3,
+           -1.2, 3, 0.7,
+           0.3, 0.7, 2), 3, 3),
+  matrix(c(2, 0.5, -0.6,
+           0.5, 2.5, 0.8,
+           -0.6, 0.8, 3), 3, 3),
+  matrix(c(3.5, 1, -0.4,
+           1, 2.8, 0.6,
+           -0.4, 0.6, 2.5), 3, 3),
+  matrix(c(2.5, 0.6, 0.2,
+           0.6, 2.2, -0.3,
+           0.2, -0.3, 1.5), 3, 3),
+  matrix(c(3, -0.8, 0.5,
+           -0.8, 2.5, 0.4,
+           0.5, 0.4, 2), 3, 3)   # new 6th component
+)
+
+weights <- rep(1/6, 6)  # equal mixture weights for 6 components
+
+# =========================================
+# 2) Sample from mixture
+# =========================================
+n <- 2000
+comp <- sample(1:6, n, replace = TRUE, prob = weights)
+
+X <- matrix(0, n, 3)
+for (i in 1:n) {
+  X[i, ] <- mvrnorm(1, mu_list[[comp[i]]], Sigma_list[[comp[i]]])
+}
+
+X <- as.data.frame(X)
+colnames(X) <- c("X1", "X2", "X3")
+X$comp <- as.factor(comp)
+
+obs <- as.matrix(X[, 1:3])  # numeric copy for modeling
+
+# =========================================
+# 3) Plot pairwise 2D projections with 90% ellipses
+# =========================================
+plot_pairs <- function(df, mu_list, Sigma_list) {
+  combos <- list(c(1,2), c(1,3), c(2,3))
+  titles <- c("X1 vs X2", "X1 vs X3", "X2 vs X3")
+  
+  for (j in seq_along(combos)) {
+    x_idx <- combos[[j]][1]
+    y_idx <- combos[[j]][2]
+    
+    g <- ggplot(df, aes_string(x = colnames(df)[x_idx],
+                               y = colnames(df)[y_idx],
+                               color = "comp")) +
+      geom_point(alpha = 0.4) +
+      theme_minimal() +
+      labs(title = paste("Projection:", titles[j])) +
+      theme(legend.position = "top")
+    
+    for (k in 1:length(mu_list)) {
+      ell <- ellipse(Sigma_list[[k]][c(x_idx,y_idx), c(x_idx,y_idx)],
+                     centre = mu_list[[k]][c(x_idx,y_idx)],
+                     level = 0.9)
+      g <- g + geom_path(data = as.data.frame(ell), aes(x = x, y = y),
+                         color = "black", linetype = 2)
+    }
+    print(g)
+  }
+}
+
+plot_pairs(X, mu_list, Sigma_list)
+
+
+# =========================================
+# 4) Train/validation/test split
+# =========================================
+n_tr <- floor(0.7*n); n_val <- floor(0.15*n)
+perm <- sample.int(n)
+tr_idx <- perm[1:n_tr]; val_idx <- perm[(n_tr+1):(n_tr+n_val)]; te_idx <- perm[(n_tr+n_val+1):n]
+
+obs_tr <- obs[tr_idx,]; obs_val <- obs[val_idx,]; obs_te <- obs[te_idx,]
+
+timesteps <- 2
+X_tr <- array(rep(obs_tr, each=timesteps), dim=c(nrow(obs_tr), timesteps,3))
+X_val <- array(rep(obs_val, each=timesteps), dim=c(nrow(obs_val), timesteps,3))
+X_te  <- array(rep(obs_te, each=timesteps), dim=c(nrow(obs_te), timesteps,3))
+
+# =========================================
+# 5) CNN-LSTM distributional model
+# =========================================
+inp <- layer_input(shape=c(timesteps,3))
+
+backbone <- inp %>%
+  layer_conv_1d(filters=16, kernel_size=1, activation="relu") %>%
+  layer_lstm(units=64, return_sequences=FALSE)
+
+dist_head <- backbone %>%
+  layer_dense(units=32, activation="relu") %>%
+  layer_dense(units=9, name="dist_params")
+
+nll_loss_3d <- function(y_true, y_pred){
+  mu <- y_pred[,1:3]
+  s <- tf$nn$softplus(y_pred[,4:6]) + 1e-6
+  rho12 <- tf$tanh(y_pred[,7])*0.99
+  rho13 <- tf$tanh(y_pred[,8])*0.99
+  rho23 <- tf$tanh(y_pred[,9])*0.99
+  
+  s1 <- s[,1]; s2 <- s[,2]; s3 <- s[,3]
+  one_minus_r <- 1e-6 + 1 - rho12^2 - rho13^2 - rho23^2 + 2*rho12*rho13*rho23
+  z1 <- (y_true[,1]-mu[,1])/s1
+  z2 <- (y_true[,2]-mu[,2])/s2
+  z3 <- (y_true[,3]-mu[,3])/s3
+  cov_det <- s1*s2*s3*tf$sqrt(one_minus_r)
+  quad <- (z1^2 + z2^2 + z3^2 - 2*rho12*z1*z2 - 2*rho13*z1*z3 - 2*rho23*z2*z3)/(2*one_minus_r)
+  tf$reduce_mean(1.5*tf$math$log(2*pi) + tf$math$log(cov_det) + quad)
+}
+
+model <- keras_model(inputs=inp, outputs=dist_head)
+model %>% compile(optimizer=optimizer_adam(1e-3), loss=nll_loss_3d)
+model %>% summary()
+
+history <- model %>% fit(
+  x = X_tr, y = obs_tr,
+  validation_data = list(X_val, obs_val),
+  epochs=50, batch_size=64,
+  callbacks=list(
+    callback_reduce_lr_on_plateau(monitor="val_loss", patience=5, factor=0.5),
+    callback_early_stopping(monitor="val_loss", patience=10, restore_best_weights=TRUE)
+  ),
+  verbose=2
+)
+
+# =========================================
+# 6) CNN-LSTM predictions on test set
+# =========================================
+params_te <- model %>% predict(X_te)
+mu_te <- params_te[,1:3]
+s_te  <- tf$nn$softplus(params_te[,4:6])$numpy() + 1e-6
+rho12_te <- tanh(params_te[,7])*0.99
+rho13_te <- tanh(params_te[,8])*0.99
+rho23_te <- tanh(params_te[,9])*0.99
+
+# =========================================
+# 7) KDE baseline
+# =========================================
+kde_fit <- ks::kde(obs_tr)
+dens_kde_te <- ks::dkde(kde_fit, x=obs_te)
+loglik_kde_mean <- mean(log(pmax(dens_kde_te,1e-12)))
+dens_sorted <- sort(dens_kde_te, decreasing=TRUE)
+cut_idx <- floor(0.9*length(dens_sorted))
+cov90_kde <- mean(dens_kde_te>=dens_sorted[cut_idx])*100
+
+# =========================================
+# 8) Gaussian Copula baseline
+# =========================================
+u_tr <- pobs(obs_tr)
+cop_start <- normalCopula(param=0.0, dim=3)
+fit_cop <- fitCopula(cop_start, u_tr, method="ml")
+rho_est <- coef(fit_cop)
+cop_est <- normalCopula(param=rho_est, dim=3)
+
+marg_means <- colMeans(obs_tr)
+marg_sds <- apply(obs_tr,2,sd)
+
+dcop_obs <- function(points){
+  u <- pnorm(scale(points, center=marg_means, scale=marg_sds))
+  as.numeric(dCopula(u, cop_est)) *
+    dnorm(points[,1], marg_means[1], marg_sds[1]) *
+    dnorm(points[,2], marg_means[2], marg_sds[2]) *
+    dnorm(points[,3], marg_means[3], marg_sds[3])
+}
+dens_cop_te <- pmax(dcop_obs(obs_te),1e-12)
+loglik_cop_mean <- mean(log(dens_cop_te))
+S_cop <- cov(obs_tr)
+cov90_cop <- mean(apply(obs_te,1,function(y){
+  t(y-marg_means) %*% solve(S_cop) %*% (y-marg_means) <= qchisq(0.9,3)
+}))*100
+
+# =========================================
+# 9) CNN-LSTM 90% coverage & log-likelihood
+# =========================================
+cov90_dl <- numeric(nrow(obs_te))
+dens_dl_te <- numeric(nrow(obs_te))
+chi2_90 <- qchisq(0.9,3)
+
+for(i in 1:nrow(obs_te)){
+  S_i <- matrix(c(
+    s_te[i,1]^2, rho12_te[i]*s_te[i,1]*s_te[i,2], rho13_te[i]*s_te[i,1]*s_te[i,3],
+    rho12_te[i]*s_te[i,1]*s_te[i,2], s_te[i,2]^2, rho23_te[i]*s_te[i,2]*s_te[i,3],
+    rho13_te[i]*s_te[i,1]*s_te[i,3], rho23_te[i]*s_te[i,2]*s_te[i,3], s_te[i,3]^2
+  ),3,3)
+  e <- obs_te[i,]-mu_te[i,]
+  cov90_dl[i] <- (t(e) %*% solve(S_i) %*% e <= chi2_90)
+  dens_dl_te[i] <- dmvnorm(obs_te[i,], mean=mu_te[i,], sigma=S_i)
+}
+cov90_dl_mean <- mean(cov90_dl)*100
+loglik_dl_mean <- mean(log(pmax(dens_dl_te,1e-12)))
+
+# =========================================
+# 10) Summary metrics
+# =========================================
+metrics <- data.frame(
+  Method = c("Distributional CNN-LSTM","KDE (obs)","Gaussian Copula (obs)"),
+  MeanLogLik = c(loglik_dl_mean, loglik_kde_mean, loglik_cop_mean),
+  Coverage90 = c(cov90_dl_mean, cov90_kde, cov90_cop)
+)
+print(metrics)
+
+# =========================================
+# 11) Simulated treatment effect (CATE)
+# =========================================
+tau_te <- 0.5*obs_te[,1] - 0.3*obs_te[,2] + 0.2*obs_te[,3]  # true CATE
+W_te <- rbinom(nrow(obs_te), 1, 0.5)
+Y_te <- tau_te * W_te + rnorm(nrow(obs_te))  # observed outcome
+
+# =========================================
+# 12) CNN-LSTM CATE proxy (conditional mean difference)
+# =========================================
+# Here we assume CNN-LSTM predicts the conditional mean of Y given X
+# For simplicity in this toy example, use mu_te as prediction
+mu_te_treated <- mu_te + 0.1  # simulate treated shift
+cate_dl  <- mu_te_treated[,1] - mu_te[,1]
+
+# =========================================
+# 13) KDE-based conditional CATE
+# =========================================
+# Estimate E[Y|X,W=1] and E[Y|X,W=0] using KDE on training data
+obs_tr_df <- as.data.frame(obs_tr)
+obs_tr_df$W <- rbinom(nrow(obs_tr_df),1,0.5)
+obs_tr_df$Y <- 0.5*obs_tr_df$X1 - 0.3*obs_tr_df$X2 + 0.2*obs_tr_df$X3
+obs_tr_df$Y <- obs_tr_df$Y*obs_tr_df$W + rnorm(nrow(obs_tr_df))
+
+# KDE for treated
+kde_tr <- ks::kde(x=as.matrix(obs_tr_df[obs_tr_df$W==1,1:3]), H=diag(3))
+# KDE for control
+kde_co <- ks::kde(x=as.matrix(obs_tr_df[obs_tr_df$W==0,1:3]), H=diag(3))
+
+# Conditional expectation proxy
+E_Y1 <- sapply(1:nrow(obs_te), function(i){
+  dens_vals <- ks::dkde(kde_tr, x=matrix(obs_te[i,],1,3))
+  dens_vals
+})
+E_Y0 <- sapply(1:nrow(obs_te), function(i){
+  dens_vals <- ks::dkde(kde_co, x=matrix(obs_te[i,],1,3))
+  dens_vals
+})
+cate_kde <- E_Y1 - E_Y0
+
+# =========================================
+# 14) Gaussian Copula conditional CATE
+# =========================================
+# Fit separate copulas for treated/control
+obs_tr_t <- obs_tr[obs_tr_df$W==1,]
+obs_tr_c <- obs_tr[obs_tr_df$W==0,]
+
+# KDE marginals
+mu_t <- colMeans(obs_tr_t); sd_t <- apply(obs_tr_t,2,sd)
+mu_c <- colMeans(obs_tr_c); sd_c <- apply(obs_tr_c,2,sd)
+
+# Fit copula on pseudo-observations
+u_t <- pobs(obs_tr_t); u_c <- pobs(obs_tr_c)
+cop_t <- fitCopula(normalCopula(0.0, dim=3), u_t, method="ml")
+cop_c <- fitCopula(normalCopula(0.0, dim=3), u_c, method="ml")
+
+# Conditional CATE proxy
+cate_cop <- sapply(1:nrow(obs_te), function(i){
+  mean_t <- mu_t[1]  # use first variable as simplified prediction
+  mean_c <- mu_c[1]
+  mean_t - mean_c
+})
+
+# =========================================
+# 15) Compute RMSE and Bias
+# =========================================
+rmse_dl  <- sqrt(mean((cate_dl - tau_te)^2))
+rmse_kde <- sqrt(mean((cate_kde - tau_te)^2))
+rmse_cop <- sqrt(mean((cate_cop - tau_te)^2))
+
+bias_dl  <- mean(cate_dl - tau_te)
+bias_kde <- mean(cate_kde - tau_te)
+bias_cop <- mean(cate_cop - tau_te)
+
+# =========================================
+# 16) Updated comparison table
+# =========================================
+comparison_table <- data.frame(
+  Model = c("Distributional CNN-LSTM","KDE (3D)","Gaussian Copula (3D)"),
+  MeanLogLik = c(round(loglik_dl_mean,4), round(loglik_kde_mean,4), round(loglik_cop_mean,4)),
+  Coverage90  = c(round(cov90_dl_mean,2), round(cov90_kde,2), round(cov90_cop,2)),
+  CATE_RMSE  = c(round(rmse_dl,4), round(rmse_kde,4), round(rmse_cop,4)),
+  CATE_Bias  = c(round(bias_dl,4), round(bias_kde,4), round(bias_cop,4))
+)
+print(comparison_table)
+
+# =========================================
+# 12) Visualize CNN-LSTM predicted ellipses
+# =========================================
+plot_predicted_ellipses <- function(obs_te, mu_te, s_te, rho12_te, rho13_te, rho23_te){
+  combos <- list(c(1,2), c(1,3), c(2,3))
+  titles <- c("X1 vs X2", "X1 vs X3", "X2 vs X3")
+  
+  for (j in seq_along(combos)) {
+    x_idx <- combos[[j]][1]
+    y_idx <- combos[[j]][2]
+    
+    g <- ggplot(data.frame(obs_te), aes_string(x=colnames(obs_te)[x_idx],
+                                               y=colnames(obs_te)[y_idx])) +
+      geom_point(alpha=0.4, color="blue") +
+      theme_minimal() +
+      labs(title=paste("CNN-LSTM Predicted 90% Ellipses:", titles[j]))
+    
+    for (i in 1:nrow(obs_te)) {
+      S_i <- matrix(c(
+        s_te[i,1]^2, rho12_te[i]*s_te[i,1]*s_te[i,2], rho13_te[i]*s_te[i,1]*s_te[i,3],
+        rho12_te[i]*s_te[i,1]*s_te[i,2], s_te[i,2]^2, rho23_te[i]*s_te[i,2]*s_te[i,3],
+        rho13_te[i]*s_te[i,1]*s_te[i,3], rho23_te[i]*s_te[i,2]*s_te[i,3], s_te[i,3]^2
+      ),3,3)
+      
+      ell <- ellipse(S_i[c(x_idx,y_idx), c(x_idx,y_idx)], 
+                     centre = mu_te[i,c(x_idx,y_idx)], 
+                     level = 0.9)
+      g <- g + geom_path(data = as.data.frame(ell), aes(x=x, y=y), color="red", alpha=0.2)
+    }
+    print(g)
+  }
+}
+
+plot_predicted_ellipses(obs_te, mu_te, s_te, rho12_te, rho13_te, rho23_te)
+
+
+# =========================================
+# 13) Overlay true vs predicted ellipses
+# =========================================
+plot_true_vs_predicted <- function(obs_te, mu_list, Sigma_list, mu_te, s_te, rho12_te, rho13_te, rho23_te){
+  combos <- list(c(1,2), c(1,3), c(2,3))
+  titles <- c("X1 vs X2", "X1 vs X3", "X2 vs X3")
+  
+  for (j in seq_along(combos)) {
+    x_idx <- combos[[j]][1]
+    y_idx <- combos[[j]][2]
+    
+    g <- ggplot(data.frame(obs_te), aes_string(x=colnames(obs_te)[x_idx],
+                                               y=colnames(obs_te)[y_idx])) +
+      geom_point(alpha=0.4, color="blue") +
+      theme_minimal() +
+      labs(title=paste("True vs CNN-LSTM Predicted 90% Ellipses:", titles[j]))
+    
+    # True mixture ellipses
+    for (k in 1:length(mu_list)) {
+      ell_true <- ellipse(Sigma_list[[k]][c(x_idx,y_idx), c(x_idx,y_idx)],
+                          centre = mu_list[[k]][c(x_idx,y_idx)],
+                          level = 0.9)
+      g <- g + geom_path(data = as.data.frame(ell_true), aes(x=x, y=y),
+                         color="black", linetype=2, size=0.8)
+    }
+    
+    # CNN-LSTM predicted ellipses (subset for clarity)
+    n_sub <- min(50, nrow(obs_te))  # plot only 50 random points to reduce overplot
+    idx_sub <- sample(1:nrow(obs_te), n_sub)
+    for (i in idx_sub) {
+      S_i <- matrix(c(
+        s_te[i,1]^2, rho12_te[i]*s_te[i,1]*s_te[i,2], rho13_te[i]*s_te[i,1]*s_te[i,3],
+        rho12_te[i]*s_te[i,1]*s_te[i,2], s_te[i,2]^2, rho23_te[i]*s_te[i,2]*s_te[i,3],
+        rho13_te[i]*s_te[i,1]*s_te[i,3], rho23_te[i]*s_te[i,2]*s_te[i,3], s_te[i,3]^2
+      ),3,3)
+      
+      ell_pred <- ellipse(S_i[c(x_idx,y_idx), c(x_idx,y_idx)],
+                          centre = mu_te[i,c(x_idx,y_idx)],
+                          level = 0.9)
+      g <- g + geom_path(data = as.data.frame(ell_pred), aes(x=x, y=y),
+                         color="red", alpha=0.3)
+    }
+    print(g)
+  }
+}
+
+# Run overlay plot
+plot_true_vs_predicted(obs_te, mu_list, Sigma_list, mu_te, s_te, rho12_te, rho13_te, rho23_te)
+
+library(rgl)
+library(ellipse)
+library(viridisLite)
+
+# =========================================
+# 3D overlay: true vs predicted ellipsoids
+# =========================================
+plot_true_vs_predicted_3D <- function(obs_te, mu_list, Sigma_list, mu_te, s_te, rho12_te, rho13_te, rho23_te, n_sub=40) {
+  open3d()
+  clear3d()
+  title3d(main="True vs Predicted 3D Ellipsoids", xlab="X1", ylab="X2", zlab="X3")
+  
+  # Plot points (blue)
+  points3d(obs_te[,1], obs_te[,2], obs_te[,3], color="blue", size=5, alpha=0.4)
+  
+  # True ellipsoids (black, transparent)
+  for(k in seq_along(mu_list)) {
+    mesh <- ellipse3d(Sigma_list[[k]], centre=mu_list[[k]], level=0.9)
+    shade3d(mesh, color="black", alpha=0.2)
+  }
+  
+  # Predicted ellipsoids (subset for clarity)
+  idx_sub <- sample(1:nrow(obs_te), min(n_sub, nrow(obs_te)))
+  for(i in idx_sub) {
+    S_i <- matrix(c(
+      s_te[i,1]^2, rho12_te[i]*s_te[i,1]*s_te[i,2], rho13_te[i]*s_te[i,1]*s_te[i,3],
+      rho12_te[i]*s_te[i,1]*s_te[i,2], s_te[i,2]^2, rho23_te[i]*s_te[i,2]*s_te[i,3],
+      rho13_te[i]*s_te[i,1]*s_te[i,3], rho23_te[i]*s_te[i,2]*s_te[i,3], s_te[i,3]^2
+    ), 3,3)
+    
+    mesh_pred <- ellipse3d(S_i, centre=mu_te[i,], level=0.9)
+    shade3d(mesh_pred, color="red", alpha=0.2)
+  }
+  
+  bg3d(color="white")
+  axes3d(col="gray30")
+  grid3d(c("x","y","z"), col="gray85")
+  rglwidget()
+}
+
+# =========================================
+# Run the 3D overlay plot
+# =========================================
+plot_true_vs_predicted_3D(obs_te, mu_list, Sigma_list, mu_te, s_te, rho12_te, rho13_te, rho23_te)
+
+
+###
+# Real Data
+###
+
+rm(list = ls())
+
+# =========================================
+# Libraries
+# =========================================
+library(MASS)
+library(copula)
+library(mvtnorm)
+library(stats)
+library(ellipse)
+library(ggplot2)
+library(knitr)
+library(reshape2)
+library(akima)
+library(fields)
+library(keras)
+library(tensorflow)
+
+set.seed(123)
+tf$random$set_seed(123L)
+
+# =========================================
+# 1) Load dataset (iris)
+# =========================================
+dataset_name <- "iris"  
+
+if(dataset_name == "iris"){
+  data(iris)
+  obs <- as.matrix(iris[, sapply(iris, is.numeric)][,1:2])
+} else if(dataset_name == "mtcars"){
+  data(mtcars)
+  obs <- as.matrix(mtcars[, sapply(mtcars, is.numeric)][,1:2])
+} else {
+  stop("Dataset not recognized.")
+}
+
+# Standardize
+obs <- scale(obs)
+
+# Quick plot
+plot(obs, col = rgb(0.2,0.4,0.6,0.4), pch=16,
+     xlab="Feature 1", ylab="Feature 2",
+     main=paste("Real Data Example:", dataset_name))
+
+# =========================================
+# 2) Split train/test
+# =========================================
+n <- nrow(obs)
+tr_idx <- sample(1:n, size = round(0.7*n))
+te_idx <- setdiff(1:n, tr_idx)
+obs_tr <- obs[tr_idx, ]
+obs_te <- obs[te_idx, ]
+
+# =========================================
+# 3) CNN-LSTM model (corrected)
+# =========================================
+# Reshape input for LSTM: samples x timesteps x features
+X_tr <- array(obs_tr, dim = c(nrow(obs_tr), 1, 2))
+X_te <- array(obs_te, dim = c(nrow(obs_te), 1, 2))
+
+# Build CNN-LSTM without Conv1D
+input <- layer_input(shape = c(1, 2))
+model <- input %>%
+  layer_lstm(units=16, activation="tanh") %>%
+  layer_dense(units=2)
+
+model <- keras_model(inputs=input, outputs=model)
+
+model %>% compile(
+  loss = "mse",
+  optimizer = optimizer_adam(learning_rate=0.01)
+)
+
+# Train
+history <- model %>% fit(
+  x = X_tr, y = obs_tr,
+  epochs = 100, batch_size = 16,
+  validation_split=0.2, verbose=0
+)
+
+# Predict
+y_pred <- model %>% predict(X_te)
+
+# Compute CNN-LSTM metrics
+rmse_cnn <- sqrt(mean((y_pred - obs_te)^2))
+mu_cnn <- colMeans(y_pred)
+sigma_cnn <- cov(y_pred)
+loglik_cnn <- sum(dmvnorm(obs_te, mean=mu_cnn, sigma=sigma_cnn, log=TRUE))
+coverage_cnn <- mean(mahalanobis(obs_te, mu_cnn, sigma_cnn) < qchisq(0.9, df=2))
+
+# =========================================
+# 4) KDE model
+# =========================================
+fit_kde <- kde2d(obs_tr[,1], obs_tr[,2], n=100)
+pdf_vals <- interp.surface(list(x=fit_kde$x, y=fit_kde$y, z=fit_kde$z), obs_te[,1:2])
+pdf_vals[is.na(pdf_vals) | pdf_vals <= 0] <- 1e-8
+loglik_kde <- sum(log(pdf_vals))
+
+cov_mat <- cov(obs_tr)
+center <- colMeans(obs_tr)
+threshold <- qchisq(0.9, df=2)
+md2 <- mahalanobis(obs_te, center, cov_mat)
+coverage_kde <- mean(md2 <= threshold)
+
+grid_points <- expand.grid(x=fit_kde$x, y=fit_kde$y)
+weights <- as.vector(fit_kde$z)
+weights <- weights / sum(weights)
+kde_mean <- colSums(grid_points * weights)
+rmse_kde <- sqrt(mean((obs_te - matrix(kde_mean, nrow(obs_te), 2, byrow=TRUE))^2))
+
+# =========================================
+# 5) Gaussian Copula
+# =========================================
+u_tr <- pobs(obs_tr)
+fit_cop <- normalCopula(dim=2)
+fit_ml <- fitCopula(fit_cop, u_tr, method="ml")
+rho <- coef(fit_ml)
+cop <- normalCopula(param=rho, dim=2)
+u_te <- pobs(obs_te)
+loglik_cop <- sum(dCopula(u_te, cop, log=TRUE))
+
+covariance_cop <- cov(obs_tr)
+mu_cop <- colMeans(obs_tr)
+coverage_cop <- mean(mahalanobis(obs_te, mu_cop, covariance_cop) < qchisq(0.9, df=2))
+rmse_cop <- sqrt(mean((obs_te - matrix(mu_cop, nrow(obs_te), 2, byrow=TRUE))^2))
+
+# =========================================
+# 6) Results Table
+# =========================================
+results <- data.frame(
+  Model = c("CNN-LSTM","KDE","Gaussian Copula"),
+  Coverage = c(coverage_cnn, coverage_kde, coverage_cop),
+  LogLik = c(loglik_cnn, loglik_kde, loglik_cop),
+  CATE_RMSE = c(rmse_cnn, rmse_kde, rmse_cop)
+)
+
+kable(results, digits=3, caption=paste("Model Comparison on Real Data (", dataset_name, ")", sep=""))
+
+# =========================================
+# 7) Visualization
+# =========================================
+df_long <- reshape2::melt(results, id.vars="Model")
+
+ggplot(df_long, aes(x=Model, y=value, fill=Model)) +
+  geom_bar(stat="identity", position="dodge") +
+  facet_wrap(~variable, scales="free_y") +
+  theme_minimal(base_size=14) +
+  theme(legend.position="none") +
+  labs(title=paste("Model Comparison: Coverage, LogLik, CATE RMSE (", dataset_name, ")", sep=""),
+       y="Value", x="Model")
+

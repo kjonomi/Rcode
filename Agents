@@ -1,0 +1,369 @@
+## Real Data
+library(keras)
+library(tensorflow)
+library(tidyverse)
+library(lubridate)
+library(copula)
+library(httr)
+library(purrr)
+library(leaflet)
+library(dplyr)
+
+# --- Download & Preprocess Chicago Crime Data ---
+endpoint <- "https://data.cityofchicago.org/resource/ijzp-q8t2.csv?$limit=200000"
+crime_raw <- read_csv(endpoint)
+
+crime <- crime_raw %>%
+  filter(!is.na(longitude), !is.na(latitude)) %>%
+  mutate(
+    Date = as.POSIXct(date, tz = "UTC"),
+    Year = lubridate::year(Date),
+    Hour = lubridate::hour(Date),
+    Day = lubridate::wday(Date, label = TRUE)
+  ) %>%
+  filter(Year == 2025) %>%
+  select(Date, Hour, Day, Longitude = longitude, Latitude = latitude, PrimaryType = primary_type)
+
+crime_scaled <- crime %>%
+  mutate(
+    X = scales::rescale(Longitude, to = c(0, 2)),
+    Y = scales::rescale(Latitude, to = c(0, 2))
+  )
+
+# --- Environment Setup ---
+env_bounds <- c(0, 2)
+goal <- c(1.5, 1.5)
+goal_threshold <- 0.32  
+# Top 10 densest crime spots as obstacles
+hotspots <- crime_scaled %>%
+  mutate(Xr = round(X, 1), Yr = round(Y, 1)) %>%
+  count(Xr, Yr, sort = TRUE) %>%
+  head(10) %>%
+  mutate(coord = map2(Xr, Yr, ~c(.x, .y))) %>%
+  pull(coord)
+
+is_in_obstacle <- function(pos) {
+  any(sapply(hotspots, function(o) sum((pos - o)^2) < 0.02))
+}
+
+# --- Environment Step ---
+env_step_2d <- function(state, action, step_size = 0.2) {
+  next_state <- state + step_size * tanh(action)
+  next_state <- pmax(env_bounds[1], pmin(env_bounds[2], next_state))
+  
+  if (is_in_obstacle(next_state)) {
+    reward <- -1; done <- TRUE
+  } else if (sum((next_state - goal)^2) < goal_threshold^2) {
+    reward <- 2; done <- TRUE
+  } else {
+    reward <- -0.01 + 0.05 * (1 - sqrt(sum((next_state - goal)^2)) / 2)
+    done <- FALSE
+  }
+  
+  list(state = next_state, reward = reward, done = done)
+}
+
+# --- Encoding and Entanglement Functions ---
+phase_embed <- function(state) {
+  sin_enc <- sin(state * pi)
+  cos_enc <- cos(state * pi)
+  c(state, sin_enc, cos_enc)
+}
+
+entangled_state <- function(state, other_states) {
+  avg_other <- colMeans(do.call(rbind, other_states))
+  phase_embed((state + avg_other) / 2)
+}
+
+copula_transform <- function(actions_matrix) {
+  apply(actions_matrix, 2, rank) / (nrow(actions_matrix) + 1)
+}
+
+# --- Actor & Critic Models ---
+define_critic_model <- function(input_dim) {
+  keras_model_sequential() %>%
+    layer_dense(units = 32, activation = 'relu', input_shape = input_dim) %>%
+    layer_dense(units = 16, activation = 'relu') %>%
+    layer_dense(units = 1) %>%
+    compile(optimizer = optimizer_adam(0.001), loss = 'mse')
+}
+
+define_actor_model <- function(input_dim) {
+  keras_model_sequential() %>%
+    layer_dense(units = 16, activation = 'relu', input_shape = input_dim) %>%
+    layer_dense(units = 2, activation = 'tanh') %>%
+    compile(optimizer = optimizer_adam(0.01), loss = 'mse')
+}
+
+# --- Initialize Models ---
+set.seed(42)
+n_agents <- 6
+input_dim <- length(phase_embed(c(0, 0)))
+actor_list <- replicate(n_agents, define_actor_model(input_dim), simplify = FALSE)
+critic <- define_critic_model(input_dim + 2)
+
+# --- Spread Agents Around Start (far from goal for long trajectory) ---
+agents <- lapply(1:n_agents, function(i) runif(2, 0.1, 0.5))
+trajectories <- lapply(agents, function(start) matrix(start, nrow = 1))
+done_flags <- rep(FALSE, n_agents)
+total_rewards <- rep(0, n_agents)
+
+# --- RL Simulation Loop ---
+for (t in 1:2000) {
+  # Entangled states
+  states_embed <- lapply(seq_along(agents), function(i) {
+    entangled_state(agents[[i]], agents[-i])
+  })
+  
+  # Actor predictions
+  actions <- lapply(seq_along(actor_list), function(i) {
+    as.numeric(predict(actor_list[[i]], matrix(states_embed[[i]], nrow = 1)))
+  })
+  
+  # Copula transform
+  actions_matrix <- do.call(rbind, actions)
+  actions_transformed <- copula_transform(actions_matrix)
+  actions_final <- 2 * actions_transformed - 1
+  actions_final_list <- split(actions_final, seq(nrow(actions_final)))
+  
+  # Step environment
+  results <- lapply(seq_along(agents), function(i) {
+    env_step_2d(agents[[i]], actions_final_list[[i]])
+  })
+  
+  # Update agents & rewards
+  for (i in seq_along(agents)) {
+    reward_i <- results[[i]]$reward + 0.5
+    agents[[i]] <- results[[i]]$state
+    trajectories[[i]] <- rbind(trajectories[[i]], agents[[i]])
+    total_rewards[i] <- total_rewards[i] + reward_i
+    done_flags[i] <- done_flags[i] || results[[i]]$done
+  }
+  
+  # Update critic
+  shared_reward <- max(sapply(results, function(r) r$reward))
+  for (i in seq_along(actor_list)) {
+    critic_input <- c(states_embed[[i]], actions_final_list[[i]])
+    critic %>% fit(x = matrix(critic_input, nrow = 1),
+                   y = matrix(shared_reward, ncol = 1), verbose = 0)
+  }
+  
+  if (all(done_flags)) break
+}
+
+# --- Results Table ---
+results_df <- tibble(
+  Agent = paste0("Agent_", seq_along(agents)),
+  Total_Reward = total_rewards,
+  Final_X = sapply(agents, `[[`, 1),
+  Final_Y = sapply(agents, `[[`, 2),
+  Reached_Goal = sapply(agents, function(s) sum((s - goal)^2) < goal_threshold^2)
+)
+print(results_df)
+
+# --- Map Overlay ---
+rescale_back <- function(scaled_vals, original_min, original_max) {
+  original_min + (scaled_vals / 2) * (original_max - original_min)
+}
+
+agent_trajs_longlat <- lapply(trajectories, function(traj) {
+  lon <- rescale_back(traj[,1], min(crime$Longitude), max(crime$Longitude))
+  lat <- rescale_back(traj[,2], min(crime$Latitude), max(crime$Latitude))
+  data.frame(Longitude = lon, Latitude = lat)
+})
+
+traj_df <- bind_rows(lapply(seq_along(agent_trajs_longlat), function(i) {
+  df <- agent_trajs_longlat[[i]]
+  df$Agent <- paste0("Agent_", i)
+  df$Step <- seq_len(nrow(df))
+  df
+}))
+
+# Top 10 Hotspots
+hotspot_points <- crime_scaled %>%
+  mutate(Xr = round(X, 1), Yr = round(Y, 1)) %>%
+  count(Xr, Yr, sort = TRUE) %>%
+  head(10) %>%
+  mutate(
+    Longitude = rescale_back(Xr, min(crime$Longitude), max(crime$Longitude)),
+    Latitude = rescale_back(Yr, min(crime$Latitude), max(crime$Latitude))
+  )
+
+agent_colors <- c("red", "blue", "orange", "purple", "brown", "pink")
+
+map <- leaflet() %>%
+  addTiles() %>%
+  addCircleMarkers(data = crime, lng = ~Longitude, lat = ~Latitude,
+                   radius = 1, color = "gray", opacity = 0.3, fillOpacity = 0.1)
+
+for (i in 1:n_agents) {
+  map <- map %>%
+    addPolylines(data = traj_df %>% filter(Agent == paste0("Agent_", i)),
+                 lng = ~Longitude, lat = ~Latitude,
+                 color = agent_colors[i], weight = 4, opacity = 1)
+}
+
+# Start and goal
+map <- map %>%
+  addCircleMarkers(data = traj_df %>% group_by(Agent) %>% slice(1),
+                   lng = ~Longitude, lat = ~Latitude,
+                   color = ~agent_colors[as.numeric(factor(Agent))],
+                   radius = 5, label = ~Agent) %>%
+  addCircleMarkers(data = traj_df %>% group_by(Agent) %>% slice(n()),
+                   lng = ~Longitude, lat = ~Latitude,
+                   color = "green", radius = 5, label = ~Agent)
+
+# Add top hotspots
+map <- map %>%
+  addCircleMarkers(data = hotspot_points,
+                   lng = ~Longitude, lat = ~Latitude,
+                   radius = 8, color = "red", fillOpacity = 0.5,
+                   label = ~paste0("Hotspot: ", n), group = "Hotspots")
+
+# Legend
+map <- map %>%
+  addLegend(position = "bottomright",
+            colors = c(agent_colors, "green", "red", "gray"),
+            labels = c(paste0("Agent_", 1:n_agents, " Path"),
+                       "Goal Reached",
+                       "Top Hotspot",
+                       "Crime Locations"),
+            opacity = 1)
+
+map
+
+
+
+## Simulation
+# --- Libraries ---
+library(keras)
+library(tensorflow)
+library(tidyverse)
+library(copula)
+
+# --- Environment Setup ---
+env_bounds <- c(0, 2)
+goal <- c(1.5, 1.5)
+goal_threshold <- 0.3  # Easier to reach (≈ radius ~0.32 units)
+obstacles <- list(c(0.5, 0.5), c(1.0, 1.0), c(0.8, 1.2))
+
+is_in_obstacle <- function(pos) {
+  any(sapply(obstacles, function(o) sum((pos - o)^2) < 0.05))
+}
+
+env_step_2d <- function(state, action, step_size = 0.1) {
+  next_state <- state + step_size * tanh(action)
+  next_state <- pmax(env_bounds[1], pmin(env_bounds[2], next_state))
+  if (is_in_obstacle(next_state)) {
+    reward <- -1; done <- TRUE
+  } else if (sum((next_state - goal)^2) < goal_threshold) {
+    reward <- 2; done <- TRUE  # More rewarding goal
+  } else {
+    reward <- -0.01; done <- FALSE
+  }
+  list(state = next_state, reward = reward, done = done)
+}
+
+# --- Encoding Functions ---
+phase_embed <- function(state) {
+  sin_enc <- sin(state * pi)
+  cos_enc <- cos(state * pi)
+  c(state, sin_enc, cos_enc)
+}
+
+entangled_state <- function(state, other_states) {
+  avg_other <- colMeans(do.call(rbind, other_states))
+  phase_embed((state + avg_other) / 2)
+}
+
+copula_transform <- function(actions_matrix) {
+  apply(actions_matrix, 2, rank) / (nrow(actions_matrix) + 1)
+}
+
+# --- Actor & Critic Models ---
+define_critic_model <- function(input_dim) {
+  keras_model_sequential() %>%
+    layer_dense(units = 32, activation = 'relu', input_shape = input_dim) %>%
+    layer_dense(units = 16, activation = 'relu') %>%
+    layer_dense(units = 1) %>%
+    compile(optimizer = optimizer_adam(0.001), loss = 'mse')
+}
+
+define_actor_model <- function(input_dim) {
+  keras_model_sequential() %>%
+    layer_dense(units = 16, activation = 'relu', input_shape = input_dim) %>%
+    layer_dense(units = 2, activation = 'tanh') %>%
+    compile(optimizer = optimizer_adam(0.01), loss = 'mse')
+}
+
+# --- Initialize Models ---
+set.seed(42)
+n_agents <- 6
+input_dim <- length(phase_embed(c(0, 0)))
+actor_list <- replicate(n_agents, define_actor_model(input_dim), simplify = FALSE)
+critic <- define_critic_model(input_dim + 2)
+agents <- lapply(1:n_agents, function(i) runif(2, 0, 1))
+trajectories <- lapply(agents, function(start) matrix(start, nrow = 1))
+done_flags <- rep(FALSE, n_agents)
+total_rewards <- rep(0, n_agents)
+
+# --- Simulation Loop ---
+for (t in 1:300) {
+  states_embed <- lapply(seq_along(agents), function(i) {
+    entangled_state(agents[[i]], agents[-i])
+  })
+  
+  actions <- lapply(seq_along(actor_list), function(i) {
+    as.numeric(predict(actor_list[[i]], matrix(states_embed[[i]], nrow = 1)))
+  })
+  
+  cop_actions <- copula_transform(do.call(rbind, actions))
+  
+  results <- lapply(seq_along(agents), function(i) {
+    env_step_2d(agents[[i]], actions[[i]])
+  })
+  
+  for (i in seq_along(agents)) {
+    agents[[i]] <- results[[i]]$state
+    trajectories[[i]] <- rbind(trajectories[[i]], agents[[i]])
+    total_rewards[i] <- total_rewards[i] + results[[i]]$reward
+    done_flags[i] <- done_flags[i] || results[[i]]$done
+  }
+  
+  # Cooperative Reward Signal
+  shared_reward <- max(sapply(results, function(r) r$reward))
+  for (i in seq_along(actor_list)) {
+    critic_input <- c(states_embed[[i]], actions[[i]])
+    critic %>% fit(x = matrix(critic_input, nrow = 1),
+                   y = matrix(shared_reward, ncol = 1), verbose = 0)
+  }
+  if (all(done_flags)) break
+}
+
+# --- Visualization ---
+plot(NULL, xlim = env_bounds, ylim = env_bounds, xlab = "X", ylab = "Y", asp = 1, main = "Multi-Agent Paths")
+points(goal[1], goal[2], pch = 8, col = "green", cex = 2)
+for (o in obstacles) {
+  symbols(x = o[1], y = o[2], circles = 0.05, inches = FALSE, add = TRUE, fg = "gray", bg = "lightgray")
+}
+colors <- rainbow(n_agents)
+for (i in seq_along(trajectories)) {
+  traj <- trajectories[[i]]
+  lines(traj[,1], traj[,2], col = colors[i], lwd = 2)
+  points(traj[1,1], traj[1,2], pch = 15, col = colors[i])
+  points(tail(traj, 1)[1], tail(traj, 1)[2], pch = 19, col = colors[i])
+  text(traj[1,1], traj[1,2] + 0.05, labels = paste0("A", i, "_Start"), col = colors[i], cex = 0.7)
+  text(tail(traj, 1)[1], tail(traj, 1)[2] - 0.05, labels = paste0("A", i, "_End"), col = colors[i], cex = 0.7)
+}
+legend("topright", legend = paste0("Agent_", 1:n_agents), col = colors, lwd = 2, bty = "n")
+
+# --- Results Table ---
+results_df <- tibble(
+  Agent = paste0("Agent_", seq_along(agents)),
+  Total_Reward = total_rewards,
+  Final_X = sapply(agents, `[[`, 1),
+  Final_Y = sapply(agents, `[[`, 2),
+  Reached_Goal = sapply(agents, function(s) sum((s - goal)^2) < goal_threshold)
+)
+
+print(results_df)

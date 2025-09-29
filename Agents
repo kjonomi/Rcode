@@ -33,7 +33,7 @@ crime_scaled <- crime %>%
 # --- Environment Setup ---
 env_bounds <- c(0, 2)
 goal <- c(1.5, 1.5)
-goal_threshold <- 0.32  
+goal_threshold <- 0.8  
 # Top 10 densest crime spots as obstacles
 hotspots <- crime_scaled %>%
   mutate(Xr = round(X, 1), Yr = round(Y, 1)) %>%

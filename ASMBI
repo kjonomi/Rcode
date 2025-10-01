@@ -1,0 +1,2567 @@
+###########################################
+### Simulation Study
+###########################################
+# Load library
+library(funData)
+library(MFPCA)
+
+# Set seed and old plot settings
+oldPar <- par(no.readonly = TRUE)
+set.seed(1)
+
+# Simulate the original functional data
+sim <- simMultiFunData(
+  type = "split", 
+  argvals = list(seq(0,1,0.01), seq(0,1,0.01), seq(0,1,0.01), seq(0,1,0.01), seq(0,1,0.01)),
+  M = 10, 
+  eFunType = "Fourier", 
+  eValType = "linear", 
+  N = 100
+)
+
+# Introduce high correlation manually
+# Here, we forcefully correlate the simulated datasets
+for (i in 2:length(sim$simData)) {
+  sim$simData[[i]]@X <- 0.9 * sim$simData[[1]]@X + 0.1 * sim$simData[[i]]@X
+}
+
+# Quick check plot
+par(mfrow = c(1,1))
+plot(sim[[1]])  # Plot first function
+
+
+y1<-as.data.frame(sim$simData[[1]])$X
+y2<-as.data.frame(sim$simData[[2]])$X
+y3<-as.data.frame(sim$simData[[3]])$X
+y4<-as.data.frame(sim$simData[[4]])$X
+y5<-as.data.frame(sim$simData[[5]])$X
+
+length(y1)
+length(y2)
+length(y3)
+length(y4)
+length(y5)
+
+L = 100				#	L is the number of measurements per day
+N = 101				#	N is the number of days of data.  
+#h=1
+#data=as.matrix(Fhat$condist)
+
+data=as.matrix(y1)
+data=as.matrix(y2)
+data=as.matrix(y3)
+data=as.matrix(y4)
+data=as.matrix(y5)
+
+
+dim(data)=c(L,N)
+nrow(data)
+ncol(data)
+
+y = data[,1:N]
+
+
+s <- seq(0,1,length.out = N)
+
+L3 <- MakeFPCAInputs(IDs = rep(1:L, each=N), tVec=rep(s,L), t(y))
+FPCAdense <- FPCA(L3$Ly, L3$Lt)
+#  FPCAdense <- FPCA(L3$Ly, L3$Lt, list(plot = TRUE, maxK=8, methodMuCovEst='smooth', userBwCov=5, useBinnedData='OFF', nRegGrid=49))
+FPCAdense$cumFVE
+FPCAdense$lambda
+
+
+par(mfrow=c(1,1))
+CreateModeOfVarPlot(FPCAdense, main = "")
+
+FPCAdense$cumFVE
+FPCAdense$cumFVE[2]-FPCAdense$cumFVE[1]
+FPCAdense$cumFVE[3]-FPCAdense$cumFVE[2]
+
+FPCAdense$lambda
+FPCAdense$phi
+
+eigenfunctions <-FPCAdense$phi
+
+
+eigenvector1=eigenfunctions[,1]
+eigenvector2=eigenfunctions[,2]
+eigenvector3=eigenfunctions[,3]
+
+eigen<-as.matrix(cbind(eigenvector1, eigenvector2, eigenvector3))
+
+
+library(dygraphs)
+library(xts) # To make the convertion data-frame / xts format
+
+# Format 2: time is represented by a date.
+data <- data.frame(
+  time= seq(from=0, to=10, length.out=101 ), 
+  value1=eigen[,1],
+  value1=eigen[,2],
+  value1=eigen[,3])
+
+# Create a first line
+plot(data[,1], data[,2], frame = FALSE, type="l", lwd=1, lty = 1,
+     col = "red", xlab = "", main = "Eigenfunctions", ylab="Sim(1|2345) High Frequency", ylim=c(-5,10))
+
+# Create a first line
+plot(data[,1], data[,2], frame = FALSE, type="l", lwd=1, lty = 1,
+     col = "red", xlab = "", main = "Eigenfunctions", ylab="Sim(2|1345) High Frequency", ylim=c(-5,10))
+
+# Create a first line
+plot(data[,1], data[,2], frame = FALSE, type="l", lwd=1, lty = 1,
+     col = "red", xlab = "", main = "Eigenfunctions", ylab="Sim(3|1245) High Frequency", ylim=c(-5,10))
+
+# Create a first line
+plot(data[,1], data[,2], frame = FALSE, type="l", lwd=1, lty = 1,
+     col = "red", xlab = "", main = "Eigenfunctions", ylab="Sim(4|1235) High Frequency", ylim=c(-5,10))
+
+# Create a first line
+plot(data[,1], data[,2], frame = FALSE, type="l", lwd=1, lty = 1,
+     col = "red", xlab = "", main = "Eigenfunctions", ylab="Sim(5|1234) High Frequency", ylim=c(-5,10))
+
+# Add a second line
+lines(data[,1], data[,3], pch = 18, col = "blue", lty = 2)
+
+
+# Add a legend to the plot
+legend("topright", legend=c("EigenFun1", "EigenFun2", "EigenFun3"),
+       col=c("red", "blue", "black"), lty = 1:5, cex=0.5)
+
+
+#-----------------------------------------------------------------------------#
+#   Transform data to standard uniform d.f. through its empirical d.f.        #
+#-----------------------------------------------------------------------------#
+
+Empiric.df<-function(data,x)
+{	data<-sort(data)
+
+if(min(data)>0) a<-0 else a<-floor(min(data)/100)*100
+if(max(data)<0) b<-0 else b<-ceiling(max(data)/100)*100
+
+for(j in 1:length(x))
+{
+  if(x[j]<a) x[j]<-a
+  if(x[j]>b) x[j]<-b
+}
+
+data<-c(a,data,b)
+n<-length(data)
+p<-c(rep(0,(n-1)))
+q<-c(rep(0,(n-1)))
+
+for(i in 2:(n-2))
+{
+  p[i]<-(data[i]+data[i+1])/2
+  q[i]<-(i-1)/(n-2)
+}
+p[1]<-a
+p[n-1]<-b
+q[1]<-0
+q[n-1]<-1
+approx(p,q,xout=c(x))$y
+}
+
+
+gene<-eigen
+
+
+#--------------------------- Initial values ---------------------------------#
+
+col1.n <- length(gene[1,]); col1.n
+row1.n <- length(gene[,1]); n <- row1.n; n   
+
+#=============================================================================#
+#                 Step to transform original data to U(0,1)                   #
+#=============================================================================#
+
+Emp1.index <- matrix(rep(0,n*col1.n),n,col1.n)
+
+for(i in 1:col1.n){
+  Emp1.index[,i] <- Empiric.df(gene[,i],gene[,i])
+}
+
+
+Emp.index <- data.frame(Emp1.index)
+
+
+library(qcc)
+library(ggplot2)
+
+# Assuming Emp.index is your multivariate dataset (data.frame or matrix)
+Emp <- Emp.index  
+
+# Create Hotelling's T² control chart
+qcc_obj <- mqcc(Emp, type = "T2")
+
+# Extract T² statistics and control limit
+T2_stats <- qcc_obj$statistics
+T2_limit <- qcc_obj$limits[2]
+
+# Create dataframe for plotting
+df <- data.frame(
+  Index = 1:nrow(Emp),
+  T2 = as.vector(T2_stats),
+  OutOfControl = as.vector(T2_stats) > T2_limit
+)
+
+# Plot with labels
+ggplot(df, aes(x = Index, y = T2)) +
+  geom_line(color = "blue") +
+  geom_point(aes(color = OutOfControl), size = 2) +
+  geom_text(aes(label = Index), vjust = -0.8, size = 3) +  # <-- Point numbers
+  geom_hline(yintercept = T2_limit, linetype = "dashed", color = "red") +
+  labs(title = "Hotelling's T² Control Chart with Numbering",
+       x = "Observation Index",
+       y = "T² Statistic") +
+  scale_color_manual(values = c("black", "red")) +
+  theme_minimal()
+
+
+library(MASS)
+library(ggplot2)
+
+# Step 0: Assign your dataset
+Emp <- Emp.index  # Your multivariate dataset
+
+# Step 1: Compute spatial ranks
+ranks <- apply(Emp, 2, rank)
+n <- nrow(ranks)
+p <- ncol(ranks)
+
+# Step 2: Compute Mahalanobis distances of ranks
+rank_mean <- colMeans(ranks)
+rank_cov <- cov(ranks)
+mahal_dist <- mahalanobis(ranks, center = rank_mean, cov = rank_cov)
+
+## ===== NONPARAMETRIC CUSUM SECTION =====
+
+# Step 3a: Compute CUSUM statistics
+target <- mean(mahal_dist)  # Reference mean
+k <- 0.5                    # Reference value for detecting small shifts
+cusum_pos <- cusum_neg <- numeric(n)
+for (i in 2:n) {
+  cusum_pos[i] <- max(0, cusum_pos[i - 1] + mahal_dist[i] - (target + k))
+  cusum_neg[i] <- min(0, cusum_neg[i - 1] + mahal_dist[i] - (target - k))
+}
+
+# Step 4a: Define CUSUM control limit
+h <- 5  # User-defined (try adjusting based on data characteristics)
+
+# Step 5a: Prepare CUSUM plot
+df_cusum <- data.frame(
+  Index = 1:n,
+  CUSUM_Pos = cusum_pos,
+  CUSUM_Neg = cusum_neg,
+  OutOfControl = cusum_pos > h | cusum_neg < -h
+)
+
+# Step 6a: Plot CUSUM chart
+ggplot(df_cusum, aes(x = Index)) +
+  geom_line(aes(y = CUSUM_Pos), color = "blue") +
+  geom_line(aes(y = CUSUM_Neg), color = "red") +
+  geom_point(data = subset(df_cusum, OutOfControl), 
+             aes(y = ifelse(CUSUM_Pos > h, CUSUM_Pos, CUSUM_Neg)), 
+             color = "darkred", size = 2) +
+  geom_text(data = subset(df_cusum, OutOfControl), 
+            aes(y = ifelse(CUSUM_Pos > h, CUSUM_Pos, CUSUM_Neg), label = Index), 
+            vjust = -1, size = 3) +
+  geom_hline(yintercept = h, linetype = "dashed", color = "darkgreen") +
+  geom_hline(yintercept = -h, linetype = "dashed", color = "darkgreen") +
+  labs(title = "Nonparametric Multivariate CUSUM Chart",
+       y = "CUSUM Statistic", x = "Observation Index") +
+  theme_minimal()
+
+## ===== NONPARAMETRIC EWMA SECTION =====
+
+# Step 3b: Compute EWMA of Mahalanobis rank distance
+lambda <- 0.2
+ewma <- numeric(n)
+ewma[1] <- mahal_dist[1]
+for (i in 2:n) {
+  ewma[i] <- lambda * mahal_dist[i] + (1 - lambda) * ewma[i - 1]
+}
+
+# Step 4b: Define EWMA control limits
+ewma_mean <- mean(mahal_dist)
+ewma_sd <- sd(mahal_dist) * sqrt(lambda / (2 - lambda))
+L <- 3
+ucl <- ewma_mean + L * ewma_sd
+lcl <- ewma_mean - L * ewma_sd
+
+# Step 5b: Prepare EWMA plot data
+df_ewma <- data.frame(
+  Index = 1:n,
+  EWMA = ewma,
+  OutOfControl = ewma > ucl | ewma < lcl
+)
+
+# Step 6b: Plot EWMA chart
+ggplot(df_ewma, aes(x = Index, y = EWMA)) +
+  geom_line(color = "purple") +
+  geom_point(aes(color = OutOfControl), size = 2) +
+  geom_text(data = subset(df_ewma, OutOfControl), 
+            aes(label = Index), vjust = -1, size = 3) +
+  geom_hline(yintercept = ewma_mean, linetype = "dotted", color = "blue") +
+  geom_hline(yintercept = c(ucl, lcl), linetype = "dashed", color = "red") +
+  scale_color_manual(values = c("black", "red")) +
+  labs(title = "Nonparametric Multivariate EWMA Chart",
+       y = "EWMA of Mahalanobis Rank Distance", x = "Observation Index") +
+  theme_minimal()
+
+
+library(Rcpp)
+library(ecp)
+
+# Step 1: Assign data
+Emp <- Emp.index  # Multivariate time series (n x p)
+
+# Step 2: Apply nonparametric multivariate changepoint detection
+result <- e.divisive(X = as.matrix(Emp), R = 199, sig.lvl = 0.05)
+
+# Step 3: Extract estimated changepoints
+changepoints <- result$estimates  # Includes 1 and n+1; changepoints are at changepoints[-c(1, length)]
+
+print(changepoints)
+
+library(changepoint)
+
+# Step 1: Reduce multivariate data to a univariate summary (e.g., PCA)
+Emp <- Emp.index
+pca1 <- prcomp(Emp, scale. = TRUE)$x[, 1]  # First principal component
+
+# Step 2: Apply parametric changepoint detection
+cpt_result <- cpt.meanvar(pca1, method = "PELT", penalty = "BIC")
+
+# Step 3: Extract and visualize
+changepoints <- cpts(cpt_result)
+print(changepoints)
+
+# Plot
+plot(cpt_result, main = "Changepoint Detection using PELT (PCA1)")
+
+
+#######################
+## RMSE & AUC
+###############################################################
+# Load functional data
+###############################################################
+library(funData)
+library(MFPCA)
+
+# Set seed and old plot settings
+oldPar <- par(no.readonly = TRUE)
+set.seed(1)
+
+# Simulate the original functional data
+sim <- simMultiFunData(
+  type = "split", 
+  argvals = list(seq(0,1,0.01), seq(0,1,0.01), seq(0,1,0.01), seq(0,1,0.01), seq(0,1,0.01)),
+  M = 10, 
+  eFunType = "Fourier", 
+  eValType = "linear", 
+  N = 100
+)
+
+# Introduce high correlation manually
+# Here, we forcefully correlate the simulated datasets
+for (i in 2:length(sim$simData)) {
+  sim$simData[[i]]@X <- 0.9 * sim$simData[[1]]@X + 0.1 * sim$simData[[i]]@X
+}
+
+# Quick check plot
+par(mfrow = c(1,1))
+plot(sim[[1]])  # Plot first function
+
+
+y1<-as.data.frame(sim$simData[[1]])$X
+y2<-as.data.frame(sim$simData[[2]])$X
+y3<-as.data.frame(sim$simData[[3]])$X
+y4<-as.data.frame(sim$simData[[4]])$X
+y5<-as.data.frame(sim$simData[[5]])$X
+
+length(y1)
+length(y2)
+length(y3)
+length(y4)
+length(y5)
+
+L = 100				#	L is the number of measurements per day
+N = 101				#	N is the number of days of data.  
+#h=1
+#data=as.matrix(Fhat$condist)
+
+data1=as.matrix(y1)
+data2=as.matrix(y2)
+data3=as.matrix(y3)
+data4=as.matrix(y4)
+data5=as.matrix(y5)
+
+Adata<-data.frame(cbind(data1,data2,data3,data4,data5))
+###############################################################
+# Full analysis script for Fhat2 (5 series in columns)
+###############################################################
+
+Fhat2 <- as.matrix(Adata)
+
+# --- 1) Libraries ---
+library(fda)
+library(fdapace)
+library(funData)
+library(qcc)
+library(ggplot2)
+library(MASS)
+library(Rcpp)
+library(ecp)
+library(changepoint)
+library(np)
+library(pROC)
+library(gridExtra)
+library(reshape2)
+library(dplyr)
+
+# --- 2) Prepare list: one element per column/series ---
+fy_list <- lapply(1:ncol(Fhat2), function(j) {
+  # Keep rows = curves, cols = timepoints. If each column is a time series
+  # over timepoints we create a matrix with rows = curves (days) and columns = timepoints.
+  # Here your Fhat2 has rows = curves (days) and columns = five series (so we create a matrix with 1 column)
+  matrix(Fhat2[, j], nrow = nrow(Fhat2), ncol = ncol(Fhat2)) # keep full time grid across rows
+})
+# Above we keep the whole matrix form for each series (rows=curves, cols=time points).
+names(fy_list) <- paste0("Series", seq_along(fy_list))
+
+# --- 3) Robust FPCA LOOCV RMSE function ---
+fpca_loocv_rmse <- function(y_mat, maxK = 8){
+  # y_mat: matrix with rows = curves (L), cols = time points (N)
+  L <- nrow(y_mat); N <- ncol(y_mat)
+  if(L < 2) return(list(rmse_by_k = matrix(NA, 0, maxK), mean_rmse = rep(NA, maxK), bestK = NA))
+  s <- seq(0,1,length.out=N)
+  rmse_by_k <- matrix(NA, nrow = L, ncol = maxK)
+  
+  for(i in 1:L){
+    train_idx <- setdiff(1:L, i)
+    train_y <- t(y_mat[train_idx, , drop=FALSE])  # columns are curves for MakeFPCAInputs
+    # Build FPCA inputs
+    L3 <- tryCatch(
+      MakeFPCAInputs(IDs = rep(1:length(train_idx), each=N),
+                     tVec = rep(s, length(train_idx)),
+                     y = train_y),
+      error = function(e) NULL
+    )
+    if(is.null(L3)) next
+    FPC <- tryCatch(FPCA(L3$Ly, L3$Lt, list(maxK = maxK, methodMuCovEst='smooth')),
+                    error = function(e) NULL)
+    if(is.null(FPC) || is.null(FPC$phi) || is.null(FPC$mu)) next
+    phi <- FPC$phi; mu_hat <- FPC$mu
+    K_avail <- ncol(phi)
+    left_curve <- as.numeric(y_mat[i, ])
+    
+    for(K in 1:K_avail){
+      dif <- left_curve - mu_hat
+      # compute scores robustly (projection)
+      scores <- sapply(1:K, function(k) sum(dif * phi[,k]) / length(dif))
+      scores <- matrix(scores, ncol=1)
+      recon <- tryCatch(as.vector(mu_hat + phi[,1:K] %*% scores), error=function(e) rep(NA, length(mu_hat)))
+      if(all(is.na(recon))) next
+      rmse_by_k[i,K] <- sqrt(mean((left_curve - recon)^2, na.rm=TRUE))
+    }
+  }
+  
+  # compute mean RMSE per K (keep only Ks that have at least one non-NA)
+  mean_rmse <- rep(NA, maxK)
+  for(K in 1:maxK){
+    if(any(!is.na(rmse_by_k[,K]))) mean_rmse[K] <- mean(rmse_by_k[,K], na.rm=TRUE)
+  }
+  # find best K among valid ones
+  if(all(is.na(mean_rmse))) bestK <- NA else bestK <- which.min(mean_rmse)
+  list(rmse_by_k = rmse_by_k, mean_rmse = mean_rmse, bestK = bestK)
+}
+
+# --- 4) compute AUC from Hotelling T2 (safe) ---
+compute_auc_from_t2 <- function(y_mat, n_anom = 10){
+  # y_mat: rows=curves, cols=timepoints OR features. For mqcc we pass matrix with rows=observations, cols=variables.
+  # Here we assume y_mat rows = observations, cols = features (works for 1-col too).
+  t2_obj <- tryCatch(mqcc(y_mat, type="T2"), error = function(e) NULL)
+  if(is.null(t2_obj)) return(NA_real_)
+  t2_vals <- as.numeric(t2_obj$statistics)
+  n <- nrow(y_mat)
+  # If n_anom >= n, adjust
+  n_anom <- min(n_anom, n-1)
+  labels <- c(rep(0, n - n_anom), rep(1, n_anom))
+  # If t2_vals contain NAs, return NA
+  if(any(is.na(t2_vals))) return(NA_real_)
+  roc_obj <- tryCatch(roc(labels, t2_vals, quiet=TRUE), error = function(e) NULL)
+  if(is.null(roc_obj)) return(NA_real_)
+  as.numeric(auc(roc_obj))
+}
+
+# --- 5) Bootstrap T2 limits (safe) ---
+bootstrap_t2_limit <- function(Emp_df, B = 100, seed = 1){
+  set.seed(seed)
+  n <- nrow(Emp_df)
+  t2_limits <- replicate(B, {
+    samp <- Emp_df[sample(1:n, replace=TRUE), , drop=FALSE]
+    qcc_obj <- tryCatch(mqcc(samp, type = "T2"), error=function(e) NULL)
+    if(!is.null(qcc_obj)) qcc_obj$limits[2] else NA
+  })
+  t2_limits <- t2_limits[!is.na(t2_limits)]
+  if(length(t2_limits)==0) return(rep(NA,4))
+  quantile(t2_limits, probs=c(0.5,0.9,0.95,0.99), na.rm=TRUE)
+}
+
+# --- 6) compute_metrics for one series (robust) ---
+compute_metrics <- function(fy_mat, maxK=8, n_anom=10){
+  # fy_mat: rows = curves, cols = timepoints (or features)
+  fpca_res <- fpca_loocv_rmse(fy_mat, maxK = maxK)
+  rmse_mean <- if(all(is.na(fpca_res$mean_rmse))) NA_real_ else mean(fpca_res$mean_rmse, na.rm=TRUE)
+  bestK <- fpca_res$bestK
+  auc_val <- compute_auc_from_t2(fy_mat, n_anom)
+  list(RMSE_mean = rmse_mean,
+       BestK = bestK,
+       AUC = auc_val,
+       RMSE_curve = fpca_res$mean_rmse)
+}
+
+# --- 7) Run metrics on all series in fy_list ---
+metrics_results <- lapply(fy_list, compute_metrics, maxK = 8, n_anom = 10)
+names(metrics_results) <- names(fy_list)
+
+# --- 8) Tidy the results into a data.frame ---
+metrics_results_df <- do.call(rbind, lapply(metrics_results, function(x) {
+  data.frame(RMSE_mean = x$RMSE_mean, BestK = x$BestK, AUC = x$AUC)
+}))
+metrics_results_df$Variable <- rownames(metrics_results_df)
+metrics_results_df <- metrics_results_df[, c("Variable","RMSE_mean","BestK","AUC")]
+rownames(metrics_results_df) <- NULL
+
+print(metrics_results_df)
+
+# --- 9) Diagnostics: show which series had NA RMSEs ---
+na_rmse_series <- sapply(metrics_results, function(x) all(is.na(x$RMSE_curve)))
+if(any(na_rmse_series)){
+  message("Series with all-NA RMSE curves (FPCA reconstruction failed):")
+  print(names(which(na_rmse_series)))
+} else {
+  message("No series produced all-NA RMSE curves.")
+}
+
+# --- 10) Plot: RMSE vs K for each series (if available) ---
+rmse_plot_list <- list()
+for(i in seq_along(metrics_results)){
+  rmse_vals <- metrics_results[[i]]$RMSE_curve
+  if(is.null(rmse_vals) || all(is.na(rmse_vals))){
+    next
+  }
+  # Only plot Ks that have values
+  validK <- which(!is.na(rmse_vals))
+  df <- data.frame(K = validK, RMSE = rmse_vals[validK])
+  p <- ggplot(df, aes(x=K, y=RMSE)) +
+    geom_line() + geom_point() +
+    ggtitle(paste0("FPCA RMSE vs K: ", names(metrics_results)[i])) +
+    theme_minimal() + xlab("Number of components K") + ylab("Mean RMSE")
+  rmse_plot_list[[length(rmse_plot_list)+1]] <- p
+}
+if(length(rmse_plot_list)>0) do.call(grid.arrange, c(rmse_plot_list, ncol=2))
+
+# --- 11) Hotelling T2 control charts for each series ---
+for(i in seq_along(fy_list)){
+  fy_mat <- fy_list[[i]]
+  t2_obj <- tryCatch(mqcc(fy_mat, type="T2"), error = function(e) NULL)
+  if(is.null(t2_obj)){
+    message("mqcc failed for ", names(fy_list)[i], " -- skipping T2 plot.")
+    next
+  }
+  t2_vals <- as.numeric(t2_obj$statistics)
+  df_t2 <- data.frame(Index = seq_along(t2_vals), T2 = t2_vals)
+  t2_limits <- bootstrap_t2_limit(fy_mat, B = 500, seed = 123) # fewer bootstraps by default
+  ucl99 <- ifelse(length(t2_limits)>=4, t2_limits[4], NA_real_)
+  p <- ggplot(df_t2, aes(x=Index, y=T2)) +
+    geom_line() +
+    geom_hline(yintercept = ucl99, linetype="dashed", color="red") +
+    ggtitle(paste0("Hotelling T2 Chart: ", names(fy_list)[i])) +
+    theme_minimal() + ylab("T2 statistic")
+  print(p)
+}
+
+
+
+####################################################
+### Conditional Distrubution
+####################################################
+# Load library
+library(funData)
+library(MFPCA)
+
+# Set seed and old plot settings
+oldPar <- par(no.readonly = TRUE)
+set.seed(1)
+
+# Simulate the original functional data
+sim <- simMultiFunData(
+  type = "split", 
+  argvals = list(seq(0,1,0.01), seq(0,1,0.01), seq(0,1,0.01), seq(0,1,0.01), seq(0,1,0.01)),
+  M = 10, 
+  eFunType = "Fourier", 
+  eValType = "linear", 
+  N = 100
+)
+
+# Introduce high correlation manually
+# Here, we forcefully correlate the simulated datasets
+for (i in 2:length(sim$simData)) {
+  sim$simData[[i]]@X <- 0.9 * sim$simData[[1]]@X + 0.1 * sim$simData[[i]]@X
+}
+
+# Quick check plot
+par(mfrow = c(1,1))
+plot(sim[[1]])  # Plot first function
+
+
+y1<-as.data.frame(sim$simData[[1]])$X
+y2<-as.data.frame(sim$simData[[2]])$X
+y3<-as.data.frame(sim$simData[[3]])$X
+y4<-as.data.frame(sim$simData[[4]])$X
+y5<-as.data.frame(sim$simData[[5]])$X
+
+length(y1)
+length(y2)
+length(y3)
+length(y4)
+length(y5)
+
+mfpca.sim<-data.frame(cbind(y1,y2,y3,y4,y5))
+
+library(np)
+library(sde)
+library(fda)
+library(fdapace)
+
+attach(mfpca.sim)
+bw1 <- npcdistbw(formula=y1~y2+y3+y4+y5)
+# Next, compute the condistribution object...
+Fhat1 <- npcdist(bws=bw1)
+# The object Fhat now contains results such as the estimated cumulative
+# conditional distribution function (Fhat$condist) and so on...
+summary(Fhat1)
+
+bw2 <- npcdistbw(formula=y2~y1+y3+y4+y5)
+Fhat2 <- npcdist(bws=bw2)
+summary(Fhat2)
+
+bw3 <- npcdistbw(formula=y3~y1+y2+y4+y5)
+Fhat3 <- npcdist(bws=bw3)
+summary(Fhat3)
+
+bw4 <- npcdistbw(formula=y4~y1+y2+y3+y5)
+Fhat4 <- npcdist(bws=bw4)
+summary(Fhat4)
+
+bw5 <- npcdistbw(formula=y5~y1+y2+y3+y4)
+Fhat5 <- npcdist(bws=bw5)
+summary(Fhat5)
+
+
+Fhat1con<-Fhat1$condist 
+Fhat2con<-Fhat2$condist
+Fhat3con<-Fhat3$condist
+Fhat4con<-Fhat4$condist
+Fhat5con<-Fhat5$condist
+
+Fhat2<-data.frame(cbind(Fhat1con, Fhat2con, Fhat3con, Fhat4con, Fhat5con))
+
+
+save(Fhat2, file ="Fhat2.Rdata")
+
+#setwd("C:/Users/kjono/Dropbox/Documents/My Paper/multivariate fpca and nonparametric")
+
+load('Fhat2.RData')
+attach("Fhat2.RData")
+
+#load("~/Fhat2.Rdata")
+# Load library
+library(funData)
+library(MFPCA)
+library(sde)
+library(fda)
+library(fdapace)
+
+L = 100				#	L is the number of measurements per day
+N = 101				#	N is the number of days of data.  
+
+data=as.matrix(Fhat2[,1])
+data=as.matrix(Fhat2[,2])
+data=as.matrix(Fhat2[,3])
+data=as.matrix(Fhat2[,4])
+data=as.matrix(Fhat2[,5])
+
+dim(data)=c(L,N)
+nrow(data)
+ncol(data)
+
+y = data[,1:N]
+
+
+s <- seq(0,1,length.out = N)
+
+L3 <- MakeFPCAInputs(IDs = rep(1:L, each=N), tVec=rep(s,L), t(y))
+FPCAdense <- FPCA(L3$Ly, L3$Lt)
+#  FPCAdense <- FPCA(L3$Ly, L3$Lt, list(plot = TRUE, maxK=8, methodMuCovEst='smooth', userBwCov=5, useBinnedData='OFF', nRegGrid=49))
+FPCAdense$cumFVE
+FPCAdense$lambda
+
+
+par(mfrow=c(1,1))
+CreateModeOfVarPlot(FPCAdense, main = "")
+
+FPCAdense$cumFVE
+FPCAdense$cumFVE[2]-FPCAdense$cumFVE[1]
+FPCAdense$cumFVE[3]-FPCAdense$cumFVE[2]
+FPCAdense$cumFVE[4]-FPCAdense$cumFVE[3]
+FPCAdense$cumFVE[5]-FPCAdense$cumFVE[4]
+
+FPCAdense$lambda
+FPCAdense$phi
+
+eigenfunctions <-FPCAdense$phi
+
+
+eigenvector1=eigenfunctions[,1]
+eigenvector2=eigenfunctions[,2]
+eigenvector3=eigenfunctions[,3]
+eigenvector4=eigenfunctions[,4]
+eigenvector5=eigenfunctions[,5]
+
+eigen<-as.matrix(cbind(eigenvector1, eigenvector2, eigenvector3, eigenvector4, eigenvector5))
+
+
+library(dygraphs)
+library(xts) # To make the convertion data-frame / xts format
+
+# Format 2: time is represented by a date.
+data <- data.frame(
+  time= seq(from=0, to=10, length.out=101 ), 
+  value1=eigen[,1],
+  value1=eigen[,2],
+  value1=eigen[,3],
+  value1=eigen[,4],
+  value2=eigen[,5])
+
+# Create a first line
+plot(data[,1], data[,2], frame = FALSE, type="l", lwd=1, lty = 1,
+     col = "red", xlab = "", main = "Eigenfunctions", ylab="Sim(1|2345) High Frequency", ylim=c(-5,10))
+
+# Create a first line
+plot(data[,1], data[,2], frame = FALSE, type="l", lwd=1, lty = 1,
+     col = "red", xlab = "", main = "Eigenfunctions", ylab="Sim(2|1345) High Frequency", ylim=c(-5,10))
+
+# Create a first line
+plot(data[,1], data[,2], frame = FALSE, type="l", lwd=1, lty = 1,
+     col = "red", xlab = "", main = "Eigenfunctions", ylab="Sim(3|1245) High Frequency", ylim=c(-5,10))
+
+# Create a first line
+plot(data[,1], data[,2], frame = FALSE, type="l", lwd=1, lty = 1,
+     col = "red", xlab = "", main = "Eigenfunctions", ylab="Sim(4|1235) High Frequency", ylim=c(-5,10))
+
+# Create a first line
+plot(data[,1], data[,2], frame = FALSE, type="l", lwd=1, lty = 1,
+     col = "red", xlab = "", main = "Eigenfunctions", ylab="Sim(5|1234) High Frequency", ylim=c(-5,10))
+
+# Add a second line
+lines(data[,1], data[,3], pch = 18, col = "blue", lty = 2)
+
+
+# Add a second line
+lines(data[,1], data[,4], pch = 18, col = "black", lty = 3)
+
+
+# Add a second line
+lines(data[,1], data[,5], pch = 18, col = "green", lty = 4)
+
+
+# Add a second line
+lines(data[,1], data[,6], pch = 8, col = "chocolate",  lty = 5)
+
+# Add a legend to the plot
+legend("topright", legend=c("EigenFun1", "EigenFun2", "EigenFun3", "EigenFun4", "EigenFun5"),
+       col=c("red", "blue", "black", "green", "chocolate"), lty = 1:5, cex=0.5)
+
+
+#-----------------------------------------------------------------------------#
+#   Transform data to standard uniform d.f. through its empirical d.f.        #
+#-----------------------------------------------------------------------------#
+
+Empiric.df<-function(data,x)
+{	data<-sort(data)
+
+if(min(data)>0) a<-0 else a<-floor(min(data)/100)*100
+if(max(data)<0) b<-0 else b<-ceiling(max(data)/100)*100
+
+for(j in 1:length(x))
+{
+  if(x[j]<a) x[j]<-a
+  if(x[j]>b) x[j]<-b
+}
+
+data<-c(a,data,b)
+n<-length(data)
+p<-c(rep(0,(n-1)))
+q<-c(rep(0,(n-1)))
+
+for(i in 2:(n-2))
+{
+  p[i]<-(data[i]+data[i+1])/2
+  q[i]<-(i-1)/(n-2)
+}
+p[1]<-a
+p[n-1]<-b
+q[1]<-0
+q[n-1]<-1
+approx(p,q,xout=c(x))$y
+}
+
+
+gene<-eigen
+
+
+#--------------------------- Initial values ---------------------------------#
+
+col1.n <- length(gene[1,]); col1.n
+row1.n <- length(gene[,1]); n <- row1.n; n   
+
+#=============================================================================#
+#                 Step to transform original data to U(0,1)                   #
+#=============================================================================#
+
+Emp1.index <- matrix(rep(0,n*col1.n),n,col1.n)
+
+for(i in 1:col1.n){
+  Emp1.index[,i] <- Empiric.df(gene[,i],gene[,i])
+}
+
+
+Emp.index <- data.frame(Emp1.index)
+
+
+library(qcc)
+library(ggplot2)
+
+# Assuming Emp.index is your multivariate dataset (data.frame or matrix)
+Emp <- Emp.index  
+
+# Create Hotelling's T² control chart
+qcc_obj <- mqcc(Emp, type = "T2")
+
+# Extract T² statistics and control limit
+T2_stats <- qcc_obj$statistics
+T2_limit <- qcc_obj$limits[2]
+
+# Create dataframe for plotting
+df <- data.frame(
+  Index = 1:nrow(Emp),
+  T2 = as.vector(T2_stats),
+  OutOfControl = as.vector(T2_stats) > T2_limit
+)
+
+# Plot with labels
+ggplot(df, aes(x = Index, y = T2)) +
+  geom_line(color = "blue") +
+  geom_point(aes(color = OutOfControl), size = 2) +
+  geom_text(aes(label = Index), vjust = -0.8, size = 3) +  # <-- Point numbers
+  geom_hline(yintercept = T2_limit, linetype = "dashed", color = "red") +
+  labs(title = "Hotelling's T² Control Chart with Numbering",
+       x = "Observation Index",
+       y = "T² Statistic") +
+  scale_color_manual(values = c("black", "red")) +
+  theme_minimal()
+
+
+library(MASS)
+library(ggplot2)
+
+# Step 0: Assign your dataset
+Emp <- Emp.index  # Your multivariate dataset
+
+# Step 1: Compute spatial ranks
+ranks <- apply(Emp, 2, rank)
+n <- nrow(ranks)
+p <- ncol(ranks)
+
+# Step 2: Compute Mahalanobis distances of ranks
+rank_mean <- colMeans(ranks)
+rank_cov <- cov(ranks)
+mahal_dist <- mahalanobis(ranks, center = rank_mean, cov = rank_cov)
+
+## ===== NONPARAMETRIC CUSUM SECTION =====
+
+# Step 3a: Compute CUSUM statistics
+target <- mean(mahal_dist)  # Reference mean
+k <- 0.5                    # Reference value for detecting small shifts
+cusum_pos <- cusum_neg <- numeric(n)
+for (i in 2:n) {
+  cusum_pos[i] <- max(0, cusum_pos[i - 1] + mahal_dist[i] - (target + k))
+  cusum_neg[i] <- min(0, cusum_neg[i - 1] + mahal_dist[i] - (target - k))
+}
+
+# Step 4a: Define CUSUM control limit
+h <- 5  # User-defined (try adjusting based on data characteristics)
+
+# Step 5a: Prepare CUSUM plot
+df_cusum <- data.frame(
+  Index = 1:n,
+  CUSUM_Pos = cusum_pos,
+  CUSUM_Neg = cusum_neg,
+  OutOfControl = cusum_pos > h | cusum_neg < -h
+)
+
+# Step 6a: Plot CUSUM chart
+ggplot(df_cusum, aes(x = Index)) +
+  geom_line(aes(y = CUSUM_Pos), color = "blue") +
+  geom_line(aes(y = CUSUM_Neg), color = "red") +
+  geom_point(data = subset(df_cusum, OutOfControl), 
+             aes(y = ifelse(CUSUM_Pos > h, CUSUM_Pos, CUSUM_Neg)), 
+             color = "darkred", size = 2) +
+  geom_text(data = subset(df_cusum, OutOfControl), 
+            aes(y = ifelse(CUSUM_Pos > h, CUSUM_Pos, CUSUM_Neg), label = Index), 
+            vjust = -1, size = 3) +
+  geom_hline(yintercept = h, linetype = "dashed", color = "darkgreen") +
+  geom_hline(yintercept = -h, linetype = "dashed", color = "darkgreen") +
+  labs(title = "Nonparametric Multivariate CUSUM Chart",
+       y = "CUSUM Statistic", x = "Observation Index") +
+  theme_minimal()
+
+## ===== NONPARAMETRIC EWMA SECTION =====
+
+# Step 3b: Compute EWMA of Mahalanobis rank distance
+lambda <- 0.2
+ewma <- numeric(n)
+ewma[1] <- mahal_dist[1]
+for (i in 2:n) {
+  ewma[i] <- lambda * mahal_dist[i] + (1 - lambda) * ewma[i - 1]
+}
+
+# Step 4b: Define EWMA control limits
+ewma_mean <- mean(mahal_dist)
+ewma_sd <- sd(mahal_dist) * sqrt(lambda / (2 - lambda))
+L <- 3
+ucl <- ewma_mean + L * ewma_sd
+lcl <- ewma_mean - L * ewma_sd
+
+# Step 5b: Prepare EWMA plot data
+df_ewma <- data.frame(
+  Index = 1:n,
+  EWMA = ewma,
+  OutOfControl = ewma > ucl | ewma < lcl
+)
+
+# Step 6b: Plot EWMA chart
+ggplot(df_ewma, aes(x = Index, y = EWMA)) +
+  geom_line(color = "purple") +
+  geom_point(aes(color = OutOfControl), size = 2) +
+  geom_text(data = subset(df_ewma, OutOfControl), 
+            aes(label = Index), vjust = -1, size = 3) +
+  geom_hline(yintercept = ewma_mean, linetype = "dotted", color = "blue") +
+  geom_hline(yintercept = c(ucl, lcl), linetype = "dashed", color = "red") +
+  scale_color_manual(values = c("black", "red")) +
+  labs(title = "Nonparametric Multivariate EWMA Chart",
+       y = "EWMA of Mahalanobis Rank Distance", x = "Observation Index") +
+  theme_minimal()
+
+library(Rcpp)
+library(ecp)
+
+# Step 1: Assign data
+Emp <- Emp.index  # Multivariate time series (n x p)
+
+# Step 2: Apply nonparametric multivariate changepoint detection
+result <- e.divisive(X = as.matrix(Emp), R = 199, sig.lvl = 0.05)
+
+# Step 3: Extract estimated changepoints
+changepoints <- result$estimates  # Includes 1 and n+1; changepoints are at changepoints[-c(1, length)]
+
+print(changepoints)
+
+library(changepoint)
+
+# Step 1: Reduce multivariate data to a univariate summary (e.g., PCA)
+Emp <- Emp.index
+pca1 <- prcomp(Emp, scale. = TRUE)$x[, 1]  # First principal component
+
+# Step 2: Apply parametric changepoint detection
+cpt_result <- cpt.meanvar(pca1, method = "PELT", penalty = "BIC")
+
+# Step 3: Extract and visualize
+changepoints <- cpts(cpt_result)
+print(changepoints)
+
+# Plot
+plot(cpt_result, main = "Changepoint Detection using PELT (PCA1)")
+
+
+
+####
+# Load library
+library(funData)
+library(MFPCA)
+
+# Set seed and old plot settings
+oldPar <- par(no.readonly = TRUE)
+set.seed(1)
+
+# Simulate the original functional data
+sim <- simMultiFunData(
+  type = "split", 
+  argvals = list(seq(0,1,0.01), seq(0,1,0.01), seq(0,1,0.01), seq(0,1,0.01), seq(0,1,0.01)),
+  M = 10, 
+  eFunType = "Fourier", 
+  eValType = "linear", 
+  N = 100
+)
+
+# Introduce high correlation manually
+# Here, we forcefully correlate the simulated datasets
+for (i in 2:length(sim$simData)) {
+  sim$simData[[i]]@X <- 0.9 * sim$simData[[1]]@X + 0.1 * sim$simData[[i]]@X
+}
+
+# Quick check plot
+par(mfrow = c(1,1))
+plot(sim[[1]])  # Plot first function
+
+
+y1<-as.data.frame(sim$simData[[1]])$X
+y2<-as.data.frame(sim$simData[[2]])$X
+y3<-as.data.frame(sim$simData[[3]])$X
+y4<-as.data.frame(sim$simData[[4]])$X
+y5<-as.data.frame(sim$simData[[5]])$X
+
+length(y1)
+length(y2)
+length(y3)
+length(y4)
+length(y5)
+
+mfpca.sim<-data.frame(cbind(y1,y2,y3,y4,y5))
+
+library(np)
+library(sde)
+library(fda)
+library(fdapace)
+
+attach(mfpca.sim)
+bw1 <- npcdistbw(formula=y1~y2+y3+y4+y5)
+# Next, compute the condistribution object...
+Fhat1 <- npcdist(bws=bw1)
+# The object Fhat now contains results such as the estimated cumulative
+# conditional distribution function (Fhat$condist) and so on...
+summary(Fhat1)
+
+bw2 <- npcdistbw(formula=y2~y1+y3+y4+y5)
+Fhat2 <- npcdist(bws=bw2)
+summary(Fhat2)
+
+bw3 <- npcdistbw(formula=y3~y1+y2+y4+y5)
+Fhat3 <- npcdist(bws=bw3)
+summary(Fhat3)
+
+bw4 <- npcdistbw(formula=y4~y1+y2+y3+y5)
+Fhat4 <- npcdist(bws=bw4)
+summary(Fhat4)
+
+bw5 <- npcdistbw(formula=y5~y1+y2+y3+y4)
+Fhat5 <- npcdist(bws=bw5)
+summary(Fhat5)
+
+
+Fhat1con<-Fhat1$condist 
+Fhat2con<-Fhat2$condist
+Fhat3con<-Fhat3$condist
+Fhat4con<-Fhat4$condist
+Fhat5con<-Fhat5$condist
+
+Fhat2<-data.frame(cbind(Fhat1con, Fhat2con, Fhat3con, Fhat4con, Fhat5con))
+
+
+save(Fhat2, file ="Fhat2.Rdata")
+
+
+
+#==========================================================#
+# Functional PCA & Multivariate SPC Analysis with FAR/ARL
+#==========================================================#
+
+#setwd("C:/Users/kjono/Dropbox/Documents/My Paper/multivariate fpca and nonparametric")
+
+# Load data
+load('Fhat2.RData')
+attach("Fhat2.RData")
+#load("~/Fhat2.Rdata")
+
+library("fda")
+library("fdapace")
+library("funData")
+library("qcc")
+library("ggplot2")
+library("MASS")
+library("Rcpp")
+library("ecp")
+library("changepoint")
+library("np")
+library("pROC")
+library("knitr")
+library("gridExtra")
+library("reshape2")
+library("dplyr")
+library("tidyr")
+
+
+
+###############################################################
+# 1) Construct fy1..fy5
+###############################################################
+make_fy <- function(x, L = 100, h = 1){
+  M <- matrix(x, nrow = L, byrow = TRUE)
+  N <- ncol(M) - h   # infer number of valid comparisons
+  logM <- log(M)
+  fy <- logM[, (h+1):(N+h)] - logM[, 1:N]
+  fy
+}
+
+fy1 <- make_fy(Fhat2[,1])
+fy1 <- make_fy(Fhat2[,2])
+fy1 <- make_fy(Fhat2[,3])
+fy1 <- make_fy(Fhat2[,4])
+fy1 <- make_fy(Fhat2[,5])
+
+###############################################################
+# 2) Utility functions
+###############################################################
+fpca_loocv_rmse <- function(y_mat, maxK = 8, verbose = TRUE){
+  L <- nrow(y_mat); N <- ncol(y_mat)
+  s <- seq(0,1,length.out=N)
+  rmse_by_k <- matrix(NA, nrow = L, ncol = maxK)
+  for(i in 1:L){
+    train_idx <- setdiff(1:L, i)
+    train_y <- t(y_mat[train_idx, , drop=FALSE])
+    L3 <- MakeFPCAInputs(IDs = rep(1:length(train_idx), each=ncol(y_mat)),
+                         tVec = rep(s,length(train_idx)), train_y)
+    FPC <- FPCA(L3$Ly, L3$Lt, list(maxK = maxK, methodMuCovEst='smooth'))
+    phi <- FPC$phi; mu_hat <- FPC$mu
+    K_avail <- ncol(phi)
+    left_curve <- y_mat[i, ]
+    for(K in 1:K_avail){
+      dif <- left_curve - mu_hat
+      scores <- sapply(1:K, function(k) sum(dif * phi[,k]) / length(dif))
+      recon <- as.vector(mu_hat + phi[,1:K] %*% scores)
+      rmse_by_k[i,K] <- sqrt(mean((left_curve - recon)^2))
+    }
+  }
+  mean_rmse <- colMeans(rmse_by_k, na.rm=TRUE)
+  bestK <- which.min(mean_rmse)
+  list(rmse_by_k = rmse_by_k, mean_rmse = mean_rmse, bestK = bestK)
+}
+
+bootstrap_fpca_eigen <- function(y_mat, B = 200, K = 5, seed = 123){
+  set.seed(seed)
+  L <- nrow(y_mat); N <- ncol(y_mat)
+  s <- seq(0,1,length.out=N)
+  phi_list <- array(NA, dim = c(N, K, B))
+  for(b in 1:B){
+    idx <- sample(1:L, size=L, replace=TRUE)
+    yb <- t(y_mat[idx, , drop=FALSE])
+    L3 <- MakeFPCAInputs(IDs = rep(1:L, each=N), tVec=rep(s,L), yb)
+    FPCb <- FPCA(L3$Ly, L3$Lt, list(maxK = K, methodMuCovEst='smooth'))
+    takeK <- min(K, ncol(FPCb$phi))
+    phi_list[,1:takeK,b] <- FPCb$phi[,1:takeK]
+  }
+  phi_mean <- apply(phi_list, c(1,2), mean, na.rm=TRUE)
+  phi_sd   <- apply(phi_list, c(1,2), sd, na.rm=TRUE)
+  list(phi_mean = phi_mean, phi_sd = phi_sd, raw = phi_list, grid = s)
+}
+
+bootstrap_t2_limit <- function(Emp_df, B = 1000, alpha = 0.05, seed = 1){
+  set.seed(seed)
+  n <- nrow(Emp_df); p <- ncol(Emp_df)
+  t2_limits <- replicate(B, {
+    samp <- Emp_df[sample(1:n, replace=TRUE), ]
+    qcc_obj <- tryCatch(mqcc(samp, type = "T2"), error=function(e) NULL)
+    if(!is.null(qcc_obj)) qcc_obj$limits[2] else NA
+  })
+  t2_limits <- t2_limits[!is.na(t2_limits)]
+  quantile(t2_limits, probs=c(0.5,0.9,0.95,0.99))
+}
+
+###############################################################
+# 3) Empirical index transformation
+###############################################################
+Empiric.df <- function(data,x){
+  data <- sort(data)
+  a <- if(min(data)>0) 0 else floor(min(data)/100)*100
+  b <- if(max(data)<0) 0 else ceiling(max(data)/100)*100
+  data <- c(a,data,b)
+  n <- length(data)
+  p <- rep(0,n-1); q <- rep(0,n-1)
+  for(i in 2:(n-2)){
+    p[i] <- (data[i]+data[i+1])/2
+    q[i] <- (i-1)/(n-2)
+  }
+  p[1] <- a; p[n-1] <- b; q[1] <- 0; q[n-1] <- 1
+  approx(p,q,xout=c(x))$y
+}
+
+s <- seq(0,1,length.out = ncol(fy1))
+L3 <- MakeFPCAInputs(IDs = rep(1:nrow(fy1), each=ncol(fy1)),
+                     tVec=rep(s,nrow(fy1)), t(fy1))
+FPCAdense <- FPCA(L3$Ly, L3$Lt, list(maxK=8))
+eigen <- FPCAdense$phi[,1:5]
+
+n <- nrow(eigen)
+Emp1.index <- matrix(0,n,ncol(eigen))
+for(i in 1:ncol(eigen)){
+  Emp1.index[,i] <- Empiric.df(eigen[,i],eigen[,i])
+}
+Emp.index <- data.frame(Emp1.index)
+
+###############################################################
+# 4) Hotelling T² chart
+###############################################################
+qcc_obj <- mqcc(Emp.index, type="T2")
+T2_stats <- qcc_obj$statistics
+T2_limit <- qcc_obj$limits[2]
+
+df_T2 <- data.frame(Index=1:nrow(Emp.index),
+                    T2=as.vector(T2_stats),
+                    Out=T2_stats>T2_limit)
+
+ggplot(df_T2,aes(Index,T2))+
+  geom_line(color="blue")+
+  geom_point(aes(color=Out),size=2)+
+  geom_hline(yintercept=T2_limit,linetype="dashed",color="red")+
+  labs(title="Hotelling's T² Chart",y="T² Statistic")+
+  scale_color_manual(values=c("black","red"))
+
+###############################################################
+# 5) Nonparametric CUSUM & EWMA
+###############################################################
+ranks <- apply(Emp.index,2,rank)
+rank_mean <- colMeans(ranks); rank_cov <- cov(ranks)
+mahal_dist <- mahalanobis(ranks, center=rank_mean, cov=rank_cov)
+
+## CUSUM
+target <- mean(mahal_dist); k<-0.5; n <- length(mahal_dist)
+cusum_pos <- cusum_neg <- numeric(n)
+for(i in 2:n){
+  cusum_pos[i] <- max(0,cusum_pos[i-1]+mahal_dist[i]-(target+k))
+  cusum_neg[i] <- min(0,cusum_neg[i-1]+mahal_dist[i]-(target-k))
+}
+h<-5
+df_cusum <- data.frame(Index=1:n,CUSUM_Pos=cusum_pos,CUSUM_Neg=cusum_neg,
+                       Out=(cusum_pos>h | cusum_neg< -h))
+
+ggplot(df_cusum,aes(Index))+
+  geom_line(aes(y=CUSUM_Pos),color="blue")+
+  geom_line(aes(y=CUSUM_Neg),color="red")+
+  labs(title="Nonparametric Multivariate CUSUM")
+
+## EWMA
+lambda<-0.2; ewma<-numeric(n); ewma[1]<-mahal_dist[1]
+for(i in 2:n) ewma[i]<-lambda*mahal_dist[i]+(1-lambda)*ewma[i-1]
+ewma_mean<-mean(mahal_dist)
+ewma_sd<-sd(mahal_dist)*sqrt(lambda/(2-lambda))
+L<-3; ucl<-ewma_mean+L*ewma_sd; lcl<-ewma_mean-L*ewma_sd
+df_ewma <- data.frame(Index=1:n,EWMA=ewma,Out=(ewma>ucl|ewma<lcl))
+
+ggplot(df_ewma,aes(Index,EWMA))+
+  geom_line(color="purple")+
+  geom_hline(yintercept=c(ucl,lcl),linetype="dashed",color="red")+
+  labs(title="Nonparametric Multivariate EWMA")
+
+###############################################################
+# 6) Changepoint detection
+###############################################################
+res_div <- e.divisive(as.matrix(Emp.index),R=199,sig.lvl=0.05)
+print(res_div$estimates)
+
+pca1 <- prcomp(Emp.index,scale.=TRUE)$x[,1]
+cpt_result <- cpt.meanvar(pca1,method="PELT",penalty="BIC")
+plot(cpt_result,main="Changepoint Detection (PELT on PCA1)")
+print(cpts(cpt_result))
+
+###############################################################
+# 7) Summary Table
+###############################################################
+summary_table <- data.frame(
+  Method=c("Hotelling","CUSUM","EWMA","E-divisive","PELT"),
+  Detected=c(any(df_T2$Out),
+             any(df_cusum$Out),
+             any(df_ewma$Out),
+             length(res_div$estimates)>2,
+             length(cpts(cpt_result))>0),
+  Details=c(
+    paste(which(df_T2$Out),collapse=","),
+    paste(which(df_cusum$Out),collapse=","),
+    paste(which(df_ewma$Out),collapse=","),
+    paste(res_div$estimates,collapse=","),
+    paste(cpts(cpt_result),collapse=",")
+  )
+)
+print(summary_table)
+
+###############################################################
+# 8) FAR & ARL Computation
+###############################################################
+res_dir <- "results"
+if(!dir.exists(res_dir)) dir.create(res_dir)
+
+if(exists("Emp.index")){
+  Emp <- as.matrix(Emp.index)
+  n <- nrow(Emp)
+  
+  # Observed FAR & ARL
+  qcc_obj <- mqcc(Emp, type="T2")
+  T2_stats <- qcc_obj$statistics
+  T2_limit <- qcc_obj$limits[2]
+  Out_Hotelling <- T2_stats > T2_limit
+  FAR_Hotelling <- mean(Out_Hotelling)
+  alarm_idx <- which(Out_Hotelling)
+  ARL_Hotelling <- if(length(alarm_idx) > 1) mean(diff(alarm_idx)) else NA
+  
+  ranks <- apply(Emp,2,rank)
+  rank_mean <- colMeans(ranks); rank_cov <- cov(ranks)
+  d <- mahalanobis(ranks, center = rank_mean, cov = rank_cov)
+  
+  # CUSUM
+  target <- mean(d); k <- 0.5
+  cusum_pos <- cusum_neg <- numeric(n)
+  for(i in 2:n){
+    cusum_pos[i] <- max(0, cusum_pos[i-1] + d[i] - (target + k))
+    cusum_neg[i] <- min(0, cusum_neg[i-1] + d[i] - (target - k))
+  }
+  h <- 5
+  Out_CUSUM <- (cusum_pos > h) | (cusum_neg < -h)
+  FAR_CUSUM <- mean(Out_CUSUM)
+  alarm_idx <- which(Out_CUSUM)
+  ARL_CUSUM <- if(length(alarm_idx) > 1) mean(diff(alarm_idx)) else NA
+  
+  # EWMA
+  lambda <- 0.2
+  ewma <- numeric(n); ewma[1] <- d[1]
+  for(i in 2:n) ewma[i] <- lambda*d[i] + (1-lambda)*ewma[i-1]
+  L <- 3
+  ucl <- mean(d) + L * sd(d) * sqrt(lambda/(2-lambda))
+  lcl <- mean(d) - L * sd(d) * sqrt(lambda/(2-lambda))
+  Out_EWMA <- (ewma > ucl) | (ewma < lcl)
+  FAR_EWMA <- mean(Out_EWMA)
+  alarm_idx <- which(Out_EWMA)
+  ARL_EWMA <- if(length(alarm_idx) > 1) mean(diff(alarm_idx)) else NA
+  
+  obs_table <- data.frame(
+    Method = c("Hotelling","CUSUM","EWMA"),
+    FAR = c(FAR_Hotelling, FAR_CUSUM, FAR_EWMA),
+    ARL = c(ARL_Hotelling, ARL_CUSUM, ARL_EWMA)
+  )
+  print(knitr::kable(obs_table, caption = "Observed FAR & ARL"))
+  
+  # Bootstrap FAR & ARL
+  set.seed(123)
+  B <- 200
+  boot_FAR <- matrix(NA, nrow=B, ncol=3)
+  boot_ARL <- matrix(NA, nrow=B, ncol=3)
+  colnames(boot_FAR) <- colnames(boot_ARL) <- c("Hotelling","CUSUM","EWMA")
+  
+  for(b in 1:B){
+    sim_Emp <- Emp[sample(1:n, n, replace = TRUE), ]
+    
+    # Hotelling
+    qcc_boot <- tryCatch(mqcc(sim_Emp, type="T2"), error=function(e) NULL)
+    if(!is.null(qcc_boot)){
+      T2_boot <- qcc_boot$statistics
+      lim <- qcc_boot$limits[2]
+      alarms <- which(T2_boot > lim)
+      boot_FAR[b,"Hotelling"] <- mean(T2_boot > lim)
+      boot_ARL[b,"Hotelling"] <- if(length(alarms) > 1) mean(diff(alarms)) else NA
+    }
+    
+    # CUSUM
+    ranks_boot <- apply(sim_Emp,2,rank)
+    d_boot <- mahalanobis(ranks_boot, colMeans(ranks_boot), cov(ranks_boot))
+    cusum_pos <- cusum_neg <- numeric(n)
+    for(i in 2:n){
+      cusum_pos[i] <- max(0, cusum_pos[i-1] + d_boot[i] - (mean(d_boot)+k))
+      cusum_neg[i] <- min(0, cusum_neg[i-1] + d_boot[i] - (mean(d_boot)-k))
+    }
+    Out_CUSUM_boot <- (cusum_pos>h) | (cusum_neg< -h)
+    alarms <- which(Out_CUSUM_boot)
+    boot_FAR[b,"CUSUM"] <- mean(Out_CUSUM_boot)
+    boot_ARL[b,"CUSUM"] <- if(length(alarms) > 1) mean(diff(alarms)) else NA
+    
+    # EWMA
+    ewma <- numeric(n); ewma[1] <- d_boot[1]
+    for(i in 2:n) ewma[i] <- lambda*d_boot[i] + (1-lambda)*ewma[i-1]
+    ucl <- mean(d_boot) + L * sd(d_boot) * sqrt(lambda/(2-lambda))
+    lcl <- mean(d_boot) - L * sd(d_boot) * sqrt(lambda/(2-lambda))
+    Out_EWMA_boot <- (ewma>ucl) | (ewma<lcl)
+    alarms <- which(Out_EWMA_boot)
+    boot_FAR[b,"EWMA"] <- mean(Out_EWMA_boot)
+    boot_ARL[b,"EWMA"] <- if(length(alarms) > 1) mean(diff(alarms)) else NA
+  }
+  
+  summary_boot <- data.frame(
+    Method = c("Hotelling","CUSUM","EWMA"),
+    FAR_mean = colMeans(boot_FAR, na.rm=TRUE),
+    FAR_sd = apply(boot_FAR,2,sd, na.rm=TRUE),
+    ARL_mean = colMeans(boot_ARL, na.rm=TRUE),
+    ARL_sd = apply(boot_ARL,2,sd, na.rm=TRUE)
+  )
+  print(knitr::kable(summary_boot, caption = "Bootstrap FAR & ARL"))
+  
+}
+
+
+###############################
+### Real Data Analysis ###
+###############################
+library(alphavantager)
+
+av_api_key("XCENNGJQEVBVP06T") # YOUR_API_KEY 
+AAPL5m8<-av_get(symbol="AAPL",av_fun="TIME_SERIES_INTRADAY",interval="5min",outputsize="full", extended_hours="false", month="2023-08")
+MSFT5m8<-av_get(symbol="MSFT",av_fun="TIME_SERIES_INTRADAY",interval="5min",outputsize="full", extended_hours="false", month="2023-08")
+AMZN5m8<-av_get(symbol="AMZN",av_fun="TIME_SERIES_INTRADAY",interval="5min",outputsize="full", extended_hours="false", month="2023-08")
+NVDA5m8<-av_get(symbol="NVDA",av_fun="TIME_SERIES_INTRADAY",interval="5min",outputsize="full", extended_hours="false", month="2023-08")
+GOOGL5m8<-av_get(symbol="GOOGL",av_fun="TIME_SERIES_INTRADAY",interval="5min",outputsize="full", extended_hours="false", month="2023-08")
+
+# command reference website: https://www.alphavantage.co/documentation/
+#extended_hours=false to query regular trading hours (9:30am to 4:00pm US Eastern Time) only.
+
+# number of daily trading =78
+# number of days = 23
+# number of stocks =5
+#length(AAPL5m$close)
+#data<-as.matrix(cbind(AAPL5m$close, MSFT5m$close, AMZN5m$close, NVDA5m$close, GOOGL5m))
+
+
+av_api_key("XCENNGJQEVBVP06T") # YOUR_API_KEY 
+AAPL5m7<-av_get(symbol="AAPL",av_fun="TIME_SERIES_INTRADAY",interval="5min",outputsize="full", extended_hours="false", month="2023-07")
+MSFT5m7<-av_get(symbol="MSFT",av_fun="TIME_SERIES_INTRADAY",interval="5min",outputsize="full", extended_hours="false", month="2023-07")
+AMZN5m7<-av_get(symbol="AMZN",av_fun="TIME_SERIES_INTRADAY",interval="5min",outputsize="full", extended_hours="false", month="2023-07")
+NVDA5m7<-av_get(symbol="NVDA",av_fun="TIME_SERIES_INTRADAY",interval="5min",outputsize="full", extended_hours="false", month="2023-07")
+GOOGL5m7<-av_get(symbol="GOOGL",av_fun="TIME_SERIES_INTRADAY",interval="5min",outputsize="full", extended_hours="false", month="2023-07")
+
+#length(GOOGL5m7$close)/78
+# number of daily trading =78
+# number of days = 20
+# number of stocks =5
+
+av_api_key("XCENNGJQEVBVP06T") # YOUR_API_KEY 
+AAPL5m6<-av_get(symbol="AAPL",av_fun="TIME_SERIES_INTRADAY",interval="5min",outputsize="full", extended_hours="false", month="2023-06")
+MSFT5m6<-av_get(symbol="MSFT",av_fun="TIME_SERIES_INTRADAY",interval="5min",outputsize="full", extended_hours="false", month="2023-06")
+AMZN5m6<-av_get(symbol="AMZN",av_fun="TIME_SERIES_INTRADAY",interval="5min",outputsize="full", extended_hours="false", month="2023-06")
+NVDA5m6<-av_get(symbol="NVDA",av_fun="TIME_SERIES_INTRADAY",interval="5min",outputsize="full", extended_hours="false", month="2023-06")
+GOOGL5m6<-av_get(symbol="GOOGL",av_fun="TIME_SERIES_INTRADAY",interval="5min",outputsize="full", extended_hours="false", month="2023-06")
+
+length(GOOGL5m6$close)/78
+# number of daily trading =78
+# number of days = 21
+# number of stocks =5
+
+#setwd("C:/Users/kjono/Dropbox/Documents/My Paper/multivariate fpca and nonparametric")
+
+nq1<-c(AAPL5m6$close, AAPL5m7$close, AAPL5m8$close)
+nq2<-c(MSFT5m6$close, MSFT5m7$close, MSFT5m8$close)
+nq3<-c(AMZN5m6$close, AMZN5m7$close, AMZN5m8$close)
+nq4<-c(NVDA5m6$close, NVDA5m7$close, NVDA5m8$close)
+nq5<-c(GOOGL5m6$close, GOOGL5m7$close, GOOGL5m8$close)
+
+nq<-data.frame(cbind(nq1, nq2, nq3, nq4, nq5))
+
+save(nq, file ="nq678.Rdata")
+
+
+### RMSE and AUC
+###############################################################
+# Set working directory and load data
+###############################################################
+#setwd("C:/Users/kjono/Dropbox/Documents/My Paper/multivariate fpca and nonparametric")
+load('nq678.RData')
+attach("nq678.RData")
+
+###############################################################
+# Load required libraries
+###############################################################
+library(fda)
+library(fdapace)
+library(funData)
+library(qcc)
+library(ggplot2)
+library(MASS)
+library(Rcpp)
+library(ecp)
+library(changepoint)
+library(np)
+library(pROC)
+library(knitr)
+library(gridExtra)
+library(reshape2)
+library(dplyr)
+library(tidyr)
+
+###############################################################
+# 1) Construct fy1..fy5
+###############################################################
+make_fy <- function(x){
+  n <- length(x)
+  M <- matrix(x, nrow = 78, byrow = TRUE)
+  L <- 78; N <- 63; h <- 1
+  logM <- log(M)
+  fy <- logM[, (h+1):(N+h)] - logM[, 1:N]
+  fy
+}
+
+fy1 <- make_fy(nq[,1])
+fy2 <- make_fy(nq[,2])
+fy3 <- make_fy(nq[,3])
+fy4 <- make_fy(nq[,4])
+fy5 <- make_fy(nq[,5])
+fy_list <- list(fy1, fy2, fy3, fy4, fy5)
+
+###############################################################
+# 2) FPCA LOOCV RMSE (robust version)
+###############################################################
+fpca_loocv_rmse <- function(y_mat, maxK = 8){
+  L <- nrow(y_mat); N <- ncol(y_mat)
+  s <- seq(0,1,length.out=N)
+  rmse_by_k <- matrix(NA, nrow = L, ncol = maxK)
+  
+  for(i in 1:L){
+    train_idx <- setdiff(1:L, i)
+    train_y <- t(y_mat[train_idx, , drop=FALSE])
+    
+    L3 <- MakeFPCAInputs(IDs = rep(1:length(train_idx), each=N),
+                         tVec = rep(s,length(train_idx)), train_y)
+    FPC <- FPCA(L3$Ly, L3$Lt, list(maxK = maxK, methodMuCovEst='smooth'))
+    phi <- FPC$phi
+    mu_hat <- FPC$mu
+    K_avail <- ncol(phi)
+    left_curve <- y_mat[i, ]
+    
+    for(K in 1:K_avail){
+      dif <- left_curve - mu_hat
+      scores <- sapply(1:K, function(k) sum(dif * phi[,k]) / length(dif))
+      scores <- matrix(scores, ncol=1)  # ensure column matrix
+      recon <- mu_hat + phi[,1:K] %*% scores
+      rmse_by_k[i,K] <- sqrt(mean((left_curve - recon)^2))
+    }
+  }
+  
+  # Only keep valid columns
+  mean_rmse <- colMeans(rmse_by_k[,1:K_avail, drop=FALSE], na.rm=TRUE)
+  bestK <- which.min(mean_rmse)
+  list(rmse_by_k = rmse_by_k[,1:K_avail, drop=FALSE], mean_rmse = mean_rmse, bestK = bestK)
+}
+
+###############################################################
+# 3) Bootstrap FPCA eigenfunctions
+###############################################################
+bootstrap_fpca_eigen <- function(y_mat, B = 200, K = 5, seed = 123){
+  set.seed(seed)
+  L <- nrow(y_mat); N <- ncol(y_mat)
+  s <- seq(0,1,length.out=N)
+  phi_list <- array(NA, dim = c(N, K, B))
+  for(b in 1:B){
+    idx <- sample(1:L, size=L, replace=TRUE)
+    yb <- t(y_mat[idx, , drop=FALSE])
+    L3 <- MakeFPCAInputs(IDs = rep(1:L, each=N), tVec=rep(s,L), yb)
+    FPCb <- FPCA(L3$Ly, L3$Lt, list(maxK = K, methodMuCovEst='smooth'))
+    takeK <- min(K, ncol(FPCb$phi))
+    phi_list[,1:takeK,b] <- FPCb$phi[,1:takeK]
+  }
+  phi_mean <- apply(phi_list, c(1,2), mean, na.rm=TRUE)
+  phi_sd   <- apply(phi_list, c(1,2), sd, na.rm=TRUE)
+  list(phi_mean = phi_mean, phi_sd = phi_sd, raw = phi_list, grid = s)
+}
+
+###############################################################
+# 4) Bootstrap Hotelling T2 limits
+###############################################################
+bootstrap_t2_limit <- function(Emp_df, B = 1000, alpha = 0.05, seed = 1){
+  set.seed(seed)
+  n <- nrow(Emp_df)
+  t2_limits <- replicate(B, {
+    samp <- Emp_df[sample(1:n, replace=TRUE), ]
+    qcc_obj <- tryCatch(mqcc(samp, type = "T2"), error=function(e) NULL)
+    if(!is.null(qcc_obj)) qcc_obj$limits[2] else NA
+  })
+  t2_limits <- t2_limits[!is.na(t2_limits)]
+  quantile(t2_limits, probs=c(0.5,0.9,0.95,0.99))
+}
+
+###############################################################
+# 5) Compute Performance Metrics (Bias removed)
+###############################################################
+compute_metrics <- function(fy_mat, maxK=8){
+  fpca_res <- fpca_loocv_rmse(fy_mat, maxK=maxK)
+  
+  t2_vals <- mqcc(fy_mat, type="T2")$statistics
+  labels <- c(rep(0, nrow(fy_mat)-10), rep(1,10))
+  roc_obj <- roc(labels, t2_vals)
+  auc_val <- auc(roc_obj)
+  
+  list(RMSE_mean = mean(fpca_res$mean_rmse),
+       BestK = fpca_res$bestK,
+       AUC = auc_val,
+       RMSE_curve = fpca_res$mean_rmse)
+}
+
+###############################################################
+# 6) Run metrics on fy1..fy5
+###############################################################
+metrics_results <- lapply(fy_list, compute_metrics)
+names(metrics_results) <- paste0("fy",1:5)
+
+metrics_results_df <- do.call(rbind, lapply(metrics_results, function(x) unlist(x)[1:3]))
+metrics_results_df <- as.data.frame(metrics_results_df)
+metrics_results_df$Variable <- rownames(metrics_results_df)
+metrics_results_df <- metrics_results_df[,c("Variable","RMSE_mean","BestK","AUC")]
+kable(metrics_results_df)
+
+###############################################################
+# 7) Plot RMSE vs K
+###############################################################
+rmse_plot_list <- list()
+for(i in 1:length(fy_list)){
+  rmse_vals <- metrics_results[[i]]$RMSE_curve
+  df <- data.frame(K = 1:length(rmse_vals), RMSE = rmse_vals)
+  p <- ggplot(df, aes(x=K, y=RMSE)) +
+    geom_line(color="blue") +
+    geom_point(color="red") +
+    ggtitle(paste0("FPCA RMSE vs K: fy", i)) +
+    theme_minimal() +
+    xlab("Number of Components K") +
+    ylab("Mean RMSE")
+  rmse_plot_list[[i]] <- p
+}
+do.call(grid.arrange, c(rmse_plot_list, ncol=2))
+
+###############################################################
+# 8) Hotelling T2 Control Charts
+###############################################################
+for(i in 1:length(fy_list)){
+  fy_mat <- fy_list[[i]]
+  t2_vals <- mqcc(fy_mat, type="T2")$statistics
+  df_t2 <- data.frame(Index = 1:length(t2_vals), T2 = t2_vals)
+  t2_limits <- bootstrap_t2_limit(fy_mat)
+  
+  p <- ggplot(df_t2, aes(x=Index, y=T2)) +
+    geom_line(color="blue") +
+    geom_hline(yintercept=t2_limits[4], color="red", linetype="dashed") +
+    ggtitle(paste0("Hotelling T2 Control Chart: fy", i)) +
+    theme_minimal() +
+    ylab("T2 Statistic")
+  
+  print(p)
+}
+
+
+#==========================================================#
+# Functional PCA & Multivariate SPC Analysis with FAR/ARL
+#==========================================================#
+
+
+#setwd("C:/Users/kjono/Dropbox/Documents/My Paper/multivariate fpca and nonparametric")
+load('nq678.RData')
+attach("nq678.RData")
+
+library("fda")
+library("fdapace")
+library("funData")
+library("qcc")
+library("ggplot2")
+library("MASS")
+library("Rcpp")
+library("ecp")
+library("changepoint")
+library("np")
+library("pROC")
+library("knitr")
+library("gridExtra")
+library("reshape2")
+library("dplyr")
+library("tidyr")
+
+
+###############################################################
+# 1) Construct fy1..fy5
+###############################################################
+make_fy <- function(x){
+  n <- length(x)
+  M <- matrix(x, nrow = 78, byrow = TRUE)
+  L <- 78; N <- 63; h <- 1
+  logM <- log(M)
+  fy <- logM[, (h+1):(N+h)] - logM[, 1:N]
+  fy
+}
+
+fy1 <- make_fy(nq[,1])
+fy2 <- make_fy(nq[,2])
+fy3 <- make_fy(nq[,3])
+fy4 <- make_fy(nq[,4])
+fy5 <- make_fy(nq[,5])
+
+###############################################################
+# 2) Utility functions
+###############################################################
+fpca_loocv_rmse <- function(y_mat, maxK = 8, verbose = TRUE){
+  L <- nrow(y_mat); N <- ncol(y_mat)
+  s <- seq(0,1,length.out=N)
+  rmse_by_k <- matrix(NA, nrow = L, ncol = maxK)
+  for(i in 1:L){
+    train_idx <- setdiff(1:L, i)
+    train_y <- t(y_mat[train_idx, , drop=FALSE])
+    L3 <- MakeFPCAInputs(IDs = rep(1:length(train_idx), each=ncol(y_mat)),
+                         tVec = rep(s,length(train_idx)), train_y)
+    FPC <- FPCA(L3$Ly, L3$Lt, list(maxK = maxK, methodMuCovEst='smooth'))
+    phi <- FPC$phi; mu_hat <- FPC$mu
+    K_avail <- ncol(phi)
+    left_curve <- y_mat[i, ]
+    for(K in 1:K_avail){
+      dif <- left_curve - mu_hat
+      scores <- sapply(1:K, function(k) sum(dif * phi[,k]) / length(dif))
+      recon <- as.vector(mu_hat + phi[,1:K] %*% scores)
+      rmse_by_k[i,K] <- sqrt(mean((left_curve - recon)^2))
+    }
+  }
+  mean_rmse <- colMeans(rmse_by_k, na.rm=TRUE)
+  bestK <- which.min(mean_rmse)
+  list(rmse_by_k = rmse_by_k, mean_rmse = mean_rmse, bestK = bestK)
+}
+
+bootstrap_fpca_eigen <- function(y_mat, B = 200, K = 5, seed = 123){
+  set.seed(seed)
+  L <- nrow(y_mat); N <- ncol(y_mat)
+  s <- seq(0,1,length.out=N)
+  phi_list <- array(NA, dim = c(N, K, B))
+  for(b in 1:B){
+    idx <- sample(1:L, size=L, replace=TRUE)
+    yb <- t(y_mat[idx, , drop=FALSE])
+    L3 <- MakeFPCAInputs(IDs = rep(1:L, each=N), tVec=rep(s,L), yb)
+    FPCb <- FPCA(L3$Ly, L3$Lt, list(maxK = K, methodMuCovEst='smooth'))
+    takeK <- min(K, ncol(FPCb$phi))
+    phi_list[,1:takeK,b] <- FPCb$phi[,1:takeK]
+  }
+  phi_mean <- apply(phi_list, c(1,2), mean, na.rm=TRUE)
+  phi_sd   <- apply(phi_list, c(1,2), sd, na.rm=TRUE)
+  list(phi_mean = phi_mean, phi_sd = phi_sd, raw = phi_list, grid = s)
+}
+
+bootstrap_t2_limit <- function(Emp_df, B = 1000, alpha = 0.05, seed = 1){
+  set.seed(seed)
+  n <- nrow(Emp_df); p <- ncol(Emp_df)
+  t2_limits <- replicate(B, {
+    samp <- Emp_df[sample(1:n, replace=TRUE), ]
+    qcc_obj <- tryCatch(mqcc(samp, type = "T2"), error=function(e) NULL)
+    if(!is.null(qcc_obj)) qcc_obj$limits[2] else NA
+  })
+  t2_limits <- t2_limits[!is.na(t2_limits)]
+  quantile(t2_limits, probs=c(0.5,0.9,0.95,0.99))
+}
+
+###############################################################
+# 3) Empirical index transformation
+###############################################################
+Empiric.df <- function(data,x){
+  data <- sort(data)
+  a <- if(min(data)>0) 0 else floor(min(data)/100)*100
+  b <- if(max(data)<0) 0 else ceiling(max(data)/100)*100
+  data <- c(a,data,b)
+  n <- length(data)
+  p <- rep(0,n-1); q <- rep(0,n-1)
+  for(i in 2:(n-2)){
+    p[i] <- (data[i]+data[i+1])/2
+    q[i] <- (i-1)/(n-2)
+  }
+  p[1] <- a; p[n-1] <- b; q[1] <- 0; q[n-1] <- 1
+  approx(p,q,xout=c(x))$y
+}
+
+s <- seq(0,1,length.out = ncol(fy1))
+L3 <- MakeFPCAInputs(IDs = rep(1:nrow(fy1), each=ncol(fy1)),
+                     tVec=rep(s,nrow(fy1)), t(fy1))
+FPCAdense <- FPCA(L3$Ly, L3$Lt, list(maxK=8))
+eigen <- FPCAdense$phi[,1:5]
+
+n <- nrow(eigen)
+Emp1.index <- matrix(0,n,ncol(eigen))
+for(i in 1:ncol(eigen)){
+  Emp1.index[,i] <- Empiric.df(eigen[,i],eigen[,i])
+}
+Emp.index <- data.frame(Emp1.index)
+
+###############################################################
+# 4) Hotelling T² chart
+###############################################################
+qcc_obj <- mqcc(Emp.index, type="T2")
+T2_stats <- qcc_obj$statistics
+T2_limit <- qcc_obj$limits[2]
+
+df_T2 <- data.frame(Index=1:nrow(Emp.index),
+                    T2=as.vector(T2_stats),
+                    Out=T2_stats>T2_limit)
+
+ggplot(df_T2,aes(Index,T2))+
+  geom_line(color="blue")+
+  geom_point(aes(color=Out),size=2)+
+  geom_hline(yintercept=T2_limit,linetype="dashed",color="red")+
+  labs(title="Hotelling's T² Chart",y="T² Statistic")+
+  scale_color_manual(values=c("black","red"))
+
+###############################################################
+# 5) Nonparametric CUSUM & EWMA
+###############################################################
+ranks <- apply(Emp.index,2,rank)
+rank_mean <- colMeans(ranks); rank_cov <- cov(ranks)
+mahal_dist <- mahalanobis(ranks, center=rank_mean, cov=rank_cov)
+
+## CUSUM
+target <- mean(mahal_dist); k<-0.5; n <- length(mahal_dist)
+cusum_pos <- cusum_neg <- numeric(n)
+for(i in 2:n){
+  cusum_pos[i] <- max(0,cusum_pos[i-1]+mahal_dist[i]-(target+k))
+  cusum_neg[i] <- min(0,cusum_neg[i-1]+mahal_dist[i]-(target-k))
+}
+h<-5
+df_cusum <- data.frame(Index=1:n,CUSUM_Pos=cusum_pos,CUSUM_Neg=cusum_neg,
+                       Out=(cusum_pos>h | cusum_neg< -h))
+
+ggplot(df_cusum,aes(Index))+
+  geom_line(aes(y=CUSUM_Pos),color="blue")+
+  geom_line(aes(y=CUSUM_Neg),color="red")+
+  labs(title="Nonparametric Multivariate CUSUM")
+
+## EWMA
+lambda<-0.2; ewma<-numeric(n); ewma[1]<-mahal_dist[1]
+for(i in 2:n) ewma[i]<-lambda*mahal_dist[i]+(1-lambda)*ewma[i-1]
+ewma_mean<-mean(mahal_dist)
+ewma_sd<-sd(mahal_dist)*sqrt(lambda/(2-lambda))
+L<-3; ucl<-ewma_mean+L*ewma_sd; lcl<-ewma_mean-L*ewma_sd
+df_ewma <- data.frame(Index=1:n,EWMA=ewma,Out=(ewma>ucl|ewma<lcl))
+
+ggplot(df_ewma,aes(Index,EWMA))+
+  geom_line(color="purple")+
+  geom_hline(yintercept=c(ucl,lcl),linetype="dashed",color="red")+
+  labs(title="Nonparametric Multivariate EWMA")
+
+###############################################################
+# 6) Changepoint detection
+###############################################################
+res_div <- e.divisive(as.matrix(Emp.index),R=199,sig.lvl=0.05)
+print(res_div$estimates)
+
+pca1 <- prcomp(Emp.index,scale.=TRUE)$x[,1]
+cpt_result <- cpt.meanvar(pca1,method="PELT",penalty="BIC")
+plot(cpt_result,main="Changepoint Detection (PELT on PCA1)")
+print(cpts(cpt_result))
+
+###############################################################
+# 7) Summary Table
+###############################################################
+summary_table <- data.frame(
+  Method=c("Hotelling","CUSUM","EWMA","E-divisive","PELT"),
+  Detected=c(any(df_T2$Out),
+             any(df_cusum$Out),
+             any(df_ewma$Out),
+             length(res_div$estimates)>2,
+             length(cpts(cpt_result))>0),
+  Details=c(
+    paste(which(df_T2$Out),collapse=","),
+    paste(which(df_cusum$Out),collapse=","),
+    paste(which(df_ewma$Out),collapse=","),
+    paste(res_div$estimates,collapse=","),
+    paste(cpts(cpt_result),collapse=",")
+  )
+)
+print(summary_table)
+
+###############################################################
+# 8) FAR & ARL Computation
+###############################################################
+res_dir <- "results"
+if(!dir.exists(res_dir)) dir.create(res_dir)
+
+if(exists("Emp.index")){
+  Emp <- as.matrix(Emp.index)
+  n <- nrow(Emp)
+  
+  # Observed FAR & ARL
+  qcc_obj <- mqcc(Emp, type="T2")
+  T2_stats <- qcc_obj$statistics
+  T2_limit <- qcc_obj$limits[2]
+  Out_Hotelling <- T2_stats > T2_limit
+  FAR_Hotelling <- mean(Out_Hotelling)
+  alarm_idx <- which(Out_Hotelling)
+  ARL_Hotelling <- if(length(alarm_idx) > 1) mean(diff(alarm_idx)) else NA
+  
+  ranks <- apply(Emp,2,rank)
+  rank_mean <- colMeans(ranks); rank_cov <- cov(ranks)
+  d <- mahalanobis(ranks, center = rank_mean, cov = rank_cov)
+  
+  # CUSUM
+  target <- mean(d); k <- 0.5
+  cusum_pos <- cusum_neg <- numeric(n)
+  for(i in 2:n){
+    cusum_pos[i] <- max(0, cusum_pos[i-1] + d[i] - (target + k))
+    cusum_neg[i] <- min(0, cusum_neg[i-1] + d[i] - (target - k))
+  }
+  h <- 5
+  Out_CUSUM <- (cusum_pos > h) | (cusum_neg < -h)
+  FAR_CUSUM <- mean(Out_CUSUM)
+  alarm_idx <- which(Out_CUSUM)
+  ARL_CUSUM <- if(length(alarm_idx) > 1) mean(diff(alarm_idx)) else NA
+  
+  # EWMA
+  lambda <- 0.2
+  ewma <- numeric(n); ewma[1] <- d[1]
+  for(i in 2:n) ewma[i] <- lambda*d[i] + (1-lambda)*ewma[i-1]
+  L <- 3
+  ucl <- mean(d) + L * sd(d) * sqrt(lambda/(2-lambda))
+  lcl <- mean(d) - L * sd(d) * sqrt(lambda/(2-lambda))
+  Out_EWMA <- (ewma > ucl) | (ewma < lcl)
+  FAR_EWMA <- mean(Out_EWMA)
+  alarm_idx <- which(Out_EWMA)
+  ARL_EWMA <- if(length(alarm_idx) > 1) mean(diff(alarm_idx)) else NA
+  
+  obs_table <- data.frame(
+    Method = c("Hotelling","CUSUM","EWMA"),
+    FAR = c(FAR_Hotelling, FAR_CUSUM, FAR_EWMA),
+    ARL = c(ARL_Hotelling, ARL_CUSUM, ARL_EWMA)
+  )
+  print(knitr::kable(obs_table, caption = "Observed FAR & ARL"))
+  
+  # Bootstrap FAR & ARL
+  set.seed(123)
+  B <- 200
+  boot_FAR <- matrix(NA, nrow=B, ncol=3)
+  boot_ARL <- matrix(NA, nrow=B, ncol=3)
+  colnames(boot_FAR) <- colnames(boot_ARL) <- c("Hotelling","CUSUM","EWMA")
+  
+  for(b in 1:B){
+    sim_Emp <- Emp[sample(1:n, n, replace = TRUE), ]
+    
+    # Hotelling
+    qcc_boot <- tryCatch(mqcc(sim_Emp, type="T2"), error=function(e) NULL)
+    if(!is.null(qcc_boot)){
+      T2_boot <- qcc_boot$statistics
+      lim <- qcc_boot$limits[2]
+      alarms <- which(T2_boot > lim)
+      boot_FAR[b,"Hotelling"] <- mean(T2_boot > lim)
+      boot_ARL[b,"Hotelling"] <- if(length(alarms) > 1) mean(diff(alarms)) else NA
+    }
+    
+    # CUSUM
+    ranks_boot <- apply(sim_Emp,2,rank)
+    d_boot <- mahalanobis(ranks_boot, colMeans(ranks_boot), cov(ranks_boot))
+    cusum_pos <- cusum_neg <- numeric(n)
+    for(i in 2:n){
+      cusum_pos[i] <- max(0, cusum_pos[i-1] + d_boot[i] - (mean(d_boot)+k))
+      cusum_neg[i] <- min(0, cusum_neg[i-1] + d_boot[i] - (mean(d_boot)-k))
+    }
+    Out_CUSUM_boot <- (cusum_pos>h) | (cusum_neg< -h)
+    alarms <- which(Out_CUSUM_boot)
+    boot_FAR[b,"CUSUM"] <- mean(Out_CUSUM_boot)
+    boot_ARL[b,"CUSUM"] <- if(length(alarms) > 1) mean(diff(alarms)) else NA
+    
+    # EWMA
+    ewma <- numeric(n); ewma[1] <- d_boot[1]
+    for(i in 2:n) ewma[i] <- lambda*d_boot[i] + (1-lambda)*ewma[i-1]
+    ucl <- mean(d_boot) + L * sd(d_boot) * sqrt(lambda/(2-lambda))
+    lcl <- mean(d_boot) - L * sd(d_boot) * sqrt(lambda/(2-lambda))
+    Out_EWMA_boot <- (ewma>ucl) | (ewma<lcl)
+    alarms <- which(Out_EWMA_boot)
+    boot_FAR[b,"EWMA"] <- mean(Out_EWMA_boot)
+    boot_ARL[b,"EWMA"] <- if(length(alarms) > 1) mean(diff(alarms)) else NA
+  }
+  
+  summary_boot <- data.frame(
+    Method = c("Hotelling","CUSUM","EWMA"),
+    FAR_mean = colMeans(boot_FAR, na.rm=TRUE),
+    FAR_sd = apply(boot_FAR,2,sd, na.rm=TRUE),
+    ARL_mean = colMeans(boot_ARL, na.rm=TRUE),
+    ARL_sd = apply(boot_ARL,2,sd, na.rm=TRUE)
+  )
+  print(knitr::kable(summary_boot, caption = "Bootstrap FAR & ARL"))
+  
+  # Save results
+  write.csv(obs_table, file=file.path(res_dir,"observed_FAR_ARL.csv"), row.names=FALSE)
+  write.csv(summary_boot, file=file.path(res_dir,"bootstrap_FAR_ARL.csv"), row.names=FALSE)
+}
+
+####################################
+## Conditional Distribution Case
+#####################################
+
+###############################
+## conditonal distribution
+##################################
+
+
+nq1<-c(fy1)
+nq2<-c(fy2)
+nq3<-c(fy3)
+nq4<-c(fy4)
+nq5<-c(fy5)
+
+mfpca.real<-data.frame(cbind(nq1, nq2, nq3, nq4, nq5))
+
+colnames(mfpca.real)=c("y1", "y2", "y3", "y4", "y5")
+
+
+attach(mfpca.real)
+bw1 <- npcdistbw(formula=y1~y2+y3+y4+y5)
+# Next, compute the condistribution object...
+Fhat1 <- npcdist(bws=bw1)
+# The object Fhat now contains results such as the estimated cumulative
+# conditional distribution function (Fhat$condist) and so on...
+summary(Fhat1)
+
+bw2 <- npcdistbw(formula=y2~y1+y3+y4+y5)
+Fhat2 <- npcdist(bws=bw2)
+summary(Fhat2)
+
+bw3 <- npcdistbw(formula=y3~y1+y2+y4+y5)
+Fhat3 <- npcdist(bws=bw3)
+summary(Fhat3)
+
+bw4 <- npcdistbw(formula=y4~y1+y2+y3+y5)
+Fhat4 <- npcdist(bws=bw4)
+summary(Fhat4)
+
+bw5 <- npcdistbw(formula=y5~y1+y2+y3+y4)
+Fhat5 <- npcdist(bws=bw5)
+
+
+Fhat1conr<-Fhat1$condist 
+Fhat2conr<-Fhat2$condist
+Fhat3conr<-Fhat3$condist
+Fhat4conr<-Fhat4$condist
+Fhat5conr<-Fhat5$condist
+
+Fhatreal<-data.frame(cbind(Fhat1conr, Fhat2conr, Fhat3conr, Fhat4conr, Fhat5conr))
+
+save(Fhatreal, file ="Fhatreal.Rdata")
+
+
+
+### RMSE and AUC
+###############################################################
+# Set working directory and load data
+###############################################################
+#setwd("C:/Users/kjono/Dropbox/Documents/My Paper/multivariate fpca and nonparametric")
+#load('Fhatreal.RData')
+#attach("Fhatreal.RData")
+
+###############################################################
+# Load required libraries
+###############################################################
+library(fda)
+library(fdapace)
+library(funData)
+library(qcc)
+library(ggplot2)
+library(MASS)
+library(Rcpp)
+library(ecp)
+library(changepoint)
+library(np)
+library(pROC)
+library(knitr)
+library(gridExtra)
+library(reshape2)
+library(dplyr)
+library(tidyr)
+
+###############################################################
+# 1) Construct fy1..fy5
+###############################################################
+make_fy <- function(x, L = 78, h = 1){
+  M <- matrix(x, nrow = L, byrow = TRUE)
+  N <- ncol(M) - h   # infer number of valid comparisons
+  logM <- log(M)
+  fy <- logM[, (h+1):(N+h)] - logM[, 1:N]
+  fy
+}
+
+fy1 <- make_fy(Fhatreal[,1])
+fy2 <- make_fy(Fhatreal[,2])
+fy3 <- make_fy(Fhatreal[,3])
+fy4 <- make_fy(Fhatreal[,4])
+fy5 <- make_fy(Fhatreal[,5])
+fy_list <- list(fy1, fy2, fy3, fy4, fy5)
+
+###############################################################
+# 2) FPCA LOOCV RMSE (robust version)
+###############################################################
+fpca_loocv_rmse <- function(y_mat, maxK = 8){
+  L <- nrow(y_mat); N <- ncol(y_mat)
+  s <- seq(0,1,length.out=N)
+  rmse_by_k <- matrix(NA, nrow = L, ncol = maxK)
+  
+  for(i in 1:L){
+    train_idx <- setdiff(1:L, i)
+    train_y <- t(y_mat[train_idx, , drop=FALSE])
+    
+    L3 <- MakeFPCAInputs(IDs = rep(1:length(train_idx), each=N),
+                         tVec = rep(s,length(train_idx)), train_y)
+    FPC <- FPCA(L3$Ly, L3$Lt, list(maxK = maxK, methodMuCovEst='smooth'))
+    phi <- FPC$phi
+    mu_hat <- FPC$mu
+    K_avail <- ncol(phi)
+    left_curve <- y_mat[i, ]
+    
+    for(K in 1:K_avail){
+      dif <- left_curve - mu_hat
+      scores <- sapply(1:K, function(k) sum(dif * phi[,k]) / length(dif))
+      scores <- matrix(scores, ncol=1)  # ensure column matrix
+      recon <- mu_hat + phi[,1:K] %*% scores
+      rmse_by_k[i,K] <- sqrt(mean((left_curve - recon)^2))
+    }
+  }
+  
+  # Only keep valid columns
+  mean_rmse <- colMeans(rmse_by_k[,1:K_avail, drop=FALSE], na.rm=TRUE)
+  bestK <- which.min(mean_rmse)
+  list(rmse_by_k = rmse_by_k[,1:K_avail, drop=FALSE], mean_rmse = mean_rmse, bestK = bestK)
+}
+
+###############################################################
+# 3) Bootstrap FPCA eigenfunctions
+###############################################################
+bootstrap_fpca_eigen <- function(y_mat, B = 200, K = 5, seed = 123){
+  set.seed(seed)
+  L <- nrow(y_mat); N <- ncol(y_mat)
+  s <- seq(0,1,length.out=N)
+  phi_list <- array(NA, dim = c(N, K, B))
+  for(b in 1:B){
+    idx <- sample(1:L, size=L, replace=TRUE)
+    yb <- t(y_mat[idx, , drop=FALSE])
+    L3 <- MakeFPCAInputs(IDs = rep(1:L, each=N), tVec=rep(s,L), yb)
+    FPCb <- FPCA(L3$Ly, L3$Lt, list(maxK = K, methodMuCovEst='smooth'))
+    takeK <- min(K, ncol(FPCb$phi))
+    phi_list[,1:takeK,b] <- FPCb$phi[,1:takeK]
+  }
+  phi_mean <- apply(phi_list, c(1,2), mean, na.rm=TRUE)
+  phi_sd   <- apply(phi_list, c(1,2), sd, na.rm=TRUE)
+  list(phi_mean = phi_mean, phi_sd = phi_sd, raw = phi_list, grid = s)
+}
+
+###############################################################
+# 4) Bootstrap Hotelling T2 limits
+###############################################################
+bootstrap_t2_limit <- function(Emp_df, B = 1000, alpha = 0.05, seed = 1){
+  set.seed(seed)
+  n <- nrow(Emp_df)
+  t2_limits <- replicate(B, {
+    samp <- Emp_df[sample(1:n, replace=TRUE), ]
+    qcc_obj <- tryCatch(mqcc(samp, type = "T2"), error=function(e) NULL)
+    if(!is.null(qcc_obj)) qcc_obj$limits[2] else NA
+  })
+  t2_limits <- t2_limits[!is.na(t2_limits)]
+  quantile(t2_limits, probs=c(0.5,0.9,0.95,0.99))
+}
+
+###############################################################
+# 5) Compute Performance Metrics (Bias removed)
+###############################################################
+compute_metrics <- function(fy_mat, maxK=8){
+  fpca_res <- fpca_loocv_rmse(fy_mat, maxK=maxK)
+  
+  t2_vals <- mqcc(fy_mat, type="T2")$statistics
+  labels <- c(rep(0, nrow(fy_mat)-10), rep(1,10))
+  roc_obj <- roc(labels, t2_vals)
+  auc_val <- auc(roc_obj)
+  
+  list(RMSE_mean = mean(fpca_res$mean_rmse),
+       BestK = fpca_res$bestK,
+       AUC = auc_val,
+       RMSE_curve = fpca_res$mean_rmse)
+}
+
+###############################################################
+# 6) Run metrics on fy1..fy5
+###############################################################
+metrics_results <- lapply(fy_list, compute_metrics)
+names(metrics_results) <- paste0("fy",1:5)
+
+metrics_results_df <- do.call(rbind, lapply(metrics_results, function(x) unlist(x)[1:3]))
+metrics_results_df <- as.data.frame(metrics_results_df)
+metrics_results_df$Variable <- rownames(metrics_results_df)
+metrics_results_df <- metrics_results_df[,c("Variable","RMSE_mean","BestK","AUC")]
+kable(metrics_results_df)
+
+###############################################################
+# 7) Plot RMSE vs K
+###############################################################
+rmse_plot_list <- list()
+for(i in 1:length(fy_list)){
+  rmse_vals <- metrics_results[[i]]$RMSE_curve
+  df <- data.frame(K = 1:length(rmse_vals), RMSE = rmse_vals)
+  p <- ggplot(df, aes(x=K, y=RMSE)) +
+    geom_line(color="blue") +
+    geom_point(color="red") +
+    ggtitle(paste0("FPCA RMSE vs K: fy", i)) +
+    theme_minimal() +
+    xlab("Number of Components K") +
+    ylab("Mean RMSE")
+  rmse_plot_list[[i]] <- p
+}
+do.call(grid.arrange, c(rmse_plot_list, ncol=2))
+
+###############################################################
+# 8) Hotelling T2 Control Charts
+###############################################################
+for(i in 1:length(fy_list)){
+  fy_mat <- fy_list[[i]]
+  t2_vals <- mqcc(fy_mat, type="T2")$statistics
+  df_t2 <- data.frame(Index = 1:length(t2_vals), T2 = t2_vals)
+  t2_limits <- bootstrap_t2_limit(fy_mat)
+  
+  p <- ggplot(df_t2, aes(x=Index, y=T2)) +
+    geom_line(color="blue") +
+    geom_hline(yintercept=t2_limits[4], color="red", linetype="dashed") +
+    ggtitle(paste0("Hotelling T2 Control Chart: fy", i)) +
+    theme_minimal() +
+    ylab("T2 Statistic")
+  
+  print(p)
+}
+
+
+#==========================================================#
+# Functional PCA & Multivariate SPC Analysis with FAR/ARL
+#==========================================================#
+
+
+#setwd("C:/Users/kjono/Dropbox/Documents/My Paper/multivariate fpca and nonparametric")
+#load('Fhatreal.RData')
+#attach("Fhatreal.RData")
+
+library("fda")
+library("fdapace")
+library("funData")
+library("qcc")
+library("ggplot2")
+library("MASS")
+library("Rcpp")
+library("ecp")
+library("changepoint")
+library("np")
+library("pROC")
+library("knitr")
+library("gridExtra")
+library("reshape2")
+library("dplyr")
+library("tidyr")
+
+
+
+###############################################################
+# 1) Construct fy1..fy5
+###############################################################
+make_fy <- function(x, L = 78, h = 1){
+  M <- matrix(x, nrow = L, byrow = TRUE)
+  N <- ncol(M) - h   # infer number of valid comparisons
+  logM <- log(M)
+  fy <- logM[, (h+1):(N+h)] - logM[, 1:N]
+  fy
+}
+
+fy1 <- make_fy(Fhatreal[,1])
+fy1 <- make_fy(Fhatreal[,2])
+fy1 <- make_fy(Fhatreal[,3])
+fy1 <- make_fy(Fhatreal[,4])
+fy1 <- make_fy(Fhatreal[,5])
+#fy_list <- list(fy1, fy2, fy3, fy4, fy5)
+
+###############################################################
+# 2) Utility functions
+###############################################################
+fpca_loocv_rmse <- function(y_mat, maxK = 8, verbose = TRUE){
+  L <- nrow(y_mat); N <- ncol(y_mat)
+  s <- seq(0,1,length.out=N)
+  rmse_by_k <- matrix(NA, nrow = L, ncol = maxK)
+  for(i in 1:L){
+    train_idx <- setdiff(1:L, i)
+    train_y <- t(y_mat[train_idx, , drop=FALSE])
+    L3 <- MakeFPCAInputs(IDs = rep(1:length(train_idx), each=ncol(y_mat)),
+                         tVec = rep(s,length(train_idx)), train_y)
+    FPC <- FPCA(L3$Ly, L3$Lt, list(maxK = maxK, methodMuCovEst='smooth'))
+    phi <- FPC$phi; mu_hat <- FPC$mu
+    K_avail <- ncol(phi)
+    left_curve <- y_mat[i, ]
+    for(K in 1:K_avail){
+      dif <- left_curve - mu_hat
+      scores <- sapply(1:K, function(k) sum(dif * phi[,k]) / length(dif))
+      recon <- as.vector(mu_hat + phi[,1:K] %*% scores)
+      rmse_by_k[i,K] <- sqrt(mean((left_curve - recon)^2))
+    }
+  }
+  mean_rmse <- colMeans(rmse_by_k, na.rm=TRUE)
+  bestK <- which.min(mean_rmse)
+  list(rmse_by_k = rmse_by_k, mean_rmse = mean_rmse, bestK = bestK)
+}
+
+bootstrap_fpca_eigen <- function(y_mat, B = 200, K = 5, seed = 123){
+  set.seed(seed)
+  L <- nrow(y_mat); N <- ncol(y_mat)
+  s <- seq(0,1,length.out=N)
+  phi_list <- array(NA, dim = c(N, K, B))
+  for(b in 1:B){
+    idx <- sample(1:L, size=L, replace=TRUE)
+    yb <- t(y_mat[idx, , drop=FALSE])
+    L3 <- MakeFPCAInputs(IDs = rep(1:L, each=N), tVec=rep(s,L), yb)
+    FPCb <- FPCA(L3$Ly, L3$Lt, list(maxK = K, methodMuCovEst='smooth'))
+    takeK <- min(K, ncol(FPCb$phi))
+    phi_list[,1:takeK,b] <- FPCb$phi[,1:takeK]
+  }
+  phi_mean <- apply(phi_list, c(1,2), mean, na.rm=TRUE)
+  phi_sd   <- apply(phi_list, c(1,2), sd, na.rm=TRUE)
+  list(phi_mean = phi_mean, phi_sd = phi_sd, raw = phi_list, grid = s)
+}
+
+bootstrap_t2_limit <- function(Emp_df, B = 1000, alpha = 0.05, seed = 1){
+  set.seed(seed)
+  n <- nrow(Emp_df); p <- ncol(Emp_df)
+  t2_limits <- replicate(B, {
+    samp <- Emp_df[sample(1:n, replace=TRUE), ]
+    qcc_obj <- tryCatch(mqcc(samp, type = "T2"), error=function(e) NULL)
+    if(!is.null(qcc_obj)) qcc_obj$limits[2] else NA
+  })
+  t2_limits <- t2_limits[!is.na(t2_limits)]
+  quantile(t2_limits, probs=c(0.5,0.9,0.95,0.99))
+}
+
+###############################################################
+# 3) Empirical index transformation
+###############################################################
+Empiric.df <- function(data,x){
+  data <- sort(data)
+  a <- if(min(data)>0) 0 else floor(min(data)/100)*100
+  b <- if(max(data)<0) 0 else ceiling(max(data)/100)*100
+  data <- c(a,data,b)
+  n <- length(data)
+  p <- rep(0,n-1); q <- rep(0,n-1)
+  for(i in 2:(n-2)){
+    p[i] <- (data[i]+data[i+1])/2
+    q[i] <- (i-1)/(n-2)
+  }
+  p[1] <- a; p[n-1] <- b; q[1] <- 0; q[n-1] <- 1
+  approx(p,q,xout=c(x))$y
+}
+
+s <- seq(0,1,length.out = ncol(fy1))
+L3 <- MakeFPCAInputs(IDs = rep(1:nrow(fy1), each=ncol(fy1)),
+                     tVec=rep(s,nrow(fy1)), t(fy1))
+FPCAdense <- FPCA(L3$Ly, L3$Lt, list(maxK=8))
+eigen <- FPCAdense$phi[,1:5]
+
+n <- nrow(eigen)
+Emp1.index <- matrix(0,n,ncol(eigen))
+for(i in 1:ncol(eigen)){
+  Emp1.index[,i] <- Empiric.df(eigen[,i],eigen[,i])
+}
+Emp.index <- data.frame(Emp1.index)
+
+###############################################################
+# 4) Hotelling T² chart
+###############################################################
+qcc_obj <- mqcc(Emp.index, type="T2")
+T2_stats <- qcc_obj$statistics
+T2_limit <- qcc_obj$limits[2]
+
+df_T2 <- data.frame(Index=1:nrow(Emp.index),
+                    T2=as.vector(T2_stats),
+                    Out=T2_stats>T2_limit)
+
+ggplot(df_T2,aes(Index,T2))+
+  geom_line(color="blue")+
+  geom_point(aes(color=Out),size=2)+
+  geom_hline(yintercept=T2_limit,linetype="dashed",color="red")+
+  labs(title="Hotelling's T² Chart",y="T² Statistic")+
+  scale_color_manual(values=c("black","red"))
+
+###############################################################
+# 5) Nonparametric CUSUM & EWMA
+###############################################################
+ranks <- apply(Emp.index,2,rank)
+rank_mean <- colMeans(ranks); rank_cov <- cov(ranks)
+mahal_dist <- mahalanobis(ranks, center=rank_mean, cov=rank_cov)
+
+## CUSUM
+target <- mean(mahal_dist); k<-0.5; n <- length(mahal_dist)
+cusum_pos <- cusum_neg <- numeric(n)
+for(i in 2:n){
+  cusum_pos[i] <- max(0,cusum_pos[i-1]+mahal_dist[i]-(target+k))
+  cusum_neg[i] <- min(0,cusum_neg[i-1]+mahal_dist[i]-(target-k))
+}
+h<-5
+df_cusum <- data.frame(Index=1:n,CUSUM_Pos=cusum_pos,CUSUM_Neg=cusum_neg,
+                       Out=(cusum_pos>h | cusum_neg< -h))
+
+ggplot(df_cusum,aes(Index))+
+  geom_line(aes(y=CUSUM_Pos),color="blue")+
+  geom_line(aes(y=CUSUM_Neg),color="red")+
+  labs(title="Nonparametric Multivariate CUSUM")
+
+## EWMA
+lambda<-0.2; ewma<-numeric(n); ewma[1]<-mahal_dist[1]
+for(i in 2:n) ewma[i]<-lambda*mahal_dist[i]+(1-lambda)*ewma[i-1]
+ewma_mean<-mean(mahal_dist)
+ewma_sd<-sd(mahal_dist)*sqrt(lambda/(2-lambda))
+L<-3; ucl<-ewma_mean+L*ewma_sd; lcl<-ewma_mean-L*ewma_sd
+df_ewma <- data.frame(Index=1:n,EWMA=ewma,Out=(ewma>ucl|ewma<lcl))
+
+ggplot(df_ewma,aes(Index,EWMA))+
+  geom_line(color="purple")+
+  geom_hline(yintercept=c(ucl,lcl),linetype="dashed",color="red")+
+  labs(title="Nonparametric Multivariate EWMA")
+
+###############################################################
+# 6) Changepoint detection
+###############################################################
+res_div <- e.divisive(as.matrix(Emp.index),R=199,sig.lvl=0.05)
+print(res_div$estimates)
+
+pca1 <- prcomp(Emp.index,scale.=TRUE)$x[,1]
+cpt_result <- cpt.meanvar(pca1,method="PELT",penalty="BIC")
+plot(cpt_result,main="Changepoint Detection (PELT on PCA1)")
+print(cpts(cpt_result))
+
+###############################################################
+# 7) Summary Table
+###############################################################
+summary_table <- data.frame(
+  Method=c("Hotelling","CUSUM","EWMA","E-divisive","PELT"),
+  Detected=c(any(df_T2$Out),
+             any(df_cusum$Out),
+             any(df_ewma$Out),
+             length(res_div$estimates)>2,
+             length(cpts(cpt_result))>0),
+  Details=c(
+    paste(which(df_T2$Out),collapse=","),
+    paste(which(df_cusum$Out),collapse=","),
+    paste(which(df_ewma$Out),collapse=","),
+    paste(res_div$estimates,collapse=","),
+    paste(cpts(cpt_result),collapse=",")
+  )
+)
+print(summary_table)
+
+###############################################################
+# 8) FAR & ARL Computation
+###############################################################
+res_dir <- "results"
+if(!dir.exists(res_dir)) dir.create(res_dir)
+
+if(exists("Emp.index")){
+  Emp <- as.matrix(Emp.index)
+  n <- nrow(Emp)
+  
+  # Observed FAR & ARL
+  qcc_obj <- mqcc(Emp, type="T2")
+  T2_stats <- qcc_obj$statistics
+  T2_limit <- qcc_obj$limits[2]
+  Out_Hotelling <- T2_stats > T2_limit
+  FAR_Hotelling <- mean(Out_Hotelling)
+  alarm_idx <- which(Out_Hotelling)
+  ARL_Hotelling <- if(length(alarm_idx) > 1) mean(diff(alarm_idx)) else NA
+  
+  ranks <- apply(Emp,2,rank)
+  rank_mean <- colMeans(ranks); rank_cov <- cov(ranks)
+  d <- mahalanobis(ranks, center = rank_mean, cov = rank_cov)
+  
+  # CUSUM
+  target <- mean(d); k <- 0.5
+  cusum_pos <- cusum_neg <- numeric(n)
+  for(i in 2:n){
+    cusum_pos[i] <- max(0, cusum_pos[i-1] + d[i] - (target + k))
+    cusum_neg[i] <- min(0, cusum_neg[i-1] + d[i] - (target - k))
+  }
+  h <- 5
+  Out_CUSUM <- (cusum_pos > h) | (cusum_neg < -h)
+  FAR_CUSUM <- mean(Out_CUSUM)
+  alarm_idx <- which(Out_CUSUM)
+  ARL_CUSUM <- if(length(alarm_idx) > 1) mean(diff(alarm_idx)) else NA
+  
+  # EWMA
+  lambda <- 0.2
+  ewma <- numeric(n); ewma[1] <- d[1]
+  for(i in 2:n) ewma[i] <- lambda*d[i] + (1-lambda)*ewma[i-1]
+  L <- 3
+  ucl <- mean(d) + L * sd(d) * sqrt(lambda/(2-lambda))
+  lcl <- mean(d) - L * sd(d) * sqrt(lambda/(2-lambda))
+  Out_EWMA <- (ewma > ucl) | (ewma < lcl)
+  FAR_EWMA <- mean(Out_EWMA)
+  alarm_idx <- which(Out_EWMA)
+  ARL_EWMA <- if(length(alarm_idx) > 1) mean(diff(alarm_idx)) else NA
+  
+  obs_table <- data.frame(
+    Method = c("Hotelling","CUSUM","EWMA"),
+    FAR = c(FAR_Hotelling, FAR_CUSUM, FAR_EWMA),
+    ARL = c(ARL_Hotelling, ARL_CUSUM, ARL_EWMA)
+  )
+  print(knitr::kable(obs_table, caption = "Observed FAR & ARL"))
+  
+  # Bootstrap FAR & ARL
+  set.seed(123)
+  B <- 200
+  boot_FAR <- matrix(NA, nrow=B, ncol=3)
+  boot_ARL <- matrix(NA, nrow=B, ncol=3)
+  colnames(boot_FAR) <- colnames(boot_ARL) <- c("Hotelling","CUSUM","EWMA")
+  
+  for(b in 1:B){
+    sim_Emp <- Emp[sample(1:n, n, replace = TRUE), ]
+    
+    # Hotelling
+    qcc_boot <- tryCatch(mqcc(sim_Emp, type="T2"), error=function(e) NULL)
+    if(!is.null(qcc_boot)){
+      T2_boot <- qcc_boot$statistics
+      lim <- qcc_boot$limits[2]
+      alarms <- which(T2_boot > lim)
+      boot_FAR[b,"Hotelling"] <- mean(T2_boot > lim)
+      boot_ARL[b,"Hotelling"] <- if(length(alarms) > 1) mean(diff(alarms)) else NA
+    }
+    
+    # CUSUM
+    ranks_boot <- apply(sim_Emp,2,rank)
+    d_boot <- mahalanobis(ranks_boot, colMeans(ranks_boot), cov(ranks_boot))
+    cusum_pos <- cusum_neg <- numeric(n)
+    for(i in 2:n){
+      cusum_pos[i] <- max(0, cusum_pos[i-1] + d_boot[i] - (mean(d_boot)+k))
+      cusum_neg[i] <- min(0, cusum_neg[i-1] + d_boot[i] - (mean(d_boot)-k))
+    }
+    Out_CUSUM_boot <- (cusum_pos>h) | (cusum_neg< -h)
+    alarms <- which(Out_CUSUM_boot)
+    boot_FAR[b,"CUSUM"] <- mean(Out_CUSUM_boot)
+    boot_ARL[b,"CUSUM"] <- if(length(alarms) > 1) mean(diff(alarms)) else NA
+    
+    # EWMA
+    ewma <- numeric(n); ewma[1] <- d_boot[1]
+    for(i in 2:n) ewma[i] <- lambda*d_boot[i] + (1-lambda)*ewma[i-1]
+    ucl <- mean(d_boot) + L * sd(d_boot) * sqrt(lambda/(2-lambda))
+    lcl <- mean(d_boot) - L * sd(d_boot) * sqrt(lambda/(2-lambda))
+    Out_EWMA_boot <- (ewma>ucl) | (ewma<lcl)
+    alarms <- which(Out_EWMA_boot)
+    boot_FAR[b,"EWMA"] <- mean(Out_EWMA_boot)
+    boot_ARL[b,"EWMA"] <- if(length(alarms) > 1) mean(diff(alarms)) else NA
+  }
+  
+  summary_boot <- data.frame(
+    Method = c("Hotelling","CUSUM","EWMA"),
+    FAR_mean = colMeans(boot_FAR, na.rm=TRUE),
+    FAR_sd = apply(boot_FAR,2,sd, na.rm=TRUE),
+    ARL_mean = colMeans(boot_ARL, na.rm=TRUE),
+    ARL_sd = apply(boot_ARL,2,sd, na.rm=TRUE)
+  )
+  print(knitr::kable(summary_boot, caption = "Bootstrap FAR & ARL"))
+  
+  # Save results
+  write.csv(obs_table, file=file.path(res_dir,"observed_FAR_ARL.csv"), row.names=FALSE)
+  write.csv(summary_boot, file=file.path(res_dir,"bootstrap_FAR_ARL.csv"), row.names=FALSE)
+}

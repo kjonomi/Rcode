@@ -1,0 +1,358 @@
+This R code was written by Jong-Min Kim, Jihoon Kim and IL Do Ha.(10/04/2025)
+
+#################################### simulation ######################################
+
+# Simulated Data R code
+library(reticulate)
+use_condaenv("dl-keras",
+             conda = "C:/ProgramData/anaconda3/Scripts/conda.exe",
+             required = TRUE)
+
+## Frank copula Case
+# Load necessary libraries
+library(survival)
+library(dplyr)
+library(MASS)  # For correlated data generation
+library(keras)
+library(tensorflow)
+library(survminer)
+library(ggplot2)
+library(tidyr)
+library(kableExtra)
+library(caret)
+
+source("R/functions.R")
+
+n_sim <- 100
+
+metrics_all <- vector("list", n_sim)
+event_tables <- list()
+
+for (i in 1:n_sim) {
+  
+  cat("Running simulation", i, "...\n")
+
+  # Generate Highly Correlated Synthetic Data
+
+  # Set seed for reproducibility
+  set.seed(100+i)
+
+  # Number of samples and features
+  n_samples <- 1000  
+  n_features <- 100  
+
+  rho <- 0.8
+  Sigma <- outer(1:n_features, 1:n_features, function(i,j) rho^abs(i-j))  # Toeplitz
+
+  # Generate highly correlated features using multivariate normal
+  mean_values <- rep(0, n_features)  
+  x_data <- mvrnorm(n = n_samples, mu = mean_values, Sigma = Sigma)  
+
+  # Convert to DataFrame
+  x_data <- as.data.frame(x_data)
+  colnames(x_data) <- paste0("X", 1:n_features)
+
+  # Generate Survival Data
+  beta_norm <- rnorm(n_features, mean = 0, sd = 1)
+  beta_unif <- runif(n_samples, min = -1, max = 1)
+  beta <- list(beta_norm, beta_unif)
+
+  lin_part <- as.matrix(x_data) %*% beta[[1]]
+  rbf_part <- rbf_kernel(x_data, gamma = 1/55) %*% beta[[2]]
+
+  eta = exp(cbind(rbf_part, lin_part))  # eta= exp(f(x)) : exp'l risk score
+  b = 1 / c(1 / 0.5, 1 / 2)
+  haz = sweep(eta, 2, b, "/")   # hazard: Type1 (main event), Type 2 (competing event) 
+  allhaz = rowSums(haz)  # overall hazard: hazard 1 + hazard 2
+  time = - log(runif(n_samples)) / allhaz   # survival time (T) 
+  epsilon = rbinom(n_samples, 1, haz[, 1] / allhaz) + 1  # type of event(E): 1 and 2
+
+  tau = seq(2.20, 2.22, length = 50)
+  if(!is.null(tau)) censor = runif(n_samples, 0, tau) else censor = rep(Inf, n_samples)  # Censoring time (C)
+
+  observed_event = (time <= censor) * epsilon  # event indicator: delta=I(T<=C)*E = 0,1 or 2
+  observed_times = pmin(time, censor)          # y: observed event time
+
+  # Create final dataset
+  synthetic_data <- cbind(x_data, time = observed_times, event = observed_event)
+  synthetic_data <- as.data.frame(synthetic_data)
+
+  tbl <- table(synthetic_data$event)
+  df_tbl <- as.data.frame(tbl)
+  df_tbl$Simulation <- i
+  
+  event_tables[[i]] <- df_tbl
+
+  # ------------------------
+  # 3. Prepare Data for Deep Learning
+  # ------------------------
+
+  # Select the first 100 feature columns
+  x_data <- as.matrix(synthetic_data[, 1:100])
+
+  # One-hot encode event types for classification
+  y_labels <- one_hot(synthetic_data$event, num_classes = 3)
+
+
+  # training and prediction
+ pred_list <- list(
+   "Clayton CNN"      = train_and_predict("cnn", "Clayton",  x_data, y_labels),
+   "Clayton CNN-LSTM" = train_and_predict("cnn_lstm", "Clayton",  x_data, y_labels),
+   "Clayton LSTM"     = train_and_predict("lstm", "Clayton",  x_data, y_labels),
+   "Frank CNN"      = train_and_predict("cnn", "Frank",  x_data, y_labels),
+   "Frank CNN-LSTM" = train_and_predict("cnn_lstm", "Frank",  x_data, y_labels),
+   "Frank LSTM"     = train_and_predict("lstm", "Frank",  x_data, y_labels),
+   "Gaussian CNN"      = train_and_predict("cnn", "Gaussian",  x_data, y_labels),
+   "Gaussian CNN-LSTM" = train_and_predict("cnn_lstm", "Gaussian",  x_data, y_labels),
+   "Gaussian LSTM"     = train_and_predict("lstm", "Gaussian",  x_data, y_labels),
+   "CNN without Copula"         = train_and_predict("cnn", NULL, x_data, y_labels),
+   "CNN-LSTM without Copula"    = train_and_predict("cnn_lstm", NULL, x_data, y_labels),
+   "LSTM without Copula"        = train_and_predict("lstm", NULL, x_data, y_labels)
+ )
+
+  sim_metrics <- lapply(names(pred_list), function(model) {
+    preds <- pred_list[[model]]$y_pred
+    true  <- pred_list[[model]]$y_test
+    
+    data.frame(
+      Simulation = i,
+      Model = model,
+      Accuracy = compute_accuracy(preds, true),
+      MacroF1  = compute_macro_f1(preds, true),
+      Brier    = compute_multiclass_brier(preds, true)
+    )
+  })
+  
+  metrics_all[[i]] <- do.call(rbind, sim_metrics)
+}
+
+# ----- 결과 합치기 -----
+metrics_df <- do.call(rbind, metrics_all)
+event_results <- do.call(rbind, event_tables)
+
+# ----- 모델별 평균 -----
+avg_metrics <- metrics_df %>%
+  group_by(Model) %>%
+  summarise(across(c(Accuracy, MacroF1, Brier), mean))
+
+write.csv(metrics_df, "results/metrics_df_100_250919.csv", row.names = FALSE)
+write.csv(avg_metrics, "results/avg_metrics_100_250919.csv", row.names = FALSE)
+write.csv(event_results, "results/event_results_250919.csv", row.names = FALSE)
+
+png("results/event_boxplot_sim100_251001.png", width=800, height=600)
+boxplot1 <- boxplot(Freq ~ Var1, data=df,
+        xlab="Class",
+        ylab="Frequency (Count per Simulation)",
+        col=c("skyblue","lightgreen","lightpink"))
+means <- tapply(df$Freq, df$Var1, mean)
+points(1:length(means), means, col="red", pch=4, cex=1.5, lwd=2)
+dev.off()
+
+
+print(avg_metrics)
+
+metrics_df <- read.csv("results/metrics_df_100_250916.csv")
+
+library(stringr)
+metrics_df <- metrics_df %>%
+  mutate(Model = case_when(
+    str_detect(Model, "with") ~ str_replace(Model, "(.*) with (.*) Copula", "\\2 \\1"),
+    # str_detect(Model, "without Copula") ~ str_replace(Model, "(.*) without Copula", "\\1"),
+    TRUE ~ Model
+  ))
+
+# ----- Boxplot -----
+metrics_long <- metrics_df %>%
+  pivot_longer(
+      cols = c(Accuracy, Macro.F1.score, Brier.Score),
+      names_to = "Metric", 
+      values_to = "Value"
+  ) %>%
+  mutate(
+      Metric = factor(Metric, levels = c('Brier.Score', 'Accuracy', 'Macro.F1.score'))
+  )  
+
+levels(metrics_long$Metric)[levels(metrics_long$Metric) == "Macro.F1.score"] <- "Macro F1-score"
+levels(metrics_long$Metric)[levels(metrics_long$Metric) == "Brier.Score"]     <- "Brier Score"
+
+desired_order <- c(
+  "Clayton CNN", "Clayton CNN-LSTM", "Clayton LSTM",
+  "Frank CNN", "Frank CNN-LSTM", "Frank LSTM",
+  "Gaussian CNN", "Gaussian CNN-LSTM", "Gaussian LSTM",
+  "CNN without Copula", "CNN-LSTM without Copula", "LSTM without Copula"
+)
+
+metrics_long$Model <- factor(metrics_long$Model, levels = desired_order)
+
+short_names <- paste0("M", seq_along(desired_order))
+metrics_long$Model <- factor(metrics_long$Model,
+                             levels = desired_order,
+                             labels = short_names)
+
+p <- ggplot(metrics_long, aes(x = Model, y = Value, fill = Model)) +
+  geom_boxplot() +
+  facet_wrap(~ Metric, scales = "free_y", ncol = 1) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_discrete(
+    labels = paste(short_names, desired_order, sep = ": ")
+  )
+
+
+ggsave("results/metrics_boxplot_100_251002.png", plot = p, width = 10, height = 6, dpi = 300)
+ggsave("results/metrics_boxplot_100_251002.pdf", plot = p, width = 10, height = 6)
+
+
+
+##################################### real data ######################################
+
+# Simulated Data R code
+library(reticulate)
+use_condaenv("dl-keras",
+             conda = "C:/ProgramData/anaconda3/Scripts/conda.exe",
+             required = TRUE)
+
+# Load necessary libraries
+library(survival)
+library(dplyr)
+library(MASS)  # For correlated data generation
+library(keras)
+library(tensorflow)
+library(survminer)
+library(ggplot2)
+library(tidyr)
+library(kableExtra)
+library(caret)
+library(JM)
+library(reshape2)
+
+source("R/functions.R")
+
+# import pbc2 data 
+data(pbc2.id)
+
+# data preprocessing
+pbc2_clean <- pbc2.id[, colSums(is.na(pbc2.id)) == 0]
+
+X <- pbc2_clean[, !(names(pbc2_clean) %in% c("id", "years", "year", "status", "status2"))]
+Y <- ifelse(pbc2_clean$status == 'alive', 0,
+            ifelse(pbc2_clean$status == 'dead', 1, 2))
+
+# cor_matrix <- cor(X[, sapply(X, is.numeric)], use = "complete.obs", method = "pearson")
+# write.csv(cor_matrix, "results/pbc2_cor.csv")
+
+dummies <- dummyVars(~ ., data = X)
+x_data <- data.frame(predict(dummies, newdata = X))
+
+num_cols <- sapply(x_data, is.numeric)
+scale_cols <- names(x_data)[num_cols & (apply(x_data, 2, function(col) length(unique(col)) > 2))]
+
+x_data[scale_cols] <- scale(x_data[scale_cols])
+
+x_data <- as.matrix(x_data)
+y_labels <- one_hot(Y, num_classes = 3)
+
+y_factor <- as.factor(Y)
+
+# training and prediction
+set.seed(123)
+folds <- createFolds(y_factor, k = 5, list = TRUE, returnTrain = FALSE)
+
+cv_results <- list()
+
+for (i in 1:5) {
+  cat("Fold", i, "\n")
+  
+  test_idx  <- folds[[i]]
+  train_idx <- setdiff(1:nrow(x_data), test_idx)
+  
+  pred_list <- list(
+    "Clayton CNN"      = train_and_predict("cnn", "Clayton",  x_data, y_labels, train_idx, test_idx),
+    "Clayton CNN-LSTM" = train_and_predict("cnn_lstm", "Clayton",  x_data, y_labels, train_idx, test_idx),
+    "Clayton LSTM"     = train_and_predict("lstm", "Clayton",  x_data, y_labels, train_idx, test_idx),
+    "Frank CNN"        = train_and_predict("cnn", "Frank",  x_data, y_labels, train_idx, test_idx),
+    "Frank CNN-LSTM"   = train_and_predict("cnn_lstm", "Frank",  x_data, y_labels, train_idx, test_idx),
+    "Frank LSTM"       = train_and_predict("lstm", "Frank",  x_data, y_labels, train_idx, test_idx),
+    "Gaussian CNN"     = train_and_predict("cnn", "Gaussian",  x_data, y_labels, train_idx, test_idx),
+    "Gaussian CNN-LSTM"= train_and_predict("cnn_lstm", "Gaussian",  x_data, y_labels, train_idx, test_idx),
+    "Gaussian LSTM"    = train_and_predict("lstm", "Gaussian",  x_data, y_labels, train_idx, test_idx),
+    "CNN without Copula"      = train_and_predict("cnn", NULL, x_data, y_labels, train_idx, test_idx),
+    "CNN-LSTM without Copula" = train_and_predict("cnn_lstm", NULL, x_data, y_labels, train_idx, test_idx),
+    "LSTM without Copula"     = train_and_predict("lstm", NULL, x_data, y_labels, train_idx, test_idx)
+  )
+  
+  sim_metrics <- lapply(names(pred_list), function(model) {
+    preds <- pred_list[[model]]$y_pred
+    true  <- pred_list[[model]]$y_test
+    
+    data.frame(
+      Model = model,
+      Accuracy   = compute_accuracy(preds, true),
+      MacroF1    = compute_macro_f1(preds, true),
+      BrierScore = compute_multiclass_brier(preds, true),
+      Fold       = i
+    )
+  })
+  
+  cv_results[[i]] <- do.call(rbind, sim_metrics)
+}
+
+# 모든 fold 합치기
+metrics_all <- do.call(rbind, cv_results)
+
+# 모델별 평균 성능
+metrics_mean <- aggregate(. ~ Model, data = metrics_all[,-ncol(metrics_all)], mean)
+metrics_mean
+
+write.csv(metrics_all, "results/pbc2_all_250919.csv", row.names = FALSE)
+write.csv(metrics_mean, "results/pbc2_mean_250919.csv", row.names = FALSE)
+
+metrics_all <- read.csv("results/pbc2_all_250919.csv")
+
+library(reshape2)
+metrics_long <- melt(metrics_all,
+                     id.vars = c("Model", "Fold"),
+                     measure.vars = c("Accuracy", "Macro.F1.score", "Brier.Score"),
+                     variable.name = "Metric",
+                     value.name = "Value")
+
+levels(metrics_long$Metric)[levels(metrics_long$Metric) == "Macro.F1.score"] <- "Macro F1-score"
+levels(metrics_long$Metric)[levels(metrics_long$Metric) == "Brier.Score"]     <- "Brier Score"
+
+metrics_long$Metric <- factor(metrics_long$Metric,
+                              levels = c("Brier Score", "Accuracy", "Macro F1-score"))
+
+desired_order <- c(
+  "Clayton CNN", "Clayton CNN-LSTM", "Clayton LSTM",
+  "Frank CNN", "Frank CNN-LSTM", "Frank LSTM",
+  "Gaussian CNN", "Gaussian CNN-LSTM", "Gaussian LSTM",
+  "CNN without Copula", "CNN-LSTM without Copula", "LSTM without Copula"
+)
+
+short_labels <- paste0("M", seq_along(desired_order))
+name_map <- setNames(short_labels, desired_order)
+
+metrics_long$ModelShort <- factor(name_map[metrics_long$Model], 
+                                  levels = short_labels)
+
+legend_labels <- paste0(short_labels, ": ", desired_order)
+
+p <- ggplot(metrics_long, aes(x = ModelShort, y = Value, fill = ModelShort)) +
+  geom_boxplot() +
+  facet_wrap(~ Metric, ncol = 1, strip.position = "top") + 
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.placement = "outside",
+    strip.background = element_rect(fill = "grey90")
+  ) +
+  labs(x = "Model", y = "Value", fill = "Model") +
+  scale_fill_manual(values = scales::hue_pal()(length(desired_order)),
+                    labels = legend_labels)
+
+
+ggsave("results/metrics_boxplot_pbc2_251002.png", plot = p, width = 10, height = 6, dpi = 300)
+ggsave("results/metrics_boxplot_pbc2_251002.pdf", plot = p, width = 10, height = 6)
+
+
+

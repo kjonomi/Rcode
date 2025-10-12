@@ -703,6 +703,7 @@ kable(summary_table, caption = "Summary of DQN Results (ρ = -0.5)", align = "lc
 
 
 ###############################
+# Wine Quality Dataset
 # --- Libraries ---
 library(MASS)
 library(Matrix)
@@ -721,7 +722,7 @@ set.seed(123)
 tensorflow::set_random_seed(123)
 
 # --- Load Wine Quality Dataset ---
-# Download only once
+# Download https://archive.ics.uci.edu/ml/machine-learning-databases/wine-quality/winequality-red.csv
 library(data.table)
 wine_file <- "winequality-red.csv"
 wine <- fread(wine_file, sep = ";")

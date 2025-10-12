@@ -1,0 +1,862 @@
+#################
+## Positive correlation rho=0.5
+# ============================================================
+# Full Temporal Multi-Stage DQN with Learned Dynamic DAG — Positive Correlation (rho = 0.5)
+# ============================================================
+rm(list = ls(), envir = .GlobalEnv)
+# Full Temporal Multi-Stage DQN with Learned Dynamic DAG — Positive Correlation (rho = 0.5)
+# Updated, vectorized, robust version (uses Boston housing data)
+
+# --- Libraries ---
+library(MASS)         # Boston, mvrnorm
+library(Matrix)       # nearPD
+library(keras)
+library(tensorflow)
+library(tidyverse)
+library(RColorBrewer)
+library(igraph)
+library(ggrepel)
+library(patchwork)
+library(data.table)
+library(ggplot2)
+library(knitr)
+
+set.seed(123)
+tensorflow::set_random_seed(123)
+
+# -----------------------------
+# 1) Build DQN (Functional API)
+# -----------------------------
+build_dqn <- function(input_shape, lr = 1e-3) {
+  inputs <- layer_input(shape = input_shape)
+  outputs <- inputs %>%
+    layer_conv_1d(filters = 32, kernel_size = 3, activation = "relu", padding = "same") %>%
+    layer_max_pooling_1d(pool_size = 2) %>%
+    layer_lstm(units = 32, return_sequences = FALSE) %>%
+    layer_dense(units = 32, activation = "relu") %>%
+    layer_dense(units = 2, activation = "linear")
+  
+  model <- keras_model(inputs = inputs, outputs = outputs)
+  model %>% compile(
+    optimizer = optimizer_adam(learning_rate = lr),
+    loss = "mse"
+  )
+  return(model)
+}
+
+# -----------------------------
+# 2) Initial state generator
+# -----------------------------
+generate_initial_long <- function(df, n, T_steps) {
+  p <- ncol(df)
+  idxs <- sample(1:nrow(df), n, replace = TRUE)
+  base_mat <- as.matrix(df[idxs, ])
+  X_long <- array(0, dim = c(n, T_steps, p))
+  for (t in 1:T_steps) {
+    X_long[, t, ] <- base_mat + matrix(rnorm(n * p, 0, 0.01), n, p)
+  }
+  return(X_long)
+}
+
+# -----------------------------
+# 3) Generate multistage outcomes with heterogeneous tau
+# -----------------------------
+generate_multistage_outcomes_with_hetero_tau <- function(X_long, A_matrix, n_outcomes = 6,
+                                                         rho = 0.5, phi = 0.6, base_noise_sd = 0.05) {
+  n <- dim(X_long)[1]; T_steps <- dim(X_long)[2]; p <- dim(X_long)[3]
+  Sigma <- matrix(rho, n_outcomes, n_outcomes); diag(Sigma) <- 1
+  eigs <- eigen(Sigma)$values
+  if (any(eigs <= 0)) Sigma <- as.matrix(nearPD(Sigma)$mat)
+  L <- chol(Sigma)
+  
+  Y <- array(0, dim = c(n, T_steps, n_outcomes))
+  for (k in 1:n_outcomes) {
+    feat_idx <- ((k - 1) %% p) + 1
+    Y[, 1, k] <- as.numeric(X_long[, 1, feat_idx]) + rnorm(n, 0, base_noise_sd)
+  }
+  
+  tau_fun <- function(x_row, k) {
+    coef_vec <- sin(seq_len(length(x_row)) + k) * (0.2 + 0.05 * k)
+    val <- 0.2 * tanh(sum(coef_vec * x_row))
+    return(as.numeric(val))
+  }
+  
+  for (t in 2:T_steps) {
+    noise_raw <- matrix(rnorm(n * n_outcomes, 0, base_noise_sd), n, n_outcomes) %*% L
+    for (k in 1:n_outcomes) {
+      feat_idx <- ((k - 1) %% p) + 1
+      f_xt <- as.numeric(X_long[, t, feat_idx])
+      tau_vec <- apply(X_long[, t, , drop = FALSE], 1, function(r) tau_fun(as.numeric(r), k))
+      Y[, t, k] <- phi * Y[, t - 1, k] + f_xt + tau_vec * A_matrix[, t] + noise_raw[, k]
+    }
+  }
+  return(Y)
+}
+
+# -----------------------------
+# 4) Empirical copula transform
+# -----------------------------
+empirical_copula_multistage <- function(Y_array) {
+  n <- dim(Y_array)[1]; T_steps <- dim(Y_array)[2]; n_outcomes <- dim(Y_array)[3]
+  Y_cop <- array(0, dim = c(n, T_steps, n_outcomes))
+  for (t in 1:T_steps) {
+    for (k in 1:n_outcomes) {
+      col <- Y_array[, t, k]
+      Y_cop[, t, k] <- rank(col, ties.method = "average") / length(col)
+    }
+  }
+  return(Y_cop)
+}
+
+# -----------------------------
+# 5) Assign treatment
+# -----------------------------
+assign_treatment_multistage <- function(X_long, cov_idx = 1, strength = 6) {
+  n <- dim(X_long)[1]; T_steps <- dim(X_long)[2]
+  A <- matrix(0, nrow = n, ncol = T_steps)
+  for (t in 1:T_steps) {
+    logits <- apply(X_long[, t, cov_idx, drop = FALSE], 1, mean) - 0.5
+    A[, t] <- rbinom(n, 1, plogis(strength * logits))
+  }
+  return(A)
+}
+
+# -----------------------------
+# 6) Estimate dynamic CATE
+# -----------------------------
+estimate_dynamic_treatment_effect <- function(Y_array, A_matrix) {
+  n_outcomes <- dim(Y_array)[3]; T_steps <- dim(Y_array)[2]
+  CATE <- matrix(0, nrow = n_outcomes, ncol = T_steps)
+  for (k in 1:n_outcomes) {
+    for (t in 1:T_steps) {
+      treated <- which(A_matrix[, t] == 1); control <- which(A_matrix[, t] == 0)
+      yvec <- Y_array[, t, k]
+      if (length(treated) > 0 && length(control) > 0) {
+        CATE[k, t] <- mean(yvec[treated]) - mean(yvec[control])
+      } else CATE[k, t] <- 0
+    }
+  }
+  rownames(CATE) <- paste0("Y", 1:n_outcomes); colnames(CATE) <- paste0("T", 1:T_steps)
+  return(CATE)
+}
+
+# -----------------------------
+# 7) Full DQN experiment — positive correlation
+# -----------------------------
+run_full_dqn_temporal_pos <- function(df, T_steps=8, n_outcomes=6, rho=0.5,
+                                      n=200, episodes=30, gamma=0.95, alpha=0.001,
+                                      epsilon_init=1.0, epsilon_decay=0.99, epsilon_min=0.05,
+                                      replay_size=3000, batch_size=64, edge_threshold=0.05,
+                                      use_train_on_batch = TRUE) {
+  
+  p <- ncol(df)
+  X_long <- generate_initial_long(df, n, T_steps)
+  for (j in 1:p) for (t in 1:T_steps) {
+    mu <- mean(X_long[, t, j]); s <- sd(X_long[, t, j]); if(s==0)s<-1
+    X_long[, t, j] <- (X_long[, t, j] - mu)/s
+  }
+  
+  cov_idx <- which(colnames(df)=="rm"); if(length(cov_idx)==0) cov_idx <- 1
+  A_true <- assign_treatment_multistage(X_long, cov_idx=cov_idx, strength=6)
+  Y_array <- generate_multistage_outcomes_with_hetero_tau(X_long, A_true, n_outcomes=n_outcomes, rho=rho)
+  Y_cop <- empirical_copula_multistage(Y_array)
+  
+  input_shape <- c(T_steps, p)
+  model <- build_dqn(input_shape, lr=alpha)
+  
+  # --- Replay memory ---
+  memory <- list(); mem_pos <- 1
+  push_memory <- function(s, a, r, s_next, done) {
+    entry <- list(s=s, a=a, r=r, s_next=s_next, done=done)
+    if(length(memory) < replay_size) memory[[length(memory) + 1]] <<- entry
+    else { memory[[mem_pos]] <<- entry; mem_pos <<- ifelse(mem_pos == replay_size, 1, mem_pos + 1) }
+  }
+  sample_batch <- function(batch_size) {
+    nmem <- length(memory)
+    if(nmem == 0) return(list())
+    idx <- sample(seq_len(nmem), min(nmem, batch_size))
+    memory[idx]
+  }
+  
+  policy_matrix_learned <- matrix(0, nrow=n, ncol=T_steps)
+  episode_rewards <- numeric(episodes)
+  epsilon <- epsilon_init
+  
+  for(ep in 1:episodes){
+    total_reward_ep <- rep(0,n)
+    S <- X_long  # current states
+    for(t in 1:T_steps){
+      # Vectorized action selection
+      states_batch <- S
+      q_all <- model %>% predict(states_batch, verbose = 0)  # n x 2
+      rnd <- runif(n)
+      greedy_actions <- apply(q_all, 1, which.max) - 1
+      actions <- ifelse(rnd < epsilon, rbinom(n, 1, 0.5), greedy_actions)
+      
+      # Compute reward: mean across outcomes at time t
+      rewards_mean_outcome <- rowMeans(Y_cop[, t, , drop = FALSE])
+      r_vec <- rewards_mean_outcome * actions
+      
+      # Build S_next by shifting historical window and filling last slice
+      S_next <- S
+      if(T_steps > 1) {
+        S_next[ , 1:(T_steps-1), ] <- S_next[ , 2:T_steps, ]
+      }
+      # set last time-slice: keep the last observed features (or change to simulated next covariate)
+      S_next[ , T_steps, ] <- S[ , T_steps, ]
+      
+      # push experiences
+      for(i in 1:n){
+        s_i <- array_reshape(S[i,,], dim = c(1, T_steps, p))
+        s_next_i <- array_reshape(S_next[i,,], dim = c(1, T_steps, p))
+        push_memory(s_i, actions[i], r_vec[i], s_next_i, (t == T_steps))
+      }
+      
+      total_reward_ep <- total_reward_ep + (gamma^(t-1)) * r_vec
+      policy_matrix_learned[, t] <- actions
+      
+      # Replay: sample batch and train vectorized
+      batch <- sample_batch(batch_size)
+      if(length(batch) > 0){
+        bsize <- length(batch)
+        s_batch <- array(0, dim = c(bsize, T_steps, p))
+        s_next_batch <- array(0, dim = c(bsize, T_steps, p))
+        target_qs <- array(0, dim = c(bsize, 2))
+        for(ii in seq_len(bsize)){
+          s_batch[ii,,] <- batch[[ii]]$s
+          s_next_batch[ii,,] <- batch[[ii]]$s_next
+        }
+        q_next_batch <- model %>% predict(s_next_batch, verbose = 0)
+        q_curr_batch <- model %>% predict(s_batch, verbose = 0)
+        for(ii in seq_len(bsize)){
+          r_i <- batch[[ii]]$r
+          done_i <- batch[[ii]]$done
+          a_i <- batch[[ii]]$a
+          if(!done_i) target <- r_i + gamma * max(q_next_batch[ii, ])
+          else target <- r_i
+          q_curr_batch[ii, a_i + 1] <- target
+          target_qs[ii, ] <- q_curr_batch[ii, ]
+        }
+        # train once on the batch
+        if(use_train_on_batch && "train_on_batch" %in% ls(envir = asNamespace("keras"))) {
+          keras::train_on_batch(model, x = s_batch, y = target_qs)
+        } else {
+          model %>% fit(s_batch, target_qs, epochs = 1, verbose = 0)
+        }
+      }
+      
+      # advance environment
+      S <- S_next
+    } # t loop
+    
+    episode_rewards[ep] <- mean(total_reward_ep)
+    epsilon <- max(epsilon * epsilon_decay, epsilon_min)
+    if(ep %% 10 == 0) cat(sprintf("Episode %d / %d — avg reward %.6f — epsilon %.3f\n",
+                                  ep, episodes, episode_rewards[ep], epsilon), "\n")
+  } # ep loop
+  
+  # --- Learned DAG (robust edge_df fix) ---
+  edge_matrix <- cor(policy_matrix_learned)
+  if(is.null(colnames(edge_matrix))){
+    colnames(edge_matrix) <- paste0("T", seq_len(ncol(edge_matrix)))
+    rownames(edge_matrix) <- colnames(edge_matrix)
+  }
+  idxs <- which(abs(edge_matrix) > edge_threshold, arr.ind = TRUE)
+  if (length(idxs) == 0) {
+    idxs <- matrix(nrow = 0, ncol = 2)
+  } else {
+    if (is.vector(idxs)) idxs <- matrix(idxs, nrow = 1)
+    idxs <- idxs[idxs[,1] < idxs[,2], , drop = FALSE]
+  }
+  if(nrow(idxs) == 0) {
+    g_und <- make_empty_graph(n = ncol(edge_matrix), directed = FALSE)
+    V(g_und)$name <- colnames(edge_matrix)
+    edge_df <- data.frame(from=character(0), to=character(0), weight=numeric(0), stringsAsFactors = FALSE)
+  } else {
+    edge_df <- data.frame(
+      from = colnames(edge_matrix)[idxs[,1]],
+      to   = colnames(edge_matrix)[idxs[,2]],
+      weight = edge_matrix[cbind(idxs[,1], idxs[,2])],
+      stringsAsFactors = FALSE
+    )
+    g_und <- graph_from_edgelist(as.matrix(edge_df[, c("from", "to")]), directed = FALSE)
+    E(g_und)$weight <- edge_df$weight
+    E(g_und)$width  <- 1 + 5 * abs(edge_df$weight)
+    E(g_und)$color  <- ifelse(edge_df$weight > 0, "darkgreen", "darkred")
+    E(g_und)$label  <- round(edge_df$weight, 3)
+  }
+  
+  # --- Temporal reward plot ---
+  temporal_rewards <- matrix(0, nrow=T_steps, ncol=n_outcomes)
+  for(t in 1:T_steps) for(k in 1:n_outcomes) temporal_rewards[t,k] <- mean(Y_cop[,t,k]*policy_matrix_learned[,t])
+  df_temp <- as.data.frame(temporal_rewards); colnames(df_temp) <- paste0("Y",1:n_outcomes); df_temp$Time <- 1:T_steps
+  df_long <- pivot_longer(df_temp, cols=starts_with("Y"), names_to="Outcome", values_to="Reward")
+  outcome_colors <- RColorBrewer::brewer.pal(min(8,n_outcomes),"Set2")
+  p_temporal <- ggplot(df_long, aes(x=Time,y=Reward,color=Outcome)) +
+    geom_line(linewidth=1.2)+geom_point(size=1.6)+
+    scale_color_manual(values=outcome_colors)+
+    theme_minimal(base_size=13)+
+    labs(title="Temporal Evolution of Reward (Positive Correlation)",x="Time",y="Reward")
+  
+  DynamicDAG <- list(graph = g_und, edge_df = edge_df)
+  
+  list(
+    model=model,
+    X_long=X_long,
+    A_true=A_true,
+    Y_array=Y_array,
+    Y_cop=Y_cop,
+    PolicyMatrix=policy_matrix_learned,
+    EpisodeRewards=episode_rewards,
+    TemporalPlot=p_temporal,
+    LearnedDAG=g_und,
+    DynamicDAG=DynamicDAG
+  )
+}
+
+# -----------------------------
+# Run full experiment (positive correlation)
+# -----------------------------
+data("Boston", package="MASS")
+res_pos_full <- run_full_dqn_temporal_pos(Boston, T_steps=8, n_outcomes=6, rho=0.5, n=200, episodes=30)
+
+# Plot learned DAG
+if(length(E(res_pos_full$LearnedDAG)) > 0) {
+  plot(res_pos_full$LearnedDAG, vertex.size=25, vertex.label.cex=1.2,
+       main="Learned Dynamic DAG — Positive Correlation (rho = 0.5)")
+} else {
+  plot(make_empty_graph(n=10), main="No edges learned (threshold may be too high)")
+}
+
+# Results — temporal plot
+print(res_pos_full$TemporalPlot)
+
+# -----------------------------
+# 8) Summarize outputs into a table
+# -----------------------------
+# Average reward over all episodes
+avg_reward <- mean(res_pos_full$EpisodeRewards)
+final_reward <- tail(res_pos_full$EpisodeRewards, 1)
+reward_improvement <- final_reward - res_pos_full$EpisodeRewards[1]
+
+# Estimate CATE for comparison
+CATE_est <- estimate_dynamic_treatment_effect(res_pos_full$Y_array, res_pos_full$A_true)
+CATE_summary <- colMeans(CATE_est)
+
+# Average correlation of learned policy (off-diagonal)
+cor_mat <- cor(res_pos_full$PolicyMatrix)
+policy_corr <- if(ncol(cor_mat) > 1) mean(cor_mat[upper.tri(cor_mat)]) else 0
+
+# DAG summary
+n_edges <- length(E(res_pos_full$LearnedDAG))
+avg_edge_weight <- if(n_edges == 0) 0 else mean(abs(E(res_pos_full$LearnedDAG)$weight))
+
+# Construct summary table
+summary_table <- data.frame(
+  Metric = c("Episodes", 
+             "Average Episode Reward",
+             "Final Episode Reward",
+             "Reward Improvement",
+             "Mean CATE (across outcomes)",
+             "Avg Policy Correlation (off-diag)",
+             "Number of Edges in Learned DAG",
+             "Avg |Edge Weight|"),
+  Value = c(length(res_pos_full$EpisodeRewards),
+            round(avg_reward, 4),
+            round(final_reward, 4),
+            round(reward_improvement, 4),
+            round(mean(CATE_summary), 4),
+            round(policy_corr, 4),
+            n_edges,
+            round(avg_edge_weight, 4))
+)
+
+# Display formatted table
+kable(summary_table, caption = "Summary of DQN Results (ρ = 0.5)", align = "lc")
+
+
+
+#################
+## Negative correlation rho=-0.5
+library(MASS)
+library(keras)
+library(keras3)
+library(tensorflow)
+library(tidyverse)
+library(RColorBrewer)
+library(igraph)
+library(ggrepel)
+library(patchwork)
+library(data.table)
+library(ggplot2)
+library(knitr)
+
+set.seed(123)
+tensorflow::set_random_seed(123)
+
+# -----------------------------
+# 1) Build DQN (Functional API)
+# -----------------------------
+build_dqn <- function(input_shape, lr = 1e-3) {
+  inputs <- layer_input(shape = input_shape)
+  outputs <- inputs %>%
+    layer_conv_1d(filters = 32, kernel_size = 3, activation = "relu") %>%
+    layer_max_pooling_1d(pool_size = 2) %>%
+    layer_lstm(units = 32, return_sequences = FALSE) %>%
+    layer_dense(units = 32, activation = "relu") %>%
+    layer_dense(units = 2, activation = "linear")
+  
+  model <- keras_model(inputs = inputs, outputs = outputs)
+  model %>% compile(
+    optimizer = optimizer_adam(learning_rate = lr),
+    loss = "mse"
+  )
+  return(model)
+}
+
+# -----------------------------
+# 2) Initial state generator
+# -----------------------------
+generate_initial_long <- function(df, n, T_steps) {
+  p <- ncol(df)
+  idxs <- sample(1:nrow(df), n, replace = TRUE)
+  base_mat <- as.matrix(df[idxs, ])
+  X_long <- array(0, dim = c(n, T_steps, p))
+  for (t in 1:T_steps) {
+    X_long[, t, ] <- base_mat + matrix(rnorm(n * p, 0, 0.01), n, p)
+  }
+  return(X_long)
+}
+
+# -----------------------------
+# 3) Generate multistage outcomes with heterogeneous tau
+# -----------------------------
+generate_multistage_outcomes_with_hetero_tau <- function(X_long, A_matrix, n_outcomes = 6,
+                                                         rho = -0.5, phi = 0.6, base_noise_sd = 0.05) {
+  n <- dim(X_long)[1]; T_steps <- dim(X_long)[2]; p <- dim(X_long)[3]
+  Sigma <- matrix(rho, n_outcomes, n_outcomes); diag(Sigma) <- 1
+  eigs <- eigen(Sigma)$values
+  if (any(eigs <= 0)) Sigma <- as.matrix(nearPD(Sigma)$mat)
+  L <- chol(Sigma)
+  
+  Y <- array(0, dim = c(n, T_steps, n_outcomes))
+  for (k in 1:n_outcomes) {
+    feat_idx <- ((k - 1) %% p) + 1
+    Y[, 1, k] <- as.numeric(X_long[, 1, feat_idx]) + rnorm(n, 0, base_noise_sd)
+  }
+  
+  tau_fun <- function(x_row, k) {
+    coef_vec <- sin(seq_len(length(x_row)) + k) * (0.2 + 0.05 * k)
+    val <- 0.2 * tanh(sum(coef_vec * x_row))
+    return(as.numeric(val))
+  }
+  
+  for (t in 2:T_steps) {
+    noise_raw <- matrix(rnorm(n * n_outcomes, 0, base_noise_sd), n, n_outcomes) %*% L
+    for (k in 1:n_outcomes) {
+      feat_idx <- ((k - 1) %% p) + 1
+      f_xt <- as.numeric(X_long[, t, feat_idx])
+      tau_vec <- apply(X_long[, t, , drop = FALSE], 1, function(r) tau_fun(as.numeric(r), k))
+      Y[, t, k] <- phi * Y[, t - 1, k] + f_xt + tau_vec * A_matrix[, t] + noise_raw[, k]
+    }
+  }
+  return(Y)
+}
+
+# -----------------------------
+# 4) Empirical copula transform
+# -----------------------------
+empirical_copula_multistage <- function(Y_array) {
+  n <- dim(Y_array)[1]; T_steps <- dim(Y_array)[2]; n_outcomes <- dim(Y_array)[3]
+  Y_cop <- array(0, dim = c(n, T_steps, n_outcomes))
+  for (t in 1:T_steps) {
+    for (k in 1:n_outcomes) {
+      col <- Y_array[, t, k]
+      Y_cop[, t, k] <- rank(col, ties.method = "average") / length(col)
+    }
+  }
+  return(Y_cop)
+}
+
+# -----------------------------
+# 5) Assign treatment
+# -----------------------------
+assign_treatment_multistage <- function(X_long, cov_idx = 1, strength = 6) {
+  n <- dim(X_long)[1]; T_steps <- dim(X_long)[2]
+  A <- matrix(0, nrow = n, ncol = T_steps)
+  for (t in 1:T_steps) {
+    logits <- apply(X_long[, t, cov_idx, drop = FALSE], 1, mean) - 0.5
+    A[, t] <- rbinom(n, 1, plogis(strength * logits))
+  }
+  return(A)
+}
+
+# -----------------------------
+# 6) Estimate dynamic CATE
+# -----------------------------
+estimate_dynamic_treatment_effect <- function(Y_array, A_matrix) {
+  n_outcomes <- dim(Y_array)[3]; T_steps <- dim(Y_array)[2]
+  CATE <- matrix(0, nrow = n_outcomes, ncol = T_steps)
+  for (k in 1:n_outcomes) {
+    for (t in 1:T_steps) {
+      treated <- which(A_matrix[, t] == 1); control <- which(A_matrix[, t] == 0)
+      yvec <- Y_array[, t, k]
+      if (length(treated) > 0 && length(control) > 0) {
+        CATE[k, t] <- mean(yvec[treated]) - mean(yvec[control])
+      } else CATE[k, t] <- 0
+    }
+  }
+  rownames(CATE) <- paste0("Y", 1:n_outcomes); colnames(CATE) <- paste0("T", 1:T_steps)
+  return(CATE)
+}
+
+# -----------------------------
+# 7) Full DQN experiment — negative correlation
+# -----------------------------
+run_full_dqn_temporal_neg <- function(df, T_steps=8, n_outcomes=6, rho=-0.5,
+                                      n=200, episodes=30, gamma=0.95, alpha=0.001,
+                                      epsilon_init=1.0, epsilon_decay=0.99, epsilon_min=0.05,
+                                      replay_size=3000, batch_size=64, edge_threshold=0.05) {
+  
+  p <- ncol(df)
+  X_long <- generate_initial_long(df, n, T_steps)
+  for (j in 1:p) for (t in 1:T_steps) {
+    mu <- mean(X_long[, t, j]); s <- sd(X_long[, t, j]); if(s==0)s<-1
+    X_long[, t, j] <- (X_long[, t, j] - mu)/s
+  }
+  
+  cov_idx <- which(colnames(df)=="rm"); if(length(cov_idx)==0) cov_idx <- 1
+  A_true <- assign_treatment_multistage(X_long, cov_idx=cov_idx, strength=6)
+  Y_array <- generate_multistage_outcomes_with_hetero_tau(X_long, A_true, n_outcomes=n_outcomes, rho=rho)
+  Y_cop <- empirical_copula_multistage(Y_array)
+  
+  input_shape <- c(T_steps, p)
+  model <- build_dqn(input_shape, lr=alpha)
+  
+  # --- Replay memory ---
+  memory <- list(); mem_neg <- 1
+  push_memory <- function(s, a, r, s_next, done) {
+    if(length(memory)<replay_size) memory[[length(memory)+1]] <<- list(s=s,a=a,r=r,s_next=s_next,done=done)
+    else { memory[[mem_neg]] <<- list(s=s,a=a,r=r,s_next=s_next,done=done); mem_neg <<- ifelse(mem_neg==replay_size,1,mem_neg+1) }
+  }
+  sample_batch <- function(batch_size) { idx <- sample(seq_along(memory), min(length(memory), batch_size)); memory[idx] }
+  
+  policy_matrix_learned <- matrix(0, nrow=n, ncol=T_steps)
+  episode_rewards <- numeric(episodes)
+  epsilon <- epsilon_init
+  
+  for(ep in 1:episodes){
+    total_reward_ep <- rep(0,n)
+    S <- X_long
+    for(t in 1:T_steps){
+      actions <- integer(n)
+      for(i in 1:n){
+        state_i <- array_reshape(S[i,,], dim=c(1,T_steps,p))
+        if(runif(1)<epsilon) actions[i] <- sample(0:1,1) else {
+          qv <- model %>% predict(state_i, verbose=0); actions[i] <- which.max(qv)-1
+        }
+      }
+      r_vec <- apply(Y_cop[, t, , drop=FALSE], 1, mean) * actions
+      for(i in 1:n){
+        s_i <- array_reshape(S[i,,], dim=c(1,T_steps,p))
+        S_next <- S[i,,,drop=FALSE]; 
+        if(T_steps>1) S_next[1,1:(T_steps-1),] <- S_next[1,2:T_steps,] # shift
+        s_next_i <- array_reshape(S_next[1,,], dim=c(1,T_steps,p))
+        done <- (t==T_steps)
+        push_memory(s_i, actions[i], r_vec[i], s_next_i, done)
+      }
+      total_reward_ep <- total_reward_ep + (gamma^(t-1)) * r_vec
+      policy_matrix_learned[,t] <- actions
+      # --- replay ---
+      batch <- sample_batch(batch_size)
+      for(sample_i in batch){
+        s_i <- sample_i$s; a_i <- sample_i$a; r_i <- sample_i$r; s_next_i <- sample_i$s_next; done <- sample_i$done
+        target <- r_i
+        if(!done){
+          q_next <- model %>% predict(s_next_i, verbose=0)
+          target <- r_i + gamma * max(q_next)
+        }
+        q_vals <- model %>% predict(s_i, verbose=0)
+        q_vals[1,a_i+1] <- target
+        model %>% train_on_batch(s_i, q_vals)
+      }
+    }
+    episode_rewards[ep] <- mean(total_reward_ep)
+    epsilon <- max(epsilon*epsilon_decay, epsilon_min)
+    if(ep %% 10==0) cat(sprintf("Episode %d / %d — avg reward %.4f — epsilon %.3f\n",
+                                ep, episodes, episode_rewards[ep], epsilon), "\n")
+  }
+  
+  # --- Learned DAG (robust edge_df fix) ---
+  edge_matrix <- cor(policy_matrix_learned)
+  if(is.null(colnames(edge_matrix))){
+    colnames(edge_matrix) <- paste0("T", seq_len(ncol(edge_matrix)))
+    rownames(edge_matrix) <- colnames(edge_matrix)
+  }
+  idxs <- which(abs(edge_matrix) > edge_threshold, arr.ind = TRUE)
+  if (length(idxs) == 0) {
+    idxs <- matrix(nrow = 0, ncol = 2)
+  } else {
+    if (is.vector(idxs)) idxs <- matrix(idxs, nrow = 1)
+    idxs <- idxs[idxs[,1] < idxs[,2], , drop = FALSE]
+  }
+  if(nrow(idxs) == 0) {
+    g_und <- make_empty_graph(n = ncol(edge_matrix), directed = FALSE)
+    V(g_und)$name <- colnames(edge_matrix)
+    edge_df <- data.frame(from=character(0), to=character(0), weight=numeric(0), stringsAsFactors = FALSE)
+  } else {
+    edge_df <- data.frame(
+      from = colnames(edge_matrix)[idxs[,1]],
+      to   = colnames(edge_matrix)[idxs[,2]],
+      weight = edge_matrix[cbind(idxs[,1], idxs[,2])],
+      stringsAsFactors = FALSE
+    )
+    g_und <- graph_from_edgelist(as.matrix(edge_df[, c("from", "to")]), directed = FALSE)
+    E(g_und)$weight <- edge_df$weight
+    E(g_und)$width  <- 1 + 5 * abs(edge_df$weight)
+    E(g_und)$color  <- ifelse(edge_df$weight > 0, "darkgreen", "darkred")
+    E(g_und)$label  <- round(edge_df$weight, 3)
+  }
+  
+  # --- Temporal reward plot ---
+  temporal_rewards <- matrix(0, nrow=T_steps, ncol=n_outcomes)
+  for(t in 1:T_steps) for(k in 1:n_outcomes) temporal_rewards[t,k] <- mean(Y_cop[,t,k]*policy_matrix_learned[,t])
+  df_temp <- as.data.frame(temporal_rewards); colnames(df_temp) <- paste0("Y",1:n_outcomes); df_temp$Time <- 1:T_steps
+  df_long <- pivot_longer(df_temp, cols=starts_with("Y"), names_to="Outcome", values_to="Reward")
+  outcome_colors <- RColorBrewer::brewer.pal(min(8,n_outcomes),"Set2")
+  p_temporal <- ggplot(df_long, aes(x=Time,y=Reward,color=Outcome)) +
+    geom_line(linewidth=1.2)+geom_point(size=1.6)+
+    scale_color_manual(values=outcome_colors)+
+    theme_minimal(base_size=13)+
+    labs(title="Temporal Evolution of Reward (Negative Correlation)",x="Time",y="Reward")
+  
+  DynamicDAG <- list(graph = g_und, edge_df = edge_df)
+  
+  list(
+    model=model,
+    X_long=X_long,
+    A_true=A_true,
+    Y_array=Y_array,
+    Y_cop=Y_cop,
+    PolicyMatrix=policy_matrix_learned,
+    EpisodeRewards=episode_rewards,
+    TemporalPlot=p_temporal,
+    LearnedDAG=g_und,
+    DynamicDAG=DynamicDAG
+  )
+}
+
+# -----------------------------
+# Run full experiment
+# -----------------------------
+data("Boston", package="MASS")
+res_neg_full <- run_full_dqn_temporal_neg(Boston, T_steps=8, n_outcomes=6, rho=-0.5, n=200, episodes=30)
+
+plot(res_neg_full$LearnedDAG, vertex.size=25, vertex.label.cex=1.2,
+     main="Learned Dynamic DAG — Negative Correlation (rho = -0.5)")
+# Plot results
+plot(res_neg_full$TemporalPlot,
+     main="Temporal Plot — Negative Correlation (rho = -0.5)")
+
+# -----------------------------
+# 8) Summarize outputs into a table
+# -----------------------------
+
+# Average reward over all episodes
+avg_reward <- mean(res_neg_full$EpisodeRewards)
+final_reward <- tail(res_neg_full$EpisodeRewards, 1)
+reward_improvement <- final_reward - res_neg_full$EpisodeRewards[1]
+
+# Estimate CATE for comparison
+CATE_est <- estimate_dynamic_treatment_effect(res_neg_full$Y_array, res_neg_full$A_true)
+CATE_summary <- colMeans(CATE_est)
+
+# Average correlation of learned policy
+policy_corr <- mean(cor(res_neg_full$PolicyMatrix))
+
+# DAG summary
+n_edges <- length(E(res_neg_full$LearnedDAG))
+avg_edge_weight <- mean(abs(E(res_neg_full$LearnedDAG)$weight))
+
+# Construct summary table
+summary_table <- data.frame(
+  Metric = c("Episodes", 
+             "Average Episode Reward",
+             "Final Episode Reward",
+             "Reward Improvement",
+             "Mean CATE (across outcomes)",
+             "Avg Policy Correlation",
+             "Number of Edges in Learned DAG",
+             "Avg |Edge Weight|"),
+  Value = c(length(res_neg_full$EpisodeRewards),
+            round(avg_reward, 4),
+            round(final_reward, 4),
+            round(reward_improvement, 4),
+            round(mean(CATE_summary), 4),
+            round(policy_corr, 4),
+            n_edges,
+            round(avg_edge_weight, 4))
+)
+
+# Display formatted table
+kable(summary_table, caption = "Summary of DQN Results (ρ = -0.5)", align = "lc")
+
+
+###############################
+# --- Libraries ---
+library(MASS)
+library(Matrix)
+library(keras)
+library(tensorflow)
+library(tidyverse)
+library(RColorBrewer)
+library(igraph)
+library(ggrepel)
+library(patchwork)
+library(data.table)
+library(ggplot2)
+library(knitr)
+
+set.seed(123)
+tensorflow::set_random_seed(123)
+
+# --- Load Wine Quality Dataset ---
+# Download only once
+library(data.table)
+wine_file <- "winequality-red.csv"
+wine <- fread(wine_file, sep = ";")
+features <- setdiff(names(wine), "quality")
+n <- 200  # sample size for DQN
+df_sampled <- wine[sample(1:nrow(wine), n, replace = TRUE), ..features]
+df_scaled <- as.data.frame(scale(df_sampled))
+
+# -----------------------------
+# Run full experiment (positive correlation)
+# -----------------------------
+res_pos <- run_full_dqn_temporal_pos(df_scaled, T_steps = 8, n_outcomes = 6, rho = 0.5, n = n, episodes = 30)
+
+# -----------------------------
+# Run full experiment (negative correlation)
+# -----------------------------
+run_full_dqn_temporal_neg <- function(df, ...) {
+  run_full_dqn_temporal_pos(df, ..., rho = -0.5)  # just override rho
+}
+res_neg <- run_full_dqn_temporal_neg(df_scaled, T_steps = 8, n_outcomes = 6, n = n, episodes = 30)
+
+# -----------------------------
+# Function to summarize results
+# -----------------------------
+summarize_dqn_results <- function(res, dataset_name, rho_value){
+  avg_reward <- mean(res$EpisodeRewards)
+  final_reward <- tail(res$EpisodeRewards, 1)
+  reward_improvement <- final_reward - res$EpisodeRewards[1]
+  
+  CATE_est <- estimate_dynamic_treatment_effect(res$Y_array, res$A_true)
+  CATE_summary <- colMeans(CATE_est)
+  
+  cor_mat <- cor(res$PolicyMatrix)
+  policy_corr <- if(ncol(cor_mat) > 1) mean(cor_mat[upper.tri(cor_mat)]) else 0
+  
+  n_edges <- length(E(res$LearnedDAG))
+  avg_edge_weight <- if(n_edges == 0) 0 else mean(abs(E(res$LearnedDAG)$weight))
+  
+  summary_table <- data.frame(
+    Metric = c("Episodes", 
+               "Average Episode Reward",
+               "Final Episode Reward",
+               "Reward Improvement",
+               "Mean CATE (across outcomes)",
+               "Avg Policy Correlation (off-diag)",
+               "Number of Edges in Learned DAG",
+               "Avg |Edge Weight|"),
+    Value = c(length(res$EpisodeRewards),
+              round(avg_reward, 4),
+              round(final_reward, 4),
+              round(reward_improvement, 4),
+              round(mean(CATE_summary), 4),
+              round(policy_corr, 4),
+              n_edges,
+              round(avg_edge_weight, 4))
+  )
+  
+  kable(summary_table, caption = paste0("Summary of DQN Results on ", dataset_name, " (ρ = ", rho_value, ")"), align = "lc")
+}
+
+# -----------------------------
+# Display summary tables
+# -----------------------------
+summarize_dqn_results(res_pos, "Wine Quality Dataset", 0.5)
+summarize_dqn_results(res_neg, "Wine Quality Dataset", -0.5)
+
+# -----------------------------
+# Function to plot temporal rewards
+# -----------------------------
+plot_temporal_rewards <- function(res, rho_value, dataset_name){
+  n_outcomes <- dim(res$Y_array)[3]
+  T_steps <- dim(res$Y_array)[2]
+  
+  temporal_rewards <- matrix(0, nrow=T_steps, ncol=n_outcomes)
+  for(t in 1:T_steps) 
+    for(k in 1:n_outcomes) 
+      temporal_rewards[t,k] <- mean(res$Y_cop[,t,k] * res$PolicyMatrix[,t])
+  
+  df_temp <- as.data.frame(temporal_rewards)
+  colnames(df_temp) <- paste0("Y",1:n_outcomes)
+  df_temp$Time <- 1:T_steps
+  df_long <- pivot_longer(df_temp, cols=starts_with("Y"), names_to="Outcome", values_to="Reward")
+  
+  outcome_colors <- RColorBrewer::brewer.pal(min(8,n_outcomes),"Set2")
+  
+  p <- ggplot(df_long, aes(x=Time, y=Reward, color=Outcome)) +
+    geom_line(linewidth=1.2) +
+    geom_point(size=1.6) +
+    scale_color_manual(values=outcome_colors) +
+    theme_minimal(base_size=13) +
+    labs(title=paste0("Temporal Rewards — ", dataset_name, " (ρ = ", rho_value, ")"),
+         x="Time Step", y="Average Reward")
+  return(p)
+}
+
+# -----------------------------
+# Plot positive correlation
+# -----------------------------
+p_pos <- plot_temporal_rewards(res_pos, 0.5, "Wine Quality Dataset")
+print(p_pos)
+
+
+# -----------------------------
+# Plot negative correlation
+# -----------------------------
+p_neg <- plot_temporal_rewards(res_neg, -0.5, "Wine Quality Dataset")
+print(p_neg)
+
+# -----------------------------
+# Optional: Combine both plots side-by-side
+# -----------------------------
+library(patchwork)
+combined_plot <- p_pos + p_neg + plot_layout(ncol=2)
+print(combined_plot)
+
+library(igraph)
+
+# --- Plot Learned DAG — Positive Correlation ---
+if(length(E(res_pos$LearnedDAG)) > 0) {
+  plot(res_pos$LearnedDAG,
+       vertex.size = 25,
+       vertex.label.cex = 1.2,
+       main = "Learned Dynamic DAG — Positive Correlation (ρ = 0.5)")
+} else {
+  plot(make_empty_graph(n=10),
+       main = "No edges learned (Positive Correlation)")
+}
+
+# --- Plot Learned DAG — Negative Correlation ---
+if(length(E(res_neg$LearnedDAG)) > 0) {
+  plot(res_neg$LearnedDAG,
+       vertex.size = 25,
+       vertex.label.cex = 1.2,
+       main = "Learned Dynamic DAG — Negative Correlation (ρ = -0.5)")
+} else {
+  plot(make_empty_graph(n=10),
+       main = "No edges learned (Negative Correlation)")
+}

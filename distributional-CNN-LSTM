@@ -1,4 +1,425 @@
+# =======================================================
+# CNN-LSTM vs KDE vs Copula on Criteo Uplift Dataset
+# Robustified version with runtime/convergence diagnostics
+# =======================================================
+library(MASS)
+library(copula)
+library(mvtnorm)
+library(stats)
+library(ellipse)
+library(ggplot2)
+library(knitr)
+library(reshape2)
+library(akima)
+library(fields)
+library(keras)
+library(keras3)
+library(tensorflow)
+library(data.table)
 
+set.seed(123)
+tf$random$set_seed(123L)
+
+# =========================================
+# 1) Load Criteo Uplift dataset
+# =========================================
+# Download data frm https://huggingface.co/datasets/criteo/criteo-uplift/blob/main/criteo-research-uplift-v2.1.csv.gz
+uplift_path <- "criteo-research-uplift-v2.1.csv.gz"
+if(!file.exists(uplift_path)) stop("Criteo file not found. Place it in your working directory.")
+
+cat("Loading Criteo Uplift dataset...\n")
+criteo <- fread(uplift_path)
+cat("Columns:", ncol(criteo), " Rows:", nrow(criteo), "\n")
+
+# =========================================
+# 2) Select and clean numeric features
+# =========================================
+num_cols <- names(criteo)[grepl("^f", names(criteo))]
+if(length(num_cols) < 2) stop("Dataset doesn't contain f* columns to choose from. Edit feature selection.")
+num_cols <- num_cols[1:2]
+cat("Using features:", paste(num_cols, collapse = ", "), "\n")
+
+obs_dt <- criteo[, ..num_cols]
+for (j in seq_along(num_cols)) {
+  if (!is.numeric(obs_dt[[j]])) obs_dt[[j]] <- as.numeric(factor(obs_dt[[j]]))
+}
+obs_dt <- obs_dt[apply(obs_dt, 1, function(r) all(is.finite(r))), ]
+obs_dt <- obs_dt[complete.cases(obs_dt), ]
+
+# Optional downsample
+n_sample <- min(5000, nrow(obs_dt))
+if(nrow(obs_dt) > n_sample) obs_dt <- obs_dt[sample(.N, n_sample)]
+
+obs <- as.matrix(obs_dt)
+obs <- scale(obs)
+
+# Add tiny jitter to zero-variance columns
+sds <- apply(obs, 2, sd, na.rm = TRUE)
+zero_sd_cols <- which(sds <= 0 | is.na(sds))
+if(length(zero_sd_cols) > 0){
+  cat("Adding jitter to constant columns:", zero_sd_cols, "\n")
+  for(c in zero_sd_cols) obs[,c] <- obs[,c] + rnorm(nrow(obs), 0, 1e-6)
+}
+
+plot(obs, col = rgb(0.2,0.4,0.6,0.4), pch=16,
+     xlab = num_cols[1], ylab = num_cols[2],
+     main = "Criteo Uplift Sample (scaled features)")
+
+# =========================================
+# 3) Train/test split
+# =========================================
+n <- nrow(obs)
+tr_idx <- sample(1:n, size = round(0.7*n))
+te_idx <- setdiff(1:n, tr_idx)
+obs_tr <- obs[tr_idx, , drop = FALSE]
+obs_te <- obs[te_idx, , drop = FALSE]
+
+# =========================================
+# 4) CNN-LSTM model
+# =========================================
+X_tr <- array(obs_tr, dim = c(nrow(obs_tr), 1, ncol(obs_tr)))
+X_te <- array(obs_te, dim = c(nrow(obs_te), 1, ncol(obs_te)))
+
+input <- layer_input(shape = c(1, ncol(obs_tr)))
+model <- input %>%
+  layer_lstm(units = 16, activation = "tanh") %>%
+  layer_dense(units = ncol(obs_tr))
+model <- keras_model(inputs = input, outputs = model)
+
+model %>% compile(loss = "mse", optimizer = optimizer_adam(0.01))
+
+cat("Training CNN-LSTM model...\n")
+history <- model %>% fit(
+  x = X_tr, y = obs_tr,
+  epochs = 50, batch_size = 32,
+  validation_split = 0.2, verbose = 0
+)
+
+y_pred <- model %>% predict(X_te)
+
+rmse_cnn <- sqrt(mean((y_pred - obs_te)^2))
+mu_cnn <- colMeans(y_pred)
+sigma_cnn <- tryCatch(cov(y_pred), error = function(e) diag(rep(1e-6, ncol(y_pred))))
+loglik_cnn <- tryCatch(sum(dmvnorm(obs_te, mean = mu_cnn, sigma = sigma_cnn, log = TRUE)), error = function(e) NA)
+coverage_cnn <- tryCatch(mean(mahalanobis(obs_te, mu_cnn, sigma_cnn) < qchisq(0.9, df = ncol(obs_te))), error = function(e) NA)
+
+# =========================================
+# 4b) CNN-LSTM runtime & stability diagnostics
+# =========================================
+n_repeats <- 5
+cnn_times <- numeric(n_repeats)
+cnn_rmse_vec <- numeric(n_repeats)
+
+for(i in 1:n_repeats){
+  tf$random$set_seed(123L + i)
+  start_time <- Sys.time()
+  
+  model_i <- input %>%
+    layer_lstm(units = 16, activation = "tanh") %>%
+    layer_dense(units = ncol(obs_tr)) %>%
+    keras_model(inputs = input, outputs = .)
+  
+  model_i %>% compile(loss = "mse", optimizer = optimizer_adam(0.01))
+  
+  model_i %>% fit(
+    x = X_tr, y = obs_tr,
+    epochs = 50, batch_size = 32,
+    validation_split = 0.2, verbose = 0
+  )
+  
+  cnn_times[i] <- as.numeric(difftime(Sys.time(), start_time, units = "secs")) / 50
+  y_pred_i <- model_i %>% predict(X_te)
+  cnn_rmse_vec[i] <- sqrt(mean((y_pred_i - obs_te)^2))
+}
+
+avg_epoch_time <- mean(cnn_times)
+total_train_time <- sum(cnn_times) * 50
+cnn_rmse_mean <- mean(cnn_rmse_vec)
+cnn_rmse_sd <- sd(cnn_rmse_vec)
+
+cat("\nCNN-LSTM Training Diagnostics:\n")
+cat(sprintf("Average runtime per epoch: %.3f sec\n", avg_epoch_time))
+cat(sprintf("Total convergence time (50 epochs): %.3f sec\n", total_train_time))
+cat(sprintf("RMSE across %d runs: mean=%.4f, SD=%.4f\n", n_repeats, cnn_rmse_mean, cnn_rmse_sd))
+
+# =========================================
+# 5) KDE model
+# =========================================
+obs_tr_dt <- as.data.table(obs_tr)
+obs_te_dt <- as.data.table(obs_te)
+n_tr <- nrow(obs_tr_dt)
+
+for(j in seq_len(ncol(obs_tr_dt))){
+  obs_tr_dt[[paste0("u", j)]] <- rank(obs_tr_dt[[j]]) / (n_tr + 1)
+}
+u1 <- obs_tr_dt[["u1"]]
+u2 <- obs_tr_dt[["u2"]]
+
+bw1 <- max(1e-3, bandwidth.nrd(u1))
+bw2 <- max(1e-3, bandwidth.nrd(u2))
+fit_kde <- tryCatch(kde2d(u1, u2, n = 100, h = c(bw1, bw2)),
+                    error = function(e) kde2d(u1, u2, n = 100, h = c(max(bw1,1e-2), max(bw2,1e-2))))
+
+emp_cdf <- function(x_train, x_new) {
+  sapply(x_new, function(v) (sum(x_train <= v) + 1) / (length(x_train) + 1))
+}
+
+u_te1 <- emp_cdf(obs_tr[,1], obs_te[,1])
+u_te2 <- emp_cdf(obs_tr[,2], obs_te[,2])
+pdf_vals <- interp.surface(list(x = fit_kde$x, y = fit_kde$y, z = fit_kde$z), cbind(u_te1, u_te2))
+pdf_vals[is.na(pdf_vals) | pdf_vals <= 0] <- 1e-8
+loglik_kde <- sum(log(pdf_vals))
+
+cov_mat <- tryCatch(cov(obs_tr), error = function(e) diag(rep(1e-6, ncol(obs_tr))))
+center <- colMeans(obs_tr)
+threshold <- qchisq(0.9, df = ncol(obs_tr))
+md2 <- mahalanobis(obs_te, center, cov_mat)
+coverage_kde <- mean(md2 <= threshold)
+
+grid_points <- expand.grid(x = fit_kde$x, y = fit_kde$y)
+weights <- as.vector(fit_kde$z)
+weights <- weights / sum(weights)
+kde_mean_uv <- colSums(grid_points * weights)
+kde_mean_orig <- sapply(seq_len(ncol(obs_tr)), function(j){
+  quantile(obs_tr[,j], probs = kde_mean_uv[j], names = FALSE, type = 8)
+})
+rmse_kde <- sqrt(mean((obs_te - matrix(kde_mean_orig, nrow(obs_te), ncol(obs_te), byrow = TRUE))^2))
+
+# =========================================
+# 6) Gaussian Copula
+# =========================================
+u_tr_mat <- pobs(obs_tr)
+fit_cop <- normalCopula(dim = ncol(obs_tr))
+fit_ml <- tryCatch(fitCopula(fit_cop, u_tr_mat, method = "ml"), error = function(e) NULL)
+
+if(is.null(fit_ml)){
+  warning("Copula ML fit failed; using empirical correlation for Gaussian copula.")
+  rho_est <- cor(obs_tr)
+  rho_val <- if(is.matrix(rho_est)) rho_est[1,2] else 0
+  cop <- normalCopula(param = rho_val, dim = ncol(obs_tr))
+} else {
+  rho <- coef(fit_ml)
+  cop <- normalCopula(param = rho, dim = ncol(obs_tr))
+}
+
+u_te_mat <- pobs(obs_te)
+loglik_cop <- tryCatch(sum(dCopula(u_te_mat, cop, log = TRUE)), error = function(e) NA)
+covariance_cop <- tryCatch(cov(obs_tr), error = function(e) diag(rep(1e-6, ncol(obs_tr))))
+mu_cop <- colMeans(obs_tr)
+coverage_cop <- tryCatch(mean(mahalanobis(obs_te, mu_cop, covariance_cop) < qchisq(0.9, df=ncol(obs_tr))), error = function(e) NA)
+rmse_cop <- sqrt(mean((obs_te - matrix(mu_cop, nrow(obs_te), ncol(obs_te), byrow = TRUE))^2))
+
+# =========================================
+# 7) Results Table
+# =========================================
+results <- data.frame(
+  Model = c("CNN-LSTM", "KDE", "Gaussian Copula"),
+  Coverage = c(coverage_cnn, coverage_kde, coverage_cop),
+  LogLik = c(loglik_cnn, loglik_kde, loglik_cop),
+  CATE_RMSE = c(rmse_cnn, rmse_kde, rmse_cop)
+)
+
+kable(results, digits = 3, caption = "Model Comparison on Criteo Uplift Dataset (two continuous features)")
+
+# =========================================
+# 8) Visualization (improved)
+#
+
+# Improved visualization with clear axis labels, color legend, and self-contained captions
+df_long <- reshape2::melt(results, id.vars = "Model")
+
+ggplot(df_long, aes(x = Model, y = value, fill = Model)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  facet_wrap(~variable, scales = "free_y") +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "bottom",
+        axis.text.x = element_text(angle = 30, hjust = 1),
+        strip.text = element_text(size = 12, face = "bold")) +
+  scale_fill_manual(values = c("CNN-LSTM" = "#1b9e77", "KDE" = "#d95f02", "Gaussian Copula" = "#7570b3")) +
+  labs(
+    title = "Comparison of CNN-LSTM, KDE, and Gaussian Copula on Criteo Uplift Dataset",
+    subtitle = "Metrics: 90% Coverage, Log-Likelihood, and CATE RMSE; two continuous features used",
+    x = "Model",
+    y = "Metric Value",
+    fill = "Model"
+  )
+
+# =========================================
+# 9) Diagnostics
+# =========================================
+cat("\nDiagnostics:\n")
+cat("Train size:", nrow(obs_tr), "Test size:", nrow(obs_te), "\n")
+cat("CNN-LSTM average epoch time (sec):", round(avg_epoch_time, 4), "\n")
+cat("CNN-LSTM total convergence time (50 epochs, sec):", round(total_train_time, 4), "\n")
+cat("CNN-LSTM RMSE across repeated runs: mean =", round(cnn_rmse_mean, 4),
+    ", SD =", round(cnn_rmse_sd, 4), "\n")
+cat("KDE bandwidths:", bw1, bw2, "\n")
+cat("KDE grid dimensions:", dim(fit_kde$z), "\n")
+if(!is.null(fit_ml)){
+  cat("Fitted Gaussian copula parameter(s):", coef(fit_ml), "\n")
+} else {
+  cat("Copula fit failed; used fallback.\n")
+}
+
+
+#########################
+# Real Data (IRIS)
+#########################
+
+rm(list = ls())
+
+# =========================================
+# Libraries
+# =========================================
+library(MASS)
+library(copula)
+library(mvtnorm)
+library(stats)
+library(ellipse)
+library(ggplot2)
+library(knitr)
+library(reshape2)
+library(akima)
+library(fields)
+library(keras)
+library(tensorflow)
+
+set.seed(123)
+tf$random$set_seed(123L)
+
+# =========================================
+# 1) Load dataset (iris)
+# =========================================
+dataset_name <- "iris"  
+
+if(dataset_name == "iris"){
+  data(iris)
+  obs <- as.matrix(iris[, sapply(iris, is.numeric)][,1:2])
+} else if(dataset_name == "mtcars"){
+  data(mtcars)
+  obs <- as.matrix(mtcars[, sapply(mtcars, is.numeric)][,1:2])
+} else {
+  stop("Dataset not recognized.")
+}
+
+# Standardize
+obs <- scale(obs)
+
+# Quick plot
+plot(obs, col = rgb(0.2,0.4,0.6,0.4), pch=16,
+     xlab="Feature 1", ylab="Feature 2",
+     main=paste("Real Data Example:", dataset_name))
+
+# =========================================
+# 2) Split train/test
+# =========================================
+n <- nrow(obs)
+tr_idx <- sample(1:n, size = round(0.7*n))
+te_idx <- setdiff(1:n, tr_idx)
+obs_tr <- obs[tr_idx, ]
+obs_te <- obs[te_idx, ]
+
+# =========================================
+# 3) CNN-LSTM model (corrected)
+# =========================================
+# Reshape input for LSTM: samples x timesteps x features
+X_tr <- array(obs_tr, dim = c(nrow(obs_tr), 1, 2))
+X_te <- array(obs_te, dim = c(nrow(obs_te), 1, 2))
+
+# Build CNN-LSTM without Conv1D
+input <- layer_input(shape = c(1, 2))
+model <- input %>%
+  layer_lstm(units=16, activation="tanh") %>%
+  layer_dense(units=2)
+
+model <- keras_model(inputs=input, outputs=model)
+
+model %>% compile(
+  loss = "mse",
+  optimizer = optimizer_adam(learning_rate=0.01)
+)
+
+# Train
+history <- model %>% fit(
+  x = X_tr, y = obs_tr,
+  epochs = 100, batch_size = 16,
+  validation_split=0.2, verbose=0
+)
+
+# Predict
+y_pred <- model %>% predict(X_te)
+
+# Compute CNN-LSTM metrics
+rmse_cnn <- sqrt(mean((y_pred - obs_te)^2))
+mu_cnn <- colMeans(y_pred)
+sigma_cnn <- cov(y_pred)
+loglik_cnn <- sum(dmvnorm(obs_te, mean=mu_cnn, sigma=sigma_cnn, log=TRUE))
+coverage_cnn <- mean(mahalanobis(obs_te, mu_cnn, sigma_cnn) < qchisq(0.9, df=2))
+
+# =========================================
+# 4) KDE model
+# =========================================
+fit_kde <- kde2d(obs_tr[,1], obs_tr[,2], n=100)
+pdf_vals <- interp.surface(list(x=fit_kde$x, y=fit_kde$y, z=fit_kde$z), obs_te[,1:2])
+pdf_vals[is.na(pdf_vals) | pdf_vals <= 0] <- 1e-8
+loglik_kde <- sum(log(pdf_vals))
+
+cov_mat <- cov(obs_tr)
+center <- colMeans(obs_tr)
+threshold <- qchisq(0.9, df=2)
+md2 <- mahalanobis(obs_te, center, cov_mat)
+coverage_kde <- mean(md2 <= threshold)
+
+grid_points <- expand.grid(x=fit_kde$x, y=fit_kde$y)
+weights <- as.vector(fit_kde$z)
+weights <- weights / sum(weights)
+kde_mean <- colSums(grid_points * weights)
+rmse_kde <- sqrt(mean((obs_te - matrix(kde_mean, nrow(obs_te), 2, byrow=TRUE))^2))
+
+# =========================================
+# 5) Gaussian Copula
+# =========================================
+u_tr <- pobs(obs_tr)
+fit_cop <- normalCopula(dim=2)
+fit_ml <- fitCopula(fit_cop, u_tr, method="ml")
+rho <- coef(fit_ml)
+cop <- normalCopula(param=rho, dim=2)
+u_te <- pobs(obs_te)
+loglik_cop <- sum(dCopula(u_te, cop, log=TRUE))
+
+covariance_cop <- cov(obs_tr)
+mu_cop <- colMeans(obs_tr)
+coverage_cop <- mean(mahalanobis(obs_te, mu_cop, covariance_cop) < qchisq(0.9, df=2))
+rmse_cop <- sqrt(mean((obs_te - matrix(mu_cop, nrow(obs_te), 2, byrow=TRUE))^2))
+
+# =========================================
+# 6) Results Table
+# =========================================
+results <- data.frame(
+  Model = c("CNN-LSTM","KDE","Gaussian Copula"),
+  Coverage = c(coverage_cnn, coverage_kde, coverage_cop),
+  LogLik = c(loglik_cnn, loglik_kde, loglik_cop),
+  CATE_RMSE = c(rmse_cnn, rmse_kde, rmse_cop)
+)
+
+kable(results, digits=3, caption=paste("Model Comparison on Real Data (", dataset_name, ")", sep=""))
+
+# =========================================
+# 7) Visualization
+# =========================================
+df_long <- reshape2::melt(results, id.vars="Model")
+
+ggplot(df_long, aes(x=Model, y=value, fill=Model)) +
+  geom_bar(stat="identity", position="dodge") +
+  facet_wrap(~variable, scales="free_y") +
+  theme_minimal(base_size=14) +
+  theme(legend.position="none") +
+  labs(title=paste("Model Comparison: Coverage, LogLik, CATE RMSE (", dataset_name, ")", sep=""),
+       y="Value", x="Model")
+
+
+##################################
+## Simulated Data Analysis ###
 ##################################
 ## Bivariate Case
 ##################################
@@ -1222,160 +1643,4 @@ plot_true_vs_predicted_3D <- function(obs_te, mu_list, Sigma_list, mu_te, s_te, 
 # Run the 3D overlay plot
 # =========================================
 plot_true_vs_predicted_3D(obs_te, mu_list, Sigma_list, mu_te, s_te, rho12_te, rho13_te, rho23_te)
-
-
-###
-# Real Data
-###
-
-rm(list = ls())
-
-# =========================================
-# Libraries
-# =========================================
-library(MASS)
-library(copula)
-library(mvtnorm)
-library(stats)
-library(ellipse)
-library(ggplot2)
-library(knitr)
-library(reshape2)
-library(akima)
-library(fields)
-library(keras)
-library(tensorflow)
-
-set.seed(123)
-tf$random$set_seed(123L)
-
-# =========================================
-# 1) Load dataset (iris)
-# =========================================
-dataset_name <- "iris"  
-
-if(dataset_name == "iris"){
-  data(iris)
-  obs <- as.matrix(iris[, sapply(iris, is.numeric)][,1:2])
-} else if(dataset_name == "mtcars"){
-  data(mtcars)
-  obs <- as.matrix(mtcars[, sapply(mtcars, is.numeric)][,1:2])
-} else {
-  stop("Dataset not recognized.")
-}
-
-# Standardize
-obs <- scale(obs)
-
-# Quick plot
-plot(obs, col = rgb(0.2,0.4,0.6,0.4), pch=16,
-     xlab="Feature 1", ylab="Feature 2",
-     main=paste("Real Data Example:", dataset_name))
-
-# =========================================
-# 2) Split train/test
-# =========================================
-n <- nrow(obs)
-tr_idx <- sample(1:n, size = round(0.7*n))
-te_idx <- setdiff(1:n, tr_idx)
-obs_tr <- obs[tr_idx, ]
-obs_te <- obs[te_idx, ]
-
-# =========================================
-# 3) CNN-LSTM model (corrected)
-# =========================================
-# Reshape input for LSTM: samples x timesteps x features
-X_tr <- array(obs_tr, dim = c(nrow(obs_tr), 1, 2))
-X_te <- array(obs_te, dim = c(nrow(obs_te), 1, 2))
-
-# Build CNN-LSTM without Conv1D
-input <- layer_input(shape = c(1, 2))
-model <- input %>%
-  layer_lstm(units=16, activation="tanh") %>%
-  layer_dense(units=2)
-
-model <- keras_model(inputs=input, outputs=model)
-
-model %>% compile(
-  loss = "mse",
-  optimizer = optimizer_adam(learning_rate=0.01)
-)
-
-# Train
-history <- model %>% fit(
-  x = X_tr, y = obs_tr,
-  epochs = 100, batch_size = 16,
-  validation_split=0.2, verbose=0
-)
-
-# Predict
-y_pred <- model %>% predict(X_te)
-
-# Compute CNN-LSTM metrics
-rmse_cnn <- sqrt(mean((y_pred - obs_te)^2))
-mu_cnn <- colMeans(y_pred)
-sigma_cnn <- cov(y_pred)
-loglik_cnn <- sum(dmvnorm(obs_te, mean=mu_cnn, sigma=sigma_cnn, log=TRUE))
-coverage_cnn <- mean(mahalanobis(obs_te, mu_cnn, sigma_cnn) < qchisq(0.9, df=2))
-
-# =========================================
-# 4) KDE model
-# =========================================
-fit_kde <- kde2d(obs_tr[,1], obs_tr[,2], n=100)
-pdf_vals <- interp.surface(list(x=fit_kde$x, y=fit_kde$y, z=fit_kde$z), obs_te[,1:2])
-pdf_vals[is.na(pdf_vals) | pdf_vals <= 0] <- 1e-8
-loglik_kde <- sum(log(pdf_vals))
-
-cov_mat <- cov(obs_tr)
-center <- colMeans(obs_tr)
-threshold <- qchisq(0.9, df=2)
-md2 <- mahalanobis(obs_te, center, cov_mat)
-coverage_kde <- mean(md2 <= threshold)
-
-grid_points <- expand.grid(x=fit_kde$x, y=fit_kde$y)
-weights <- as.vector(fit_kde$z)
-weights <- weights / sum(weights)
-kde_mean <- colSums(grid_points * weights)
-rmse_kde <- sqrt(mean((obs_te - matrix(kde_mean, nrow(obs_te), 2, byrow=TRUE))^2))
-
-# =========================================
-# 5) Gaussian Copula
-# =========================================
-u_tr <- pobs(obs_tr)
-fit_cop <- normalCopula(dim=2)
-fit_ml <- fitCopula(fit_cop, u_tr, method="ml")
-rho <- coef(fit_ml)
-cop <- normalCopula(param=rho, dim=2)
-u_te <- pobs(obs_te)
-loglik_cop <- sum(dCopula(u_te, cop, log=TRUE))
-
-covariance_cop <- cov(obs_tr)
-mu_cop <- colMeans(obs_tr)
-coverage_cop <- mean(mahalanobis(obs_te, mu_cop, covariance_cop) < qchisq(0.9, df=2))
-rmse_cop <- sqrt(mean((obs_te - matrix(mu_cop, nrow(obs_te), 2, byrow=TRUE))^2))
-
-# =========================================
-# 6) Results Table
-# =========================================
-results <- data.frame(
-  Model = c("CNN-LSTM","KDE","Gaussian Copula"),
-  Coverage = c(coverage_cnn, coverage_kde, coverage_cop),
-  LogLik = c(loglik_cnn, loglik_kde, loglik_cop),
-  CATE_RMSE = c(rmse_cnn, rmse_kde, rmse_cop)
-)
-
-kable(results, digits=3, caption=paste("Model Comparison on Real Data (", dataset_name, ")", sep=""))
-
-# =========================================
-# 7) Visualization
-# =========================================
-df_long <- reshape2::melt(results, id.vars="Model")
-
-ggplot(df_long, aes(x=Model, y=value, fill=Model)) +
-  geom_bar(stat="identity", position="dodge") +
-  facet_wrap(~variable, scales="free_y") +
-  theme_minimal(base_size=14) +
-  theme(legend.position="none") +
-  labs(title=paste("Model Comparison: Coverage, LogLik, CATE RMSE (", dataset_name, ")", sep=""),
-       y="Value", x="Model")
 

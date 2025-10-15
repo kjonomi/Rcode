@@ -1,0 +1,217 @@
+###############################
+## Real Data with All Copulas
+###############################
+library(copula)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+
+# =========================================
+# Helper: Laplace quantile function
+# =========================================
+qlaplace <- function(p, mu = 0, sigma = 1) {
+  ifelse(p < 0.5,
+         mu + sigma * log(2 * p),
+         mu - sigma * log(2 * (1 - p)))
+}
+
+# =========================================
+# Copula-based randomized response + DP
+# =========================================
+apply_stratified_random_response_dp_copula <- function(true_value, q, epsilon, copula_model) {
+  # Step 1: Warner randomized response
+  randomized_response <- ifelse(runif(1) < q, sample(c(0, 1), 1), true_value)
+  
+  # Step 2: Generate dependent uniforms from copula
+  u <- if (is.null(copula_model)) runif(2) else rCopula(1, copula_model)
+  
+  # Step 3: Transform to Laplace and Gaussian margins
+  noise_laplace <- qlaplace(u[1], mu = 0, sigma = 1/epsilon)
+  noise_gaussian <- qnorm(u[2], mean = 0, sd = 1/epsilon)
+  
+  # Step 4: Apply noise
+  noisy_response_laplace <- randomized_response + noise_laplace
+  noisy_response_gaussian <- randomized_response + noise_gaussian
+  
+  return(c(noisy_response_laplace, noisy_response_gaussian))
+}
+
+# =========================================
+# Load real dataset
+# =========================================
+data("mtcars")
+real_values <- mtcars$am  # 0 = automatic, 1 = manual
+n <- length(real_values)
+
+# Optional: create stratification variable
+set.seed(123)
+strata <- sample(c("Group 1", "Group 2"), n, replace = TRUE)
+q_values <- c("Group 1" = 0.5, "Group 2" = 0.7)
+epsilons <- c(0.5, 1, 2)
+
+# Copula families and rho values
+copula_families <- list(
+  NoCopula = NULL,
+  Gaussian = normalCopula,
+  Clayton  = claytonCopula,
+  Gumbel   = gumbelCopula
+)
+
+rho_values <- c(0.2, 0.5, 0.8)
+gumbel_rho_values <- 1 + rho_values  # Gumbel copula parameter must be >= 1
+
+# =========================================
+# Simulation Loop on Real Data
+# =========================================
+results <- data.frame()
+
+for (fam in names(copula_families)) {
+  rhos_to_use <- if (fam == "Gumbel") gumbel_rho_values else rho_values
+  for (rho in rhos_to_use) {
+    for (eps in epsilons) {
+      
+      copula_model <- if (is.null(copula_families[[fam]])) NULL else copula_families[[fam]](param = rho, dim = 2)
+      
+      noisy_responses <- t(mapply(function(tv, s) {
+        apply_stratified_random_response_dp_copula(tv, q_values[s], eps, copula_model)
+      }, real_values, strata))
+      
+      df <- data.frame(
+        Group = strata,
+        TrueValue = real_values,
+        Laplace = noisy_responses[,1],
+        Gaussian = noisy_responses[,2],
+        Epsilon = eps,
+        Family = fam,
+        Theta = rho
+      )
+      
+      summary_df <- df %>%
+        group_by(Group, Epsilon, Family, Theta) %>%
+        summarise(
+          TrueMean = mean(TrueValue),
+          Mean_Laplace = mean(Laplace),
+          Mean_Gaussian = mean(Gaussian),
+          Bias_Laplace = mean(Laplace) - mean(TrueValue),
+          Bias_Gaussian = mean(Gaussian) - mean(TrueValue),
+          Var_Laplace = var(Laplace),
+          Var_Gaussian = var(Gaussian),
+          .groups = "drop"
+        )
+      
+      results <- rbind(results, summary_df)
+    }
+  }
+}
+
+# =========================================
+# Five-number summary table
+# =========================================
+results_table <- results %>%
+  pivot_longer(cols = c(Mean_Laplace, Mean_Gaussian,
+                        Bias_Laplace, Bias_Gaussian,
+                        Var_Laplace, Var_Gaussian),
+               names_to = c(".value", "NoiseType"),
+               names_sep = "_") %>%
+  select(Family, Theta, Epsilon, NoiseType, TrueMean, Mean, Bias, Var) %>%
+  arrange(Family, Theta, Epsilon, NoiseType)
+
+results_summary <- results_table %>%
+  group_by(Family, Theta, Epsilon, NoiseType) %>%
+  summarise(
+    Min_Bias    = min(Bias, na.rm = TRUE),
+    Q1_Bias     = quantile(Bias, 0.25, na.rm = TRUE),
+    Median_Bias = median(Bias, na.rm = TRUE),
+    Q3_Bias     = quantile(Bias, 0.75, na.rm = TRUE),
+    Max_Bias    = max(Bias, na.rm = TRUE),
+    
+    Min_Var     = min(Var, na.rm = TRUE),
+    Q1_Var      = quantile(Var, 0.25, na.rm = TRUE),
+    Median_Var  = median(Var, na.rm = TRUE),
+    Q3_Var      = quantile(Var, 0.75, na.rm = TRUE),
+    Max_Var     = max(Var, na.rm = TRUE),
+    
+    .groups = "drop"
+  )
+
+# View the summary table
+View(results_summary)
+
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+# =========================================
+# Prepare long format for variance plot
+# =========================================
+results_long_var <- results_table %>%
+  pivot_longer(cols = c(Var),
+               names_to = "Metric", values_to = "Variance") %>%
+  mutate(NoiseType = factor(NoiseType, levels = c("Laplace", "Gaussian")))
+
+# -----------------------------------------
+# Improved Variance Plot
+# -----------------------------------------
+ggplot(results_long_var, aes(x = Theta, y = Variance, 
+                             color = NoiseType, linetype = Family, 
+                             shape = NoiseType,
+                             group = interaction(Family, NoiseType, Epsilon))) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 3, alpha = 0.8) +
+  geom_smooth(se = FALSE, method = "loess", linewidth = 0.8, alpha = 0.3) +
+  facet_wrap(~Epsilon, nrow = 1, labeller = label_bquote(epsilon == .(Epsilon))) +
+  scale_color_manual(values = c("Laplace" = "#1f77b4", "Gaussian" = "#d62728")) +
+  labs(title = "Variance Comparison: Laplace vs Gaussian Noise Across Copula Families",
+       x = "Copula Parameter (Theta or Rho, 0 = NoCopula)",
+       y = "Variance",
+       color = "Noise Type",
+       linetype = "Copula Family",
+       shape = "Noise Type") +
+  theme_bw(base_size = 14) +
+  theme(
+    legend.position = "bottom",
+    legend.box = "vertical",
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    strip.background = element_rect(fill = "grey90", color = NA),
+    strip.text = element_text(size = 12, face = "bold"),
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
+
+# =========================================
+# Prepare long format for bias plot
+# =========================================
+results_long_bias <- results_table %>%
+  pivot_longer(cols = c(Bias),
+               names_to = "Metric", values_to = "Bias") %>%
+  mutate(NoiseType = factor(NoiseType, levels = c("Laplace", "Gaussian")))
+
+# -----------------------------------------
+# Improved Bias Plot
+# -----------------------------------------
+ggplot(results_long_bias, aes(x = Theta, y = Bias, 
+                              color = NoiseType, linetype = Family, 
+                              shape = NoiseType,
+                              group = interaction(Family, NoiseType, Epsilon))) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 3, alpha = 0.8) +
+  geom_smooth(se = FALSE, method = "loess", linewidth = 0.8, alpha = 0.3) +
+  facet_wrap(~Epsilon, nrow = 1, labeller = label_bquote(epsilon == .(Epsilon))) +
+  scale_color_manual(values = c("Laplace" = "#1f77b4", "Gaussian" = "#d62728")) +
+  labs(title = "Bias Comparison: Laplace vs Gaussian Noise Across Copula Families",
+       x = "Copula Parameter (Theta or Rho, 0 = NoCopula)",
+       y = "Bias",
+       color = "Noise Type",
+       linetype = "Copula Family",
+       shape = "Noise Type") +
+  theme_bw(base_size = 14) +
+  theme(
+    legend.position = "bottom",
+    legend.box = "vertical",
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    strip.background = element_rect(fill = "grey90", color = NA),
+    strip.text = element_text(size = 12, face = "bold"),
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
+

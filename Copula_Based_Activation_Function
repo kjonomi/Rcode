@@ -159,7 +159,7 @@ for (i in seq_along(model_types)) {
   
   history <- m %>% fit(
     x_scaled, y_numeric,
-    epochs = 10, batch_size = 32, verbose = 0, validation_split = 0.2
+    epochs = 200, batch_size = 32, verbose = 0, validation_split = 0.2
   )
   
   preds <- m %>% predict(x_scaled)

@@ -1,5 +1,207 @@
+# ===============================================================
+# Copula-based CNN-LSTM Simulation Framework (Fully Corrected)
+# ===============================================================
+
+# --- Load Required Libraries ---
+library(keras)
+library(tensorflow)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(caret)
+
+# ===============================================================
+# 1. Simulation Settings
+# ===============================================================
+set.seed(123)
+timesteps <- 10
+features  <- 30
+n         <- 500     # reduce for faster demo
+num_simulations <- 1
+
+# ===============================================================
+# 2. Utility Functions
+# ===============================================================
+to_uniform_tf <- function(x) {
+  u <- 0.5 * (1 + tf$math$erf(x / tf$math$sqrt(2.0)))
+  tf$clip_by_value(u, 1e-6, 1 - 1e-6)
+}
+
+# ===============================================================
+# 3. Custom Learnable Copula Layers
+# ===============================================================
+
+# --- Learnable Clayton Copula Activation ---
+LearnableClaytonActivation <- new_layer_class(
+  classname = "LearnableClaytonActivation",
+  initialize = function(self, theta_init = 1.0) {
+    super$initialize()
+    self$theta <- self$add_weight(
+      shape = list(), initializer = initializer_constant(theta_init),
+      trainable = TRUE, name = "theta"
+    )
+  },
+  call = function(self, inputs) {
+    theta_safe <- tf$abs(self$theta) + 1e-6
+    u <- to_uniform_tf(inputs)
+    tf$pow(tf$pow(u, -theta_safe) - 1, -1 / theta_safe)
+  }
+)
+
+# --- Learnable Gumbel Copula Activation ---
+LearnableGumbelActivation <- new_layer_class(
+  classname = "LearnableGumbelActivation",
+  initialize = function(self, theta_init = 2.0) {
+    super$initialize()
+    self$theta <- self$add_weight(
+      shape = list(), initializer = initializer_constant(theta_init),
+      trainable = TRUE, name = "theta"
+    )
+  },
+  call = function(self, inputs) {
+    theta_safe <- tf$abs(self$theta) + 1
+    u <- to_uniform_tf(inputs)
+    tf$math$exp(-tf$math$pow(-tf$math$log(u), theta_safe))
+  }
+)
+
+# --- Learnable Clayton–Gumbel Hybrid Activation ---
+LearnableClaytonGumbelHybrid <- new_layer_class(
+  classname = "LearnableClaytonGumbelHybrid",
+  initialize = function(self, theta_c_init = 1.0, theta_g_init = 2.0, alpha_init = 0.5) {
+    super$initialize()
+    self$theta_c <- self$add_weight(shape = list(), initializer = initializer_constant(theta_c_init),
+                                    trainable = TRUE, name = "theta_c")
+    self$theta_g <- self$add_weight(shape = list(), initializer = initializer_constant(theta_g_init),
+                                    trainable = TRUE, name = "theta_g")
+    self$alpha <- self$add_weight(shape = list(), initializer = initializer_constant(alpha_init),
+                                  trainable = TRUE, name = "alpha")
+  },
+  call = function(self, inputs) {
+    u <- to_uniform_tf(inputs)
+    theta_c <- tf$abs(self$theta_c) + 1e-6
+    theta_g <- tf$abs(self$theta_g) + 1
+    alpha <- tf$nn$sigmoid(self$alpha)
+
+    clayton <- tf$pow(tf$pow(u, -theta_c) - 1, -1 / theta_c)
+    gumbel  <- tf$math$exp(-tf$math$pow(-tf$math$log(u), theta_g))
+    alpha * clayton + (1 - alpha) * gumbel
+  }
+)
+
+# ===============================================================
+# 4. Generate Simulated Multitask Data (Continuous, Binary, Categorical)
+# ===============================================================
+generate_censored_data <- function(censoring_percentage = 0.1, threshold = 5) {
+  shape <- 1.5; scale <- 2
+  time1 <- rweibull(n, shape, scale)
+  time2 <- time1 * 0.9 + rweibull(n, shape, scale) * 0.1
+  time3 <- time1 * 0.9 + rweibull(n, shape, scale) * 0.1
+  time2 <- time2 + rnorm(n, 0, 0.5)
+  time3 <- time3 + rnorm(n, 0, 0.5)
+
+  binary <- ifelse(time2 > threshold, 1, 0)
+  categorical <- cut(time3, breaks = c(-Inf, 2, 5, Inf), labels = c("Low", "Medium", "High"))
+  censor <- sample(c(0,1), n, replace=TRUE, prob=c(censoring_percentage, 1-censoring_percentage))
+  time1[censor==0] <- rexp(sum(censor==0), rate = 1/10)
+  y <- data.frame(event=censor, cont=time1, bin=binary, cat=categorical)
+  return(y)
+}
+
+# Generate one dataset
+y_data <- generate_censored_data(0.05)
+x_data <- array(runif(n * timesteps * features), dim = c(n, timesteps, features))
+
+# ===============================================================
+# 5. Model Creation Function
+# ===============================================================
+create_cnn_lstm <- function(type = c("clayton", "gumbel", "hybrid", "relu", "sigmoid")) {
+  type <- match.arg(type)
+  model <- keras_model_sequential() %>%
+    layer_conv_1d(filters = 32, kernel_size = 3, activation = "relu",
+                  input_shape = c(timesteps, features)) %>%
+    layer_max_pooling_1d(pool_size = 2) %>%
+    layer_lstm(units = 64, return_sequences = FALSE) %>%
+    layer_dropout(0.3)
+  
+  if (type == "clayton") {
+    model <- model %>% LearnableClaytonActivation()
+  } else if (type == "gumbel") {
+    model <- model %>% LearnableGumbelActivation()
+  } else if (type == "hybrid") {
+    model <- model %>% LearnableClaytonGumbelHybrid()
+  } else if (type == "relu") {
+    model <- model %>% layer_activation("relu")
+  } else if (type == "sigmoid") {
+    model <- model %>% layer_activation("sigmoid")
+  }
+
+  model %>%
+    layer_dense(units = 3, activation = "linear")
+}
+
+# ===============================================================
+# 6. Training Loop for Multiple Models
+# ===============================================================
+model_types <- c("clayton", "gumbel", "hybrid", "relu", "sigmoid")
+model_names <- c("Clayton", "Gumbel", "Clayton-Gumbel", "ReLU", "Sigmoid")
+
+x_scaled <- (x_data - mean(x_data)) / sd(x_data)
+y_numeric <- as.matrix(cbind(y_data$cont, as.numeric(y_data$bin), as.numeric(y_data$cat)))
+
+results <- list()
+
+for (i in seq_along(model_types)) {
+  cat("Training model:", model_names[i], "\n")
+  m <- create_cnn_lstm(model_types[i])
+  m %>% compile(optimizer = "adam", loss = "mse", metrics = "mae")
+  
+  history <- m %>% fit(
+    x_scaled, y_numeric,
+    epochs = 10, batch_size = 32, verbose = 0, validation_split = 0.2
+  )
+  
+  preds <- m %>% predict(x_scaled)
+  residuals <- y_numeric - preds
+  
+  results[[i]] <- data.frame(
+    Model = model_names[i],
+    MeanResidual = colMeans(residuals),
+    SDResidual = apply(residuals, 2, sd)
+  )
+}
+
+results_df <- do.call(rbind, results)
+print(results_df)
+
+# ===============================================================
+# 7. Visualization
+# ===============================================================
+results_long <- results_df %>%
+  pivot_longer(cols = c(MeanResidual, SDResidual), names_to = "Metric", values_to = "Value")
+
+ggplot(results_long, aes(x = Model, y = Value, fill = Model)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  facet_wrap(~Metric, scales = "free_y") +
+  theme_minimal(base_size = 14) +
+  labs(title = "Residual Metrics Across Copula and Baseline CNN-LSTM Models",
+       x = "Model Type", y = "Value") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# ===============================================================
+# 8. Inspect Learned Parameters
+# ===============================================================
+for (i in seq_along(model_types)) {
+  m <- create_cnn_lstm(model_types[i])
+  if (model_types[i] == "clayton")
+    cat("Clayton θ =", m$layers[[5]]$get_weights()[[1]], "\n")
+  if (model_types[i] == "gumbel")
+    cat("Gumbel θ =", m$layers[[5]]$get_weights()[[1]], "\n")
+}
+
 # Deep Learning-Based Survival Analysis with Copula-Based Activation Functions for Multivariate Response Prediction
 # Computation Statistics (Accepted on August 15, 2025)
+
 ################################################
 ### Simulated Data Analysis with CNN-LSTM Model
 ################################################

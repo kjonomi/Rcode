@@ -18,7 +18,7 @@ set.seed(123)
 timesteps <- 10
 features  <- 30
 n         <- 500     # reduce for faster demo
-num_simulations <- 1
+num_simulations <- 10
 
 # ===============================================================
 # 2. Utility Functions

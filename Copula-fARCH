@@ -345,3 +345,333 @@ ggplot(summary_long, aes(x = Model, y = Mean, fill = Type)) +
   theme_minimal(base_size = 12) +
   theme(plot.title = element_text(face = "bold", size = 14))
 
+# --- Real Data Analysis ---
+rm(list = ls()); gc()
+
+library(sde)
+library(fda)
+library(fdapace)
+library(MASS)
+library(copula)
+library(ggplot2)
+library(forecast)
+library(DEoptim)
+library(Matrix)
+library(tseries)  # for dm.test
+library(reshape2)
+
+# Parameters (use your original choices)
+L <- 381     # Intraday observations per day
+# Original N (216) will be overridden by number of usable days read from file
+h <- 1
+p <- 2
+nbasis <- 32
+norder <- 4
+lambda <- 1e-4
+itermax <- 200
+
+# --- Load and Process Data ---
+# NOTE: ensure "newkospi.csv" has no zeros in prices (log) or handle them explicitly.
+kospi <- read.csv("newkospi.csv", header = FALSE)
+data <- as.matrix(kospi)[,-(1:176)]
+
+# Attempt to coerce into (L+h) x ncol format only if file is raw; otherwise skip this.
+# If file is already rows = times and cols = days, you can omit dim() override.
+if(nrow(data) == (L + h)) {
+  # OK as-is: columns are days
+} else if(ncol(data) == (L + h)) {
+  # transpose so rows correspond to times
+  data <- t(data)
+} else {
+  warning("Input dimensions don't match L+h. Check newkospi.csv formatting.")
+}
+
+# safe log: if any non-positive entries exist, stop and inspect.
+if(any(data <= 0)) stop("Non-positive price(s) found; log() not possible. Clean data first.")
+
+log_data <- 100 * log(data)
+# compute intraday returns: rows = days, cols = intraday timepoints
+returns_mat <- t(log_data[(h + 1):(L + h), ] - log_data[1:L, ])
+# remove days (columns) with any NA in original (if any)
+returns_mat <- returns_mat[, colSums(is.na(returns_mat)) == 0]
+
+# Now returns_mat: rows = days, cols = L
+N_days <- nrow(returns_mat)
+cat("Usable days:", N_days, "Intraday points:", ncol(returns_mat), "\n")
+
+# proxy volatility (squared returns) - keep the same shape (days x L)
+proxy_vol <- returns_mat^2
+
+# --- Corrected fARCH Estimation Function ---
+estimate_farch <- function(y_old, L, p, nbasis = 32, norder = 4, lambda = 1e-6) {
+  # y_old: matrix (days x L)
+  N <- nrow(y_old)
+  times <- seq(0, 1, length.out = L)
+  basis <- create.bspline.basis(rangeval = c(0, 1), nbasis = nbasis, norder = norder)
+  fd_par <- fdPar(basis, Lfd = 2, lambda = lambda)
+
+  sigma_out_squared <- matrix(NA, N - 2, L)  # will store rows for out = 2:(N-1)
+
+  for (out in 2:(N - 1)) {
+    cat("Estimating fARCH Day:", out, "/", N - 1, "\n")
+    # leave-one-out set of observations
+    y <- y_old[-out, , drop = FALSE]   # (n_obs x L) where n_obs = N-1
+    n_obs <- nrow(y)
+
+    # smooth squared functions: smooth.basis expects rows = timepoints, cols = obs
+    smooth_res <- smooth.basis(argvals = times, y = t(y^2), fdParobj = fd_par)
+    fd_y2 <- smooth_res$fd
+
+    # FPCA: pca.fd returns scores with rows = observations
+    pca_obj <- pca.fd(fdobj = fd_y2, nharm = p, center = TRUE)
+    # scores: n_obs x p; we want Z as p x n_obs
+    Z <- t(pca_obj$scores)   # correct shape: p x n_obs
+
+    # Estimate transition matrix M using Z (lag-1)
+    part1 <- matrix(0, p, p)
+    part2 <- matrix(0, p, p)
+    for (k in 2:ncol(Z)) {
+      part1 <- part1 + Z[, k] %*% t(Z[, k - 1])
+      part2 <- part2 + Z[, k - 1] %*% t(Z[, k - 1])
+    }
+    # regularize solve if needed
+    M <- tryCatch(part1 %*% solve(part2), error = function(e) part1 %*% ginv(part2))
+
+    # reconstruct beta matrix on time grid using eigenfunctions (harmonics)
+    eigenfun_list <- lapply(1:p, function(i) eval.fd(times, pca_obj$harmonics[i]))
+    beta_matrix_estimated <- Reduce(`+`, lapply(1:p, function(k) {
+      Reduce(`+`, lapply(1:p, function(ell) {
+        M[k, ell] * (eigenfun_list[[k]] %*% t(eigenfun_list[[ell]]))
+      }))
+    }))
+
+    beta_hat <- function(x) t(beta_matrix_estimated %*% t(x)) / L   # same form you used
+    mean_fd_vals <- t(as.matrix(eval.fd(times, pca_obj$meanfd)))
+
+    # estimated_delta and prediction (note using y_old[out-1, ]^2 as last observed)
+    estimated_delta <- mean_fd_vals - beta_hat(mean_fd_vals)
+    sigma_out_squared[out - 1, ] <- as.numeric(estimated_delta + beta_hat(t(y_old[out - 1, ]^2)))
+  }
+
+  return(sigma_out_squared)
+}
+
+# --- Corrected Copula-fARCH Estimation Function ---
+estimate_cfarch <- function(y_old, L, p, nbasis = 32, norder = 4, lambda = 1e-4) {
+  set.seed(123)
+  N <- nrow(y_old)
+  times <- seq(0, 1, length.out = L)
+  basis <- create.bspline.basis(rangeval = c(0, 1), nbasis = nbasis, norder = norder)
+  fd_par <- fdPar(basis, Lfd = 2, lambda = lambda)
+
+  sigma_out_squared <- matrix(NA, N - 2, L)
+
+  for (out in 2:(N - 1)) {
+    cat("Estimating Copula-fARCH Day:", out, "/", N - 1, "\n")
+    y <- y_old[-out, , drop = FALSE]   # n_obs x L
+    n_obs <- nrow(y)
+
+    # Smooth and FPCA
+    smooth_res <- smooth.basis(argvals = times, y = t(y^2), fdParobj = fd_par)
+    fd_y2 <- smooth_res$fd
+    pca_obj <- pca.fd(fdobj = fd_y2, nharm = p, center = TRUE)
+
+    # Z: p x n_obs
+    Z <- t(pca_obj$scores)
+
+    # --- Copula modeling on pseudo-observations ---
+    # pobs expects obs in rows; we pass matrix n_obs x p
+    u_data <- pobs(t(Z)) # returns n_obs x p (pobs expects columns as variables)
+    sims_list <- list()
+
+    # fit Gaussian and Clayton (if possible)
+    for (cop_type in c("gaussian", "clayton")) {
+      fit_cop <- tryCatch({
+        cop_obj <- switch(cop_type,
+                          "gaussian" = normalCopula(dim = p, dispstr = "un"),
+                          "clayton" = claytonCopula(dim = p))
+        fitCopula(cop_obj, data = u_data, method = "ml")
+      }, error = function(e) NULL)
+
+      if (!is.null(fit_cop)) {
+        sim_cop <- rCopula(n = n_obs, fit_cop@copula)  # n_obs x p
+        sims_list[[length(sims_list) + 1]] <- qnorm(sim_cop)  # transform to Gaussian scores
+      }
+    }
+
+    # If we have simulated copula-improved scores, average them; otherwise fallback to Z (original)
+    if (length(sims_list) > 0) {
+      avg_sim <- Reduce(`+`, sims_list) / length(sims_list)  # n_obs x p
+      Z_used <- t(avg_sim)   # p x n_obs
+    } else {
+      Z_used <- Z
+    }
+
+    # Estimate M using Z_used
+    part1 <- matrix(0, p, p)
+    part2 <- matrix(0, p, p)
+    for (k in 2:ncol(Z_used)) {
+      part1 <- part1 + Z_used[, k] %*% t(Z_used[, k - 1])
+      part2 <- part2 + Z_used[, k - 1] %*% t(Z_used[, k - 1])
+    }
+    M <- tryCatch(part1 %*% solve(part2), error = function(e) part1 %*% ginv(part2))
+
+    # reconstruct volatility surface
+    eigenfun_list <- lapply(1:p, function(i) eval.fd(times, pca_obj$harmonics[i]))
+    beta_matrix_estimated <- Reduce(`+`, lapply(1:p, function(k) {
+      Reduce(`+`, lapply(1:p, function(ell) {
+        M[k, ell] * (eigenfun_list[[k]] %*% t(eigenfun_list[[ell]]))
+      }))
+    }))
+
+    beta_hat <- function(x) t(beta_matrix_estimated %*% t(x)) / L
+    mean_fd_vals <- t(as.matrix(eval.fd(times, pca_obj$meanfd)))
+    estimated_delta <- mean_fd_vals - beta_hat(mean_fd_vals)
+
+    sigma_out_squared[out - 1, ] <- as.numeric(estimated_delta + beta_hat(t(y_old[out - 1, ]^2)))
+  }
+
+  return(sigma_out_squared)
+}
+
+# --- Run Estimations ---
+sigma_farch  <- estimate_farch(returns_mat, L, p, nbasis = nbasis, norder = norder, lambda = 1e-6)
+sigma_cfarch <- estimate_cfarch(returns_mat, L, p, nbasis = nbasis, norder = norder, lambda = lambda)
+
+# --- Evaluation Function (unchanged but aligned indices) ---
+evaluate_model <- function(est, proxy) {
+  proxy_sub <- proxy[1:nrow(est), , drop = FALSE]
+  error <- est - proxy_sub
+
+  rmse <- sqrt(mean(error^2, na.rm = TRUE))
+  mse  <- mean(error^2, na.rm = TRUE)
+  mae  <- mean(abs(error), na.rm = TRUE)
+  mape <- mean(abs((proxy_sub - est) / ifelse(proxy_sub == 0, NA, proxy_sub)), na.rm = TRUE) * 100
+
+  log_est <- log1p(pmax(est, 0))
+  log_proxy <- log1p(pmax(proxy_sub, 0))
+  msle <- mean((log_est - log_proxy)^2, na.rm = TRUE)
+
+  corr <- mean(sapply(1:nrow(est), function(i) cor(est[i, ], proxy_sub[i, ], use = "complete.obs")), na.rm = TRUE)
+
+  return(list(RMSE = rmse, MSE = mse, MAE = mae, MAPE = mape, MSLE = msle, Corr = corr))
+}
+
+# --- Evaluate ---
+eval_cfarch <- evaluate_model(sigma_cfarch, proxy_vol)
+eval_farch  <- evaluate_model(sigma_farch, proxy_vol)
+
+# Log-likelihood (Gaussian errors)
+loglik_fun <- function(est, proxy) {
+  resid <- as.vector(proxy[1:nrow(est), ] - est)
+  sigma_eps <- sd(resid, na.rm = TRUE)
+  sum(dnorm(resid, mean = 0, sd = sigma_eps, log = TRUE), na.rm = TRUE)
+}
+
+loglik_cfarch <- loglik_fun(sigma_cfarch, proxy_vol)
+loglik_farch  <- loglik_fun(sigma_farch, proxy_vol)
+
+k <- p
+n <- nrow(proxy_vol)
+aic <- function(ll, k) -2 * ll + 2 * k
+bic <- function(ll, k, n) -2 * ll + log(n) * k
+
+aic_cfarch <- aic(loglik_cfarch, k)
+bic_cfarch <- bic(loglik_cfarch, k, n)
+aic_farch  <- aic(loglik_farch, k)
+bic_farch  <- bic(loglik_farch, k, n)
+
+result_table <- data.frame(
+  Model = c("Copula-fARCH", "fARCH"),
+  RMSE = c(eval_cfarch$RMSE, eval_farch$RMSE),
+  MSE = c(eval_cfarch$MSE, eval_farch$MSE),
+  MAE = c(eval_cfarch$MAE, eval_farch$MAE),
+  MAPE = c(eval_cfarch$MAPE, eval_farch$MAPE),
+  MSLE = c(eval_cfarch$MSLE, eval_farch$MSLE),
+  Correlation = c(eval_cfarch$Corr, eval_farch$Corr),
+  LogLikelihood = c(loglik_cfarch, loglik_farch),
+  AIC = c(aic_cfarch, aic_farch),
+  BIC = c(bic_cfarch, bic_farch)
+)
+
+print(result_table)
+
+# --- Align for plotting ---
+true_vol <- returns_mat^2
+pred_farch  <- sigma_farch   # (N-2) x L
+pred_cfarch <- sigma_cfarch
+true_vol_eval <- true_vol[2:(nrow(true_vol) - 1), , drop = FALSE]  # align length
+
+
+# --- Choose sample days for visualization ---
+sample_days <- c(5, 20)
+sample_days <- sample_days[sample_days <= nrow(pred_farch)]  # ensure valid indices
+
+# --- Prepare plotting data frame ---
+library(reshape2)
+library(dplyr)
+library(ggplot2)
+library(scales)
+
+df_list <- lapply(sample_days, function(day_idx) {
+  data.frame(
+    Time = 1:L,
+    True = true_vol_eval[day_idx, ],
+    fARCH = pred_farch[day_idx, ],
+    Copula_fARCH = pred_cfarch[day_idx, ],
+    Day = paste("Day", day_idx)
+  )
+})
+
+df_plot <- bind_rows(df_list)
+df_plot_melt <- melt(df_plot, id.vars = c("Time", "Day"))
+df_plot_melt$variable <- factor(df_plot_melt$variable, 
+                                levels = c("True", "fARCH", "Copula_fARCH"))
+
+ggplot(df_plot_melt, aes(x = Time, y = value, 
+                         color = variable, 
+                         linetype = variable)) +
+  geom_line(size = 1.2, alpha = 0.95) +
+  scale_color_manual(values = c(
+    "True"          = "#FFD700",  # Golden yellow for True
+    "fARCH"         = "#E63946",  # Strong red
+    "Copula_fARCH"  = "#1D3557"   # Deep navy blue
+  )) +
+  scale_linetype_manual(values = c(
+    "True"          = "dashed",
+    "fARCH"         = "dotdash",
+    "Copula_fARCH"  = "solid"
+  )) +
+  facet_wrap(~ Day, ncol = 2, scales = "free_y") +
+  labs(
+    title = "KOSPI Functional Volatility Surface Comparison Across Sample Days",
+    subtitle = "True vs Estimated Volatility Functions (σ²)",
+    x = "Intraday Time Index",
+    y = expression("Estimated Volatility" ~ (σ^2))
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16, hjust = 0.5),
+    plot.subtitle = element_text(size = 12, color = "gray40", hjust = 0.5),
+    axis.title = element_text(face = "bold", size = 13),
+    strip.text = element_text(face = "bold", size = 13),
+    legend.position = "top",
+    legend.title = element_blank(),
+    legend.text = element_text(size = 12),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.grid.major.y = element_line(color = "gray85", size = 0.3),
+    plot.margin = margin(10, 20, 10, 20)
+  ) +
+  guides(color = guide_legend(override.aes = list(size = 1.6, alpha = 1)))
+
+# --- Diebold-Mariano test for MSE comparison ---
+mse_cfarch_vec <- rowMeans((pred_cfarch - proxy_vol[1:nrow(pred_cfarch), ])^2, na.rm = TRUE)
+mse_farch_vec  <- rowMeans((pred_farch  - proxy_vol[1:nrow(pred_farch), ])^2, na.rm = TRUE)
+
+# dm.test expects two numeric vectors
+dm_cfarch_farch <- dm.test(mse_cfarch_vec, mse_farch_vec, alternative = "two.sided", h = 1)
+
+cat("\nDiebold-Mariano Test (Copula-fARCH vs fARCH):\n")
+print(dm_cfarch_farch)
+

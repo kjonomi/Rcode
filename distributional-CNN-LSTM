@@ -1,3 +1,5 @@
+# Distributional CNN-LSTM, KDE, and Copula Approaches for Multimodal Multivariate Data: Assessing Conditional Treatment Effects
+# Analytics 2025, 4(4), 29; https://doi.org/10.3390/analytics4040029
 # =======================================================
 # CNN-LSTM vs KDE vs Copula on Criteo Uplift Dataset
 # Robustified version with runtime/convergence diagnostics

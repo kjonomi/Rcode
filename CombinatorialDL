@@ -1,0 +1,547 @@
+## Real Data Analysis
+# ==========================
+# 1️⃣ Load libraries
+# ==========================
+library(data.table)
+library(tensorflow)
+library(keras)
+library(dplyr)
+library(purrr)
+library(ggplot2)
+library(tidyr)
+library(reticulate)
+
+# ==========================
+# 2️⃣ Load Criteo Uplift dataset
+# ==========================
+uplift_path <- "criteo-research-uplift-v2.1.csv.gz"
+if(!file.exists(uplift_path)) stop("Criteo file not found in working dir")
+
+cat("Loading dataset...\n")
+criteo <- fread(uplift_path)
+
+# ==========================
+# 3️⃣ Simulate 3 treatments and outcome
+# ==========================
+set.seed(123)
+n <- nrow(criteo)
+criteo$treatment1 <- rbinom(n, 1, 0.5)
+criteo$treatment2 <- rbinom(n, 1, 0.5)
+criteo$treatment3 <- rbinom(n, 1, 0.5)
+criteo$outcome    <- rbinom(n, 1, 0.1)
+
+# ==========================
+# 4️⃣ Select numeric features
+# ==========================
+num_cols <- names(criteo)[grepl("^f", names(criteo))]
+num_cols <- num_cols[1:2]  # just 2 numeric features for demo
+X_dt <- criteo[, ..num_cols]
+
+# Convert to numeric if necessary
+for(j in seq_along(num_cols)){
+  if(!is.numeric(X_dt[[j]])) X_dt[[j]] <- as.numeric(factor(X_dt[[j]]))
+}
+
+# Combine X and T
+X <- scale(as.matrix(X_dt))
+T_mat <- as.matrix(criteo[, .(treatment1, treatment2, treatment3)])
+Y <- as.numeric(criteo$outcome)
+
+# Subsample for faster demo
+set.seed(123)
+idx <- sample(1:nrow(X), min(2000, nrow(X)))
+X <- X[idx,]; T_mat <- T_mat[idx,]; Y <- Y[idx]
+
+# -------------------------
+# 5️⃣ Train/test split
+# -------------------------
+train_idx <- sample(1:nrow(X), 0.8*nrow(X))
+X_train <- X[train_idx,]; T_train <- T_mat[train_idx,]; Y_train <- Y[train_idx]
+X_test  <- X[-train_idx,]; T_test  <- T_mat[-train_idx,]; Y_test  <- Y[-train_idx]
+
+# -------------------------
+# 6️⃣ Convert to tensors
+# -------------------------
+X_train <- tf$cast(X_train, tf$float32)
+T_train <- tf$cast(T_train, tf$float32)
+Y_train <- tf$cast(tf$reshape(Y_train, shape = c(-1L,1L)), tf$float32)
+
+X_test  <- tf$cast(X_test, tf$float32)
+T_test  <- tf$cast(T_test, tf$float32)
+Y_test  <- tf$cast(tf$reshape(Y_test, shape = c(-1L,1L)), tf$float32)
+
+# Combine X and T for input
+train_input <- tf$concat(list(X_train, T_train), axis=1L)
+test_input  <- tf$concat(list(X_test, T_test), axis=1L)
+input_dim   <- dim(train_input)[2]
+p <- dim(X_train)[2]
+K <- dim(T_train)[2]
+
+# -------------------------
+# 7️⃣ Build CCDN model
+# -------------------------
+hidden_units <- 64
+lambda <- 0.1
+
+ccdn <- keras_model_custom(name = "CCDNModel", function(self){
+  self$shared_layer1 <- layer_dense(units = hidden_units, activation = "relu")
+  self$shared_layer2 <- layer_dense(units = hidden_units, activation = "relu")
+  self$latent_layer  <- layer_dense(units = hidden_units, activation = "relu")
+  self$output_layer  <- layer_dense(units = 1, activation = "linear")
+  
+  function(inputs, mask = NULL){
+    x <- inputs[, 1:p]
+    t_input <- inputs[, (p+1):(p+K)]
+    
+    phi <- x %>% self$shared_layer1() %>% self$shared_layer2()
+    phi_latent <- k_concatenate(list(phi, t_input)) %>% self$latent_layer()
+    y_hat <- phi_latent %>% self$output_layer()
+    
+    list(y_hat = y_hat, phi_latent = phi_latent, t_input = t_input)
+  }
+})
+
+# -------------------------
+# 8️⃣ Prepare Dataset
+# -------------------------
+batch_size <- 64
+epochs <- 20
+optimizer <- optimizer_adam(learning_rate = 0.001)
+
+train_dataset <- tf$data$Dataset$from_tensor_slices(
+  dict(x = train_input, y = Y_train)
+)$shuffle(as.integer(dim(train_input)[1]))$batch(as.integer(batch_size))
+
+test_dataset <- tf$data$Dataset$from_tensor_slices(
+  dict(x = test_input, y = Y_test)
+)$batch(as.integer(batch_size))
+
+# -------------------------
+# 9️⃣ Custom Training Loop
+# -------------------------
+loss_history <- numeric(epochs)
+mse_history <- numeric(epochs)
+reg_history <- numeric(epochs)
+
+for(epoch in 1:epochs){
+  total_loss <- 0; total_mse <- 0; total_reg <- 0; n_batches <- 0
+  iter <- reticulate::as_iterator(train_dataset)
+  
+  repeat {
+    batch <- tryCatch(reticulate::iter_next(iter), error=function(e) NULL)
+    if(is.null(batch)) break
+    
+    x_batch <- batch$x
+    y_batch <- batch$y
+    
+    with(tf$GradientTape() %as% tape, {
+      out <- ccdn(x_batch)
+      y_pred <- out$y_hat
+      phi_latent <- out$phi_latent
+      t_batch <- out$t_input
+      
+      mse_loss <- tf$reduce_mean(tf$keras$losses$mse(y_batch, y_pred))
+      phi_centered <- phi_latent - tf$reduce_mean(phi_latent, axis=0L, keepdims=TRUE)
+      T_centered <- t_batch - tf$reduce_mean(t_batch, axis=0L, keepdims=TRUE)
+      cov_matrix <- tf$matmul(tf$transpose(phi_centered), T_centered) / tf$cast(tf$shape(t_batch)[1], tf$float32)
+      copula_reg <- tf$reduce_sum(tf$square(cov_matrix))
+      loss <- mse_loss + lambda*copula_reg
+    })
+    
+    gradients <- tape$gradient(loss, ccdn$trainable_variables)
+    optimizer$apply_gradients(purrr::transpose(list(gradients, ccdn$trainable_variables)))
+    
+    total_loss <- total_loss + as.numeric(loss)
+    total_mse  <- total_mse + as.numeric(mse_loss)
+    total_reg  <- total_reg + as.numeric(copula_reg)
+    n_batches <- n_batches + 1
+  }
+  
+  loss_history[epoch] <- total_loss / n_batches
+  mse_history[epoch]  <- total_mse / n_batches
+  reg_history[epoch]  <- total_reg / n_batches
+  
+  cat(sprintf("Epoch %d/%d - Loss: %.4f | MSE: %.4f | CopulaReg: %.4f\n",
+              epoch, epochs, loss_history[epoch], mse_history[epoch], reg_history[epoch]))
+}
+
+# -------------------------
+# 🔟 Predict for all treatment combinations
+# -------------------------
+all_combos <- expand.grid(replicate(K, c(0,1), simplify=FALSE))
+
+predict_Y_given_T <- function(X_data, combo_mat, model){
+  preds <- sapply(1:nrow(combo_mat), function(i){
+    T_new <- matrix(rep(as.numeric(combo_mat[i,]), dim(X_data)[1]),
+                    nrow = dim(X_data)[1], byrow=TRUE)
+    input_new <- tf$cast(tf$concat(list(X_data, T_new), axis=1L), tf$float32)
+    as.vector(model(input_new)$y_hat)
+  })
+  colnames(preds) <- apply(combo_mat, 1, paste, collapse="")
+  preds
+}
+
+pred_matrix <- predict_Y_given_T(X_test, all_combos, ccdn)
+tau <- pred_matrix[, "111"] - pred_matrix[, "000"]
+cat("\nEstimated mean combinatorial treatment effect τ(111,000) =", round(mean(tau),3), "\n")
+
+# -------------------------
+# 1️⃣ Plot training curves
+# -------------------------
+df_plot <- data.frame(Epoch=1:epochs, Loss=loss_history, MSE=mse_history, CopulaReg=reg_history)
+df_plot_long <- pivot_longer(df_plot, -Epoch, names_to="Metric", values_to="Value")
+
+ggplot(df_plot_long, aes(x=Epoch, y=Value, color=Metric)) +
+  geom_line(size=1.2) + geom_point(size=2) +
+  theme_minimal(base_size=14) +
+  labs(title="CCDN Training Curves", y="Value") +
+  scale_color_manual(values=c("Loss"="blue", "MSE"="green", "CopulaReg"="red"))
+
+# -------------------------
+# 2️⃣ Bar plot: average outcome per treatment combination
+# -------------------------
+avg_outcomes <- colMeans(pred_matrix)
+df_cate <- data.frame(Combo=names(avg_outcomes), Avg_Y=avg_outcomes)
+
+ggplot(df_cate, aes(x=reorder(Combo, Avg_Y), y=Avg_Y, fill=Avg_Y)) +
+  geom_bar(stat="identity") +
+  theme_minimal(base_size=14) +
+  labs(title="Predicted Outcome per Treatment Combination", x="Treatment Combination", y="Average Predicted Y") +
+  scale_fill_gradient(low="lightblue", high="darkblue") +
+  theme(axis.text.x=element_text(angle=45, hjust=1))
+
+# -------------------------
+# 2️⃣ Table: Training Metrics per Epoch
+# -------------------------
+train_metrics_table <- data.frame(
+  Epoch = 1:epochs,
+  Loss  = round(loss_history, 4),
+  MSE   = round(mse_history, 4),
+  CopulaReg = round(reg_history, 4)
+)
+print(train_metrics_table)
+# Optional: save CSV
+# write.csv(train_metrics_table, "CCDN_training_metrics.csv", row.names = FALSE)
+
+# -------------------------
+# 3️⃣ Table: Average Predicted Outcome per Treatment Combination
+# -------------------------
+avg_outcomes <- colMeans(pred_matrix)
+avg_outcomes_table <- data.frame(
+  Combo = names(avg_outcomes),
+  Avg_Y = round(avg_outcomes, 4)
+) %>% arrange(desc(Avg_Y))
+
+print(avg_outcomes_table)
+# Optional: save CSV
+#write.csv(avg_outcomes_table, "CCDN_avg_predicted_outcomes.csv", row.names = FALSE)
+
+# -------------------------
+# 4️⃣ Table: Individual Combinatorial Treatment Effect (τ_111_000)
+# -------------------------
+tau_table <- data.frame(
+  Obs = 1:nrow(pred_matrix),
+  Y_111 = round(pred_matrix[, "111"], 4),
+  Y_000 = round(pred_matrix[, "000"], 4),
+  Tau_111_000 = round(pred_matrix[, "111"] - pred_matrix[, "000"], 4)
+)
+print(head(tau_table, 10))  # first 10 rows
+# Optional: save CSV
+#write.csv(tau_table, "CCDN_tau_111_000.csv", row.names = FALSE)
+
+# -------------------------
+# 5️⃣ Table: Summary of Mean Combinatorial Treatment Effect
+# -------------------------
+mean_tau <- round(mean(tau), 4)
+mean_tau_table <- data.frame(
+  Effect = "Mean Tau (111 vs 000)",
+  Value = mean_tau
+)
+print(mean_tau_table)
+
+# -------------------------
+# 6️⃣ Table: Summary of All Treatment Combinations
+# -------------------------
+summary_table <- data.frame(
+  Combo = colnames(pred_matrix),
+  Avg_Y = apply(pred_matrix, 2, mean),
+  SD_Y  = apply(pred_matrix, 2, sd)
+) %>%
+  arrange(desc(Avg_Y)) %>%
+  mutate(
+    Avg_Y = round(Avg_Y, 4),
+    SD_Y  = round(SD_Y, 4),
+    Diff_vs_000 = round(Avg_Y - Avg_Y[Combo == "000"], 4)
+  )
+
+print(summary_table)
+# Optional: save CSV
+#write.csv(summary_table, "CCDN_summary_all_combos.csv", row.names = FALSE)
+
+
+#############################
+## Simulated Data
+############################
+library(tensorflow)
+library(keras)
+library(purrr)
+library(ggplot2)
+library(tidyr)
+
+set.seed(123)
+n <- 2000; p <- 10; K <- 3
+
+# -------------------------
+# 1️⃣ Simulate Data
+# -------------------------
+X <- matrix(rnorm(n * p), n, p)
+T_mat <- matrix(rbinom(n * K, 1, 0.5), n, K)
+Y <- 2*X[,1] - X[,2] + 1.5*T_mat[,1] - 1.2*T_mat[,2] + 0.8*T_mat[,3] +
+  0.5*T_mat[,1]*T_mat[,2] + 0.3*T_mat[,2]*T_mat[,3] + rnorm(n, 0, 0.5)
+
+train_idx <- sample(1:n, 0.8*n)
+X_train <- X[train_idx,]; T_train <- T_mat[train_idx,]; Y_train <- Y[train_idx]
+X_test <- X[-train_idx,]; T_test <- T_mat[-train_idx,]; Y_test <- Y[-train_idx]
+
+# -------------------------
+# 2️⃣ Convert to float32 tensors
+# -------------------------
+X_train <- tf$cast(X_train, tf$float32)
+T_train <- tf$cast(T_train, tf$float32)
+Y_train <- tf$cast(Y_train, tf$float32)
+
+
+X_test <- tf$cast(X_test, tf$float32)
+T_test <- tf$cast(T_test, tf$float32)
+Y_test <- tf$cast(Y_test, tf$float32)
+
+# reshape Y_train and Y_test to be [n_samples, 1]
+Y_train <- tf$reshape(Y_train, shape = c(-1L, 1L))
+Y_test  <- tf$reshape(Y_test,  shape = c(-1L, 1L))
+
+# Combine X and T for input
+train_input <- tf$concat(list(X_train, T_train), axis=1L)
+input_dim <- dim(train_input)[2]
+
+# -------------------------
+# 3️⃣ Build CCDN Model (Fixed Slicing)
+# -------------------------
+hidden_units <- 64
+lambda <- 0.1
+
+ccdn <- keras_model_custom(name = "CCDNModel", function(self) {
+  self$shared_layer1 <- layer_dense(units = hidden_units, activation = "relu")
+  self$shared_layer2 <- layer_dense(units = hidden_units, activation = "relu")
+  self$latent_layer  <- layer_dense(units = hidden_units, activation = "relu")
+  self$output_layer  <- layer_dense(units = 1, activation = "linear")
+  
+  function(inputs, mask = NULL) {
+    # Safe R-style slicing
+    x <- inputs[, 1:p]
+    t_input <- inputs[, (p+1):(p+K)]
+    
+    phi <- x %>% self$shared_layer1() %>% self$shared_layer2()
+    phi_latent <- k_concatenate(list(phi, t_input)) %>% self$latent_layer()
+    y_hat <- phi_latent %>% self$output_layer()
+    
+    list(y_hat = y_hat, phi_latent = phi_latent, t_input = t_input)
+  }
+})
+
+# -------------------------
+# 4️⃣ Prepare Dataset
+# -------------------------
+batch_size <- 64
+epochs <- 20
+optimizer <- optimizer_adam(learning_rate = 0.001)
+
+
+train_dataset <- tf$data$Dataset$from_tensor_slices(
+  dict(x = train_input, y = Y_train)
+)$shuffle(as.integer(dim(train_input)[1]))$
+  batch(as.integer(batch_size))
+
+test_dataset <- tf$data$Dataset$from_tensor_slices(
+  dict(x = X_test, y = Y_test)
+)$batch(as.integer(batch_size))
+
+# -------------------------
+# 5️⃣ Custom Training Loop with Tracking
+# -------------------------
+loss_history <- numeric(epochs)
+mse_history <- numeric(epochs)
+reg_history <- numeric(epochs)
+
+for(epoch in 1:epochs){
+  total_loss <- 0; total_mse <- 0; total_reg <- 0; n_batches <- 0
+  iter <- as_iterator(train_dataset)
+  
+  repeat {
+    batch <- tryCatch(iter_next(iter), error = function(e) NULL)
+    if(is.null(batch)) break
+    
+    x_batch <- batch[[1]]
+    y_batch <- batch[[2]]
+    
+    with(tf$GradientTape() %as% tape, {
+      out <- ccdn(x_batch)
+      y_pred <- out$y_hat
+      phi_latent <- out$phi_latent
+      t_batch <- out$t_input
+      
+      # MSE Loss
+      mse_loss <- tf$reduce_mean(tf$keras$losses$mse(y_batch, y_pred))
+      
+      # Copula regularization
+      phi_centered <- phi_latent - tf$reduce_mean(phi_latent, axis=0L, keepdims=TRUE)
+      T_centered <- t_batch - tf$reduce_mean(t_batch, axis=0L, keepdims=TRUE)
+      cov_matrix <- tf$matmul(tf$transpose(phi_centered), T_centered) / tf$cast(tf$shape(t_batch)[1], tf$float32)
+      copula_reg <- tf$reduce_sum(tf$square(cov_matrix))
+      
+      loss <- mse_loss + lambda * copula_reg
+    })
+    
+    gradients <- tape$gradient(loss, ccdn$trainable_variables)
+    optimizer$apply_gradients(purrr::transpose(list(gradients, ccdn$trainable_variables)))
+    
+    total_loss <- total_loss + as.numeric(loss)
+    total_mse  <- total_mse + as.numeric(mse_loss)
+    total_reg  <- total_reg + as.numeric(copula_reg)
+    n_batches <- n_batches + 1
+  }
+  
+  loss_history[epoch] <- total_loss / n_batches
+  mse_history[epoch]  <- total_mse / n_batches
+  reg_history[epoch]  <- total_reg / n_batches
+  
+  cat(sprintf("Epoch %d/%d - Loss: %.4f | MSE: %.4f | CopulaReg: %.4f\n",
+              epoch, epochs, loss_history[epoch], mse_history[epoch], reg_history[epoch]))
+}
+
+# -------------------------
+# 6️⃣ Predict for All Treatment Combinations
+# -------------------------
+all_combos <- expand.grid(replicate(K, c(0,1), simplify = FALSE))
+
+predict_Y_given_T <- function(X_data, combo_mat, model){
+  preds <- sapply(1:nrow(combo_mat), function(i){
+    T_new <- matrix(rep(as.numeric(combo_mat[i,]), dim(X_data)[1]),
+                    nrow = dim(X_data)[1], byrow = TRUE)
+    input_new <- tf$cast(tf$concat(list(X_data, T_new), axis=1L), tf$float32)
+    
+    # Convert tensor to R vector properly
+    y_hat_tensor <- model(input_new)$y_hat
+    y_hat_vec <- as.numeric(y_hat_tensor$numpy())  # <- fix here
+    y_hat_vec
+  })
+  
+  colnames(preds) <- apply(combo_mat, 1, paste, collapse = "")
+  preds
+}
+
+
+
+pred_matrix <- predict_Y_given_T(X_test, all_combos, ccdn)
+
+tau <- pred_matrix[, "111"] - pred_matrix[, "000"]
+cat("\nEstimated mean combinatorial treatment effect τ(111,000) =", round(mean(tau),3), "\n")
+
+# -------------------------
+# 7️⃣ Plot Training Curves
+# -------------------------
+df_plot <- data.frame(Epoch=1:epochs, Loss=loss_history, MSE=mse_history, CopulaReg=reg_history)
+df_plot_long <- pivot_longer(df_plot, -Epoch, names_to="Metric", values_to="Value")
+
+ggplot(df_plot_long, aes(x=Epoch, y=Value, color=Metric)) +
+  geom_line(linewidth=1.2) +  # use linewidth instead of size
+  geom_point(size=2) +
+  theme_minimal(base_size=14) +
+  labs(title="CCDN Training Curves", y="Value") +
+  scale_color_manual(values=c("Loss"="blue", "MSE"="green", "CopulaReg"="red"))
+
+# -------------------------
+# 8️⃣ Visualize average outcome per treatment combination
+# -------------------------
+avg_outcomes <- colMeans(pred_matrix)
+df_cate <- data.frame(Combo=names(avg_outcomes), Avg_Y=avg_outcomes)
+
+ggplot(df_cate, aes(x=reorder(Combo, Avg_Y), y=Avg_Y, fill=Avg_Y)) +
+  geom_bar(stat="identity") +
+  theme_minimal(base_size=14) +
+  labs(title="Predicted Outcome per Treatment Combination", x="Treatment Combination", y="Average Predicted Y") +
+  scale_fill_gradient(low="lightblue", high="darkblue") +
+  theme(axis.text.x=element_text(angle=45, hjust=1))
+
+
+library(dplyr)
+
+# -------------------------
+# 1️⃣ Table: Training Metrics per Epoch
+# -------------------------
+train_metrics_table <- data.frame(
+  Epoch = 1:epochs,
+  Loss = round(loss_history, 4),
+  MSE = round(mse_history, 4),
+  CopulaReg = round(reg_history, 4)
+)
+print(train_metrics_table)
+
+# Optional: save to CSV
+#write.csv(train_metrics_table, "CCDN_training_metrics.csv", row.names = FALSE)
+
+# -------------------------
+# 2️⃣ Table: Average Predicted Outcome per Treatment Combination
+# -------------------------
+avg_outcomes_table <- df_cate %>%
+  arrange(desc(Avg_Y)) %>%
+  mutate(Avg_Y = round(Avg_Y, 4))
+print(avg_outcomes_table)
+
+# Optional: save to CSV
+#write.csv(avg_outcomes_table, "CCDN_avg_predicted_outcomes.csv", row.names = FALSE)
+
+# -------------------------
+# 3️⃣ Table: Individual Combinatorial Treatment Effect (τ_111_000)
+# -------------------------
+tau_table <- data.frame(
+  Obs = 1:nrow(pred_matrix),
+  Y_111 = round(pred_matrix[, "111"], 4),
+  Y_000 = round(pred_matrix[, "000"], 4),
+  Tau_111_000 = round(pred_matrix[, "111"] - pred_matrix[, "000"], 4)
+)
+print(head(tau_table, 10))  # show first 10 rows
+
+# Optional: save to CSV
+#write.csv(tau_table, "CCDN_tau_111_000.csv", row.names = FALSE)
+
+# -------------------------
+# 4️⃣ Summary of Mean Combinatorial Treatment Effect
+# -------------------------
+mean_tau <- round(mean(tau), 4)
+mean_tau_table <- data.frame(
+  Effect = "Mean Tau (111 vs 000)",
+  Value = mean_tau
+)
+print(mean_tau_table)
+
+library(dplyr)
+
+# -------------------------
+# Compute mean and SD per treatment combination
+# -------------------------
+summary_table <- data.frame(
+  Combo = colnames(pred_matrix),
+  Avg_Y = apply(pred_matrix, 2, mean),
+  SD_Y  = apply(pred_matrix, 2, sd)
+) %>%
+  arrange(desc(Avg_Y)) %>%
+  mutate(
+    Avg_Y = round(Avg_Y, 4),
+    SD_Y  = round(SD_Y, 4),
+    Diff_vs_000 = round(Avg_Y - Avg_Y[Combo == "000"], 4)
+  )
+
+print(summary_table)
+
+# Optional: save to CSV
+#write.csv(summary_table, "CCDN_treatment_summary.csv", row.names = FALSE)

@@ -1,0 +1,798 @@
+# ================================
+# Simulation Study
+# ================================
+library(keras)
+library(keras3)
+library(tensorflow)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(copula)
+library(gridExtra)
+library(kableExtra)
+library(viridis)
+
+# (Sections 1, 2, 3, 5, 6 remain the same as the final corrected script)
+# ... (Code for Sections 1, 2, 3, 5, 6) ...
+
+# 1️⃣ Simulation Settings
+set.seed(123)
+timesteps <- 10
+features  <- 30
+n         <- 500
+weibull_shape <- 1.5
+weibull_scale <- 5
+# ... (rest of simulation settings) ...
+
+# 2️⃣ Generate Continuous Outcomes and Survival Time
+y_continuous <- data.frame(Y1 = rnorm(n, mean = 0, sd = 1), Y2 = rnorm(n, mean = 1, sd = 2))
+Time <- rweibull(n, shape = weibull_shape, scale = weibull_scale)
+CensorTime <- runif(n, min = 0, max = 10)
+ObservedTime <- pmin(Time, CensorTime)
+Event <- as.numeric(Time <= CensorTime)
+S <- Time
+y_data <- data.frame(Y1 = y_continuous$Y1, Y2 = y_continuous$Y2, S = S)
+x_data <- array(runif(n * timesteps * features), dim = c(n, timesteps, features))
+# ... (rest of section 2) ...
+
+# 3️⃣ Copula Transformation
+u_data_df <- as.data.frame(lapply(y_data, function(x) rank(x)/(length(x)+1)))
+u_mat <- as.matrix(pmin(pmax(u_data_df, 1e-6), 1 - 1e-6))
+cop_fit0 <- normalCopula(dim = 3)
+fit0 <- fitCopula(cop_fit0, data = u_mat, method = "ml")
+
+rho <- coef(fit0)
+cop_fit0 <- normalCopula(param = rho, dim = 3)
+y_copula <- as.data.frame(sapply(1:3, function(j) qnorm(u_data_df[[j]])))
+colnames(y_copula) <- c("Y1", "Y2", "S")
+y_numeric <- as.matrix(y_copula)
+
+# ✅ Fixed line
+x_scaled <- (x_data - mean(x_data)) / sd(x_data)
+
+# ================================
+# 4️⃣ New Copula Loss Functions
+# The NLL requires the data to be transformed to Uniform margins first.
+# ================================
+
+# --- Helper function: Transform N(0,1) predictions to U(0,1) ---
+to_uniform_tf <- function(x) {
+  u <- 0.5 * (1 + tf$math$erf(x / tf$math$sqrt(2.0)))
+  tf$clip_by_value(u, 1e-6, 1 - 1e-6)
+}
+
+# --- Gaussian Copula Loss (Original) ---
+copula_gaussian_loss <- function(y_true, y_pred) {
+  # y_true/y_pred are assumed to be N(0, 1) transformed data/predictions
+  u_true <- to_uniform_tf(y_true)
+  u_pred <- to_uniform_tf(y_pred)
+  
+  # ... (Rest of Gaussian Copula NLL calculation remains the same) ...
+  phi_true <- tf$math$erfinv(2 * u_true - 1) * tf$sqrt(2.0)
+  phi_pred <- tf$math$erfinv(2 * u_pred - 1) * tf$sqrt(2.0)
+  
+  phi_centered <- phi_pred - tf$reduce_mean(phi_pred, axis = as.integer(0L), keepdims = TRUE)
+  n_samples <- tf$cast(tf$shape(phi_centered)[1], tf$float32)
+  cov_mat <- tf$matmul(tf$transpose(phi_centered), phi_centered) / (n_samples - 1.0)
+  epsilon <- 1e-6
+  cov_mat_stable <- cov_mat + epsilon * tf$eye(tf$shape(cov_mat)[1])
+  
+  # Check for potential failure to invert (e.g., singular matrix)
+  tryCatch({
+    inv_cov <- tf$linalg$inv(cov_mat_stable)
+  }, error = function(e) {
+    # If inversion fails, fall back to a simple MSE as a robust measure
+    return(tf$reduce_mean(tf$math$square(y_true - y_pred)))
+  })
+  
+  det_cov <- tf$linalg$det(cov_mat_stable)
+  quad_term <- tf$reduce_sum(tf$matmul(phi_true, inv_cov) * phi_true, axis = as.integer(1L))
+  log_det_term <- tf$math$log(det_cov + 1e-6)
+  nll <- 0.5 * (log_det_term + quad_term)
+  tf$reduce_mean(nll, axis = as.integer(0L))
+}
+
+
+# --- Clayton Copula Loss (3D) ---
+copula_clayton_loss <- function(y_true, y_pred, theta = rho[1]) {
+  # We use the fitted Gaussian rho as a proxy for the Clayton theta initialization.
+  # Theta must be > 0.
+  theta <- tf$abs(tf$constant(theta, dtype = tf$float32)) + 1e-3
+  
+  u_pred <- to_uniform_tf(y_pred)
+  u_true <- to_uniform_tf(y_true)
+  
+  # Transform u_true to the copula variables (v_j)
+  v <- tf$pow(u_true, -theta)
+  sum_v <- tf$reduce_sum(v, axis = as.integer(1L), keepdims = TRUE)
+  
+  # The log-likelihood of a d-dimensional Clayton copula is:
+  # L_i = log(C) = log( (theta*d-1)! / ((theta-1)!) ) - (d + 1/theta) * log( S - d + 1 )
+  # where S = sum(u_j^(-theta))
+  # Simplified NLL (using density log-likelihood from copula density formula):
+  
+  log_term1 <- tf$math$log(theta) - (theta + 1) * tf$reduce_sum(tf$math$log(u_pred), axis = as.integer(1L))
+  log_term2 <- (1/theta - 3) * tf$math$log(sum_v - 3 + 1) # log(C_u) term
+  
+  # Simplified formula for the 3D log-density:
+  # log(c(u)) = log(1 + 2*theta) - (1+theta) * sum(log(u_j)) - (3+1/theta) * log(S - 2)
+  # Where S = sum(u_j^(-theta))
+  
+  # Let's use the density (partial derivatives) approximation for simplicity:
+  log_C_density <- tf$math$log(1 + 2*theta) - (theta + 1) * tf$reduce_sum(tf$math$log(u_pred), axis = as.integer(1L)) - (3 + 1/theta) * tf$math$log(sum_v - 2)
+  
+  nll <- -log_C_density
+  tf$reduce_mean(nll)
+}
+
+
+# --- Gumbel Copula Loss (3D) ---
+copula_gumbel_loss <- function(y_true, y_pred, theta = rho[1] + 1) {
+  # Theta must be >= 1. We use a positive offset from the Gaussian rho.
+  theta <- tf$constant(theta, dtype = tf$float32)
+  theta <- tf$maximum(theta, 1.0 + 1e-3)
+  
+  u_pred <- to_uniform_tf(y_pred)
+  u_true <- to_uniform_tf(y_true)
+  
+  # Gumbel generator: phi(t) = (-log t)^theta
+  log_u <- -tf$math$log(u_true)
+  phi_u <- tf$math$pow(log_u, theta)
+  sum_phi_u <- tf$reduce_sum(phi_u, axis = as.integer(1L))
+  
+  # Term 1: log(C) = - (sum_phi_u)^(1/theta)
+  log_C <- -tf$math$pow(sum_phi_u, 1/theta)
+  
+  # Density log-likelihood from the copula density formula (3D):
+  # log(c(u)) = log( (1/theta) * sum_phi_u^(3/theta - 3) ) + (theta - 1) * sum(log(-log(u_j))) - (theta - 1) * sum(log(u_j))
+  
+  # Simpler NLL using log-likelihood for the 3D Gumbel copula:
+  log_C_density <- tf$math$log(tf$math$pow(sum_phi_u, 1/theta - 3)) + (3 - 1/theta) * tf$math$log(sum_phi_u) + tf$reduce_sum( (theta - 1) * tf$math$log(-tf$math$log(u_pred)) - theta * tf$math$log(u_pred), axis = as.integer(1L) )
+  
+  nll <- -log_C_density
+  tf$reduce_mean(nll)
+}
+
+# --- Combined loss function (still only calls 3D Gaussian NLL) ---
+# We keep this as a placeholder for the original combined intent.
+combined_copula_loss <- function(y_true, y_pred) {
+  return(copula_gaussian_loss(y_true, y_pred))
+}
+
+# ================================
+# 5️⃣ CNN-LSTM + Custom Layers
+# ================================
+to_uniform_tf <- function(x) {
+  u <- 0.5 * (1 + tf$math$erf(x / tf$math$sqrt(2.0)))
+  tf$clip_by_value(u, 1e-6, 1 - 1e-6)
+}
+
+LearnableClaytonActivation <- new_layer_class(
+  classname = "LearnableClaytonActivation",
+  initialize = function(self, theta_init = 1.0) {
+    super$initialize()
+    self$theta <- self$add_weight(shape = list(), initializer = initializer_constant(theta_init),
+                                  trainable = TRUE, name = "theta")
+  },
+  call = function(self, inputs) {
+    theta_safe <- tf$abs(self$theta) + 1e-6
+    u <- to_uniform_tf(inputs)
+    tf$pow(tf$pow(u, -theta_safe) - 1, -1 / theta_safe)
+  }
+)
+
+LearnableGumbelActivation <- new_layer_class(
+  classname = "LearnableGumbelActivation",
+  initialize = function(self, theta_init = 2.0) {
+    super$initialize()
+    self$theta <- self$add_weight(shape = list(), initializer = initializer_constant(theta_init),
+                                  trainable = TRUE, name = "theta")
+  },
+  call = function(self, inputs) {
+    theta_safe <- tf$abs(self$theta) + 1
+    u <- to_uniform_tf(inputs)
+    tf$math$exp(-tf$math$pow(-tf$math$log(u), theta_safe))
+  }
+)
+
+LearnableClaytonGumbelHybrid <- new_layer_class(
+  classname = "LearnableClaytonGumbelHybrid",
+  initialize = function(self, theta_c_init = 1.0, theta_g_init = 2.0, alpha_init = 0.5) {
+    super$initialize()
+    self$theta_c <- self$add_weight(shape = list(), initializer = initializer_constant(theta_c_init),
+                                    trainable = TRUE, name = "theta_c")
+    self$theta_g <- self$add_weight(shape = list(), initializer = initializer_constant(theta_g_init),
+                                    trainable = TRUE, name = "theta_g")
+    self$alpha <- self$add_weight(shape = list(), initializer = initializer_constant(alpha_init),
+                                  trainable = TRUE, name = "alpha")
+  },
+  call = function(self, inputs) {
+    u <- to_uniform_tf(inputs)
+    theta_c <- tf$abs(self$theta_c) + 1e-6
+    theta_g <- tf$abs(self$theta_g) + 1
+    alpha <- tf$nn$sigmoid(self$alpha)
+    clayton <- tf$pow(tf$pow(u, -theta_c) - 1, -1 / theta_c)
+    gumbel  <- tf$math$exp(-tf$math$pow(-tf$math$log(u), theta_g))
+    alpha * clayton + (1 - alpha) * gumbel
+  }
+)
+
+# ================================
+# 6️⃣ CNN-LSTM Model Builder (output units remains 3)
+# ================================
+create_cnn_lstm <- function(type = c("clayton", "gumbel", "hybrid", "relu", "sigmoid")) {
+  type <- match.arg(type)
+  model <- keras_model_sequential() %>%
+    layer_conv_1d(filters = 32, kernel_size = 3, activation = "relu",
+                  input_shape = c(timesteps, features)) %>%
+    layer_max_pooling_1d(pool_size = 2) %>%
+    layer_lstm(units = 64, return_sequences = FALSE) %>%
+    layer_dropout(0.3)
+  
+  if (type == "clayton") model <- model %>% LearnableClaytonActivation()
+  if (type == "gumbel")  model <- model %>% LearnableGumbelActivation()
+  if (type == "hybrid")  model <- model %>% LearnableClaytonGumbelHybrid()
+  if (type == "relu")    model <- model %>% layer_activation("relu")
+  if (type == "sigmoid") model <- model %>% layer_activation("sigmoid")
+  
+  model %>% layer_dense(units = 3, activation = "linear") 
+}
+
+# ================================
+# 7️⃣ Train Each Model with ALL Copula Losses
+# ================================
+model_types <- c("clayton", "gumbel", "hybrid", "relu", "sigmoid")
+model_names <- c("Clayton", "Gumbel", "Clayton-Gumbel", "ReLU", "Sigmoid")
+loss_types <- c("mse", "gauss_copula", "clayton_copula", "gumbel_copula") # Added new losses
+
+all_results <- list()
+all_residuals <- list()
+
+for (i in seq_along(model_types)) {
+  for (loss in loss_types) {
+    cat("Training", model_names[i], "with", loss, "loss\n")
+    m <- create_cnn_lstm(model_types[i])
+    
+    current_loss_fn <- switch(
+      loss,
+      "mse" = "mse",
+      "gauss_copula" = copula_gaussian_loss,
+      "clayton_copula" = copula_clayton_loss,
+      "gumbel_copula" = copula_gumbel_loss
+    )
+    
+    m %>% compile(
+      optimizer = "adam",
+      loss = current_loss_fn,
+      metrics = "mae"
+    )
+    
+    # Use the 3-column copula target for ALL loss types
+    train_target <- y_numeric
+    
+    history <- m %>% fit(
+      x_scaled, train_target, 
+      epochs = 10, batch_size = 32, verbose = 0, validation_split = 0.2
+    )
+    
+    preds <- m %>% predict(x_scaled)
+    target_for_res <- y_numeric
+    residuals <- target_for_res - preds
+    
+    res_df <- data.frame(Model = model_names[i],
+                         Loss  = loss,
+                         ResidualY1 = residuals[,1],
+                         ResidualY2 = residuals[,2],
+                         ResidualS  = residuals[,3])
+    all_residuals[[paste0(model_names[i], "_", loss)]] <- res_df
+    
+    all_results[[paste0(model_names[i], "_", loss)]] <- data.frame(
+      Model = model_names[i],
+      Loss  = loss,
+      MeanResidual1 = mean(residuals[,1]),
+      SDResidual1   = sd(residuals[,1]),
+      MeanResidual2 = mean(residuals[,2]),
+      SDResidual2   = sd(residuals[,2]),
+      MeanResidualS = mean(residuals[,3]),
+      SDResidualS   = sd(residuals[,3])
+    )
+  }
+}
+
+results_df <- do.call(rbind, all_results)
+residuals_df <- do.call(rbind, all_residuals)
+
+# ================================
+# 8️⃣ Residual Metrics Table & Final Visualization
+# ================================
+# (Code for residual processing and plotting remains the same, updated to include new losses)
+
+# Update the column selection to reflect the new 'S' outcome
+res_table <- results_df %>%
+  pivot_longer(cols = c(MeanResidual1:SDResidualS),
+               names_to = "Metric", values_to = "Value") %>%
+  mutate(
+    Stat    = gsub("([A-Za-z]+)Residual[12S]", "\\1Residual", Metric),
+    Outcome = gsub("[A-Za-z]+Residual", "", Metric)
+  ) %>%
+  dplyr::select(Model, Loss, Stat, Outcome, Value)
+
+
+res_wide <- res_table %>%
+  group_by(Model, Loss, Stat, Outcome) %>%
+  summarise(Value = mean(Value, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = c(Stat, Outcome), values_from = Value)
+
+# ----------------------------------------------------------
+# 1️⃣ Residual Diagnostics 
+# ----------------------------------------------------------
+
+residuals_long <- residuals_df %>%
+  dplyr::select(Model, Loss, ResidualY1, ResidualY2, ResidualS) %>%
+  tidyr::pivot_longer(
+    cols = c(ResidualY1, ResidualY2, ResidualS),
+    names_to = "Outcome",
+    values_to = "Residual"
+  ) %>%
+  mutate(Outcome = gsub("Residual", "", Outcome)) 
+
+res_summary <- residuals_long %>%
+  group_by(Model, Loss, Outcome) %>%
+  summarise(
+    Mean = mean(Residual, na.rm = TRUE),
+    SD   = sd(Residual, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Display residual summary table
+cat("\n\n")
+print(kable(res_wide, caption = "Residual Summary per Model and Loss (Wide Format: Y1, Y2, S-Latent Risk)") %>%
+        kable_styling(full_width = FALSE, bootstrap_options = c("striped", "condensed", "hover")))
+
+cat("\n\n")
+print(kable(res_summary, caption = "Residual Summary by Model, Loss Function, and Outcome (Y1, Y2, S-Latent Risk)") %>%
+        kable_styling(full_width = FALSE,
+                      bootstrap_options = c("striped", "hover", "condensed"),
+                      position = "center"))
+
+# ---- Residual density comparison (All Losses)
+p_density <- ggplot(residuals_long, aes(x = Residual, fill = Loss)) +
+  geom_density(alpha = 0.55, adjust = 1.2) +
+  facet_grid(Model ~ Outcome, scales = "free") +
+  theme_minimal(base_size = 13) +
+  scale_fill_viridis_d(option = "C", end = 0.8) +
+  labs(title = "Residual Density Comparison",
+       subtitle = "Per Model, Outcome (Y1, Y2, S), and Loss Function (MSE vs Copula-NLLs)",
+       x = "Residual", y = "Density", fill = "Loss Function") +
+  theme(
+    plot.title = element_text(face = "bold", size = 15),
+    plot.subtitle = element_text(size = 12),
+    strip.text = element_text(face = "bold"),
+    legend.position = "bottom"
+  )
+
+# ---- Boxplot comparison for clearer loss differentiation
+p_box <- ggplot(residuals_long, aes(x = Loss, y = Residual, fill = Loss)) +
+  geom_boxplot(alpha = 0.6, outlier.size = 0.8, width = 0.6) +
+  facet_grid(Model ~ Outcome, scales = "free_y") +
+  theme_minimal(base_size = 13) +
+  scale_fill_viridis_d(option = "C", end = 0.8) +
+  labs(title = "Residual Spread by Loss Function",
+       subtitle = "Faceted by Model and Outcome (Y1, Y2, S)",
+       x = "Loss Function", y = "Residual") +
+  theme(
+    plot.title = element_text(face = "bold", size = 15),
+    plot.subtitle = element_text(size = 12),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "none"
+  )
+
+# Print individual plots
+print(p_density)
+print(p_box)
+
+#####################################
+## Real Data
+#####################################
+#################################################################
+# Full R Code: CNN-LSTM with Real PBC Data and Copula NLL Losses
+# (Fixed factor conversions, custom layers, and section separators)
+#################################################################
+
+# 0️⃣ Setup
+set.seed(123)
+
+library(dplyr)
+library(tidyr)
+library(keras)
+library(tensorflow)
+library(JM)       # For pbc2.id data
+library(purrr)
+library(ggplot2)
+library(copula)
+library(gridExtra)
+library(kableExtra)
+library(viridis)
+
+timesteps <- 10        # max visits per subject
+max_features <- 30     # max number of numeric features
+n_desired <- 500       # number of subjects to use
+
+# ---------------------------
+# 1️⃣ Load and Inspect Data
+# ---------------------------
+data("pbc2.id", package = "JM")
+pbc <- pbc2.id
+
+id_col <- if ("id" %in% names(pbc)) "id" else names(pbc)[1]
+time_col <- if ("year" %in% names(pbc)) "year" else if ("years" %in% names(pbc)) "years" else
+  if ("time" %in% names(pbc)) "time" else NULL
+status_col <- if ("status" %in% names(pbc)) "status" else if ("death" %in% names(pbc)) "death" else NULL
+
+if (is.null(time_col)) {
+  candidates <- c("visit", "day", "days")
+  found <- intersect(candidates, names(pbc))
+  time_col <- if (length(found) > 0) found[1] else stop("No time column found in pbc2.id")
+}
+if (is.null(status_col)) status_col <- "status"
+
+# Convert factor/character columns to numeric
+if (is.factor(pbc[[time_col]])) pbc[[time_col]] <- as.numeric(as.character(pbc[[time_col]]))
+if (!is.null(status_col) && is.factor(pbc[[status_col]])) pbc[[status_col]] <- as.numeric(as.character(pbc[[status_col]]))
+
+cat("✅ Data loaded. ID:", id_col, "Time:", time_col, "Status:", status_col, "\n")
+
+# ---------------------------
+# 2️⃣ Build Per-Subject Survival Summary
+# ---------------------------
+surv_summary <- pbc %>%
+  group_by_at(id_col) %>%
+  summarise(
+    surv_time = max(.data[[time_col]], na.rm = TRUE),
+    event = {
+      if (!is.null(status_col)) {
+        svec <- .data[[status_col]][!is.na(.data[[status_col]])]
+        if (length(svec) == 0) NA_integer_ else as.integer(any(svec %in% c(1,2)))
+      } else NA_integer_
+    }
+  ) %>% ungroup()
+
+# Filter to desired subjects
+subject_ids <- head(surv_summary[[id_col]], n_desired)
+surv_summary <- surv_summary %>% filter(.data[[id_col]] %in% subject_ids)
+pbc <- pbc %>% filter(.data[[id_col]] %in% subject_ids)
+
+cat("✅ Survival summary created with", nrow(surv_summary), "subjects.\n")
+
+# ---------------------------
+# 3️⃣ Prepare Longitudinal Feature Data
+# ---------------------------
+excluded_cols <- c(id_col, time_col, status_col, "drug", "sex", "ascites", "hepatomegaly",
+                   "spiders", "edema", "histol")
+candidate_features <- setdiff(names(pbc), excluded_cols)
+numeric_features <- candidate_features[sapply(pbc[candidate_features], is.numeric)]
+numeric_features <- head(numeric_features, max_features)
+
+long_data <- pbc[, c(id_col, time_col, numeric_features)]
+long_data <- long_data[order(long_data[[id_col]], long_data[[time_col]]), ]
+
+# ---------------------------
+# 4️⃣ Pad to Fixed Timesteps (X-array)
+# ---------------------------
+subject_list <- split(long_data, long_data[[id_col]])
+
+pad_subject <- function(df, features, tsteps) {
+  mat <- as.matrix(df[, features, drop = FALSE])
+  if (nrow(mat) >= tsteps) mat[1:tsteps, ] else rbind(mat, matrix(0, nrow = tsteps - nrow(mat), ncol = ncol(mat)))
+}
+
+x_array <- array(
+  data = unlist(lapply(subject_list, pad_subject, numeric_features, timesteps)),
+  dim = c(length(subject_list), timesteps, length(numeric_features))
+)
+
+# ---------------------------
+# 5️⃣ Impute Missing Values and Scale
+# ---------------------------
+for (j in 1:dim(x_array)[3]) {
+  col_data <- x_array[,,j]
+  col_mean <- mean(col_data[col_data != 0], na.rm = TRUE)
+  col_data[is.na(col_data)] <- col_mean
+  if (!is.na(col_mean) && col_mean != 0) col_data[col_data == 0] <- col_mean
+  x_array[,,j] <- col_data
+}
+x_scaled <- (x_array - mean(x_array)) / sd(x_array)
+
+# ---------------------------
+# 6️⃣ Prepare Copula-Transformed Target (Robust for 2 or 3 outcomes)
+# ---------------------------
+
+# Specify the longitudinal outcomes you want to predict
+long_outcomes <- c("serBilir", "albumin")  # can extend to 3 if needed
+
+# Summarize last available measurement per subject
+y_long_summary <- long_data %>%
+  group_by_at(id_col) %>%
+  summarise(
+    across(all_of(long_outcomes), ~ last(.[!is.na(.)]), .names = "Y_{.col}")
+  ) %>%
+  ungroup()
+
+# Combine with survival time
+y_data_df <- surv_summary %>%
+  left_join(y_long_summary, by = id_col) %>%
+  dplyr::select(all_of(paste0("Y_", long_outcomes)), S = surv_time) %>%
+  na.omit()
+
+# Match subject order to x_scaled
+id_order <- names(subject_list)
+y_data_df <- y_data_df[match(id_order, surv_summary[[id_col]]), ]
+x_scaled <- x_scaled[1:nrow(y_data_df), , ]  # ensure alignment
+
+# Copula transformation: rank-based uniform [0,1], avoid 0/1
+u_data_df <- as.data.frame(lapply(y_data_df, function(x) rank(x, na.last = "keep") / (sum(!is.na(x)) + 1)))
+u_mat <- as.matrix(pmin(pmax(u_data_df, 1e-6), 1 - 1e-6))
+u_mat[!is.finite(u_mat)] <- 0.5  # fallback for safety
+
+# Fit Gaussian copula (robust to 2 or 3 columns)
+if (all(apply(u_mat, 2, function(x) all(is.finite(x))))) {
+  cop_fit0 <- normalCopula(dim = ncol(u_mat))
+  suppressWarnings(
+    fit0 <- try(fitCopula(cop_fit0, data = u_mat, method = "ml"), silent = TRUE)
+  )
+  if (inherits(fit0, "try-error")) {
+    warning("Gaussian copula ML fit failed; using identity correlation rho = 0.5")
+    rho <- rep(0.5, ncol(u_mat))
+  } else {
+    rho <- as.vector(coef(fit0))
+  }
+} else {
+  warning("Non-finite values in u_mat; skipping copula fit, setting rho = 0.5")
+  rho <- rep(0.5, ncol(u_mat))
+}
+
+# Transform uniform to standard normal for model training
+y_copula <- as.data.frame(lapply(u_data_df, function(u) qnorm(u)))
+colnames(y_copula) <- colnames(y_data_df)
+y_numeric <- as.matrix(y_copula)
+
+n_final <- nrow(y_numeric)
+x_scaled <- x_scaled[1:n_final, , ]
+cat("✅ Copula-transformed target created for", ncol(y_numeric), "outcomes and", n_final, "subjects.\n")
+
+
+# ---------------------------
+# 7️⃣ Custom Loss Functions
+# ---------------------------
+to_uniform_tf <- function(x) {
+  u <- 0.5 * (1 + tf$math$erf(tf$cast(x, tf$float32) / tf$math$sqrt(2.0)))
+  tf$clip_by_value(u, 1e-6, 1 - 1e-6)
+}
+
+copula_gaussian_loss <- function(y_true, y_pred) {
+  y_true <- tf$cast(y_true, tf$float32)
+  y_pred <- tf$cast(y_pred, tf$float32)
+  phi_centered <- y_pred - tf$reduce_mean(y_pred, axis = as.integer(0L), keepdims = TRUE)
+  n_samples <- tf$cast(tf$shape(phi_centered)[1], tf$float32)
+  cov_mat <- tf$matmul(tf$transpose(phi_centered), phi_centered) / (n_samples - 1.0)
+  epsilon <- 1e-6
+  cov_mat_stable <- cov_mat + epsilon * tf$eye(tf$shape(cov_mat)[1])
+  inv_cov <- tf$linalg$inv(cov_mat_stable)
+  det_cov <- tf$linalg$det(cov_mat_stable)
+  quad_term <- tf$reduce_sum(tf$matmul(y_true, inv_cov) * y_true, axis = as.integer(1L))
+  log_det_term <- tf$math$log(det_cov + epsilon)
+  nll <- 0.5 * (log_det_term + quad_term)
+  tf$reduce_mean(nll, axis = as.integer(0L))
+}
+
+copula_clayton_loss <- function(y_true, y_pred, theta_init = rho[1]) {
+  y_true <- tf$cast(y_true, tf$float32)
+  y_pred <- tf$cast(y_pred, tf$float32)
+  theta <- tf$abs(tf$constant(theta_init, dtype = tf$float32)) + 1e-3
+  u_pred <- to_uniform_tf(y_pred)
+  S <- tf$reduce_sum(tf$math$pow(u_pred, -theta), axis = as.integer(1L))
+  log_C_density <- tf$math$log(1 + 2*theta) - 
+    (theta + 1) * tf$reduce_sum(tf$math$log(u_pred), axis = as.integer(1L)) - 
+    (3 + 1/theta) * tf$math$log(S - 2 + 1e-6)
+  nll <- -log_C_density
+  tf$reduce_mean(nll)
+}
+
+copula_gumbel_loss <- function(y_true, y_pred, theta_init = rho[1] + 1) {
+  y_true <- tf$cast(y_true, tf$float32)
+  y_pred <- tf$cast(y_pred, tf$float32)
+  theta <- tf$constant(theta_init, dtype = tf$float32)
+  theta <- tf$maximum(theta, 1.0 + 1e-3)
+  u_pred <- to_uniform_tf(y_pred)
+  log_u <- -tf$math$log(u_pred)
+  phi_u <- tf$math$pow(log_u, theta)
+  sum_phi_u <- tf$reduce_sum(phi_u, axis = as.integer(1L))
+  log_deriv2 <- tf$math$log(tf$math$pow(sum_phi_u, 1/theta - 3)) 
+  log_remaining <- (3 - 1/theta) * tf$math$log(sum_phi_u) + 
+    tf$reduce_sum( (theta - 1) * tf$math$log(-tf$math$log(u_pred)) - theta * tf$math$log(u_pred), axis = as.integer(1L) )
+  log_C_density <- log_deriv2 + log_remaining
+  nll <- -log_C_density
+  tf$reduce_mean(nll)
+}
+
+# ---------------------------
+# 8️⃣ CNN-LSTM + Custom Layers
+# ---------------------------
+LearnableClaytonActivation <- new_layer_class(
+  classname = "LearnableClaytonActivation",
+  initialize = function(self, theta_init = 1.0) {
+    super$initialize()
+    self$theta <- self$add_weight(
+      shape = list(),
+      initializer = initializer_constant(theta_init),
+      trainable = TRUE,
+      name = "theta"
+    )
+  },
+  call = function(self, inputs) { tf$identity(inputs) }
+)
+
+LearnableGumbelActivation <- new_layer_class(
+  classname = "LearnableGumbelActivation",
+  initialize = function(self, theta_init = 2.0) {
+    super$initialize()
+    self$theta <- self$add_weight(
+      shape = list(),
+      initializer = initializer_constant(theta_init),
+      trainable = TRUE,
+      name = "theta"
+    )
+  },
+  call = function(self, inputs) { tf$identity(inputs) }
+)
+
+LearnableClaytonGumbelHybrid <- new_layer_class(
+  classname = "LearnableClaytonGumbelHybrid",
+  initialize = function(self, theta_c_init = 1.0, theta_g_init = 2.0, alpha_init = 0.5) {
+    super$initialize()
+    self$theta_c <- self$add_weight(shape = list(), initializer = initializer_constant(theta_c_init), trainable = TRUE, name = "theta_c")
+    self$theta_g <- self$add_weight(shape = list(), initializer = initializer_constant(theta_g_init), trainable = TRUE, name = "theta_g")
+    self$alpha <- self$add_weight(shape = list(), initializer = initializer_constant(alpha_init), trainable = TRUE, name = "alpha")
+  },
+  call = function(self, inputs) { tf$identity(inputs) }
+)
+
+# ---------------------------
+# 9️⃣ CNN-LSTM Model Builder
+# ---------------------------
+create_cnn_lstm <- function(type = c("clayton", "gumbel", "hybrid", "relu", "sigmoid")) {
+  type <- match.arg(type)
+  input_features <- dim(x_scaled)[3]
+  
+  model <- keras_model_sequential() %>%
+    layer_conv_1d(filters = 32, kernel_size = 3, activation = "relu", input_shape = c(timesteps, input_features)) %>%
+    layer_max_pooling_1d(pool_size = 2) %>%
+    layer_lstm(units = 64, return_sequences = FALSE) %>%
+    layer_dropout(0.3)
+  
+  if (type == "clayton") model <- model %>% LearnableClaytonActivation()
+  if (type == "gumbel") model <- model %>% LearnableGumbelActivation()
+  if (type == "hybrid") model <- model %>% LearnableClaytonGumbelHybrid()
+  if (type == "relu") model <- model %>% layer_activation("relu")
+  if (type == "sigmoid") model <- model %>% layer_activation("sigmoid")
+  
+  model %>% layer_dense(units = 3, activation = "linear")  # Y1,Y2,S
+}
+
+# ---------------------------
+# 🔟 Train Each Model with All Copula Losses
+# ---------------------------
+model_types <- c("clayton", "gumbel", "hybrid", "relu", "sigmoid")
+model_names <- c("Clayton", "Gumbel", "Clayton-Gumbel", "ReLU", "Sigmoid")
+loss_types <- c("mse", "gauss_copula", "clayton_copula", "gumbel_copula")
+
+all_results <- list()
+all_residuals <- list()
+train_x <- x_scaled
+train_target <- y_numeric
+
+for (i in seq_along(model_types)) {
+  for (loss in loss_types) {
+    k_clear_session()
+    cat("Training", model_names[i], "with", loss, "loss\n")
+    
+    m <- create_cnn_lstm(model_types[i])
+    current_loss_fn <- switch(
+      loss,
+      "mse" = "mse",
+      "gauss_copula" = copula_gaussian_loss,
+      "clayton_copula" = copula_clayton_loss,
+      "gumbel_copula" = copula_gumbel_loss
+    )
+    
+    m %>% compile(optimizer = "adam", loss = current_loss_fn, metrics = c("mae"))
+    
+    history <- m %>% fit(train_x, train_target, epochs = 10, batch_size = 32, verbose = 0, validation_split = 0.2)
+    
+    preds <- m %>% predict(train_x)
+    residuals <- train_target - preds
+    
+    res_df <- data.frame(
+      Model = model_names[i], Loss = loss,
+      ResidualY1 = residuals[,1], ResidualY2 = residuals[,2], ResidualS = residuals[,3]
+    )
+    
+    all_residuals[[paste0(model_names[i], "_", loss)]] <- res_df
+    all_results[[paste0(model_names[i], "_", loss)]] <- data.frame(
+      Model = model_names[i], Loss = loss,
+      MeanResidual1 = mean(residuals[,1]),
+      SDResidual1 = sd(residuals[,1]),
+      MeanResidual2 = mean(residuals[,2]),
+      SDResidual2 = sd(residuals[,2]),
+      MeanResidualS = mean(residuals[,3]),
+      SDResidualS = sd(residuals[,3])
+    )
+  }
+}
+
+results_df <- do.call(rbind, all_results)
+residuals_df <- do.call(rbind, all_residuals)
+
+# ---------------------------
+# 11️⃣ Residual Metrics Table & Visualization
+# ---------------------------
+# Pivot long and wide
+res_table <- results_df %>%
+  pivot_longer(cols = c(MeanResidual1:SDResidualS), names_to = "Metric", values_to = "Value") %>%
+  mutate(Stat = gsub("([A-Za-z]+)Residual[12S]", "\\1Residual", Metric),
+         Outcome = gsub("[A-Za-z]+Residual", "", Metric)) %>%
+  dplyr::select(Model, Loss, Stat, Outcome, Value)
+
+res_wide <- res_table %>%
+  group_by(Model, Loss, Stat, Outcome) %>%
+  summarise(Value = mean(Value, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = c(Stat, Outcome), values_from = Value) %>%
+  arrange(Loss, Model)
+
+residuals_long <- residuals_df %>%
+  dplyr::select(Model, Loss, ResidualY1, ResidualY2, ResidualS) %>%
+  tidyr::pivot_longer(cols = c(ResidualY1, ResidualY2, ResidualS), names_to = "Outcome", values_to = "Residual") %>%
+  mutate(Outcome = gsub("Residual", "", Outcome))
+
+res_summary <- residuals_long %>%
+  group_by(Model, Loss, Outcome) %>%
+  summarise(Mean = mean(Residual, na.rm = TRUE), SD = sd(Residual, na.rm = TRUE), .groups = "drop") %>%
+  arrange(Loss, Model)
+
+# Display
+cat("\n\n")
+print(kable(res_wide, digits = 3, caption = "Residual Summary per Model and Loss (Wide Format)") %>%
+        kable_styling(full_width = FALSE, bootstrap_options = c("striped","condensed","hover")))
+cat("\n\n")
+print(kable(res_summary, digits = 3, caption = "Residual Summary by Model, Loss, Outcome") %>%
+        kable_styling(full_width = FALSE, bootstrap_options = c("striped","hover","condensed"), position = "center"))
+
+# Residual density plot
+p_density <- ggplot(residuals_long, aes(x = Residual, fill = Loss)) +
+  geom_density(alpha = 0.55, adjust = 1.2) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
+  facet_grid(Model ~ Outcome, scales = "free") +
+  theme_minimal(base_size = 13) +
+  scale_fill_viridis_d(option = "C", end = 0.8) +
+  labs(title = "Residual Density Comparison", subtitle = "Per Model, Outcome, Loss Function", x = "Residual", y = "Density", fill = "Loss Function") +
+  theme(plot.title = element_text(face = "bold", size = 15),
+        plot.subtitle = element_text(size = 12),
+        strip.text = element_text(face = "bold"),
+        legend.position = "bottom")
+
+# Residual boxplot
+p_box <- ggplot(residuals_long, aes(x = Loss, y = Residual, fill = Loss)) +
+  geom_boxplot(alpha = 0.6, outlier.size = 0.8, width = 0.6) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  facet_grid(Model ~ Outcome, scales = "free_y") +
+  theme_minimal(base_size = 13) +
+  scale_fill_viridis_d(option = "C", end = 0.8) +
+  labs(title = "Residual Spread by Loss Function", subtitle = "Faceted by Model and Outcome", x = "Loss Function", y = "Residual") +
+  theme(plot.title = element_text(face = "bold", size = 15),
+        plot.subtitle = element_text(size = 12),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none")
+
+# Print plots
+print(p_density)
+print(p_box)

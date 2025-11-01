@@ -1,5 +1,5 @@
-This R code was written by Jong-Min Kim, Jihoon Kim and IL Do Ha.(10/04/2025)
-
+#This R code was written by Jong-Min Kim, Jihoon Kim and IL Do Ha.(11/01/2025)
+# Manuscript entitled "Copula-Based Deep Learning Models for Competing Risks" Accepted in Statistical Analysis and Data Mining
 #################################### simulation ######################################
 
 # Simulated Data R code
@@ -21,7 +21,190 @@ library(tidyr)
 library(kableExtra)
 library(caret)
 
-source("R/functions.R")
+one_hot <- function(labels, num_classes = NULL) {
+  labels <- as.integer(labels)
+  if (is.null(num_classes)) {
+    num_classes <- max(labels) + 1
+  }
+  n <- length(labels)
+  mat <- matrix(0, nrow = n, ncol = num_classes)
+  mat[cbind(seq_len(n), labels + 1)] <- 1
+  mat
+}
+
+
+# RBF kernel function
+rbf_kernel <- function(X, gamma) {
+  sq_dist <- as.matrix(dist(X))^2
+  # exp(-gamma * ||x_i - x_j||^2)
+  K <- exp(-gamma * sq_dist)
+  return(K)
+}
+
+
+LearnableFrankCopulaActivation <- new_layer_class(
+  classname = "LearnableFrankCopulaActivation",
+  initialize = function(self, theta_init = 1.0, ...) {
+    super$initialize(...)
+    self$theta <- self$add_weight(shape = list(), initializer = initializer_constant(theta_init), trainable = TRUE)
+  },
+  call = function(self, inputs, ...) {
+    theta_safe <- tf$maximum(self$theta, 1e-6)
+    u <- tf$clip_by_value(0.5 * (1 + tf$math$erf(inputs / tf$math$sqrt(2.0))), 1e-6, 1 - 1e-6)
+    
+    # Frank copula formula
+    frank_copula <- -log((tf$exp(-theta_safe * u) - 1) / (tf$exp(-theta_safe) - 1))
+    
+    return(frank_copula)
+  }
+)
+
+LearnableClaytonActivation <- new_layer_class(
+  classname = "LearnableClaytonActivation",
+  initialize = function(self, theta_init = 1.0, ...) {
+    super$initialize(...)
+    self$theta <- self$add_weight(shape = list(), initializer = initializer_constant(theta_init), trainable = TRUE)
+  },
+  call = function(self, inputs, ...) {
+    theta_safe <- tf$maximum(self$theta, 1e-6)
+    u <- tf$clip_by_value(0.5 * (1 + tf$math$erf(inputs / tf$math$sqrt(2.0))), 1e-6, 1 - 1e-6)
+    tf$pow((tf$pow(u, -theta_safe) + tf$pow(u, theta_safe) - 1), 1 / theta_safe)
+  }
+)
+
+LearnableGaussianActivation <- new_layer_class(
+  classname = "LearnableGaussianActivation",
+  initialize = function(self, theta_init = 1.0, ...) {
+    super$initialize(...)
+    self$theta <- self$add_weight(shape = list(), initializer = initializer_constant(theta_init), trainable = TRUE)
+  },
+  call = function(self, inputs, ...) {
+    theta_safe <- tf$maximum(self$theta, 1e-6)
+    u <- tf$clip_by_value(0.5 * (1 + tf$math$erf(inputs / tf$math$sqrt(2.0))), 1e-6, 1 - 1e-6)
+    tf$pow(tf$pow(u, -theta_safe) - 1, -1 / theta_safe)
+  }
+)
+
+
+# Function to Compute Brier Score
+compute_multiclass_brier <- function(pred_probs, true_y) {
+  mean(rowSums((pred_probs - true_y)^2))
+}
+
+# Function to Compute Macro f1-score
+compute_macro_f1 <- function(pred_probs, true_labels) {
+  true_class <- apply(true_labels, 1, which.max)
+  pred_class <- apply(pred_probs, 1, which.max)
+  
+  conf <- table(factor(pred_class, levels = 1:ncol(true_labels)),
+                factor(true_class, levels = 1:ncol(true_labels)))
+  
+  precision <- rep(0, ncol(true_labels))
+  recall <- rep(0, ncol(true_labels))
+  f1 <- rep(0, ncol(true_labels))
+  
+  for (k in 1:ncol(true_labels)) {
+    tp <- conf[k, k]
+    fp <- sum(conf[k, ]) - tp
+    fn <- sum(conf[, k]) - tp
+    precision[k] <- ifelse((tp + fp) > 0, tp / (tp + fp), 0)
+    recall[k] <- ifelse((tp + fn) > 0, tp / (tp + fn), 0)
+    f1[k] <- ifelse((precision[k] + recall[k]) > 0,
+                    2 * precision[k] * recall[k] / (precision[k] + recall[k]), 0)
+  }
+  
+  mean(f1)
+}
+
+# Function to Compute Accuracy
+compute_accuracy <- function(pred_probs, true_labels) {
+  true_class <- apply(true_labels, 1, which.max)
+  pred_class <- apply(pred_probs, 1, which.max)
+  mean(pred_class == true_class)
+}
+
+# model build ft
+create_model <- function(model_type = "cnn", use_copula = "Frank", x_data) {
+  
+  inputs <- layer_input(shape = c(ncol(x_data), 1))
+  
+  if (model_type == "cnn") {
+    outputs <- inputs %>%
+      layer_conv_1d(filters = 64, kernel_size = 3, activation = "relu") %>%
+      layer_flatten() %>%
+      layer_dense(units = 128, activation = "relu")
+    
+  } else if (model_type == "cnn_lstm") {
+    outputs <- inputs %>%
+      layer_conv_1d(filters = 64, kernel_size = 3, activation = "relu") %>%
+      layer_lstm(units = 64, return_sequences = TRUE) %>%
+      layer_flatten() %>%
+      layer_dense(units = 128, activation = "relu")
+    
+  } else if (model_type == "lstm") {
+    outputs <- inputs %>%
+      layer_lstm(units = 64, return_sequences = TRUE) %>%
+      layer_flatten() %>%
+      layer_dense(units = 128, activation = "relu")
+  }
+  
+
+  if (!is.null(use_copula) && use_copula == "Frank") {
+    outputs <- outputs %>% LearnableFrankCopulaActivation()
+
+  } else if (!is.null(use_copula) && use_copula == "Clayton") {
+    outputs <- outputs %>% LearnableClaytonActivation()
+
+  } else if (!is.null(use_copula) && use_copula == "Gaussian") {
+    outputs <- outputs %>% LearnableGaussianActivation()
+  }
+  
+  # 최종 출력층
+  outputs <- outputs %>% layer_dense(units = 3, activation = "softmax")
+  
+  # 모델 정의
+  model <- keras_model(inputs = inputs, outputs = outputs)
+  return(model)
+}
+
+
+train_and_predict <- function(model_type, use_copula, x_data, y_labels, train_idx, test_idx) {
+  
+  model <- create_model(model_type, use_copula, x_data)
+  
+  model$compile(
+    loss = "categorical_crossentropy",
+    optimizer = "adam",
+    metrics = list("accuracy")
+  )
+  
+if (is.matrix(y_labels) || is.data.frame(y_labels)) {
+  y_class <- apply(y_labels, 1, which.max)  # one-hot → class index
+} else {
+  y_class <- y_labels
+}
+
+# set.seed(42)
+# train_idx <- createDataPartition(y_class, p = 0.7, list = FALSE)
+# test_idx <- setdiff(1:length(y_class), train_idx)
+
+x_train <- x_data[train_idx, ]; y_train <- y_labels[train_idx, ]
+x_test  <- x_data[test_idx,  ]; y_test  <- y_labels[test_idx,  ]
+  
+  model$fit(
+    x_train, y_train,
+    # validation_data = list(x_val, y_val),
+    epochs = 130L,
+    batch_size = 32L,
+    verbose = 0
+  )
+  
+  x_pred <- array(x_test, dim = c(nrow(x_test), ncol(x_test), 1L))
+  y_pred <- model$predict(x_pred)  # <- R predict() 대신 Python 메서드 호출
+  
+  return(list(y_pred = y_pred, y_test = y_test))
+}
+
 
 n_sim <- 100
 
@@ -226,7 +409,190 @@ library(caret)
 library(JM)
 library(reshape2)
 
-source("R/functions.R")
+one_hot <- function(labels, num_classes = NULL) {
+  labels <- as.integer(labels)
+  if (is.null(num_classes)) {
+    num_classes <- max(labels) + 1
+  }
+  n <- length(labels)
+  mat <- matrix(0, nrow = n, ncol = num_classes)
+  mat[cbind(seq_len(n), labels + 1)] <- 1
+  mat
+}
+
+
+# RBF kernel function
+rbf_kernel <- function(X, gamma) {
+  sq_dist <- as.matrix(dist(X))^2
+  # exp(-gamma * ||x_i - x_j||^2)
+  K <- exp(-gamma * sq_dist)
+  return(K)
+}
+
+
+LearnableFrankCopulaActivation <- new_layer_class(
+  classname = "LearnableFrankCopulaActivation",
+  initialize = function(self, theta_init = 1.0, ...) {
+    super$initialize(...)
+    self$theta <- self$add_weight(shape = list(), initializer = initializer_constant(theta_init), trainable = TRUE)
+  },
+  call = function(self, inputs, ...) {
+    theta_safe <- tf$maximum(self$theta, 1e-6)
+    u <- tf$clip_by_value(0.5 * (1 + tf$math$erf(inputs / tf$math$sqrt(2.0))), 1e-6, 1 - 1e-6)
+    
+    # Frank copula formula
+    frank_copula <- -log((tf$exp(-theta_safe * u) - 1) / (tf$exp(-theta_safe) - 1))
+    
+    return(frank_copula)
+  }
+)
+
+LearnableClaytonActivation <- new_layer_class(
+  classname = "LearnableClaytonActivation",
+  initialize = function(self, theta_init = 1.0, ...) {
+    super$initialize(...)
+    self$theta <- self$add_weight(shape = list(), initializer = initializer_constant(theta_init), trainable = TRUE)
+  },
+  call = function(self, inputs, ...) {
+    theta_safe <- tf$maximum(self$theta, 1e-6)
+    u <- tf$clip_by_value(0.5 * (1 + tf$math$erf(inputs / tf$math$sqrt(2.0))), 1e-6, 1 - 1e-6)
+    tf$pow((tf$pow(u, -theta_safe) + tf$pow(u, theta_safe) - 1), 1 / theta_safe)
+  }
+)
+
+LearnableGaussianActivation <- new_layer_class(
+  classname = "LearnableGaussianActivation",
+  initialize = function(self, theta_init = 1.0, ...) {
+    super$initialize(...)
+    self$theta <- self$add_weight(shape = list(), initializer = initializer_constant(theta_init), trainable = TRUE)
+  },
+  call = function(self, inputs, ...) {
+    theta_safe <- tf$maximum(self$theta, 1e-6)
+    u <- tf$clip_by_value(0.5 * (1 + tf$math$erf(inputs / tf$math$sqrt(2.0))), 1e-6, 1 - 1e-6)
+    tf$pow(tf$pow(u, -theta_safe) - 1, -1 / theta_safe)
+  }
+)
+
+
+# Function to Compute Brier Score
+compute_multiclass_brier <- function(pred_probs, true_y) {
+  mean(rowSums((pred_probs - true_y)^2))
+}
+
+# Function to Compute Macro f1-score
+compute_macro_f1 <- function(pred_probs, true_labels) {
+  true_class <- apply(true_labels, 1, which.max)
+  pred_class <- apply(pred_probs, 1, which.max)
+  
+  conf <- table(factor(pred_class, levels = 1:ncol(true_labels)),
+                factor(true_class, levels = 1:ncol(true_labels)))
+  
+  precision <- rep(0, ncol(true_labels))
+  recall <- rep(0, ncol(true_labels))
+  f1 <- rep(0, ncol(true_labels))
+  
+  for (k in 1:ncol(true_labels)) {
+    tp <- conf[k, k]
+    fp <- sum(conf[k, ]) - tp
+    fn <- sum(conf[, k]) - tp
+    precision[k] <- ifelse((tp + fp) > 0, tp / (tp + fp), 0)
+    recall[k] <- ifelse((tp + fn) > 0, tp / (tp + fn), 0)
+    f1[k] <- ifelse((precision[k] + recall[k]) > 0,
+                    2 * precision[k] * recall[k] / (precision[k] + recall[k]), 0)
+  }
+  
+  mean(f1)
+}
+
+# Function to Compute Accuracy
+compute_accuracy <- function(pred_probs, true_labels) {
+  true_class <- apply(true_labels, 1, which.max)
+  pred_class <- apply(pred_probs, 1, which.max)
+  mean(pred_class == true_class)
+}
+
+# model build ft
+create_model <- function(model_type = "cnn", use_copula = "Frank", x_data) {
+  
+  inputs <- layer_input(shape = c(ncol(x_data), 1))
+  
+  if (model_type == "cnn") {
+    outputs <- inputs %>%
+      layer_conv_1d(filters = 64, kernel_size = 3, activation = "relu") %>%
+      layer_flatten() %>%
+      layer_dense(units = 128, activation = "relu")
+    
+  } else if (model_type == "cnn_lstm") {
+    outputs <- inputs %>%
+      layer_conv_1d(filters = 64, kernel_size = 3, activation = "relu") %>%
+      layer_lstm(units = 64, return_sequences = TRUE) %>%
+      layer_flatten() %>%
+      layer_dense(units = 128, activation = "relu")
+    
+  } else if (model_type == "lstm") {
+    outputs <- inputs %>%
+      layer_lstm(units = 64, return_sequences = TRUE) %>%
+      layer_flatten() %>%
+      layer_dense(units = 128, activation = "relu")
+  }
+  
+
+  if (!is.null(use_copula) && use_copula == "Frank") {
+    outputs <- outputs %>% LearnableFrankCopulaActivation()
+
+  } else if (!is.null(use_copula) && use_copula == "Clayton") {
+    outputs <- outputs %>% LearnableClaytonActivation()
+
+  } else if (!is.null(use_copula) && use_copula == "Gaussian") {
+    outputs <- outputs %>% LearnableGaussianActivation()
+  }
+  
+  # 최종 출력층
+  outputs <- outputs %>% layer_dense(units = 3, activation = "softmax")
+  
+  # 모델 정의
+  model <- keras_model(inputs = inputs, outputs = outputs)
+  return(model)
+}
+
+
+train_and_predict <- function(model_type, use_copula, x_data, y_labels, train_idx, test_idx) {
+  
+  model <- create_model(model_type, use_copula, x_data)
+  
+  model$compile(
+    loss = "categorical_crossentropy",
+    optimizer = "adam",
+    metrics = list("accuracy")
+  )
+  
+if (is.matrix(y_labels) || is.data.frame(y_labels)) {
+  y_class <- apply(y_labels, 1, which.max)  # one-hot → class index
+} else {
+  y_class <- y_labels
+}
+
+# set.seed(42)
+# train_idx <- createDataPartition(y_class, p = 0.7, list = FALSE)
+# test_idx <- setdiff(1:length(y_class), train_idx)
+
+x_train <- x_data[train_idx, ]; y_train <- y_labels[train_idx, ]
+x_test  <- x_data[test_idx,  ]; y_test  <- y_labels[test_idx,  ]
+  
+  model$fit(
+    x_train, y_train,
+    # validation_data = list(x_val, y_val),
+    epochs = 130L,
+    batch_size = 32L,
+    verbose = 0
+  )
+  
+  x_pred <- array(x_test, dim = c(nrow(x_test), ncol(x_test), 1L))
+  y_pred <- model$predict(x_pred)  # <- R predict() 대신 Python 메서드 호출
+  
+  return(list(y_pred = y_pred, y_test = y_test))
+}
+
 
 # import pbc2 data 
 data(pbc2.id)

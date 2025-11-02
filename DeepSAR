@@ -1,0 +1,375 @@
+# ============================================================
+# SAR-Q-Learning Supply-Chain using Real Data (UCI Online Retail)
+# ============================================================
+
+# -----------------------------
+# 0) Libraries & Environment
+# -----------------------------
+pkgs <- c("readxl", "dplyr", "lubridate", "ggplot2", "forecast", 
+          "tidyr", "kableExtra", "magrittr", "gridExtra", "viridisLite")
+new_pkgs <- pkgs[!(pkgs %in% installed.packages()[, "Package"])]
+if(length(new_pkgs)) install.packages(new_pkgs, repos = "https://cloud.r-project.org")
+lapply(pkgs, library, character.only = TRUE)
+
+set.seed(123)
+
+# -----------------------------
+# 1) Download & Load Online Retail Dataset (UCI)
+# -----------------------------
+u_url <- "https://archive.ics.uci.edu/ml/machine-learning-databases/00352/Online%20Retail.xlsx"
+tmpf <- tempfile(fileext = ".xlsx")
+download.file(u_url, tmpf, mode = "wb", quiet = TRUE)
+raw <- readxl::read_xlsx(tmpf, sheet = 1)
+
+# -----------------------------
+# 2) Preprocess: Aggregate Daily Sales by Country
+# -----------------------------
+retail <- raw %>%
+  dplyr::mutate(InvoiceDate = as.POSIXct(InvoiceDate, tz = "UTC"),
+                Date = as.Date(InvoiceDate)) %>%
+  dplyr::filter(!is.na(Quantity), Quantity > 0) %>%
+  dplyr::mutate(Sales = Quantity * UnitPrice)
+
+daily_sales <- retail %>%
+  dplyr::group_by(Country, Date) %>%
+  dplyr::summarise(DailySales = sum(Sales, na.rm = TRUE), .groups = "drop")
+
+# Top N countries by total sales
+topN <- 10
+country_totals <- daily_sales %>%
+  dplyr::group_by(Country) %>%
+  dplyr::summarise(Total = sum(DailySales)) %>%
+  dplyr::arrange(desc(Total))
+top_countries <- head(country_totals$Country, topN)
+
+daily_top <- daily_sales %>%
+  dplyr::filter(Country %in% top_countries)
+
+# Fill missing dates with zeros
+date_range <- seq(min(daily_top$Date), max(daily_top$Date), by = "day")
+grid <- expand.grid(Date = date_range, Country = top_countries, stringsAsFactors = FALSE)
+daily_top_full <- grid %>%
+  dplyr::left_join(daily_top, by = c("Date", "Country")) %>%
+  dplyr::mutate(DailySales = ifelse(is.na(DailySales), 0, DailySales)) %>%
+  dplyr::arrange(Country, Date)
+
+# -----------------------------
+# 3) Aggregate to Weekly Sales
+# -----------------------------
+daily_top_full <- daily_top_full %>%
+  dplyr::mutate(Week = as.integer(format(Date, "%Y%U")))
+
+weekly_sales <- daily_top_full %>%
+  dplyr::group_by(Country, Week) %>%
+  dplyr::summarise(WeeklySales = sum(DailySales),
+                   WeekStart = min(Date),
+                   .groups = "drop") %>%
+  dplyr::arrange(Country, WeekStart)
+
+weeks <- sort(unique(weekly_sales$WeekStart))
+countries <- top_countries
+sales_wide <- tidyr::pivot_wider(weekly_sales, id_cols = WeekStart, names_from = Country, values_from = WeeklySales)
+sales_wide[is.na(sales_wide)] <- 0
+
+sales_mat <- as.matrix(sales_wide[, countries, drop = FALSE])
+rownames(sales_mat) <- as.character(sales_wide$WeekStart)
+
+# -----------------------------
+# 4) Estimate AR(1) Demand Parameters
+# -----------------------------
+n_regions <- ncol(sales_mat)
+demand_phi <- numeric(n_regions)
+demand_base <- numeric(n_regions)
+for(i in 1:n_regions){
+  ts_i <- ts(sales_mat[, i], frequency = 52)
+  fit <- tryCatch(arima(ts_i, order = c(1,0,0)), error = function(e) NULL)
+  if(!is.null(fit)){
+    demand_phi[i] <- coef(fit)["ar1"]
+    demand_base[i] <- mean(ts_i, na.rm = TRUE)
+  } else {
+    demand_phi[i] <- 0.4
+    demand_base[i] <- mean(ts_i, na.rm = TRUE)
+  }
+}
+names(demand_phi) <- countries
+names(demand_base) <- countries
+phi_base <- data.frame(Region = countries, phi = round(demand_phi, 3), base = round(demand_base, 1))
+print(phi_base)
+
+# -----------------------------
+# 5) SAR-Q-Learning Initialization
+# -----------------------------
+n_actions <- 3
+n_episodes <- 300
+n_steps <- 20
+alpha <- 0.08
+gamma <- 0.96
+lambda_spatial <- 0.25
+consensus_tau <- 0.08
+epsilon_start <- 0.3
+epsilon_end <- 0.05
+
+Q <- matrix(0, nrow = n_regions, ncol = n_actions)
+states <- round(1.2 * demand_base)
+
+# Spatial adjacency matrix
+dist_mat <- as.matrix(dist(t(sales_mat)))
+W <- matrix(0, n_regions, n_regions)
+k_neigh <- pmin(3, n_regions - 1)
+for(i in 1:n_regions){
+  nbrs <- order(dist_mat[i, ])[2:(k_neigh+1)]
+  W[i, nbrs] <- 1
+}
+W <- W / rowSums(W)
+W[is.na(W)] <- 0
+
+demand_noise_sd <- apply(sales_mat, 2, sd)
+names(demand_noise_sd) <- countries
+
+cum_reward_by_region <- rep(0, n_regions)
+episode_rewards <- matrix(0, nrow = n_episodes, ncol = n_regions)
+action_counts <- matrix(0, nrow = n_actions, ncol = n_regions)
+
+reward_fn <- function(s, demand){
+  sales = pmin(s, demand)
+  revenue = 10 * sales
+  holding_cost = 0.05 * pmax(s - demand, 0)
+  shortage_cost = 0.4 * pmax(demand - s, 0)
+  return(revenue - holding_cost - shortage_cost)
+}
+next_state_fn <- function(s, a_vec, demand_forecast, rho = 0.35){
+  s <- as.numeric(s)
+  n <- length(s)
+  neighbor_influence <- as.numeric(rho * (W %*% matrix(s, ncol = 1)))
+  action_effect <- rep(0, n)
+  for (i in 1:n){
+    action_effect[i] <- switch(
+      as.character(a_vec[i]),
+      "0" = 0,
+      "1" = round(0.15 * demand_forecast[i]),
+      "2" = -round(0.15 * demand_forecast[i]),
+      0
+    )
+  }
+  noise <- rnorm(n, 0, pmax(1, 0.1 * demand_forecast))
+  s_next <- s + neighbor_influence - demand_forecast + action_effect + noise
+  s_next <- pmax(round(s_next), 0)
+  return(s_next)
+}
+
+# -----------------------------
+# 6) SAR-Q-Learning Simulation
+# -----------------------------
+demand_t <- as.numeric(demand_base)
+for(ep in 1:n_episodes){
+  s <- states
+  eps <- epsilon_start + (epsilon_end - epsilon_start) * (ep / n_episodes)
+  ep_rewards <- rep(0, n_regions)
+  alpha_ep <- alpha * (1 / (1 + 0.0005 * ep))
+  
+  for(t in 1:n_steps){
+    demand_forecast <- numeric(n_regions)
+    for(i in 1:n_regions){
+      demand_forecast[i] <- demand_t[i] * demand_phi[i] + (1 - demand_phi[i]) * demand_base[i]
+    }
+    actions <- integer(n_regions)
+    for(region in 1:n_regions){
+      if(runif(1) < eps){
+        a <- sample(0:(n_actions - 1), 1)
+      } else {
+        a <- which.max(Q[region, ]) - 1
+      }
+      actions[region] <- a
+      action_counts[a + 1, region] <- action_counts[a + 1, region] + 1
+    }
+    s_next <- next_state_fn(s, actions, demand_forecast)
+    realized_demand <- pmax(round(demand_forecast + rnorm(n_regions, 0, demand_noise_sd)), 0)
+    for(region in 1:n_regions){
+      r <- reward_fn(s_next[region], realized_demand[region])
+      ep_rewards[region] <- ep_rewards[region] + r
+      spatial_term <- lambda_spatial * sum(W[region, ] * Q[, actions[region] + 1])
+      Q[region, actions[region] + 1] <- Q[region, actions[region] + 1] +
+        alpha_ep * (r + gamma * max(Q[region, ]) + spatial_term - Q[region, actions[region] + 1])
+    }
+    # Consensus update
+    Q_new <- Q
+    for(region in 1:n_regions){
+      if(sum(W[region, ]) > 0){
+        neighbor_Q_mean <- colSums(matrix(W[region, ], nrow = n_regions, ncol = n_actions, byrow = FALSE) * Q) / sum(W[region, ])
+      } else {
+        neighbor_Q_mean <- rep(0, n_actions)
+      }
+      Q_new[region, ] <- (1 - consensus_tau) * Q[region, ] + consensus_tau * neighbor_Q_mean
+    }
+    Q <- Q_new
+    s <- s_next
+    demand_t <- realized_demand
+  }
+  episode_rewards[ep, ] <- ep_rewards
+  cum_reward_by_region <- cum_reward_by_region + ep_rewards
+  if(ep %% 50 == 0) cat(sprintf("Episode %d/%d — mean reward per region: %.1f\n", ep, n_episodes, mean(ep_rewards)))
+}
+
+# -----------------------------
+# 7) Forecast with Learned Policy
+# -----------------------------
+forecast_horizon <- 2
+s_current <- states
+demand_current <- as.numeric(demand_base)
+s_forecast <- matrix(0, nrow = forecast_horizon, ncol = n_regions)
+actions_forecast <- matrix(0, nrow = forecast_horizon, ncol = n_regions)
+for(t in 1:forecast_horizon){
+  actions_sel <- apply(Q, 1, which.max) - 1
+  demand_pred <- numeric(n_regions)
+  for(i in 1:n_regions){
+    demand_pred[i] <- demand_current[i] * demand_phi[i] + (1 - demand_phi[i]) * demand_base[i]
+  }
+  s_next <- next_state_fn(s_current, actions_sel, demand_pred)
+  s_forecast[t, ] <- s_next
+  actions_forecast[t, ] <- actions_sel
+  s_current <- s_next
+  demand_current <- demand_pred
+}
+
+# -----------------------------
+# 8) Summaries
+# -----------------------------
+policy_table <- data.frame(
+  Region = countries,
+  BestAction = apply(Q, 1, which.max) - 1,
+  ActionMeaning = c("0 = Do Nothing", "1 = Increase Shipment", "2 = Reduce Shipment")[apply(Q, 1, which.max)]
+)
+reward_summary <- data.frame(
+  Region = countries,
+  MeanReward = round(colMeans(episode_rewards), 2),
+  SDReward = round(apply(episode_rewards, 2, sd), 2),
+  CumulativeReward = round(cum_reward_by_region, 2)
+)
+forecast_summary <- data.frame(
+  Region = countries,
+  MeanForecastInventory = round(colMeans(s_forecast), 2),
+  SDForecastInventory = round(apply(s_forecast, 2, sd), 2),
+  FinalInventory = as.numeric(s_forecast[forecast_horizon, ])
+)
+combined_table <- policy_table %>%
+  dplyr::left_join(reward_summary, by = "Region") %>%
+  dplyr::left_join(forecast_summary, by = "Region") %>%
+  dplyr::select(Region, BestAction, ActionMeaning, MeanReward, SDReward, CumulativeReward,
+                MeanForecastInventory, SDForecastInventory, FinalInventory)
+print(combined_table)
+combined_table %>% knitr::kable(caption = "SAR-Q-Learning Supply Chain Results (real data)")
+
+# ============================================================
+# 9) PLOTS (all fixed with dplyr:: prefix)
+# ============================================================
+
+# 1) Weekly Sales
+ts_df <- weekly_sales %>%
+  dplyr::select(Country, WeekStart, WeeklySales) %>%
+  dplyr::filter(Country %in% countries)
+
+p_ts <- ggplot(ts_df, aes(x = WeekStart, y = WeeklySales)) +
+  geom_line(color = "steelblue") +
+  facet_wrap(~ Country, scales = "free_y", ncol = 2) +
+  labs(title = "Weekly Sales — Top Countries", x = "Week start", y = "Weekly Sales") +
+  theme_minimal(base_size = 12)
+print(p_ts)
+
+# 2) AR(1) Parameters
+p_phi <- ggplot(phi_base, aes(x = reorder(Region, phi), y = phi)) +
+  geom_col(fill = "skyblue") +
+  coord_flip() +
+  labs(title = "Estimated AR(1) phi by Region", x = "Region", y = "phi (AR1)") +
+  theme_minimal()
+print(p_phi)
+
+p_base <- ggplot(phi_base, aes(x = reorder(Region, base), y = base)) +
+  geom_col(fill = "tan") +
+  coord_flip() +
+  labs(title = "Historical Mean Weekly Demand (base)", x = "Region", y = "Mean weekly demand") +
+  theme_minimal()
+print(p_base)
+
+# 3) Training Progress
+ep_mean <- rowMeans(episode_rewards)
+ep_df <- data.frame(Episode = 1:length(ep_mean), MeanReward = ep_mean)
+p_ep <- ggplot(ep_df, aes(x = Episode, y = MeanReward)) +
+  geom_line(color = "darkred") +
+  geom_smooth(se = TRUE, span = 0.2) +
+  labs(title = "Training: Mean Reward per Episode", x = "Episode", y = "Mean reward") +
+  theme_minimal()
+print(p_ep)
+
+# 4) Forecasted Inventory Trajectories
+s_forecast_df <- as.data.frame(s_forecast)
+colnames(s_forecast_df) <- countries
+s_forecast_df$Week <- 1:nrow(s_forecast_df)
+s_long <- tidyr::pivot_longer(s_forecast_df, -Week, names_to = "Region", values_to = "Inventory")
+p_forecast <- ggplot(s_long, aes(x = Week, y = Inventory, color = Region)) +
+  geom_line() + geom_point(size = 0.8) +
+  labs(title = sprintf("Forecasted Inventory over %d Weeks", forecast_horizon),
+       x = "Week (forecast horizon)", y = "Inventory level") +
+  theme_minimal() +
+  theme(legend.position = "right")
+print(p_forecast)
+
+# -----------------------------
+# 5) Enhanced Mean Reward vs Final Inventory (final clean version)
+# -----------------------------
+library(ggrepel)
+
+last_week <- max(s_forecast_df$Week)
+
+comb_vis <- combined_table %>%
+  dplyr::mutate(
+    BestAction = factor(
+      BestAction,
+      levels = c("DoNothing", "Increase", "Reduce"),
+      ordered = TRUE
+    )
+  )
+
+p_comb <- ggplot(comb_vis, aes(
+  x = MeanReward,
+  y = FinalInventory,
+  color = BestAction
+)) +
+  geom_point(size = 4, alpha = 0.8) +
+  # ✅ FIX: explicitly give x and y inside geom_smooth + re-enable inherit.aes = TRUE
+  geom_smooth(
+    aes(x = MeanReward, y = FinalInventory, group = 1),
+    method = "lm",
+    se = FALSE,
+    color = "gray40",
+    linetype = "dashed",
+    linewidth = 0.6
+  ) +
+  ggrepel::geom_text_repel(
+    aes(label = Region),
+    size = 4,
+    max.overlaps = Inf,
+    box.padding = 0.3,
+    segment.color = "gray70",
+    segment.size = 0.3
+  ) +
+  scale_color_manual(
+    values = c("DoNothing" = "#1B9E77",
+               "Increase" = "#D95F02",
+               "Reduce"   = "#7570B3")
+  ) +
+  labs(
+    title = "Policy Outcome: Mean Reward vs Final Inventory",
+    subtitle = sprintf("Across regions (final week = %d)", last_week),
+    x = "Mean reward (per region)",
+    y = sprintf("Final inventory (week %d)", last_week),
+    color = "Best Action"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", size = 15),
+    plot.subtitle = element_text(size = 12, color = "gray40"),
+    legend.position = "top",
+    panel.grid.minor = element_blank()
+  )
+
+print(p_comb)

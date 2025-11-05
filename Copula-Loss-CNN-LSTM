@@ -467,6 +467,134 @@ p_combined_box <- ggplot(combined_residuals_long, aes(x = Loss, y = Residual, fi
 
 print(p_combined_box)
 
+##### Model fitting for CGD data with cluster embeddings #####
+library(JM)
+library(dplyr)
+library(tensorflow)
+library(keras)
+
+data("cgd")  # Load CGD dataset
+
+# --- 1️⃣ Prepare time, event, and covariates ---
+time <- cgd$tstop - cgd$tstart
+event <- cgd$status
+treat <- as.integer(cgd$treat) - 1
+sex <- as.integer(cgd$sex) - 1
+
+X <- model.matrix(~0 + treat + sex)       # design matrix
+p <- ncol(X)                               # number of covariates
+n <- nrow(X)                               # total sample size
+q <- length(unique(cgd$id))                # number of clusters
+id_numeric <- as.integer(factor(cgd$id)) - 1  # 0-indexed cluster IDs
+
+# --- 2️⃣ Prepare numeric features for CNN-LSTM ---
+timesteps <- 1
+x_numeric_df <- as.data.frame(X)
+x_array <- array(as.matrix(x_numeric_df), dim=c(n, timesteps, p))
+x_scaled <- (x_array - mean(x_array, na.rm=TRUE)) / sd(x_array, na.rm=TRUE)
+
+# --- 3️⃣ Prepare cluster embeddings ---
+embedding_dim <- min(10, ceiling(q/2))  # embedding dimension
+id_input <- layer_input(shape = 1, dtype = "int32", name = "id_input")
+id_embed <- id_input %>%
+  layer_embedding(input_dim = q, output_dim = embedding_dim, input_length = 1) %>%
+  layer_flatten()
+
+# --- 4️⃣ Prepare response variables (multivariate survival) ---
+y_data_df <- data.frame(Y1=time, Y2=event, S=time)
+u_data_df <- as.data.frame(lapply(y_data_df, function(x) rank(x)/(length(x)+1)))
+y_numeric <- as.matrix(sapply(u_data_df, qnorm))
+
+# --- 5️⃣ Updated CNN-LSTM model builder with cluster embeddings ---
+create_cnn_lstm_with_cluster <- function(type=c("clayton","gumbel","hybrid","relu","sigmoid"), 
+                                         input_features, timesteps, n_clusters, embed_dim) {
+  type <- match.arg(type)
+  
+  # Feature input
+  feature_input <- layer_input(shape = c(timesteps, input_features), name="feature_input")
+  x <- feature_input %>%
+    layer_conv_1d(filters = 32, kernel_size = min(3, timesteps), activation = "relu", padding="same")
+  if(timesteps > 1) x <- x %>% layer_max_pooling_1d(pool_size = 2)
+  x <- x %>% layer_lstm(units = 64, return_sequences = FALSE) %>% layer_dropout(0.3)
+  
+  # Cluster embedding input
+  id_input <- layer_input(shape = 1, dtype = "int32", name="id_input")
+  id_embed <- id_input %>%
+    layer_embedding(input_dim = n_clusters, output_dim = embed_dim, input_length = 1) %>%
+    layer_flatten()
+  
+  # Concatenate feature representation + cluster embedding
+  concat <- layer_concatenate(list(x, id_embed))
+  
+  if(type=="clayton") concat <- concat %>% LearnableClaytonActivation()
+  if(type=="gumbel") concat <- concat %>% LearnableGumbelActivation()
+  if(type=="hybrid") concat <- concat %>% LearnableClaytonGumbelHybrid()
+  if(type=="relu") concat <- concat %>% layer_activation("relu")
+  if(type=="sigmoid") concat <- concat %>% layer_activation("sigmoid")
+  
+  output <- concat %>% layer_dense(units = 3, activation="linear")
+  
+  model <- keras_model(inputs = list(feature_input, id_input), outputs = output)
+  return(model)
+}
+
+# --- 6️⃣ Train and Evaluate Function for Cluster Model ---
+train_and_evaluate_cluster <- function(x_scaled, id_numeric, y_numeric, timesteps, features,
+                                       n_clusters, embed_dim, model_types, model_names, loss_types) {
+  
+  all_results <- list()
+  all_residuals <- list()
+  
+  for(i in seq_along(model_types)) {
+    for(loss in loss_types) {
+      k_clear_session()
+      cat("Training", model_names[i], "with", loss, "loss\n")
+      
+      m <- create_cnn_lstm_with_cluster(model_types[i], features, timesteps, n_clusters, embed_dim)
+      
+      # Select loss
+      current_loss_fn <- switch(loss,
+                                "mse" = "mse",
+                                "gauss_copula" = copula_gaussian_loss,
+                                "clayton_copula" = copula_clayton_loss,
+                                "gumbel_copula" = copula_gumbel_loss)
+      
+      m %>% compile(optimizer = "adam", loss = current_loss_fn, metrics = "mae")
+      
+      m %>% fit(
+        list(feature_input = x_scaled, id_input = array(id_numeric, dim=c(length(id_numeric),1))),
+        y_numeric,
+        epochs = 10, batch_size = 32, verbose=0, validation_split=0.2
+      )
+      
+      # Predictions & residuals
+      preds <- m %>% predict(list(feature_input = x_scaled, id_input = array(id_numeric, dim=c(length(id_numeric),1))))
+      residuals <- y_numeric - preds
+      res_df <- data.frame(Model=model_names[i], Loss=loss,
+                           ResidualY1=residuals[,1], ResidualY2=residuals[,2], ResidualS=residuals[,3])
+      all_residuals[[paste0(model_names[i],"_",loss)]] <- res_df
+      
+      all_results[[paste0(model_names[i],"_",loss)]] <- data.frame(
+        Model=model_names[i], Loss=loss,
+        MeanResidual1 = mean(residuals[,1]), SDResidual1 = sd(residuals[,1]),
+        MeanResidual2 = mean(residuals[,2]), SDResidual2 = sd(residuals[,2]),
+        MeanResidualS = mean(residuals[,3]), SDResidualS = sd(residuals[,3])
+      )
+    }
+  }
+  
+  results_df <- do.call(rbind, all_results)
+  residuals_df <- do.call(rbind, all_residuals)
+  
+  return(list(results=results_df, residuals=residuals_df))
+}
+
+# --- 7️⃣ Train on CGD data ---
+cgd_results <- train_and_evaluate_cluster(
+  x_scaled, id_numeric, y_numeric, timesteps, p, n_clusters=q, embed_dim=embedding_dim,
+  model_types, model_names, loss_types
+)
+
 # =======================================================================
 # PART 4: CGD DATA RESIDUAL VISUALIZATION (Corrected)
 # =======================================================================
@@ -477,9 +605,6 @@ library(tidyr)
 library(viridis)
 library(kableExtra)
 
-# Note: This code assumes sim_residuals_long, real_residuals_long, and 
-#       cgd_results (used to create cgd_residuals_long) have been successfully 
-#       created by running the previous parts of the combined script.
 
 # 1️⃣ Transform CGD residuals into long format for plotting
 cgd_residuals_long <- cgd_results$residuals %>%
@@ -546,95 +671,11 @@ p_combined_box <- ggplot(combined_residuals_long, aes(x = Loss, y = Residual, fi
 
 print(p_combined_box)
 
-
-# =======================================================================
-# PART 5: SIMULATED CGD-LIKE DATA
-# =======================================================================
-
-set.seed(123)
-
-# 1️⃣ Simulation parameters
-n_clusters <- 50      # number of subjects/clusters
-obs_per_cluster <- 5  # repeated measures per cluster
-p_cov <- 2            # number of covariates
-timesteps <- 1        # for CNN input
-
-# Total sample size
-n <- n_clusters * obs_per_cluster
-
-# 2️⃣ Covariates
-treat <- rbinom(n, 1, 0.5)       # treatment assignment
-sex   <- rbinom(n, 1, 0.5)       # sex
-X <- cbind(treat, sex)           # covariate matrix
-q <- n_clusters                   # number of clusters
-
-# 3️⃣ Cluster IDs
-cluster_id <- rep(1:n_clusters, each = obs_per_cluster)
-
-# 4️⃣ Random effects for cluster
-b0 <- rnorm(n_clusters, 0, 0.5)
-cluster_effect <- b0[cluster_id]
-
-# 5️⃣ Simulate survival times
-baseline_hazard <- 0.1
-lambda <- exp(0.3*treat - 0.2*sex + cluster_effect)
-time <- -log(runif(n)) / lambda
-
-# 6️⃣ Simulate censoring
-censor_time <- runif(n, 0, 10)
-observed_time <- pmin(time, censor_time)
-event <- as.numeric(time <= censor_time)
-
-# 7️⃣ Simulate continuous outcomes Y1 and Y2
-Y1 <- 0.5*treat + 0.3*sex + cluster_effect + rnorm(n,0,0.3)
-Y2 <- -0.4*treat + 0.2*sex + 0.5*cluster_effect + rnorm(n,0,0.4)
-S  <- observed_time
-
-# 8️⃣ Create feature array for CNN-LSTM
-x_df <- data.frame(treat, sex)
-x_array <- array(as.matrix(x_df), dim=c(n, timesteps, ncol(x_df)))
-x_scaled <- (x_array - mean(x_array)) / sd(x_array)
-
-# 9️⃣ Prepare Y matrix and Copula transform
-y_data_df <- data.frame(Y1=Y1, Y2=Y2, S=S)
-u_data_df <- as.data.frame(lapply(y_data_df, function(x) rank(x)/(length(x)+1)))
-y_numeric <- as.matrix(as.data.frame(sapply(u_data_df, qnorm)))
-
-# 10️⃣ Train and evaluate
-sim_cgd_results <- train_and_evaluate(
-  x_scaled, y_numeric, timesteps, ncol(x_scaled),
-  model_types, model_names, loss_types
-)
-
-# 11️⃣ Residuals long format for plotting
-sim_cgd_residuals_long <- sim_cgd_results$residuals %>%
-  pivot_longer(cols = c(ResidualY1, ResidualY2, ResidualS),
-               names_to = "Outcome", values_to = "Residual") %>%
-  mutate(
-    Outcome = gsub("ResidualY1", "Y1", Outcome),
-    Outcome = gsub("ResidualY2", "Y2", Outcome),
-    Outcome = gsub("ResidualS", "Survival", Outcome),
-    Dataset = "SimCGD"
-  )
-
-# 12️⃣ Plot residuals
-ggplot(sim_cgd_residuals_long, aes(x=Residual, fill=Loss)) +
-  geom_density(alpha=0.55, adjust=1.2) +
-  geom_vline(xintercept=0, linetype="dashed", color="black") +
-  facet_grid(Model ~ Outcome, scales="free") +
-  theme_minimal(base_size=10) +
-  scale_fill_viridis_d(option="C", end=0.8) +
-  labs(title="Simulated CGD-like Data: Residual Density",
-       x="Residual", y="Density", fill="Loss Function") +
-  theme(plot.title=element_text(face="bold", size=12),
-        legend.position="bottom")
-
 # Combine all residuals with dataset labels
 all_residuals_long <- bind_rows(
   sim_residuals_long,
   real_residuals_long,
-  cgd_residuals_long,
-  sim_cgd_residuals_long
+  cgd_residuals_long
 )
 
 # Function to create individual residual density plots per outcome per dataset
@@ -689,11 +730,6 @@ print(individual_residual_plots[["CGD_Time"]])
 print(individual_residual_plots[["CGD_Event"]])
 print(individual_residual_plots[["CGD_Survival"]])
 
-# Example: Display plots for SimCGD dataset
-print(individual_residual_plots[["SimCGD_Y1"]])
-print(individual_residual_plots[["SimCGD_Y2"]])
-print(individual_residual_plots[["SimCGD_Survival"]])
-
 library(dplyr)
 library(kableExtra)
 
@@ -740,4 +776,3 @@ for (ds in datasets) {
     }
   }
 }
-

@@ -737,8 +737,7 @@ library(kableExtra)
 all_residuals_long <- bind_rows(
   sim_residuals_long,
   real_residuals_long,
-  cgd_residuals_long,
-  sim_cgd_residuals_long
+  cgd_residuals_long
 )
 
 # Function to summarize residuals per outcome

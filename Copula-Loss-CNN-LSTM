@@ -279,7 +279,6 @@ y_continuous <- data.frame(
   Y2 = rnorm(n, mean = 1, sd = 2)
 )
 
-# Survival Data (Competing Risks)
 beta_norm <- rnorm(n_features, mean = 0, sd = 1)
 beta_unif <- runif(n_samples, min = -1, max = 1)
 

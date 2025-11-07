@@ -16,11 +16,14 @@ library(kableExtra)
 library(viridis)
 library(JM) # For pbc2.id data in the real data section
 set.seed(123)
+# Prevent TensorFlow from using too much memory on some systems
+# tf$compat$v1$disable_eager_execution()
+# tf$compat$v1$set_random_seed(123)
 
-# --- Helper function: Transform N(0,1) predictions to U(0,1) ---
 to_uniform_tf <- function(x) {
-  # Standard normal CDF (Phi) approximation using the error function (erf)
-  u <- 0.5 * (1 + tf$math$erf(tf$cast(x, tf$float32) / tf$math$sqrt(2.0)))
+  # Applies the standard Sigmoid function to transform unconstrained inputs to (0, 1)
+  u <- tf$math$sigmoid(tf$cast(x, tf$float32))
+  
   # Clip to (0, 1) for copula stability
   tf$clip_by_value(u, 1e-6, 1 - 1e-6)
 }

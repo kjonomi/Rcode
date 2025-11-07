@@ -16,9 +16,6 @@ library(kableExtra)
 library(viridis)
 library(JM) # For pbc2.id data in the real data section
 set.seed(123)
-# Prevent TensorFlow from using too much memory on some systems
-# tf$compat$v1$disable_eager_execution()
-# tf$compat$v1$set_random_seed(123)
 
 to_uniform_tf <- function(x) {
   # Applies the standard Sigmoid function to transform unconstrained inputs to (0, 1)

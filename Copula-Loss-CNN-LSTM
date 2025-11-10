@@ -1,6 +1,5 @@
 # ==============================================================================
 # Full R Code: CNN-LSTM with Copula NLL Losses and MSE Loss for Joint Modeling
-# (ReLU and Sigmoid activations remain removed)
 # ==============================================================================
 
 # 0️⃣ Library Setup and Configuration

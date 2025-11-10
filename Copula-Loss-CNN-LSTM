@@ -1,9 +1,12 @@
 # ==============================================================================
-# Full R Code: CNN-LSTM with Copula NLL Losses and MSE Loss for Joint Modeling
+# Full R Code: CNN-LSTM with All Copula NLL Losses (Final Corrected Version)
+# - tfprobability removed
+# - tf$math$erf_inv changed to tf$math$erfinv
+# - Conv1D padding="same" added for Timestep=1 data (CGD fix)
 # ==============================================================================
 
-# 0️⃣ Library Setup and Configuration
-# ================================
+# 0️⃣ Library Setup
+# ==============================================================================
 library(keras)
 library(keras3)
 library(tensorflow)
@@ -14,50 +17,56 @@ library(copula)
 library(gridExtra)
 library(kableExtra)
 library(viridis)
-library(JM) # For pbc2.id data in the real data section
+library(JM) # For pbc2.id and cgd datasets
 set.seed(123)
 
-to_uniform_tf <- function(x) {
-  # Applies the standard Sigmoid function to transform unconstrained inputs to (0, 1)
-  u <- tf$math$sigmoid(tf$cast(x, tf$float32))
+# ==============================================================================
+# Utility Functions
+# ==============================================================================
 
-  # Clip to (0, 1) for copula stability
+# Uniform transform (sigmoid + clipping)
+to_uniform_tf <- function(x) {
+  u <- tf$math$sigmoid(tf$cast(x, tf$float32))
   tf$clip_by_value(u, 1e-6, 1 - 1e-6)
 }
 
-# --- Shared Copula Loss Functions (3D: Y1, Y2, S) ---
+# Gaussian CDF to Z-space (CRITICAL FIX: using tf$math$erfinv)
+u_to_z <- function(u) {
+  u_clipped <- tf$clip_by_value(u, 1e-6, 1 - 1e-6)
+  tf$math$sqrt(2.0) * tf$math$erfinv(2.0 * u_clipped - 1.0)
+}
 
-copula_gaussian_loss <- function(y_true, y_pred) {
-  y_true <- tf$cast(y_true, tf$float32)
-  y_pred <- tf$cast(y_pred, tf$float32)
-
-  # The Gaussian copula NLL is equivalent to the NLL of a multivariate normal distribution
-  # of the *predictions* (which are the pseudo-observations in N(0,1) space).
-  phi_centered <- y_pred - tf$reduce_mean(y_pred, axis = as.integer(0L), keepdims = TRUE)
-  n_samples <- tf$cast(tf$shape(phi_centered)[1], tf$float32)
-
-  # Covariance matrix calculation (unbiased estimate)
-  cov_mat <- tf$matmul(tf$transpose(phi_centered), phi_centered) / (n_samples - 1.0)
-  epsilon <- 1e-6
-  cov_mat_stable <- cov_mat + epsilon * tf$eye(tf$shape(cov_mat)[1])
-
-  # Inverse and Determinant
-  inv_cov <- tf$linalg$inv(cov_mat_stable)
-  det_cov <- tf$linalg$det(cov_mat_stable)
-
-  # Quadratic term (y' * inv_cov * y)
-  quad_term <- tf$reduce_sum(tf$matmul(y_true, inv_cov) * y_true, axis = as.integer(1L))
-  log_det_term <- tf$math$log(det_cov + epsilon)
-
-  # NLL = 0.5 * (log(det) + y' * inv_cov * y + d*log(2*pi)) (ignoring constant for optimization)
-  nll <- 0.5 * (log_det_term + quad_term)
-  tf$reduce_mean(nll, axis = as.integer(0L))
+# Gaussian Copula Density (Log, 3D)
+log_gaussian_copula_density <- function(u, R) {
+  z <- u_to_z(u)
+  eps <- 1e-6
+  invR <- tf$linalg$inv(R + eps * tf$eye(3L))
+  diff_mat <- invR - tf$eye(3L)
+  z_col <- tf$reshape(z, tf$stack(list(tf$shape(z)[1], tf$shape(z)[2], 1L)))
+  quad <- tf$matmul(tf$matmul(tf$transpose(z_col, perm = c(0L, 2L, 1L)), diff_mat), z_col)
+  quad_term <- tf$reshape(quad, tf$stack(list(tf$shape(z)[1])))
+  detR <- tf$linalg$det(R + eps * tf$eye(3L))
+  -0.5 * quad_term - 0.5 * tf$math$log(detR + eps)
 }
 
 
-# ---- Clayton Copula (corrected log(1+θ)+log(1+2θ)) ----
+# ==============================================================================
+# Copula Loss Functions (3D)
+# ==============================================================================
+
+# 1️⃣ Gaussian Copula NLL (TF-Native 3D)
+copula_gaussian_loss <- function(y_true, y_pred) {
+  y_pred <- tf$cast(y_pred, tf$float32)
+  R_matrix <- tf$constant(diag(3) + 1e-6, dtype = tf$float32) 
+  R <- tf$cast(R_matrix, tf$float32)
+  u_pred <- to_uniform_tf(y_pred)
+  log_c_density <- log_gaussian_copula_density(u_pred, R)
+  nll <- -log_c_density
+  tf$reduce_mean(nll)
+}
+
+# 2️⃣ Clayton Copula NLL Loss (3D)
 copula_clayton_loss <- function(y_true, y_pred, theta_init = 1.5) {
-  y_true <- tf$cast(y_true, tf$float32)
   y_pred <- tf$cast(y_pred, tf$float32)
   theta <- tf$maximum(tf$cast(theta_init, tf$float32), 0.01)
 
@@ -73,626 +82,264 @@ copula_clayton_loss <- function(y_true, y_pred, theta_init = 1.5) {
   tf$reduce_mean(nll)
 }
 
-# ---- Gumbel Copula ----
+# 3️⃣ Gumbel Copula NLL Loss (3D)
 copula_gumbel_loss <- function(y_true, y_pred, theta_init = 2.0) {
-  y_true <- tf$cast(y_true, tf$float32)
   y_pred <- tf$cast(y_pred, tf$float32)
   theta <- tf$maximum(tf$cast(theta_init, tf$float32), 1.001)
-
   u_pred <- to_uniform_tf(y_pred)
+  
   log_u <- -tf$math$log(u_pred)
   phi_u <- tf$math$pow(log_u, theta)
   sum_phi_u <- tf$reduce_sum(phi_u, axis = 1L)
-
-  # Simplified form, but more complete term retained:
-  log_deriv <- tf$math$log(sum_phi_u) * (1 / theta - 3)
-  log_remaining <- (3 - 1 / theta) * tf$math$log(sum_phi_u) +
-    tf$reduce_sum((theta - 1) * tf$math$log(log_u) - theta * tf$math$log(u_pred), axis = 1L)
-
-  log_C_density <- log_deriv + log_remaining
-  nll <- -log_C_density
+  
+  term1 <- -tf$math$pow(sum_phi_u, 1 / theta)
+  term2 <- (1 / theta - 3) * tf$math$log(sum_phi_u + 1e-6)
+  term3 <- tf$reduce_sum((theta - 1) * tf$math$log(log_u + 1e-6) - tf$math$log(u_pred + 1e-6), axis = 1L)
+  
+  inner_sum1 <- tf$math$pow(sum_phi_u, 2 / theta)
+  inner_sum2 <- 3 * (theta - 1) * tf$math$pow(sum_phi_u, 1 / theta)
+  inner_sum3 <- (2 * theta^2 - 3 * theta + 1)
+  term4 <- tf$math$log(inner_sum1 + inner_sum2 + inner_sum3 + 1e-6)
+  
+  log_c_density <- term1 + term2 + term3 + term4
+  nll <- -log_c_density
   tf$reduce_mean(nll)
 }
 
-# ---- Hybrid Clayton-Gumbel ----
-copula_hybrid_loss <- function(y_true, y_pred, theta_clayton = 1.2, theta_gumbel = 2.0, alpha = 0.5) {
+# 4️⃣ Hybrid Clayton–Gumbel Loss (3D)
+copula_hybrid_loss <- function(y_true, y_pred,
+                               theta_clayton = 1.2,
+                               theta_gumbel = 2.0,
+                               alpha = 0.5) {
   loss_c <- copula_clayton_loss(y_true, y_pred, theta_clayton)
   loss_g <- copula_gumbel_loss(y_true, y_pred, theta_gumbel)
   tf$reduce_mean(alpha * loss_c + (1 - alpha) * loss_g)
 }
 
-
-# --- Custom Keras Layers (Placeholders for Copula Activations) ---
+# --- Custom Keras Layers (Placeholders) ---
 LearnableClaytonActivation <- new_layer_class(
-  classname = "LearnableClaytonActivation",
-  initialize = function(self, theta_init = 1.0) {
-    super$initialize()
-    self$theta <- self$add_weight(shape = list(), initializer = initializer_constant(theta_init), trainable = TRUE, name = "theta")
-  },
-  call = function(self, inputs) {
-    # The actual copula transformation is *not* the activation,
-    # so we use identity for the output layer's input.
-    tf$identity(inputs)
-  }
+  classname="LearnableClaytonActivation",
+  initialize=function(self, theta_init=1.0) { super$initialize(); self$theta <- self$add_weight(shape=list(), initializer=initializer_constant(theta_init), trainable=TRUE, name="theta") },
+  call=function(self, inputs) { tf$identity(inputs) }
 )
-
 LearnableGumbelActivation <- new_layer_class(
-  classname = "LearnableGumbelActivation",
-  initialize = function(self, theta_init = 2.0) {
-    super$initialize()
-    self$theta <- self$add_weight(shape = list(), initializer = initializer_constant(theta_init), trainable = TRUE, name = "theta")
-  },
-  call = function(self, inputs) { tf$identity(inputs) }
+  classname="LearnableGumbelActivation",
+  initialize=function(self, theta_init=2.0) { super$initialize(); self$theta <- self$add_weight(shape=list(), initializer=initializer_constant(theta_init), trainable=TRUE, name="theta") },
+  call=function(self, inputs) { tf$identity(inputs) }
 )
-
 LearnableClaytonGumbelHybrid <- new_layer_class(
-  classname = "LearnableClaytonGumbelHybrid",
-  initialize = function(self, theta_c_init = 1.0, theta_g_init = 2.0, alpha_init = 0.5) {
-    super$initialize()
-    self$theta_c <- self$add_weight(shape = list(), initializer = initializer_constant(theta_c_init), trainable = TRUE, name = "theta_c")
-    self$theta_g <- self$add_weight(shape = list(), initializer = initializer_constant(theta_g_init), trainable = TRUE, name = "theta_g")
-    self$alpha <- self$add_weight(shape = list(), initializer = initializer_constant(alpha_init), trainable = TRUE, name = "alpha")
+  classname="LearnableClaytonGumbelHybrid",
+  initialize=function(self, theta_c_init=1.0, theta_g_init=2.0, alpha_init=0.5) {
+    super$initialize(); self$theta_c <- self$add_weight(shape=list(), initializer=initializer_constant(theta_c_init), trainable=TRUE, name="theta_c")
+    self$theta_g <- self$add_weight(shape=list(), initializer=initializer_constant(theta_g_init), trainable=TRUE, name="theta_g")
+    self$alpha <- self$add_weight(shape=list(), initializer=initializer_constant(alpha_init), trainable=TRUE, name="alpha")
   },
-  call = function(self, inputs) { tf$identity(inputs) }
+  call=function(self, inputs) { tf$identity(inputs) }
 )
 
-# --- CNN-LSTM Model Builder (Restored for all copula types) ---
+
+# ==============================================================================
+# CNN-LSTM Model Builder & Trainer
+# ==============================================================================
+
 create_cnn_lstm <- function(type = c("clayton", "gumbel", "hybrid"), input_features) {
   type <- match.arg(type)
+  
+  # Determine current timesteps dynamically for Conv1D/Pooling logic
+  # Checks the environment where 'train_and_evaluate' is called (or its caller)
+  current_timesteps <- if(exists("timesteps_cgd", envir = parent.frame(2))) {
+    get("timesteps_cgd", envir = parent.frame(2))
+  } else if (exists("timesteps", envir = parent.frame(2))) {
+    get("timesteps", envir = parent.frame(2))
+  } else {
+    10 # Default fallback
+  }
 
   model <- keras_model_sequential() %>%
-    layer_conv_1d(filters = 32, kernel_size = 3, activation = "relu",
-                  input_shape = c(timesteps, input_features)) %>%
-    layer_max_pooling_1d(pool_size = 2) %>%
+    layer_conv_1d(
+      filters = 32, 
+      kernel_size = 3, 
+      activation = "relu",
+      # CRITICAL FIX for Timestep=1: Use padding="same"
+      padding = "same", 
+      input_shape = c(current_timesteps, input_features)
+    )
+  
+  # Conditional Max Pooling: Skip if timesteps=1
+  if (current_timesteps > 1) {
+    model <- model %>% layer_max_pooling_1d(pool_size = 2)
+  }
+  
+  model <- model %>%
     layer_lstm(units = 64, return_sequences = FALSE) %>%
     layer_dropout(0.3)
 
-  # Add the appropriate custom layer (only for copula types)
   if (type == "clayton") model <- model %>% LearnableClaytonActivation()
   if (type == "gumbel") model <- model %>% LearnableGumbelActivation()
   if (type == "hybrid") model <- model %>% LearnableClaytonGumbelHybrid()
 
-  # Final linear layer for 3 N(0,1) outcomes (Y1, Y2, S)
-  model %>% layer_dense(units = 3, activation = "linear")
+  model %>% layer_dense(units = 3, activation = "linear") # Output 3 N(0,1) variables
 }
 
-# --- Shared Training Function ---
 train_and_evaluate <- function(x_scaled, y_numeric, timesteps, features, model_types, model_names, loss_types) {
-
-  all_results <- list()
-  all_residuals <- list()
+  all_results <- list(); all_residuals <- list()
 
   for (i in seq_along(model_types)) {
     for (loss in loss_types) {
       k_clear_session()
       cat("Training", model_names[i], "with", loss, "loss\n")
-
-      # Use the appropriate model type
+      # NOTE: timesteps and features are passed but model finds them in the parent env
       m <- create_cnn_lstm(model_types[i], input_features = dim(x_scaled)[3])
 
-      # Select the appropriate loss function
       current_loss_fn <- switch(
         loss,
-        "mse" = "mse",
-        "gauss_copula" = copula_gaussian_loss,
-        "clayton_copula" = copula_clayton_loss,
-        "gumbel_copula" = copula_gumbel_loss
+        "copula_gaussian_loss" = copula_gaussian_loss,
+        "copula_clayton_loss" = copula_clayton_loss,
+        "copula_gumbel_loss" = copula_gumbel_loss,
+        "copula_hybrid_loss" = copula_hybrid_loss
       )
+      
+      if(is.null(current_loss_fn)) { next }
 
-      m %>% compile(
-        optimizer = "adam",
-        loss = current_loss_fn,
-        metrics = "mae"
-      )
+      m %>% compile(optimizer = "adam", loss = current_loss_fn, metrics = "mae")
 
-      # Train the model
-      m %>% fit(
-        x_scaled, y_numeric,
-        epochs = 10, batch_size = 32, verbose = 0, validation_split = 0.2
-      )
+      m %>% fit(x_scaled, y_numeric, epochs = 10, batch_size = 32, verbose = 0, validation_split = 0.2)
 
-      # Predict and calculate residuals
       preds <- m %>% predict(x_scaled)
       residuals <- y_numeric - preds
+      if(ncol(residuals) < 3) residuals <- cbind(residuals, NA) 
 
-      res_df <- data.frame(
-        Model = model_names[i], Loss = loss,
-        ResidualY1 = residuals[,1], ResidualY2 = residuals[,2], ResidualS = residuals[,3]
-      )
+      res_df <- data.frame(Model = model_names[i], Loss = loss, ResidualY1 = residuals[,1], ResidualY2 = residuals[,2], ResidualS = residuals[,3])
       all_residuals[[paste0(model_names[i], "_", loss)]] <- res_df
 
       all_results[[paste0(model_names[i], "_", loss)]] <- data.frame(
-        Model = model_names[i], Loss = loss,
-        MeanResidual1 = mean(residuals[,1]), SDResidual1 = sd(residuals[,1]),
+        Model = model_names[i], Loss = loss, MeanResidual1 = mean(residuals[,1]), SDResidual1 = sd(residuals[,1]),
         MeanResidual2 = mean(residuals[,2]), SDResidual2 = sd(residuals[,2]),
         MeanResidualS = mean(residuals[,3]), SDResidualS = sd(residuals[,3])
       )
     }
   }
-
-  results_df <- do.call(rbind, all_results)
-  residuals_df <- do.call(rbind, all_residuals)
-
-  return(list(results = results_df, residuals = residuals_df))
+  return(list(results = do.call(rbind, all_results), residuals = do.call(rbind, all_residuals)))
 }
 
 
 # ==============================================================================
-# PART 1: SIMULATION STUDY
+# PART 1: SIMULATION STUDY (3-Outcome)
 # ==============================================================================
 
 cat("================================\n")
 cat("SIMULATION STUDY\n")
 cat("================================\n")
-# ========================================================================
 
-# --- Load libraries ---
-library(copula)
-library(dplyr)
-library(tidyr)
-library(ggplot2)
-library(kableExtra)
-library(viridis)
+n <- 500; timesteps <- 10; features <- 30
+x_data_array <- array(runif(n*timesteps*features), dim=c(n,timesteps,features))
+x_scaled <- (x_data_array - mean(x_data_array)) / sd(x_data_array)
 
-cat("================================\n")
-cat("SIMULATION STUDY\n")
-cat("================================\n")
+# Simulate Y1, Y2, and survival S (Latent variables)
+beta_Y1 <- rnorm(features); beta_Y2 <- rnorm(features)
+rbf_kernel <- function(x_mat) apply(x_mat,1,mean)
+x_data_matrix <- apply(x_data_array, c(1,3), mean)
+Y1 <- as.numeric(x_data_matrix %*% beta_Y1 + 2*rbf_kernel(x_data_matrix) + rnorm(n,0,0.1))
+Y2 <- as.numeric(x_data_matrix %*% beta_Y2 + 1.5*rbf_kernel(x_data_matrix) + rnorm(n,0,0.1))
+S_latent <- -log(runif(n)) / (exp(Y1 + Y2)) # S_latent is the third outcome
 
-# ========================================================================
-# 1️⃣ Simulation Settings
-# ========================================================================
-set.seed(123)
+# For the model, we use the continuous variables directly transformed to N(0,1)
+y_numeric <- as.matrix(sapply(data.frame(Y1, Y2, S=S_latent), function(x) qnorm(rank(x)/(length(x)+1))))
 
-n <- 500       # number of samples
-timesteps <- 10 # sequence length
-features <- 30  # number of features per timestep
-
-n_samples  <- n
-n_features <- features
-
-# Helper function: simplified RBF kernel
-rbf_kernel <- function(x_matrix, gamma = 1) {
-  apply(x_matrix, 1, mean) # non-linear covariate per sample
-}
-
-# ========================================================================
-# 2️⃣ Generate Covariates (Input)
-# ========================================================================
-x_data_array <- array(runif(n * timesteps * features, min = 0, max = 1),
-                      dim = c(n, timesteps, features))
-
-x_data_matrix <- apply(x_data_array, c(1, 3), mean) # n x features
-
-# ========================================================================
-# 3️⃣ Generate Continuous Outcomes and Survival Time
-# ========================================================================
-# Continuous outcomes Y1 and Y2
-y_continuous <- data.frame(
-  Y1 = rnorm(n, mean = 0, sd = 1),
-  Y2 = rnorm(n, mean = 1, sd = 2)
-)
-
-beta_norm <- rnorm(n_features, mean = 0, sd = 1)
-beta_unif <- runif(n_samples, min = -1, max = 1)
-
-lin_part <- x_data_matrix %*% beta_norm
-rbf_output <- rbf_kernel(x_data_matrix)
-rbf_part <- rbf_output * beta_unif # elementwise
-
-eta <- exp(cbind(rbf_part, lin_part))
-
-b <- 1 / c(0.5, 2)  # baseline scale parameters
-haz <- sweep(eta, 2, b, "/")
-allhaz <- rowSums(haz)
-
-# Latent survival time
-S <- -log(runif(n_samples)) / allhaz
-
-# Event type assignment
-epsilon <- rbinom(n_samples, 1, haz[,1] / allhaz) + 1
-
-# Censoring time (widened)
-tau <- seq(2, 10, length = 50)
-CensorTime <- runif(n_samples, min(tau), max(tau))
-
-# Event indicator
-Event <- as.numeric(S <= CensorTime) * epsilon
-ObservedTime <- pmin(S, CensorTime)
-
-# ========================================================================
-# 4️⃣ Final Output Data Structures
-# ========================================================================
-x_data <- x_data_array
-
-# Include observed survival for modeling
-y_data_df <- data.frame(
-  Y1 = y_continuous$Y1,
-  Y2 = y_continuous$Y2,
-  Time = ObservedTime,
-  Event = Event
-)
-
-synthetic_data_full <- data.frame(
-  PatientID = 1:n,
-  Y1 = y_continuous$Y1,
-  Y2 = y_continuous$Y2,
-  Latent_S = S,
-  ObservedTime = ObservedTime,
-  Event = Event
-)
-
-cat("\nSample Count:", n_samples, "\n")
-cat("Dimensions of x_data (array):", dim(x_data), "\n")
-cat("Censoring/Event Breakdown:\n")
-print(table(synthetic_data_full$Event))
-
-# ========================================================================
-# 5️⃣ Copula Transformation and Scaling
-# ========================================================================
-# Use only continuous variables (exclude Event)
-y_continuous_for_cop <- y_data_df[, c("Y1", "Y2", "Time")]
-
-# Empirical CDF transformation
-u_data_df <- as.data.frame(lapply(y_continuous_for_cop, function(x) rank(x) / (length(x) + 1)))
-u_mat <- as.matrix(pmin(pmax(u_data_df, 1e-6), 1 - 1e-6))
-
-# Fit Gaussian copula
-cop_fit0 <- normalCopula(dim = ncol(u_mat))
-fit0 <- fitCopula(cop_fit0, data = u_mat, method = "ml")
-rho <- coef(fit0)
-
-# Transform to standard normal scale for modeling
-y_copula <- as.data.frame(sapply(1:ncol(u_data_df), function(j) qnorm(u_data_df[[j]])))
-colnames(y_copula) <- colnames(y_continuous_for_cop)
-y_numeric <- as.matrix(y_copula)
-
-# Scale covariates
-x_scaled <- (x_data - mean(x_data)) / sd(x_data)
-
-# ========================================================================
-# 6️⃣ Optional: Preview
-# ========================================================================
-head(y_data_df)
-head(u_data_df)
-head(y_copula)
-dim(x_scaled)
-
-
-# ========================================================================
-# 4️⃣ Optional: Preview
-# ========================================================================
-head(y_data_df)
-head(u_data_df)
-head(y_copula)
-dim(x_scaled)
-
-# 4️⃣ Train and Evaluate (All models and all losses)
+# Train simulation models
 model_types <- c("clayton", "gumbel", "hybrid")
 model_names <- c("Clayton", "Gumbel", "Clayton-Gumbel")
-loss_types <- c("mse", "gauss_copula") 
-
+loss_types <- c("copula_gaussian_loss", "copula_clayton_loss", "copula_gumbel_loss", "copula_hybrid_loss")
 sim_results <- train_and_evaluate(x_scaled, y_numeric, timesteps, features, model_types, model_names, loss_types)
-sim_residuals_df <- sim_results$residuals
-sim_results_df <- sim_results$results
 
-# 5️⃣ Simulation Residual Diagnostics
-sim_residuals_long <- sim_residuals_df %>%
-  tidyr::pivot_longer(
-    cols = c(ResidualY1, ResidualY2, ResidualS), names_to = "Outcome", values_to = "Residual") %>%
-  mutate(Outcome = gsub("Residual", "", Outcome), Dataset = "Simulated")
-
-# Plot
-p_sim <- ggplot(sim_residuals_long, aes(x = Residual, fill = Loss)) +
-  geom_density(alpha = 0.55, adjust = 1.2) +
-  geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
-  facet_grid(Model ~ Outcome, scales = "free") +
-  theme_minimal(base_size = 10) +
-  scale_fill_viridis_d(option = "C", end = 0.8) +
-  labs(title = "Simulation: Residual Density Comparison",
-       subtitle = "Faceted by Model, Outcome, and Loss Function",
-       x = "Residual", y = "Density", fill = "Loss Function") +
-  theme(plot.title = element_text(face = "bold", size = 12), legend.position = "bottom")
-
-print(p_sim)
-
-cat("Simulation Residual Summary:\n")
-print(kable(sim_results_df, digits = 3, caption = "Simulation Residual Summary") %>%
-        kable_styling(full_width = FALSE))
-
+cat("\nSimulation Residual Summary:\n")
+print(kable(sim_results$results, digits = 3, caption = "Simulation Residual Summary") %>% kable_styling(full_width = FALSE))
 
 # ==============================================================================
-# PART 2: REAL DATA (PBC Study)
+# PART 2: PBC DATA (3-Outcome)
 # ==============================================================================
 
 cat("\n\n================================\n")
 cat("REAL DATA: PBC Study\n")
 cat("================================\n")
 
-# 1️⃣ Load and Inspect Data
-data("pbc2.id", package = "JM")
-pbc <- pbc2.id
-n_desired <- 500
-timesteps <- 10
-max_features <- 30
+data("pbc2.id", package="JM"); pbc <- pbc2.id
+pbc$serBilir <- as.numeric(pbc$serBilir); pbc$albumin <- as.numeric(pbc$albumin); pbc$years <- as.numeric(pbc$years); pbc$status <- as.numeric(pbc$status)
 
-id_col <- "id"
-time_col <- "years"
-status_col <- "status"
+surv_summary <- pbc %>% group_by(id) %>% summarise(surv_time=max(years,na.rm=TRUE), event=as.integer(any(status %in% c(1,2)))) %>% ungroup()
+subject_ids <- head(surv_summary$id, 500); pbc <- pbc %>% filter(id %in% subject_ids)
+timesteps <- 10; numeric_features <- head(setdiff(names(pbc), c("id","years","status","drug","sex","ascites","hepatomegaly","spiders","edema","histol")), 30)
+long_data <- pbc[, c("id","years",numeric_features)]; long_data <- long_data[order(long_data$id,long_data$years),]
 
-# Convert factor/character columns to numeric
-pbc[[time_col]] <- as.numeric(as.character(pbc[[time_col]]))
-pbc[[status_col]] <- as.numeric(as.character(pbc[[status_col]]))
-pbc$serBilir <- as.numeric(as.character(pbc$serBilir))
-pbc$albumin <- as.numeric(as.character(pbc$albumin))
-
-# 2️⃣ Build Per-Subject Survival Summary
-surv_summary <- pbc %>%
-  group_by_at(id_col) %>%
-  summarise(
-    surv_time = max(.data[[time_col]], na.rm = TRUE),
-    # Combine 1 (dead) and 2 (transplanted) as event=1
-    event = as.integer(any(.data[[status_col]] %in% c(1, 2)))
-  ) %>% ungroup()
-
-# Filter to desired subjects
-subject_ids <- head(surv_summary[[id_col]], n_desired)
-surv_summary <- surv_summary %>% filter(.data[[id_col]] %in% subject_ids)
-pbc <- pbc %>% filter(.data[[id_col]] %in% subject_ids)
-
-# 3️⃣ Prepare Longitudinal Feature Data
-excluded_cols <- c(id_col, time_col, status_col, "drug", "sex", "ascites", "hepatomegaly",
-                   "spiders", "edema", "histol")
-candidate_features <- setdiff(names(pbc), excluded_cols)
-numeric_features <- candidate_features[sapply(pbc[candidate_features], is.numeric)]
-numeric_features <- head(numeric_features, max_features)
-
-long_data <- pbc[, c(id_col, time_col, numeric_features)]
-long_data <- long_data[order(long_data[[id_col]], long_data[[time_col]]), ]
-
-# 4️⃣ Pad to Fixed Timesteps (X-array)
-subject_list <- split(long_data, long_data[[id_col]])
+# Prepare X-array
+subject_list <- split(long_data, long_data$id)
 pad_subject <- function(df, features, tsteps) {
-  mat <- as.matrix(df[, features, drop = FALSE])
-  if (nrow(mat) >= tsteps) mat[1:tsteps, ] else rbind(mat, matrix(0, nrow = tsteps - nrow(mat), ncol = ncol(mat)))
+  mat <- as.matrix(df[, features, drop=FALSE])
+  if(nrow(mat) >= tsteps) mat[1:tsteps,] else rbind(mat, matrix(0, nrow=tsteps-nrow(mat), ncol=ncol(mat)))
 }
-
-x_array <- array(
-  data = unlist(lapply(subject_list, pad_subject, numeric_features, timesteps)),
-  dim = c(length(subject_list), timesteps, length(numeric_features))
-)
-
-# 5️⃣ Impute Missing Values and Scale
-for (j in 1:dim(x_array)[3]) {
-  col_data <- x_array[,,j]
-  col_data[is.na(col_data)] <- mean(col_data[col_data != 0], na.rm = TRUE)
-  x_array[,,j] <- col_data
-}
+x_array <- array(unlist(lapply(subject_list, pad_subject, numeric_features, timesteps)), dim=c(length(subject_list),timesteps,length(numeric_features)))
+for(j in 1:dim(x_array)[3]){ col_data <- x_array[,,j]; col_data[is.na(col_data)] <- mean(col_data[col_data!=0], na.rm=TRUE); x_array[,,j] <- col_data }
 x_scaled <- (x_array - mean(x_array, na.rm=TRUE)) / sd(x_array, na.rm=TRUE)
-x_scaled[is.na(x_scaled)] <- 0 # Final safeguard
+x_scaled[is.na(x_scaled)] <- 0
 
-# 6️⃣ Prepare Copula-Transformed Target (Y1: serBilir, Y2: albumin, S: surv_time)
-long_outcomes <- c("serBilir", "albumin")
-y_long_summary <- long_data %>%
-  group_by_at(id_col) %>%
-  summarise(
-    across(all_of(long_outcomes), ~ last(.[!is.na(.)]), .names = "Y_{.col}")
-  ) %>% ungroup()
+# Prepare Y (Last serBilir, Last albumin, Survival Time)
+y_data_df <- surv_summary %>% left_join(long_data %>% group_by(id) %>% summarise(Y_serBilir=last(serBilir), Y_albumin=last(albumin)), by="id") %>% dplyr::select(Y_serBilir,Y_albumin,S=surv_time) %>% na.omit()
+y_numeric <- as.matrix(sapply(y_data_df, function(x) qnorm(rank(x)/(length(x)+1))))
+x_scaled <- x_scaled[1:nrow(y_numeric), , ] # Align X and Y
 
-y_data_df <- surv_summary %>%
-  left_join(y_long_summary, by = id_col) %>%
-  dplyr::select(Y_serBilir, Y_albumin, S = surv_time) %>%
-  na.omit()
-
-# Match subject order and align x_scaled
-id_order <- names(subject_list)
-y_data_df <- y_data_df[match(id_order, surv_summary[[id_col]]), ]
-y_data_df <- y_data_df[!is.na(y_data_df$S), ] # Ensure only subjects with complete Y data are kept
-x_scaled <- x_scaled[1:nrow(y_data_df), , ]
-
-# Copula transformation
-u_data_df <- as.data.frame(lapply(y_data_df, function(x) rank(x, na.last = "keep") / (sum(!is.na(x)) + 1)))
-u_mat <- as.matrix(pmin(pmax(u_data_df, 1e-6), 1 - 1e-6))
-u_mat[!is.finite(u_mat)] <- 0.5
-
-cop_fit0 <- normalCopula(dim = ncol(u_mat))
-suppressWarnings(fit0 <- try(fitCopula(cop_fit0, data = u_mat, method = "ml"), silent = TRUE))
-rho <- if (inherits(fit0, "try-error")) rep(0.5, ncol(u_mat)) else as.vector(coef(fit0))
-
-y_copula <- as.data.frame(lapply(u_data_df, function(u) qnorm(u)))
-colnames(y_copula) <- colnames(y_data_df)
-y_numeric <- as.matrix(y_copula)
-
-n_final <- nrow(y_numeric)
-x_scaled <- x_scaled[1:n_final, , ]
-
-# 7️⃣ Train and Evaluate Real Data
-real_results <- train_and_evaluate(x_scaled, y_numeric, timesteps, features, model_types, model_names, loss_types)
-real_residuals_df <- real_results$residuals
-real_results_df <- real_results$results
-
-# 8️⃣ Real Data Residual Diagnostics
-real_residuals_long <- real_residuals_df %>%
-  tidyr::pivot_longer(
-    cols = c(ResidualY1, ResidualY2, ResidualS), names_to = "Outcome", values_to = "Residual") %>%
-  mutate(Outcome = gsub("ResidualY1", "serBilir", Outcome),
-         Outcome = gsub("ResidualY2", "albumin", Outcome),
-         Outcome = gsub("ResidualS", "Survival", Outcome),
-         Dataset = "Real PBC")
-
-# Plot
-p_real <- ggplot(real_residuals_long, aes(x = Residual, fill = Loss)) +
-  geom_density(alpha = 0.55, adjust = 1.2) +
-  geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
-  facet_grid(Model ~ Outcome, scales = "free") +
-  theme_minimal(base_size = 10) +
-  scale_fill_viridis_d(option = "C", end = 0.8) +
-  labs(title = "Real PBC Data: Residual Density Comparison",
-       subtitle = "Faceted by Model, Outcome (serBilir, albumin, Survival), and Loss Function",
-       x = "Residual", y = "Density", fill = "Loss Function") +
-  theme(plot.title = element_text(face = "bold", size = 12), legend.position = "bottom")
-
-print(p_real)
+# Train PBC models
+real_results <- train_and_evaluate(x_scaled, y_numeric, timesteps, length(numeric_features), model_types, model_names, loss_types)
 
 cat("\nReal PBC Residual Summary:\n")
-print(kable(real_results_df, digits = 3, caption = "Real PBC Residual Summary") %>%
-        kable_styling(full_width = FALSE))
+print(kable(real_results$results, digits = 3, caption = "Real PBC Residual Summary") %>% kable_styling(full_width = FALSE))
+
 
 # ==============================================================================
-# Final Visualization (Combined)
+# PART 3: CGD DATA (3-Outcome, Timesteps=1)
 # ==============================================================================
-# Combine the two residual data frames for a final comparison
-combined_residuals_long <- bind_rows(sim_residuals_long, real_residuals_long)
 
-p_combined_box <- ggplot(combined_residuals_long, aes(x = Loss, y = Residual, fill = Loss)) +
-  geom_boxplot(alpha = 0.6, outlier.size = 0.5, width = 0.6) +
-  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
-  facet_grid(Dataset + Model ~ Outcome, scales = "free_y") +
-  theme_minimal(base_size = 10) +
-  scale_fill_viridis_d(option = "C", end = 0.8) +
-  labs(title = "Residual Spread: Simulation vs. Real PBC Data",
-       subtitle = "Faceted by Dataset, Model, and Loss Function",
-       x = "Loss Function", y = "Residual") +
-  theme(plot.title = element_text(face = "bold", size = 14),
-        axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
-        strip.text = element_text(size = 9, face = "bold"),
-        legend.position = "none")
-
-print(p_combined_box)
-
-##### Model fitting for CGD data with cluster embeddings #####
-library(JM)
-library(dplyr)
-library(tensorflow)
-library(keras)
-
-data("cgd")  # Load CGD dataset
-
-# --- 1️⃣ Prepare time, event, and covariates ---
-time <- cgd$tstop - cgd$tstart
-event <- cgd$status
-treat <- as.integer(cgd$treat) - 1
-sex <- as.integer(cgd$sex) - 1
-
-X <- model.matrix(~0 + treat + sex)     # design matrix
-p <- ncol(X)                            # number of covariates
-n <- nrow(X)                            # total sample size
-q <- length(unique(cgd$id))              # number of clusters
-id_numeric <- as.integer(factor(cgd$id)) - 1  # 0-indexed cluster IDs
-
-# --- 2️⃣ Prepare numeric features for CNN-LSTM ---
-timesteps <- 1
-x_numeric_df <- as.data.frame(X)
-x_array <- array(as.matrix(x_numeric_df), dim=c(n, timesteps, p))
-x_scaled <- (x_array - mean(x_array, na.rm=TRUE)) / sd(x_array, na.rm=TRUE)
-
-# --- 3️⃣ Prepare cluster embeddings ---
-embedding_dim <- min(10, ceiling(q/2))  # embedding dimension
-id_input <- layer_input(shape = 1, dtype = "int32", name = "id_input")
-id_embed <- id_input %>%
-  layer_embedding(input_dim = q, output_dim = embedding_dim, input_length = 1) %>%
-  layer_flatten()
-
-# --- 4️⃣ Prepare response variables (multivariate survival) ---
-y_data_df <- data.frame(Y1=time, Y2=event, S=time)
-u_data_df <- as.data.frame(lapply(y_data_df, function(x) rank(x)/(length(x)+1)))
-y_numeric <- as.matrix(sapply(u_data_df, qnorm))
-
-# --- 5️⃣ Updated CNN-LSTM model builder with cluster embeddings ---
-create_cnn_lstm_with_cluster <- function(type=c("clayton","gumbel","hybrid"),
-                                         input_features, timesteps, n_clusters, embed_dim) {
-  type <- match.arg(type)
-
-  # Feature input
-  feature_input <- layer_input(shape = c(timesteps, input_features), name="feature_input")
-  x <- feature_input %>%
-    layer_conv_1d(filters = 32, kernel_size = min(3, timesteps), activation = "relu", padding="same")
-  if(timesteps > 1) x <- x %>% layer_max_pooling_1d(pool_size = 2)
-  x <- x %>% layer_lstm(units = 64, return_sequences = FALSE) %>% layer_dropout(0.3)
-
-  # Cluster embedding input
-  id_input <- layer_input(shape = 1, dtype = "int32", name="id_input")
-  id_embed <- id_input %>%
-    layer_embedding(input_dim = n_clusters, output_dim = embed_dim, input_length = 1) %>%
-    layer_flatten()
-
-  # Concatenate feature representation + cluster embedding
-  concat <- layer_concatenate(list(x, id_embed))
-
-  # Add the appropriate custom layer (only for copula types)
-  if (type == "clayton") concat <- concat %>% LearnableClaytonActivation()
-  if (type == "gumbel") concat <- concat %>% LearnableGumbelActivation()
-  if (type == "hybrid") concat <- concat %>% LearnableClaytonGumbelHybrid()
-
-  output <- concat %>% layer_dense(units = 3, activation="linear")
-
-  model <- keras_model(inputs = list(feature_input, id_input), outputs = output)
-  return(model)
-}
-
-# --- 6️⃣ Train and Evaluate Function for Cluster Model ---
-train_and_evaluate_cluster <- function(x_scaled, id_numeric, y_numeric, timesteps, features,
-                                       n_clusters, embed_dim, model_types, model_names, loss_types) {
-
-  all_results <- list()
-  all_residuals <- list()
-
-  for(i in seq_along(model_types)) {
-    for(loss in loss_types) {
-      k_clear_session()
-      cat("Training", model_names[i], "with", loss, "loss\n")
-
-      m <- create_cnn_lstm_with_cluster(model_types[i], features, timesteps, n_clusters, embed_dim)
-
-      # Select loss
-      current_loss_fn <- switch(loss,
-                                 "mse" = "mse",
-                                 "gauss_copula" = copula_gaussian_loss,
-                                 "clayton_copula" = copula_clayton_loss,
-                                 "gumbel_copula" = copula_gumbel_loss)
-
-      m %>% compile(optimizer = "adam", loss = current_loss_fn, metrics = "mae")
-
-      m %>% fit(
-        list(feature_input = x_scaled, id_input = array(id_numeric, dim=c(length(id_numeric),1))),
-        y_numeric,
-        epochs = 10, batch_size = 32, verbose=0, validation_split=0.2
-      )
-
-      # Predictions & residuals
-      preds <- m %>% predict(list(feature_input = x_scaled, id_input = array(id_numeric, dim=c(length(id_numeric),1))))
-      residuals <- y_numeric - preds
-      res_df <- data.frame(Model=model_names[i], Loss=loss,
-                           ResidualY1=residuals[,1], ResidualY2=residuals[,2], ResidualS=residuals[,3])
-      all_residuals[[paste0(model_names[i],"_",loss)]] <- res_df
-
-      all_results[[paste0(model_names[i],"_",loss)]] <- data.frame(
-        Model=model_names[i], Loss=loss,
-        MeanResidual1 = mean(residuals[,1]), SDResidual1 = sd(residuals[,1]),
-        MeanResidual2 = mean(residuals[,2]), SDResidual2 = sd(residuals[,2]),
-        MeanResidualS = mean(residuals[,3]), SDResidualS = sd(residuals[,3])
-      )
-    }
-  }
-
-  results_df <- do.call(rbind, all_results)
-  residuals_df <- do.call(rbind, all_residuals)
-
-  return(list(results=results_df, residuals=residuals_df))
-}
-
-# --- 7️⃣ Train on CGD data ---
 cat("\n\n================================\n")
 cat("REAL DATA: CGD Study\n")
 cat("================================\n")
 
-cgd_results <- train_and_evaluate_cluster(
-  x_scaled, id_numeric, y_numeric, timesteps, p, n_clusters=q, embed_dim=embedding_dim,
-  model_types, model_names, loss_types
+data("cgd"); time <- cgd$tstop - cgd$tstart; event <- cgd$status
+X <- model.matrix(~0+treat+sex, data=cgd)
+x_array <- array(as.matrix(X), dim=c(nrow(X),1,ncol(X))) # Timesteps = 1
+x_scaled <- (x_array - mean(x_array)) / sd(x_array)
+y_numeric <- as.matrix(sapply(data.frame(Y1=time,Y2=event,S=time), function(x) qnorm(rank(x)/(length(x)+1))))
+
+# Train CGD models (Uses timesteps_cgd=1 for the model builder)
+timesteps_cgd <- 1 
+features_cgd <- ncol(X)
+
+# The train_and_evaluate function now correctly handles timesteps=1 via the create_cnn_lstm function
+cgd_results <- train_and_evaluate(x_scaled, y_numeric, timesteps_cgd, features_cgd, model_types, model_names, loss_types)
+
+cat("\nReal CGD Residual Summary:\n")
+print(kable(cgd_results$results, digits = 3, caption = "Real CGD Residual Summary") %>% kable_styling(full_width = FALSE))
+
+# ==============================================================================
+# Final Combined Summary
+# ==============================================================================
+all_results_combined <- bind_rows(
+    sim_results$results %>% mutate(Dataset = "Simulated"),
+    real_results$results %>% mutate(Dataset = "PBC"),
+    cgd_results$results %>% mutate(Dataset = "CGD")
 )
 
-# =======================================================================
-# PART 4: CGD DATA RESIDUAL VISUALIZATION (Corrected)
-# =======================================================================
+cat("\n\n================================\n")
+cat("COMBINED RESULTS SUMMARY (Mean/SD of Residuals)\n")
+cat("================================\n")
+print(kable(all_results_combined, digits = 3, caption = "Combined Residual Summaries (Mean/SD)") %>%
+          kable_styling(full_width = FALSE) %>%
+          group_rows("Simulated", 1, nrow(sim_results$results)) %>%
+          group_rows("PBC", nrow(sim_results$results) + 1, nrow(sim_results$results) + nrow(real_results$results)) %>%
+          group_rows("CGD", nrow(sim_results$results) + nrow(real_results$results) + 1, nrow(all_results_combined))
+)
+
+# ==============================================================================
+# PART 4: RESIDUAL ANALYSIS AND PLOTTING
+# ==============================================================================
 
 library(ggplot2)
 library(dplyr)
@@ -700,8 +347,28 @@ library(tidyr)
 library(viridis)
 library(kableExtra)
 
+cat("\n\n================================\n")
+cat("RESIDUAL ANALYSIS AND PLOTTING\n")
+cat("================================\n")
 
-# 1️⃣ Transform CGD residuals into long format for plotting
+# 1️⃣ Transform Residuals into Long Format
+
+# Simulation Residuals
+sim_residuals_long <- sim_results$residuals %>%
+  tidyr::pivot_longer(
+    cols = c(ResidualY1, ResidualY2, ResidualS), names_to = "Outcome", values_to = "Residual") %>%
+  mutate(Outcome = gsub("Residual", "", Outcome), Dataset = "Simulated")
+
+# PBC Residuals
+real_residuals_long <- real_results$residuals %>%
+  tidyr::pivot_longer(
+    cols = c(ResidualY1, ResidualY2, ResidualS), names_to = "Outcome", values_to = "Residual") %>%
+  mutate(Outcome = gsub("ResidualY1", "serBilir", Outcome),
+         Outcome = gsub("ResidualY2", "albumin", Outcome),
+         Outcome = gsub("ResidualS", "Survival", Outcome),
+         Dataset = "PBC")
+
+# CGD Residuals
 cgd_residuals_long <- cgd_results$residuals %>%
     pivot_longer(
         cols = c(ResidualY1, ResidualY2, ResidualS),
@@ -715,14 +382,12 @@ cgd_residuals_long <- cgd_results$residuals %>%
         Dataset = "CGD"
     )
 
-# 2️⃣ Combine with available datasets (Simulation, PBC, CGD)
+# 2️⃣ Combine all residual data
 combined_residuals_long <- bind_rows(
     sim_residuals_long,
     real_residuals_long,
     cgd_residuals_long
 )
-
-# --- The rest of the visualization code can now run ---
 
 # 3️⃣ Density Plot: Residuals by Model and Outcome
 p_combined_density <- ggplot(combined_residuals_long, aes(x = Residual, fill = Loss)) +
@@ -733,8 +398,8 @@ p_combined_density <- ggplot(combined_residuals_long, aes(x = Residual, fill = L
     scale_fill_viridis_d(option = "C", end = 0.8) +
     labs(
         title = "Residual Density Comparison Across Datasets (Sim, PBC, CGD)",
-        subtitle = "Faceted by Dataset, Model, Outcome, and Loss Function",
-        x = "Residual", y = "Density", fill = "Loss Function"
+        subtitle = "A good model should produce residuals centered around zero (N(0,1) scale)",
+        x = "Residual (Standard Normal Scale)", y = "Density", fill = "Loss Function"
     ) +
     theme(
         plot.title = element_text(face = "bold", size = 12),
@@ -743,6 +408,9 @@ p_combined_density <- ggplot(combined_residuals_long, aes(x = Residual, fill = L
     )
 
 print(p_combined_density)
+# 
+
+---
 
 # 4️⃣ Boxplot: Residual spread comparison
 p_combined_box <- ggplot(combined_residuals_long, aes(x = Loss, y = Residual, fill = Loss)) +
@@ -753,8 +421,8 @@ p_combined_box <- ggplot(combined_residuals_long, aes(x = Loss, y = Residual, fi
     scale_fill_viridis_d(option = "C", end = 0.8) +
     labs(
         title = "Residual Spread Across Datasets (Sim, PBC, CGD)",
-        subtitle = "Faceted by Dataset, Model, and Outcome",
-        x = "Loss Function", y = "Residual"
+        subtitle = "Closer median to zero and tighter IQR indicates better fit",
+        x = "Loss Function", y = "Residual (Standard Normal Scale)"
     ) +
     theme(
         plot.title = element_text(face = "bold", size = 14),
@@ -764,91 +432,78 @@ p_combined_box <- ggplot(combined_residuals_long, aes(x = Loss, y = Residual, fi
     )
 
 print(p_combined_box)
+# 
 
-# Combine all residuals with dataset labels
-all_residuals_long <- bind_rows(
-  sim_residuals_long,
-  real_residuals_long,
-  cgd_residuals_long
+
+# 5️⃣ Final Combined Summary Table
+all_results_combined <- bind_rows(
+    sim_results$results %>% mutate(Dataset = "Simulated"),
+    real_results$results %>% mutate(Dataset = "PBC"),
+    cgd_results$results %>% mutate(Dataset = "CGD")
 )
 
-# Function to create individual residual density plots per outcome per dataset
-plot_individual_residuals_all <- function(residuals_long) {
-  datasets <- unique(residuals_long$Dataset)
-  outcomes <- unique(residuals_long$Outcome)
+cat("\n\n================================\n")
+cat("COMBINED RESULTS SUMMARY (Mean/SD of Residuals)\n")
+cat("================================\n")
+print(kable(all_results_combined, digits = 3, caption = "Combined Residual Summaries (Mean/SD)") %>%
+          kable_styling(full_width = FALSE) %>%
+          group_rows("Simulated", 1, nrow(sim_results$results)) %>%
+          group_rows("PBC", nrow(sim_results$results) + 1, nrow(sim_results$results) + nrow(real_results$results)) %>%
+          group_rows("CGD", nrow(sim_results$results) + nrow(real_results$results) + 1, nrow(all_results_combined))
+)
 
-  plots <- list()
-
-  for (ds in datasets) {
-    for (out in outcomes) {
-      df <- residuals_long %>% filter(Dataset == ds, Outcome == out)
-
-      p <- ggplot(df, aes(x = Residual, fill = Loss)) +
-        geom_density(alpha = 0.55, adjust = 1.2) +
-        geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
-        facet_wrap(~Model, scales = "free") +
-        theme_minimal(base_size = 12) +
-        scale_fill_viridis_d(option = "C", end = 0.8) +
-        labs(
-          title = paste(ds, "-", out, "Residuals"),
-          x = "Residual", y = "Density", fill = "Loss Function"
-        ) +
-        theme(
-          plot.title = element_text(face = "bold", size = 14),
-          legend.position = "bottom",
-          strip.text = element_text(size = 10)
-        )
-
-      plots[[paste(ds, out, sep = "_")]] <- p
-    }
-  }
-
-  return(plots)
-}
-
-# Generate individual plots for all datasets
-individual_residual_plots <- plot_individual_residuals_all(all_residuals_long)
-
-# Example: Display plots for Simulation dataset
-print(individual_residual_plots[["Simulated_Y1"]])
-print(individual_residual_plots[["Simulated_Y2"]])
-print(individual_residual_plots[["Simulated_S"]])
-
-# Example: Display plots for Real PBC dataset
-print(individual_residual_plots[["Real PBC_serBilir"]])
-print(individual_residual_plots[["Real PBC_albumin"]])
-print(individual_residual_plots[["Real PBC_Survival"]])
-
-# Example: Display plots for CGD dataset
-print(individual_residual_plots[["CGD_Time"]])
-print(individual_residual_plots[["CGD_Event"]])
-print(individual_residual_plots[["CGD_Survival"]])
-
+library(ggplot2)
 library(dplyr)
-library(kableExtra)
+library(viridis)
 
-# Combine all residuals with dataset labels
-all_residuals_long <- bind_rows(
-  sim_residuals_long,
-  real_residuals_long,
-  cgd_residuals_long
-)
+p_sim_density <- combined_residuals_long %>%
+    filter(Dataset == "Simulated") %>%
+    ggplot(aes(x = Residual, fill = Loss)) +
+    geom_density(alpha = 0.55, adjust = 1.5) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
+    facet_grid(Model ~ Outcome, scales = "free_y") +
+    theme_minimal(base_size = 12) +
+    scale_fill_viridis_d(option = "C", end = 0.8) +
+    labs(
+        title = "Residual Density for Simulated Data",
+        subtitle = "Y1, Y2, and Survival Outcomes (N(0,1) Scale)",
+        x = "Residual", y = "Density", fill = "Loss Function"
+    ) +
+    theme(legend.position = "bottom", plot.title = element_text(face = "bold"))
 
-# Function to summarize residuals per outcome
-summarize_residuals_per_outcome <- function(residuals_long) {
-  residuals_long %>%
-    group_by(Dataset, Model, Outcome, Loss) %>%
-    summarise(
-      MeanResidual = mean(Residual, na.rm = TRUE),
-      SDResidual = sd(Residual, na.rm = TRUE),
-      .groups = "drop"
-    ) %>%
-    arrange(Dataset, Outcome, Model, Loss)
-}
+print(p_sim_density)
 
-# Generate the summary table
-residual_summary_table <- summarize_residuals_per_outcome(all_residuals_long)
 
-cat("\nCombined Residual Summary (MSE, Clayton, and Gumbel models and losses restored):\n")
-print(kable(residual_summary_table, digits = 3, caption = "Combined Residual Summary") %>%
-        kable_styling(full_width = FALSE))
+p_pbc_density <- combined_residuals_long %>%
+    filter(Dataset == "PBC") %>%
+    ggplot(aes(x = Residual, fill = Loss)) +
+    geom_density(alpha = 0.55, adjust = 1.5) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
+    facet_grid(Model ~ Outcome, scales = "free_y") +
+    theme_minimal(base_size = 12) +
+    scale_fill_viridis_d(option = "C", end = 0.8) +
+    labs(
+        title = "Residual Density for PBC Data",
+        subtitle = "serBilir, albumin, and Survival Outcomes (N(0,1) Scale)",
+        x = "Residual", y = "Density", fill = "Loss Function"
+    ) +
+    theme(legend.position = "bottom", plot.title = element_text(face = "bold"))
+
+print(p_pbc_density)
+
+p_cgd_density <- combined_residuals_long %>%
+    filter(Dataset == "CGD") %>%
+    ggplot(aes(x = Residual, fill = Loss)) +
+    geom_density(alpha = 0.55, adjust = 1.5) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
+    facet_grid(Model ~ Outcome, scales = "free_y") +
+    theme_minimal(base_size = 12) +
+    scale_fill_viridis_d(option = "C", end = 0.8) +
+    labs(
+        title = "Residual Density for CGD Data",
+        subtitle = "Time, Event, and Survival Outcomes (N(0,1) Scale)",
+        x = "Residual", y = "Density", fill = "Loss Function"
+    ) +
+    theme(legend.position = "bottom", plot.title = element_text(face = "bold"))
+
+print(p_cgd_density)

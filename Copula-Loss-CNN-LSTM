@@ -354,9 +354,8 @@ print(
   kable(cancer_results$results, digits = 3, caption = "Real Cancer Residual Summary") %>%
     kable_styling(full_width = FALSE)
 )
-
 # ==============================================================================
-# PART 4: RESIDUAL ANALYSIS AND PLOTTING
+# PART 4: RESIDUAL ANALYSIS AND PLOTTING (Simulated + PBC + Cancer)
 # ==============================================================================
 
 library(ggplot2)
@@ -374,155 +373,164 @@ cat("================================\n")
 # Simulation Residuals
 sim_residuals_long <- sim_results$residuals %>%
   tidyr::pivot_longer(
-    cols = c(ResidualY1, ResidualY2, ResidualS), names_to = "Outcome", values_to = "Residual") %>%
-  mutate(Outcome = gsub("Residual", "", Outcome), Dataset = "Simulated")
+    cols = c(ResidualY1, ResidualY2, ResidualS),
+    names_to = "Outcome",
+    values_to = "Residual"
+  ) %>%
+  mutate(
+    Outcome = gsub("Residual", "", Outcome),
+    Dataset = "Simulated"
+  )
 
 # PBC Residuals
-real_residuals_long <- real_results$residuals %>%
+pbc_residuals_long <- real_results$residuals %>%
   tidyr::pivot_longer(
-    cols = c(ResidualY1, ResidualY2, ResidualS), names_to = "Outcome", values_to = "Residual") %>%
-  mutate(Outcome = gsub("ResidualY1", "serBilir", Outcome),
-         Outcome = gsub("ResidualY2", "albumin", Outcome),
-         Outcome = gsub("ResidualS", "Survival", Outcome),
-         Dataset = "PBC")
+    cols = c(ResidualY1, ResidualY2, ResidualS),
+    names_to = "Outcome",
+    values_to = "Residual"
+  ) %>%
+  mutate(
+    Outcome = gsub("ResidualY1", "serBilir", Outcome),
+    Outcome = gsub("ResidualY2", "albumin", Outcome),
+    Outcome = gsub("ResidualS", "Survival", Outcome),
+    Dataset = "PBC"
+  )
 
-# CGD Residuals
-cgd_residuals_long <- cgd_results$residuals %>%
-    pivot_longer(
-        cols = c(ResidualY1, ResidualY2, ResidualS),
-        names_to = "Outcome",
-        values_to = "Residual"
-    ) %>%
-    mutate(
-        Outcome = gsub("ResidualY1", "Time", Outcome),
-        Outcome = gsub("ResidualY2", "Event", Outcome),
-        Outcome = gsub("ResidualS", "Survival", Outcome),
-        Dataset = "CGD"
-    )
+# Cancer Residuals
+cancer_residuals_long <- cancer_results$residuals %>%
+  pivot_longer(
+    cols = c(ResidualY1, ResidualY2, ResidualS),
+    names_to = "Outcome",
+    values_to = "Residual"
+  ) %>%
+  mutate(
+    Outcome = gsub("ResidualY1", "Event", Outcome),
+    Outcome = gsub("ResidualY2", "Time", Outcome),
+    Outcome = gsub("ResidualS", "Performance", Outcome),
+    Dataset = "Cancer"
+  )
 
 # 2️⃣ Combine all residual data
 combined_residuals_long <- bind_rows(
-    sim_residuals_long,
-    real_residuals_long,
-    cgd_residuals_long
+  sim_residuals_long,
+  pbc_residuals_long,
+  cancer_residuals_long
 )
 
 # 3️⃣ Density Plot: Residuals by Model and Outcome
 p_combined_density <- ggplot(combined_residuals_long, aes(x = Residual, fill = Loss)) +
-    geom_density(alpha = 0.55, adjust = 1.2) +
-    geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
-    facet_grid(Dataset + Model ~ Outcome, scales = "free") +
-    theme_minimal(base_size = 10) +
-    scale_fill_viridis_d(option = "C", end = 0.8) +
-    labs(
-        title = "Residual Density Comparison Across Datasets (Sim, PBC, CGD)",
-        subtitle = "A good model should produce residuals centered around zero (N(0,1) scale)",
-        x = "Residual (Standard Normal Scale)", y = "Density", fill = "Loss Function"
-    ) +
-    theme(
-        plot.title = element_text(face = "bold", size = 12),
-        legend.position = "bottom",
-        strip.text = element_text(size = 9)
-    )
+  geom_density(alpha = 0.55, adjust = 1.2) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
+  facet_grid(Dataset + Model ~ Outcome, scales = "free") +
+  theme_minimal(base_size = 10) +
+  scale_fill_viridis_d(option = "C", end = 0.8) +
+  labs(
+    title = "Residual Density Comparison Across Datasets (Sim, PBC, Cancer)",
+    subtitle = "A good model should produce residuals centered around zero (N(0,1) scale)",
+    x = "Residual (Standard Normal Scale)", y = "Density", fill = "Loss Function"
+  ) +
+  theme(
+    plot.title = element_text(face = "bold", size = 12),
+    legend.position = "bottom",
+    strip.text = element_text(size = 9)
+  )
 
 print(p_combined_density)
-# 
-
----
 
 # 4️⃣ Boxplot: Residual spread comparison
 p_combined_box <- ggplot(combined_residuals_long, aes(x = Loss, y = Residual, fill = Loss)) +
-    geom_boxplot(alpha = 0.6, outlier.size = 0.5, width = 0.6) +
-    geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
-    facet_grid(Dataset + Model ~ Outcome, scales = "free_y") +
-    theme_minimal(base_size = 10) +
-    scale_fill_viridis_d(option = "C", end = 0.8) +
-    labs(
-        title = "Residual Spread Across Datasets (Sim, PBC, CGD)",
-        subtitle = "Closer median to zero and tighter IQR indicates better fit",
-        x = "Loss Function", y = "Residual (Standard Normal Scale)"
-    ) +
-    theme(
-        plot.title = element_text(face = "bold", size = 14),
-        axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
-        strip.text = element_text(size = 9, face = "bold"),
-        legend.position = "none"
-    )
+  geom_boxplot(alpha = 0.6, outlier.size = 0.5, width = 0.6) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  facet_grid(Dataset + Model ~ Outcome, scales = "free_y") +
+  theme_minimal(base_size = 10) +
+  scale_fill_viridis_d(option = "C", end = 0.8) +
+  labs(
+    title = "Residual Spread Across Datasets (Sim, PBC, Cancer)",
+    subtitle = "Closer median to zero and tighter IQR indicates better fit",
+    x = "Loss Function", y = "Residual (Standard Normal Scale)"
+  ) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+    strip.text = element_text(size = 9, face = "bold"),
+    legend.position = "none"
+  )
 
 print(p_combined_box)
-# 
-
 
 # 5️⃣ Final Combined Summary Table
 all_results_combined <- bind_rows(
-    sim_results$results %>% mutate(Dataset = "Simulated"),
-    real_results$results %>% mutate(Dataset = "PBC"),
-    cgd_results$results %>% mutate(Dataset = "CGD")
+  sim_results$results %>% mutate(Dataset = "Simulated"),
+  real_results$results %>% mutate(Dataset = "PBC"),
+  cancer_results$results %>% mutate(Dataset = "Cancer")
 )
 
 cat("\n\n================================\n")
 cat("COMBINED RESULTS SUMMARY (Mean/SD of Residuals)\n")
 cat("================================\n")
-print(kable(all_results_combined, digits = 3, caption = "Combined Residual Summaries (Mean/SD)") %>%
-          kable_styling(full_width = FALSE) %>%
-          group_rows("Simulated", 1, nrow(sim_results$results)) %>%
-          group_rows("PBC", nrow(sim_results$results) + 1, nrow(sim_results$results) + nrow(real_results$results)) %>%
-          group_rows("CGD", nrow(sim_results$results) + nrow(real_results$results) + 1, nrow(all_results_combined))
+
+print(
+  kable(all_results_combined, digits = 3, caption = "Combined Residual Summaries (Mean/SD)") %>%
+    kable_styling(full_width = FALSE) %>%
+    group_rows("Simulated", 1, nrow(sim_results$results)) %>%
+    group_rows("PBC", nrow(sim_results$results) + 1, nrow(sim_results$results) + nrow(real_results$results)) %>%
+    group_rows("Cancer", nrow(sim_results$results) + nrow(real_results$results) + 1, nrow(all_results_combined))
 )
 
-library(ggplot2)
-library(dplyr)
-library(viridis)
+# ------------------------------------------------------------------------------
 
+# 6️⃣ Individual dataset residual densities
+
+# Simulated
 p_sim_density <- combined_residuals_long %>%
-    filter(Dataset == "Simulated") %>%
-    ggplot(aes(x = Residual, fill = Loss)) +
-    geom_density(alpha = 0.55, adjust = 1.5) +
-    geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
-    facet_grid(Model ~ Outcome, scales = "free_y") +
-    theme_minimal(base_size = 12) +
-    scale_fill_viridis_d(option = "C", end = 0.8) +
-    labs(
-        title = "Residual Density for Simulated Data",
-        subtitle = "Y1, Y2, and Survival Outcomes (N(0,1) Scale)",
-        x = "Residual", y = "Density", fill = "Loss Function"
-    ) +
-    theme(legend.position = "bottom", plot.title = element_text(face = "bold"))
+  filter(Dataset == "Simulated") %>%
+  ggplot(aes(x = Residual, fill = Loss)) +
+  geom_density(alpha = 0.55, adjust = 1.5) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
+  facet_grid(Model ~ Outcome, scales = "free_y") +
+  theme_minimal(base_size = 12) +
+  scale_fill_viridis_d(option = "C", end = 0.8) +
+  labs(
+    title = "Residual Density for Simulated Data",
+    subtitle = "Y1, Y2, and Survival Outcomes (N(0,1) Scale)",
+    x = "Residual", y = "Density", fill = "Loss Function"
+  ) +
+  theme(legend.position = "bottom", plot.title = element_text(face = "bold"))
 
 print(p_sim_density)
 
-
+# PBC
 p_pbc_density <- combined_residuals_long %>%
-    filter(Dataset == "PBC") %>%
-    ggplot(aes(x = Residual, fill = Loss)) +
-    geom_density(alpha = 0.55, adjust = 1.5) +
-    geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
-    facet_grid(Model ~ Outcome, scales = "free_y") +
-    theme_minimal(base_size = 12) +
-    scale_fill_viridis_d(option = "C", end = 0.8) +
-    labs(
-        title = "Residual Density for PBC Data",
-        subtitle = "serBilir, albumin, and Survival Outcomes (N(0,1) Scale)",
-        x = "Residual", y = "Density", fill = "Loss Function"
-    ) +
-    theme(legend.position = "bottom", plot.title = element_text(face = "bold"))
+  filter(Dataset == "PBC") %>%
+  ggplot(aes(x = Residual, fill = Loss)) +
+  geom_density(alpha = 0.55, adjust = 1.5) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
+  facet_grid(Model ~ Outcome, scales = "free_y") +
+  theme_minimal(base_size = 12) +
+  scale_fill_viridis_d(option = "C", end = 0.8) +
+  labs(
+    title = "Residual Density for PBC Data",
+    subtitle = "serBilir, albumin, and Survival Outcomes (N(0,1) Scale)",
+    x = "Residual", y = "Density", fill = "Loss Function"
+  ) +
+  theme(legend.position = "bottom", plot.title = element_text(face = "bold"))
 
 print(p_pbc_density)
 
-p_cgd_density <- combined_residuals_long %>%
-    filter(Dataset == "cancer") %>%
-    ggplot(aes(x = Residual, fill = Loss)) +
-    geom_density(alpha = 0.55, adjust = 1.5) +
-    geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
-    facet_grid(Model ~ Outcome, scales = "free_y") +
-    theme_minimal(base_size = 12) +
-    scale_fill_viridis_d(option = "C", end = 0.8) +
-    labs(
-        title = "Residual Density for CANCER Data",
-        subtitle = "Y1: survival event indicator, Y2: survival time, Y3: weighted performance index",
-        x = "Residual", y = "Density", fill = "Loss Function"
-    ) +
-    theme(legend.position = "bottom", plot.title = element_text(face = "bold"))
+# Cancer
+p_cancer_density <- combined_residuals_long %>%
+  filter(Dataset == "Cancer") %>%
+  ggplot(aes(x = Residual, fill = Loss)) +
+  geom_density(alpha = 0.55, adjust = 1.5) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
+  facet_grid(Model ~ Outcome, scales = "free_y") +
+  theme_minimal(base_size = 12) +
+  scale_fill_viridis_d(option = "C", end = 0.8) +
+  labs(
+    title = "Residual Density for Cancer Data",
+    subtitle = "Y1: survival event indicator, Y2: survival time, Y3: weighted performance index",
+    x = "Residual", y = "Density", fill = "Loss Function"
+  ) +
+  theme(legend.position = "bottom", plot.title = element_text(face = "bold"))
 
-print(p_cgd_density)
-
+print(p_cancer_density)

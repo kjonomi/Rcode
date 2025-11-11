@@ -325,12 +325,12 @@ x_scaled <- (x_array - mean(x_array)) / sd(x_array)
 
 # Prepare 3 outcome variables:
 #   Y1: survival event indicator
-#   Y2: survival time
-#   Y3: weighted performance index (e.g., ph.karno - wt.loss)
+#   Y2: weighted performance index (e.g., ph.karno - wt.loss)
+#   Y3: survival time
 y_df <- data.frame(
   Y1 = df$status,
-  Y2 = df$time,
-  Y3 = with(df, ph.karno - wt.loss)
+  Y2 = with(df, ph.karno - wt.loss),
+  Y3 = df$time
 )
 
 # Gaussianize for copula modeling
@@ -405,8 +405,8 @@ cancer_residuals_long <- cancer_results$residuals %>%
   ) %>%
   mutate(
     Outcome = gsub("ResidualY1", "Event", Outcome),
-    Outcome = gsub("ResidualY2", "Time", Outcome),
-    Outcome = gsub("ResidualS", "Performance", Outcome),
+    Outcome = gsub("ResidualY2", "Performance", Outcome),
+    Outcome = gsub("ResidualS", "Time", Outcome),
     Dataset = "Cancer"
   )
 
@@ -528,7 +528,7 @@ p_cancer_density <- combined_residuals_long %>%
   scale_fill_viridis_d(option = "C", end = 0.8) +
   labs(
     title = "Residual Density for Cancer Data",
-    subtitle = "Y1: survival event indicator, Y2: survival time, Y3: weighted performance index",
+    subtitle = "Survival Event indicator, Weighted Performance Index, Survival Time",
     x = "Residual", y = "Density", fill = "Loss Function"
   ) +
   theme(legend.position = "bottom", plot.title = element_text(face = "bold"))

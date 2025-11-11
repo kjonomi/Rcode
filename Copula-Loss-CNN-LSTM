@@ -1,8 +1,5 @@
 # ==============================================================================
-# Full R Code: CNN-LSTM with All Copula NLL Losses (Final Corrected Version)
-# - tfprobability removed
-# - tf$math$erf_inv changed to tf$math$erfinv
-# - Conv1D padding="same" added for Timestep=1 data (CGD fix)
+# Full R Code: CNN-LSTM with All Copula NLL Losses (11/11/2025)
 # ==============================================================================
 
 # 0️⃣ Library Setup

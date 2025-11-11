@@ -295,46 +295,64 @@ print(kable(real_results$results, digits = 3, caption = "Real PBC Residual Summa
 
 
 # ==============================================================================
-# PART 3: CGD DATA (3-Outcome, Timesteps=1)
+# PART 3: CANCER DATA (3-Outcome, Timesteps=1)
 # ==============================================================================
 
 cat("\n\n================================\n")
-cat("REAL DATA: CGD Study\n")
+cat("REAL DATA: Lung Cancer Study\n")
 cat("================================\n")
 
-data("cgd"); time <- cgd$tstop - cgd$tstart; event <- cgd$status
-X <- model.matrix(~0+treat+sex, data=cgd)
-x_array <- array(as.matrix(X), dim=c(nrow(X),1,ncol(X))) # Timesteps = 1
+# Load cancer survival data
+data(cancer, package = "survival")
+df <- cancer
+
+# Clean and select features
+numeric_covs <- c("age", "ph.karno", "pat.karno", "wt.loss")
+categorical_covs <- c("sex", "meal.cal", "inst")  # will one-hot encode later
+df <- df[, c("time", "status", numeric_covs, categorical_covs)]
+df <- df[complete.cases(df), ]
+
+# Convert categorical to numeric indicators
+X <- model.matrix(~ 0 + sex + meal.cal + inst, data = df)
+X <- cbind(df[, numeric_covs], X)
+
+# Prepare 3D array for CNN-LSTM input (timesteps = 1 for cross-sectional data)
+timesteps_cancer <- 1
+x_array <- array(as.matrix(X), dim = c(nrow(X), timesteps_cancer, ncol(X)))
+
+# Normalize features
 x_scaled <- (x_array - mean(x_array)) / sd(x_array)
-y_numeric <- as.matrix(sapply(data.frame(Y1=event,S=time), function(x) qnorm(rank(x)/(length(x)+1))))
 
-# Train CGD models (Uses timesteps_cgd=1 for the model builder)
-timesteps_cgd <- 1 
-features_cgd <- ncol(X)
-
-# The train_and_evaluate function now correctly handles timesteps=1 via the create_cnn_lstm function
-cgd_results <- train_and_evaluate(x_scaled, y_numeric, timesteps_cgd, features_cgd, model_types, model_names, loss_types)
-
-cat("\nReal CGD Residual Summary:\n")
-print(kable(cgd_results$results, digits = 3, caption = "Real CGD Residual Summary") %>% kable_styling(full_width = FALSE))
-
-# ==============================================================================
-# Final Combined Summary
-# ==============================================================================
-all_results_combined <- bind_rows(
-    sim_results$results %>% mutate(Dataset = "Simulated"),
-    real_results$results %>% mutate(Dataset = "PBC"),
-    cgd_results$results %>% mutate(Dataset = "CGD")
+# Prepare 3 outcome variables:
+#   Y1: survival event indicator
+#   Y2: survival time
+#   Y3: weighted performance index (e.g., ph.karno - wt.loss)
+y_df <- data.frame(
+  Y1 = df$status,
+  Y2 = df$time,
+  Y3 = with(df, ph.karno - wt.loss)
 )
 
-cat("\n\n================================\n")
-cat("COMBINED RESULTS SUMMARY (Mean/SD of Residuals)\n")
-cat("================================\n")
-print(kable(all_results_combined, digits = 3, caption = "Combined Residual Summaries (Mean/SD)") %>%
-          kable_styling(full_width = FALSE) %>%
-          group_rows("Simulated", 1, nrow(sim_results$results)) %>%
-          group_rows("PBC", nrow(sim_results$results) + 1, nrow(sim_results$results) + nrow(real_results$results)) %>%
-          group_rows("CGD", nrow(sim_results$results) + nrow(real_results$results) + 1, nrow(all_results_combined))
+# Gaussianize for copula modeling
+y_numeric <- as.matrix(sapply(y_df, function(x) qnorm(rank(x) / (length(x) + 1))))
+
+# Train models (copula + CNN-LSTM)
+features_cancer <- ncol(X)
+cancer_results <- train_and_evaluate(
+  x_scaled,
+  y_numeric,
+  timesteps_cancer,
+  features_cancer,
+  model_types,
+  model_names,
+  loss_types
+)
+
+# Display residual summaries
+cat("\nReal Cancer Residual Summary:\n")
+print(
+  kable(cancer_results$results, digits = 3, caption = "Real Cancer Residual Summary") %>%
+    kable_styling(full_width = FALSE)
 )
 
 # ==============================================================================
@@ -492,7 +510,7 @@ p_pbc_density <- combined_residuals_long %>%
 print(p_pbc_density)
 
 p_cgd_density <- combined_residuals_long %>%
-    filter(Dataset == "CGD") %>%
+    filter(Dataset == "cancer") %>%
     ggplot(aes(x = Residual, fill = Loss)) +
     geom_density(alpha = 0.55, adjust = 1.5) +
     geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
@@ -500,10 +518,11 @@ p_cgd_density <- combined_residuals_long %>%
     theme_minimal(base_size = 12) +
     scale_fill_viridis_d(option = "C", end = 0.8) +
     labs(
-        title = "Residual Density for CGD Data",
-        subtitle = "Time, Event, and Survival Outcomes (N(0,1) Scale)",
+        title = "Residual Density for CANCER Data",
+        subtitle = "Y1: survival event indicator, Y2: survival time, Y3: weighted performance index",
         x = "Residual", y = "Density", fill = "Loss Function"
     ) +
     theme(legend.position = "bottom", plot.title = element_text(face = "bold"))
 
 print(p_cgd_density)
+

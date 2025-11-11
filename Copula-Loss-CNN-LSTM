@@ -306,7 +306,7 @@ data("cgd"); time <- cgd$tstop - cgd$tstart; event <- cgd$status
 X <- model.matrix(~0+treat+sex, data=cgd)
 x_array <- array(as.matrix(X), dim=c(nrow(X),1,ncol(X))) # Timesteps = 1
 x_scaled <- (x_array - mean(x_array)) / sd(x_array)
-y_numeric <- as.matrix(sapply(data.frame(Y1=time,Y2=event,S=time), function(x) qnorm(rank(x)/(length(x)+1))))
+y_numeric <- as.matrix(sapply(data.frame(Y1=event,S=time), function(x) qnorm(rank(x)/(length(x)+1))))
 
 # Train CGD models (Uses timesteps_cgd=1 for the model builder)
 timesteps_cgd <- 1 

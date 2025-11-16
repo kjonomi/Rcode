@@ -230,53 +230,15 @@ head(cindex_all)
 head(maxrisk_all)
 
 # ================================================================
-# 6️⃣ Visualize simulation results
-# ================================================================
-
-library(ggplot2)
-library(dplyr)
-
-# ---------- 6.1 C-index boxplot across simulations ----------
-cindex_long <- cindex_all %>%
-  pivot_longer(
-    cols = starts_with("C_index"),
-    names_to = c(".value", "Cause"),
-    names_pattern = "C_index_(Cause[12])"
-  ) %>%
-  mutate(Cause = ifelse(Cause=="Cause1","Cause 1","Cause 2"))
-
-ggplot(cindex_long, aes(x=Model, y=C_index, fill=Cause)) +
-  geom_boxplot(position=position_dodge(width=0.8)) +
-  ylim(0,1) +
-  theme(axis.text.x=element_text(angle=45,hjust=1)) +
-  labs(title="Simulation: Cause-specific C-index across 100 iterations",
-       y="C-index", x="", fill="Cause")
-
-# ---------- 6.2 Max-risk counts summary ----------
-maxrisk_summary <- maxrisk_all %>%
-  pivot_longer(cols=c(risk_gauss,risk_clayton,risk_gumbel),
-               names_to="Model", values_to="MaxRisk") %>%
-  group_by(Model, MaxRisk) %>%
-  summarise(Count=n(), .groups="drop") %>%
-  group_by(Model) %>%
-  mutate(Percent = 100*Count/sum(Count)) %>%
-  ungroup()
-
-ggplot(maxrisk_summary, aes(x=Model, y=Percent, fill=MaxRisk)) +
-  geom_bar(stat="identity", position="stack") +
-  theme(axis.text.x=element_text(angle=45,hjust=1)) +
-  labs(title="Simulation: Max-risk prediction distribution across 100 iterations",
-       y="Percentage (%)", x="", fill="Max Risk")
-
-# ================================================================
-# 7️⃣ C-index with 95% bootstrap CI across 100 simulations
+# 6️⃣ & 7️⃣ Visualize simulation results: max-risk and C-index
 # ================================================================
 
 library(dplyr)
 library(ggplot2)
+library(tidyr)
 library(boot)
 
-# Function to compute bootstrap CI for a numeric vector
+# ---------- Function to compute bootstrap CI ----------
 bootstrap_ci <- function(x, R=200, conf=0.95){
   if(length(unique(x)) < 2) return(c(NA, NA))  # not enough variation
   b <- boot(x, statistic=function(data, i) mean(data[i]), R=R)
@@ -284,35 +246,74 @@ bootstrap_ci <- function(x, R=200, conf=0.95){
   return(ci)
 }
 
-# Prepare long format for C-index across simulations
-cindex_long_ci <- cindex_all %>%
+# ---------- 6.1 Prepare long format for C-index ----------
+cindex_long <- cindex_all %>%
   pivot_longer(
     cols = starts_with("C_index"),
-    names_to = c(".value","Cause"),
-    names_pattern = "C_index_(Cause[12])"
+    names_to = "Cause",
+    values_to = "C_index"
   ) %>%
-  mutate(Cause = ifelse(Cause=="Cause1","Cause 1","Cause 2"))
+  mutate(
+    Cause = ifelse(Cause == "C_index_Cause1", "Cause 1", "Cause 2"),
+    Model = factor(Model, levels = c("Cox","CE","Copula-CR Gaussian","Copula-CR Clayton","Copula-CR Gumbel"))
+  )
 
-# Compute bootstrap CI per model + cause
-cindex_ci_summary <- cindex_long_ci %>%
+# ---------- 6.2 Summarize C-index with bootstrap CI ----------
+cindex_summary <- cindex_long %>%
   group_by(Model, Cause) %>%
   summarise(
-    C_index_mean = mean(C_index, na.rm=TRUE),
-    CI = list(bootstrap_ci(C_index, R=200)),
+    Mean_C_index = mean(C_index, na.rm=TRUE),
+    CI_lower = bootstrap_ci(C_index)[1],
+    CI_upper = bootstrap_ci(C_index)[2],
     .groups="drop"
-  ) %>%
-  tidyr::unnest_wider(CI, names_sep="_") %>%
-  rename(CI_lower = CI_1, CI_upper = CI_2)
+  )
 
-# Plot with mean + bootstrap CI
-ggplot(cindex_ci_summary, aes(x=Model, y=C_index_mean, fill=Cause)) +
-  geom_col(position=position_dodge(width=0.8)) +
-  geom_errorbar(aes(ymin=CI_lower, ymax=CI_upper), width=0.2, position=position_dodge(0.8)) +
+# ---------- 6.3 Plot C-index with 95% CI ----------
+ggplot(cindex_summary, aes(x = Model, y = Mean_C_index, fill = Cause)) +
+  geom_col(position = position_dodge(0.8)) +
+  geom_errorbar(aes(ymin = CI_lower, ymax = CI_upper),
+                width = 0.2,
+                position = position_dodge(0.8)) +
   ylim(0,1) +
-  theme(axis.text.x=element_text(angle=45,hjust=1)) +
-  labs(title="Simulation: Cause-specific C-index with 95% Bootstrap CI",
-       y="C-index", x="", fill="Cause")
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle=45, hjust=1)) +
+  labs(
+    title = "Cause-specific C-index with 95% Bootstrap CI",
+    y = "C-index",
+    x = "",
+    fill = "Cause"
+  )
 
+# ---------- 6.4 Prepare max-risk summary ----------
+maxrisk_long <- maxrisk_all %>%
+  pivot_longer(
+    cols = c(risk_gauss, risk_clayton, risk_gumbel),
+    names_to = "Model",
+    values_to = "Max_Risk"
+  ) %>%
+  mutate(
+    Model = factor(Model,
+                   levels = c("risk_gauss","risk_clayton","risk_gumbel"),
+                   labels = c("Copula-CR Gaussian","Copula-CR Clayton","Copula-CR Gumbel"))
+  )
+
+maxrisk_summary <- maxrisk_long %>%
+  group_by(Model, Max_Risk) %>%
+  summarise(Count = n(),
+            Percent = 100*Count/n(),
+            .groups="drop")
+
+# ---------- 6.5 Plot max-risk counts ----------
+ggplot(maxrisk_summary, aes(x = Model, y = Percent, fill = Max_Risk)) +
+  geom_col(position = "dodge") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle=45, hjust=1)) +
+  labs(
+    title = "Predicted Maximum Risk Cause Across Simulations",
+    y = "Percentage (%)",
+    x = "",
+    fill = "Max Risk Cause"
+  )
 
 
 # ================================================================

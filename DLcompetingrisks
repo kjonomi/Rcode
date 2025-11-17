@@ -494,3 +494,253 @@ ggplot(df_cif_dist, aes(x = CIF, fill = Model)) +
         axis.title = element_text(size=13),
         legend.text = element_text(size=12),
         legend.title = element_text(size=13))
+
+
+
+# ================================================================
+# 0️⃣ Libraries
+# ================================================================
+library(survival)
+library(dplyr)
+library(tidyr)
+library(keras)
+library(tensorflow)
+library(Hmisc)
+library(boot)
+library(cmprsk)
+library(ggplot2)
+library(knitr)
+
+# ================================================================
+# 1️⃣ Load Melanoma data
+# ================================================================
+data(melanoma, package="survival")
+df <- melanoma %>%
+  filter(!is.na(time) & !is.na(status)) %>%
+  mutate(
+    event = case_when(
+      status == 1 ~ 1,  # death due to melanoma
+      status == 2 ~ 2,  # death due to other causes
+      TRUE ~ 0
+    )
+  )
+
+covariates <- c("age", "sex", "thickness", "ulcer") # example features
+df[,covariates] <- lapply(df[,covariates], function(x) as.numeric(x))
+n <- nrow(df)
+
+# Simulation / bootstrap parameters
+n_sim <- 50
+B_boot <- 50
+times_eval <- seq(0, max(df$time), by=1)
+
+# ================================================================
+# 2️⃣ Copula helper functions (same as before)
+# ================================================================
+to_uniform_tf <- function(x){
+  u <- tf$math$sigmoid(tf$cast(x, tf$float32))
+  tf$clip_by_value(u, 1e-6, 1-1e-6)
+}
+
+copula_gaussian_loss <- function(y_true, y_pred){
+  rho <- tf$constant(0.5, dtype=tf$float32)
+  u <- to_uniform_tf(y_pred)
+  z <- tf$sqrt(2) * tf$math$erfinv(2*u - 1)
+  z1 <- z[,1]; z2 <- z[,2]
+  detR <- 1 - rho^2
+  invR <- 1 / detR
+  quad <- invR * (z1^2 + z2^2 - 2*rho*z1*z2)
+  loss_term <- -0.5*quad - 0.5*tf$math$log(detR)
+  -tf$reduce_mean(loss_term)
+}
+
+copula_clayton_loss <- function(y_true, y_pred){
+  theta <- tf$constant(1.5, dtype=tf$float32)
+  u <- to_uniform_tf(y_pred)
+  S <- tf$reduce_sum(u^(-theta), axis=1L)
+  log_c <- tf$math$log(1+theta) - (theta+1)*tf$reduce_sum(tf$math$log(u), axis=1L) - (2 + 1/theta)*tf$math$log(S - 1 + 1e-6)
+  -tf$reduce_mean(log_c)
+}
+
+copula_gumbel_loss <- function(y_true, y_pred){
+  theta <- tf$constant(2.0, dtype=tf$float32)
+  u <- to_uniform_tf(y_pred)
+  log_u <- -tf$math$log(u)
+  phi <- log_u^theta
+  S <- tf$reduce_sum(phi, axis=1L)
+  log_C <- -S^(1/theta)
+  log_c <- log_C +
+    (1/theta - 1) * tf$math$log(S + 1e-6) +
+    tf$reduce_sum((theta-1)*tf$math$log(log_u + 1e-6) - tf$math$log(u + 1e-6), axis=1L) +
+    tf$math$log(1 + (theta-1)*S^(-1/theta))
+  -tf$reduce_mean(log_c)
+}
+
+# ================================================================
+# 3️⃣ CNN-LSTM model builder (same as before)
+# ================================================================
+create_model <- function(loss_fn, n_features=length(covariates), n_causes=2){
+  inputs <- layer_input(shape=c(1,n_features))
+  outputs <- inputs %>%
+    layer_conv_1d(filters=16, kernel_size=1, activation="relu") %>%
+    layer_lstm(16) %>%
+    layer_dense(16, activation="relu") %>%
+    layer_dense(n_causes, activation="sigmoid")
+  
+  model <- keras_model(inputs=inputs, outputs=outputs)
+  model %>% compile(
+    loss=loss_fn,
+    optimizer=optimizer_adam(0.001)
+  )
+  return(model)
+}
+
+# ================================================================
+# 4️⃣ CIF computation function (same as before)
+# ================================================================
+compute_cif_realistic <- function(model, df, times, time_step=1){
+  Xd <- array(as.matrix(df[,covariates]), dim=c(nrow(df),1,length(covariates)))
+  preds <- model %>% predict(Xd)
+  
+  n <- nrow(df)
+  n_times <- length(times)
+  
+  cif1 <- matrix(0, nrow=n, ncol=n_times)
+  cif2 <- matrix(0, nrow=n, ncol=n_times)
+  surv_prob <- matrix(1, nrow=n, ncol=n_times)
+  
+  for(t in 1:n_times){
+    h1 <- preds[,1] * time_step
+    h2 <- preds[,2] * time_step
+    s_prev <- if(t==1) rep(1,n) else surv_prob[,t-1]
+    
+    cif1[,t] <- if(t==1) h1 else cif1[,t-1] + h1 * s_prev
+    cif2[,t] <- if(t==1) h2 else cif2[,t-1] + h2 * s_prev
+    surv_prob[,t] <- 1 - cif1[,t] - cif2[,t]
+  }
+  
+  data.frame(
+    Time = times,
+    CIF1 = colMeans(cif1),
+    CIF2 = colMeans(cif2),
+    Model = deparse(substitute(model))
+  )
+}
+
+# ================================================================
+# 5️⃣ Bootstrap C-index functions
+# ================================================================
+cindex_cause_boot_fn <- function(data, indices, model, cause=1){
+  d <- data[indices, ]
+  y_true <- d$event
+  if(sum(y_true==cause)<2) return(NA)
+  
+  Xd <- array(as.matrix(d[,covariates]), dim=c(nrow(d),1,length(covariates)))
+  score <- model %>% predict(Xd)
+  score <- score[,cause]
+  
+  rcorr.cens(score, Surv(d$time, ifelse(y_true==cause,1,0)))["C Index"]
+}
+
+ci_safe <- function(b){ 
+  if(all(is.na(b$t))||sd(b$t,na.rm=TRUE)==0) c(NA,NA) else boot.ci(b,type="perc")$percent[4:5] 
+}
+
+# ================================================================
+# 6️⃣ Simulation loop with real Melanoma data
+# ================================================================
+set.seed(123)
+cindex_results_list <- list()
+cif_results_list <- list()
+
+for(sim in 1:n_sim){
+  cat("Simulation:", sim, "\n")
+  
+  # ---------- Train/test split ----------
+  idx_train <- sample(seq_len(n), floor(0.8*n))
+  df_train <- df[idx_train, ]
+  df_test  <- df[-idx_train, ]
+  
+  X_train <- array(as.matrix(df_train[,covariates]), dim=c(nrow(df_train),1,length(covariates)))
+  y_train_cr <- as.matrix(cbind(1-(df_train$event==1 | df_train$event==2), 
+                                df_train$event==1, df_train$event==2))
+  
+  # ---------- Train models ----------
+  model_gauss <- create_model(copula_gaussian_loss)
+  model_clayton <- create_model(copula_clayton_loss)
+  model_gumbel <- create_model(copula_gumbel_loss)
+  
+  model_gauss %>% fit(X_train, y_train_cr, epochs=5, batch_size=32, verbose=0)
+  model_clayton %>% fit(X_train, y_train_cr, epochs=5, batch_size=32, verbose=0)
+  model_gumbel %>% fit(X_train, y_train_cr, epochs=5, batch_size=32, verbose=0)
+  
+  pretrained_all <- list(
+    Copula_Gaussian=model_gauss,
+    Copula_Clayton=model_clayton,
+    Copula_Gumbel=model_gumbel
+  )
+  
+  # ---------- Bootstrap C-index ----------
+  boot_results_c1 <- lapply(pretrained_all, function(m) 
+    boot(df_test, function(d,i) cindex_cause_boot_fn(d,i,m,1), R=B_boot)
+  )
+  boot_results_c2 <- lapply(pretrained_all, function(m) 
+    boot(df_test, function(d,i) cindex_cause_boot_fn(d,i,m,2), R=B_boot)
+  )
+  
+  summary_cause_ci <- data.frame(
+    Simulation=sim,
+    Model=names(pretrained_all),
+    C_index_Cause1 = sapply(boot_results_c1, function(b) mean(b$t, na.rm=TRUE)),
+    CI_lower_Cause1 = sapply(boot_results_c1, function(b) ci_safe(b)[1]),
+    CI_upper_Cause1 = sapply(boot_results_c1, function(b) ci_safe(b)[2]),
+    C_index_Cause2 = sapply(boot_results_c2, function(b) mean(b$t, na.rm=TRUE)),
+    CI_lower_Cause2 = sapply(boot_results_c2, function(b) ci_safe(b)[1]),
+    CI_upper_Cause2 = sapply(boot_results_c2, function(b) ci_safe(b)[2])
+  )
+  
+  cindex_results_list[[sim]] <- summary_cause_ci
+  
+  # ---------- Compute CIF ----------
+  cif_results_list[[sim]] <- rbind(
+    compute_cif_realistic(model_gauss, df_test, times_eval),
+    compute_cif_realistic(model_clayton, df_test, times_eval),
+    compute_cif_realistic(model_gumbel, df_test, times_eval)
+  )
+}
+
+# ================================================================
+# 7️⃣ Aggregate CIFs and C-index results
+# ================================================================
+cif_all <- do.call(rbind, cif_results_list)
+cindex_all <- do.call(rbind, cindex_results_list)
+
+# ---------- Plot CIF ----------
+ggplot(cif_all, aes(x=Time, y=CIF1, color=Model)) +
+  geom_line(size=1) +
+  labs(title="Predicted Cause 1 CIF (Melanoma Test Set)", y="CIF", x="Time") +
+  theme_minimal()
+
+ggplot(cif_all, aes(x=Time, y=CIF2, color=Model)) +
+  geom_line(size=1) +
+  labs(title="Predicted Cause 2 CIF (Melanoma Test Set)", y="CIF", x="Time") +
+  theme_minimal()
+
+# ---------- Summarize C-index ----------
+cindex_long <- cindex_all %>%
+  pivot_longer(cols = c(C_index_Cause1, C_index_Cause2),
+               names_to = "Cause", values_to = "C_index") %>%
+  mutate(Cause = ifelse(Cause=="C_index_Cause1","Cause 1","Cause 2"))
+
+cindex_summary_table <- cindex_long %>%
+  group_by(Model, Cause) %>%
+  summarise(
+    Mean_C_index = mean(C_index, na.rm=TRUE),
+    CI_lower = mean(ifelse(Cause=="Cause 1", CI_lower_Cause1, CI_lower_Cause2), na.rm=TRUE),
+    CI_upper = mean(ifelse(Cause=="Cause 1", CI_upper_Cause1, CI_upper_Cause2), na.rm=TRUE),
+    .groups="drop"
+  ) %>%
+  arrange(Model, Cause)
+
+# ---------- Show C-index summary table ----------
+kable(cindex_summary_table, digits=3, caption="Cause-specific C-index with 95% Bootstrap CI (Melanoma Dataset)")

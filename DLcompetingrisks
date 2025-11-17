@@ -10,13 +10,14 @@ library(Hmisc)
 library(boot)
 library(cmprsk)
 library(ggplot2)
+library(knitr)
 
 # ================================================================
 # 1️⃣ Simulation parameters
 # ================================================================
-n_sim <- 10      # fewer iterations for demo
-n <- 1000
-B_boot <- 50
+n_sim <- 10      # number of simulations
+n <- 1000        # sample size
+B_boot <- 50     # bootstrap iterations
 covariates <- c("x1","x2","x3","x4")
 times_eval <- seq(0, 50, by=1)
 
@@ -91,7 +92,7 @@ cif_results_list <- list()
 for(sim in 1:n_sim){
   cat("Simulation:", sim, "\n")
   
-  # ---------- Strong signal synthetic data ----------
+  # ---------- Synthetic strong-signal competing-risk data ----------
   df <- data.frame(
     id = 1:n,
     x1 = rnorm(n),
@@ -180,7 +181,6 @@ for(sim in 1:n_sim){
   compute_cif <- function(model, df, times){
     Xd <- array(as.matrix(df[,covariates]), dim=c(nrow(df),1,length(covariates)))
     p <- model %>% predict(Xd)
-    # p[,1] ~ cause1 probability, p[,2] ~ cause2
     mean_cif1 <- sapply(times, function(t) mean(p[,1])) # placeholder: static probability
     mean_cif2 <- sapply(times, function(t) mean(p[,2]))
     data.frame(Time=times, CIF1=mean_cif1, CIF2=mean_cif2, Model=deparse(substitute(model)))
@@ -194,7 +194,7 @@ for(sim in 1:n_sim){
 }
 
 # ================================================================
-# 5️⃣ Aggregate and plot CIFs
+# 5️⃣ Aggregate results
 # ================================================================
 cindex_all <- do.call(rbind, cindex_results_list)
 cif_all <- do.call(rbind, cif_results_list)
@@ -213,11 +213,7 @@ ggplot(cif_all, aes(x=Time, y=CIF2, color=Model)) +
 # ---------- Show C-index summary ----------
 cindex_all
 
-library(dplyr)
-library(tidyr)
-library(knitr)
-
-# Pivot to long format
+# ---------- Pivot to long format ----------
 cindex_long <- cindex_all %>%
   pivot_longer(
     cols = c(C_index_Cause1, C_index_Cause2),
@@ -228,7 +224,7 @@ cindex_long <- cindex_all %>%
     Cause = ifelse(Cause == "C_index_Cause1", "Cause 1", "Cause 2")
   )
 
-# Summarize mean and CI per model and cause
+# ---------- Summarize mean and CI per model and cause ----------
 cindex_summary_table <- cindex_long %>%
   group_by(Model, Cause) %>%
   summarise(
@@ -239,14 +235,14 @@ cindex_summary_table <- cindex_long %>%
   ) %>%
   arrange(Model, Cause)
 
-# Show table
+# ---------- Show summary table ----------
 kable(cindex_summary_table, digits = 3,
       caption = "Cause-specific C-index with 95% Bootstrap CI")
 
 
 
 # ================================================================
-# 0️⃣ Libraries
+# 0️⃣ PBC Real Data
 # ================================================================
 library(JM)
 library(survival)

@@ -393,12 +393,12 @@ pretrained_all <- list(
 )
 
 # ================================================================
-# 5️⃣ Bootstrap C-index
+# 5️⃣ Bootstrap C-index (safe for zero-event causes)
 # ================================================================
 cindex_cause_boot_fn <- function(data, indices, model_name, cause=1){
   d <- data[indices, ]
   y_true <- d$event
-  if(sum(y_true==cause)<2) return(NA)
+  if(sum(y_true==cause)<2) return(NA)  # not enough events
   
   m <- pretrained_all[[model_name]]
   Xd <- array(as.matrix(d[,covariates]), dim=c(nrow(d),1,length(covariates)))
@@ -409,139 +409,87 @@ cindex_cause_boot_fn <- function(data, indices, model_name, cause=1){
 }
 
 ci_safe <- function(b){ 
-  if(all(is.na(b$t))||sd(b$t,na.rm=TRUE)==0) c(NA,NA) else boot.ci(b,type="perc")$percent[4:5] 
+  if(all(is.na(b$t)) || sd(b$t, na.rm=TRUE)==0) c(NA,NA) else boot.ci(b, type="perc")$percent[4:5] 
 }
 
 boot_models <- c("copula_gauss","copula_clayton","copula_gumbel")
-boot_results_c1 <- lapply(boot_models, function(m) boot(df_test, function(d,i) cindex_cause_boot_fn(d,i,m,cause=1), R=50))
-boot_results_c2 <- lapply(boot_models, function(m) boot(df_test, function(d,i) cindex_cause_boot_fn(d,i,m,cause=2), R=50))
 
-summary_cindex <- data.frame(
-  Model = c("Copula Gaussian","Copula Clayton","Copula Gumbel"),
-  C_index_Cause1 = sapply(boot_results_c1,function(b) mean(b$t,na.rm=TRUE)),
-  CI_lower_Cause1 = sapply(boot_results_c1,function(b) ci_safe(b)[1]),
-  CI_upper_Cause1 = sapply(boot_results_c1,function(b) ci_safe(b)[2]),
-  C_index_Cause2 = sapply(boot_results_c2,function(b) mean(b$t,na.rm=TRUE)),
-  CI_lower_Cause2 = sapply(boot_results_c2,function(b) ci_safe(b)[1]),
-  CI_upper_Cause2 = sapply(boot_results_c2,function(b) ci_safe(b)[2])
-)
+# Identify which causes exist in test set
+causes_present <- unique(df_test$event[df_test$event != 0])
+
+boot_results <- lapply(boot_models, function(m){
+  sapply(causes_present, function(c){
+    boot(df_test, function(d,i) cindex_cause_boot_fn(d,i,m,cause=c), R=50)
+  }, simplify=FALSE)
+})
+
+# Build summary table dynamically
+summary_cindex <- data.frame(Model = c("Copula Gaussian","Copula Clayton","Copula Gumbel"))
+
+for(i in seq_along(causes_present)){
+  c <- causes_present[i]
+  cindex_vals <- sapply(boot_results, function(b) mean(b[[i]]$t, na.rm=TRUE))
+  ci_lower <- sapply(boot_results, function(b) ci_safe(b[[i]])[1])
+  ci_upper <- sapply(boot_results, function(b) ci_safe(b[[i]])[2])
+  
+  summary_cindex[[paste0("C_index_Cause", c)]] <- cindex_vals
+  summary_cindex[[paste0("CI_lower_Cause", c)]] <- ci_lower
+  summary_cindex[[paste0("CI_upper_Cause", c)]] <- ci_upper
+}
 
 print(summary_cindex)
 
 # ================================================================
-# 6️⃣ Compute cause-specific CIFs for test set
+# 7️⃣ Summarize and plot mean CIF curves (only causes present)
 # ================================================================
-library(survival)
-library(cmprsk)
-library(ggplot2)
-library(dplyr)
-
-# Function to approximate discrete-time CIFs from model predictions
-compute_cif <- function(model, X_data, max_time = 15, time_step = 0.25){
-  # X_data: array of shape (n_samples,1,n_features)
-  n <- dim(X_data)[1]
-  times <- seq(0, max_time, by=time_step)
-  n_times <- length(times)
-  
-  # Initialize matrices for CIFs
-  cif1 <- matrix(0, nrow=n, ncol=n_times)
-  cif2 <- matrix(0, nrow=n, ncol=n_times)
-  surv_prob <- matrix(1, nrow=n, ncol=n_times)
-  
-  # Predict per-interval risks
-  preds <- model %>% predict(X_data)
-  # Ensure numeric & 2 causes
-  if(ncol(preds) < 2) stop("Model prediction must have 2 causes")
-  
-  for(t in 1:n_times){
-    # Discrete hazard approximation
-    h1 <- preds[,1] * time_step
-    h2 <- preds[,2] * time_step
-    s_prev <- if(t==1) rep(1,n) else surv_prob[,t-1]
-    
-    cif1[,t] <- if(t==1) h1 else cif1[,t-1] + h1 * s_prev
-    cif2[,t] <- if(t==1) h2 else cif2[,t-1] + h2 * s_prev
-    surv_prob[,t] <- 1 - cif1[,t] - cif2[,t]
-  }
-  
-  list(times = times, CIF1 = cif1, CIF2 = cif2)
+mean_cif <- function(cif_obj, causes_present){
+  df <- data.frame(time = cif_obj$times)
+  if(1 %in% causes_present) df$CIF1 <- colMeans(cif_obj$CIF1)
+  if(2 %in% causes_present) df$CIF2 <- colMeans(cif_obj$CIF2)
+  df
 }
 
-# Compute CIFs for each model
-cif_gauss   <- compute_cif(pretrained_all$copula_gauss, X_test)
-cif_clayton <- compute_cif(pretrained_all$copula_clayton, X_test)
-cif_gumbel  <- compute_cif(pretrained_all$copula_gumbel, X_test)
-
-# ================================================================
-# 7️⃣ Summarize and plot mean CIF curves
-# ================================================================
-mean_cif <- function(cif_obj){
-  data.frame(
-    time = cif_obj$times,
-    CIF1 = colMeans(cif_obj$CIF1),
-    CIF2 = colMeans(cif_obj$CIF2)
-  )
-}
-
-df_cif_gauss   <- mean_cif(cif_gauss)   %>% mutate(Model="Copula Gaussian")
-df_cif_clayton <- mean_cif(cif_clayton) %>% mutate(Model="Copula Clayton")
-df_cif_gumbel  <- mean_cif(cif_gumbel)  %>% mutate(Model="Copula Gumbel")
+df_cif_gauss   <- mean_cif(cif_gauss, causes_present)   %>% mutate(Model="Copula Gaussian")
+df_cif_clayton <- mean_cif(cif_clayton, causes_present) %>% mutate(Model="Copula Clayton")
+df_cif_gumbel  <- mean_cif(cif_gumbel, causes_present)  %>% mutate(Model="Copula Gumbel")
 
 df_plot <- bind_rows(df_cif_gauss, df_cif_clayton, df_cif_gumbel) %>%
-  tidyr::pivot_longer(cols=c("CIF1","CIF2"), names_to="Cause", values_to="CIF")
+  tidyr::pivot_longer(cols = starts_with("CIF"), names_to="Cause", values_to="CIF")
 
-# Plot mean CIF curves
 ggplot(df_plot, aes(x=time, y=CIF, color=Model, linetype=Cause)) +
   geom_line(size=1) +
   theme_minimal() +
   labs(title="Predicted Cause-specific CIFs (PBC Test Set)",
-       x="Time (years)",
-       y="Cumulative incidence function",
-       color="Model",
-       linetype="Cause") +
+       x="Time (years)", y="Cumulative incidence function",
+       color="Model", linetype="Cause") +
   theme(axis.text=element_text(size=12),
         axis.title=element_text(size=13),
         legend.text=element_text(size=12),
         legend.title=element_text(size=13))
 
 # ================================================================
-# 8️⃣ Predicted CIF distributions
+# 8️⃣ Predicted CIF distributions at 5 years (only causes present)
 # ================================================================
-
-# Function to create long-format CIF for all subjects at a given time
-cif_long_format <- function(cif_obj, model_name, selected_time = 5){
-  # selected_time: year at which to extract CIF
+cif_long_format <- function(cif_obj, model_name, selected_time = 5, causes_present){
   time_idx <- which.min(abs(cif_obj$times - selected_time))
-  
-  data.frame(
-    Subject = 1:nrow(cif_obj$CIF1),
-    CIF1 = cif_obj$CIF1[,time_idx],
-    CIF2 = cif_obj$CIF2[,time_idx],
-    Model = model_name
-  ) %>%
-    tidyr::pivot_longer(cols = c("CIF1","CIF2"), names_to = "Cause", values_to = "CIF")
+  df <- data.frame(Subject = 1:nrow(cif_obj$CIF1), Model = model_name)
+  if(1 %in% causes_present) df$CIF1 <- cif_obj$CIF1[,time_idx]
+  if(2 %in% causes_present) df$CIF2 <- cif_obj$CIF2[,time_idx]
+  tidyr::pivot_longer(df, cols=starts_with("CIF"), names_to="Cause", values_to="CIF")
 }
 
-# Extract CIF distributions at 5 years
-df_cif_gauss_dist   <- cif_long_format(cif_gauss, "Copula Gaussian", selected_time = 5)
-df_cif_clayton_dist <- cif_long_format(cif_clayton, "Copula Clayton", selected_time = 5)
-df_cif_gumbel_dist  <- cif_long_format(cif_gumbel, "Copula Gumbel", selected_time = 5)
+df_cif_dist <- bind_rows(
+  cif_long_format(cif_gauss, "Copula Gaussian", 5, causes_present),
+  cif_long_format(cif_clayton, "Copula Clayton", 5, causes_present),
+  cif_long_format(cif_gumbel, "Copula Gumbel", 5, causes_present)
+)
 
-df_cif_dist <- bind_rows(df_cif_gauss_dist,
-                         df_cif_clayton_dist,
-                         df_cif_gumbel_dist)
-
-# ================================================================
-# 8.1 Plot CIF distributions by model and cause
-# ================================================================
 ggplot(df_cif_dist, aes(x = CIF, fill = Model)) +
   geom_histogram(alpha = 0.5, position = "identity", bins = 20) +
   facet_wrap(~Cause) +
   theme_minimal() +
   labs(title = "Predicted CIF Distribution at 5 years (PBC Test Set)",
-       x = "Cumulative Incidence Function",
-       y = "Count",
-       fill = "Model") +
+       x = "Cumulative Incidence Function", y = "Count", fill = "Model") +
   theme(axis.text = element_text(size=12),
         axis.title = element_text(size=13),
         legend.text = element_text(size=12),

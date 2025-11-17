@@ -6,39 +6,32 @@ library(dplyr)
 library(tidyr)
 library(keras)
 library(tensorflow)
-library(ggplot2)
-library(MASS)
-library(cmprsk)
-library(survminer)
-library(boot)
 library(Hmisc)
+library(boot)
+library(cmprsk)
+library(ggplot2)
 
 # ================================================================
 # 1️⃣ Simulation parameters
 # ================================================================
-n_sim <- 100    # number of iterations
-n <- 1000        # sample size per iteration
-B_boot <- 20    # bootstrap resamples (short for speed)
-covariates <- c("age","sex","serChol","albumin","SGOT","serBilir",
-                "spiders","ascites","hepatomegaly")
+n_sim <- 10      # fewer iterations for demo
+n <- 1000
+B_boot <- 50
+covariates <- c("x1","x2","x3","x4")
+times_eval <- seq(0, 50, by=1)
 
 # ================================================================
-# 2️⃣ Helper functions: Copula / CIF transformation
+# 2️⃣ Copula helper functions (Gaussian/Clayton/Gumbel)
 # ================================================================
 to_uniform_tf <- function(x){
   u <- tf$math$sigmoid(tf$cast(x, tf$float32))
   tf$clip_by_value(u, 1e-6, 1-1e-6)
 }
 
-u_to_z <- function(u){
-  tf$sqrt(2.0) * tf$math$erfinv(2.0*tf$clip_by_value(u,1e-6,1-1e-6) - 1.0)
-}
-
 copula_gaussian_loss <- function(y_true, y_pred){
   rho <- tf$constant(0.5, dtype=tf$float32)
-  rho <- tf$clip_by_value(rho, -0.99, 0.99)
   u <- to_uniform_tf(y_pred)
-  z <- u_to_z(u)
+  z <- tf$sqrt(2) * tf$math$erfinv(2*u - 1)
   z1 <- z[,1]; z2 <- z[,2]
   detR <- 1 - rho^2
   invR <- 1 / detR
@@ -49,7 +42,6 @@ copula_gaussian_loss <- function(y_true, y_pred){
 
 copula_clayton_loss <- function(y_true, y_pred){
   theta <- tf$constant(1.5, dtype=tf$float32)
-  theta <- tf$maximum(theta, 0.01)
   u <- to_uniform_tf(y_pred)
   S <- tf$reduce_sum(u^(-theta), axis=1L)
   log_c <- tf$math$log(1+theta) - (theta+1)*tf$reduce_sum(tf$math$log(u), axis=1L) - (2 + 1/theta)*tf$math$log(S - 1 + 1e-6)
@@ -58,7 +50,6 @@ copula_clayton_loss <- function(y_true, y_pred){
 
 copula_gumbel_loss <- function(y_true, y_pred){
   theta <- tf$constant(2.0, dtype=tf$float32)
-  theta <- tf$maximum(theta, 1.001)
   u <- to_uniform_tf(y_pred)
   log_u <- -tf$math$log(u)
   phi <- log_u^theta
@@ -71,30 +62,22 @@ copula_gumbel_loss <- function(y_true, y_pred){
   -tf$reduce_mean(log_c)
 }
 
-competing_risks_loss <- function(y_true, y_pred){
-  event_mask <- tf$reduce_sum(y_true[,2:3], axis=1L)
-  cause_mask1 <- y_true[,2]; cause_mask2 <- y_true[,3]
-  u <- to_uniform_tf(y_pred)
-  cif1 <- u[,1]; cif2 <- u[,2]
-  ll1 <- cause_mask1 * tf$math$log(cif1 + 1e-6)
-  ll2 <- cause_mask2 * tf$math$log(cif2 + 1e-6)
-  surv_prob <- 1 - cif1 - cif2
-  ll_cens <- (1 - event_mask) * tf$math$log(surv_prob + 1e-6)
-  -tf$reduce_mean(ll1 + ll2 + ll_cens)
-}
-
 # ================================================================
 # 3️⃣ CNN-LSTM model builder
 # ================================================================
-create_model <- function(loss_fn, n_causes=2){
-  model <- keras_model_sequential() %>%
-    layer_conv_1d(filters=16, kernel_size=1, activation="relu", input_shape=c(1,length(covariates))) %>%
+create_model <- function(loss_fn, n_features=length(covariates), n_causes=2){
+  inputs <- layer_input(shape=c(1,n_features))
+  outputs <- inputs %>%
     layer_conv_1d(filters=16, kernel_size=1, activation="relu") %>%
     layer_lstm(16) %>%
     layer_dense(16, activation="relu") %>%
-    layer_dense(n_causes, activation=ifelse(n_causes==1,"softmax","sigmoid"))
+    layer_dense(n_causes, activation="sigmoid")
   
-  model %>% compile(loss=loss_fn, optimizer=optimizer_adam(0.001), metrics="accuracy")
+  model <- keras_model(inputs=inputs, outputs=outputs)
+  model %>% compile(
+    loss=loss_fn,
+    optimizer=optimizer_adam(0.001)
+  )
   return(model)
 }
 
@@ -103,93 +86,86 @@ create_model <- function(loss_fn, n_causes=2){
 # ================================================================
 set.seed(123)
 cindex_results_list <- list()
-maxrisk_results_list <- list()
+cif_results_list <- list()
 
 for(sim in 1:n_sim){
   cat("Simulation:", sim, "\n")
   
-  # ---------- Generate synthetic data ----------
+  # ---------- Strong signal synthetic data ----------
   df <- data.frame(
     id = 1:n,
-    age = rnorm(n, 50, 10),
-    sex = rbinom(n, 1, 0.6),
-    serChol = rnorm(n, 250, 40),
-    albumin = rnorm(n, 3.5, 0.5),
-    SGOT = rnorm(n, 30, 10),
-    serBilir = rnorm(n, 1, 0.5),
-    spiders = rbinom(n, 1, 0.3),
-    ascites = rbinom(n, 1, 0.2),
-    hepatomegaly = rbinom(n, 1, 0.25)
+    x1 = rnorm(n),
+    x2 = rnorm(n),
+    x3 = rnorm(n),
+    x4 = rnorm(n)
   )
-  df$time <- rexp(n, rate = 0.05)
-  df$event <- sample(0:2, n, replace=TRUE, prob=c(0.4,0.35,0.25))
+  
+  lp1 <- 2*df$x1 - df$x2 + 1.5*df$x3
+  lp2 <- -1*df$x1 + 2*df$x2 - df$x4
+  baseline_hazard <- 0.02
+  df$time1 <- -log(runif(n)) / (baseline_hazard * exp(lp1))
+  df$time2 <- -log(runif(n)) / (baseline_hazard * exp(lp2))
+  
+  df$event <- ifelse(df$time1 < df$time2, 1,
+                     ifelse(df$time2 < df$time1, 2, 0))
+  df$time <- pmin(df$time1, df$time2)
   
   # ---------- Train/test split ----------
-  idx_train <- sample(seq_len(nrow(df)), floor(0.8*nrow(df)))
+  idx_train <- sample(seq_len(n), floor(0.8*n))
   df_train <- df[idx_train, ]
   df_test  <- df[-idx_train, ]
   
   X_train <- array(as.matrix(df_train[,covariates]), dim=c(nrow(df_train),1,length(covariates)))
   X_test  <- array(as.matrix(df_test[,covariates]), dim=c(nrow(df_test),1,length(covariates)))
   
-  df_train$keras_event <- ifelse(df_train$event>0,1,0)
-  df_test$keras_event  <- ifelse(df_test$event>0,1,0)
-  y_train <- to_categorical(df_train$keras_event,2)
-  y_test  <- to_categorical(df_test$keras_event,2)
-  
   df_train$event1 <- ifelse(df_train$event==1,1,0)
   df_train$event2 <- ifelse(df_train$event==2,1,0)
-  y_train_cr <- as.matrix(cbind(1-df_train$keras_event, df_train$event1, df_train$event2))
+  y_train_cr <- as.matrix(cbind(1-(df_train$event1+df_train$event2), df_train$event1, df_train$event2))
   
   df_test$event1 <- ifelse(df_test$event==1,1,0)
   df_test$event2 <- ifelse(df_test$event==2,1,0)
-  y_test_cr <- as.matrix(cbind(1-df_test$keras_event, df_test$event1, df_test$event2))
+  y_test_cr <- as.matrix(cbind(1-(df_test$event1+df_test$event2), df_test$event1, df_test$event2))
   
-  # ---------- Build and train models ----------
-  model_ce <- create_model("categorical_crossentropy")
-  model_cr_gauss <- create_model(competing_risks_loss, n_causes=2)
-  model_cr_clayton <- create_model(competing_risks_loss, n_causes=2)
-  model_cr_gumbel <- create_model(competing_risks_loss, n_causes=2)
+  # ---------- Build and train Copula-CR models ----------
+  model_gauss <- create_model(copula_gaussian_loss)
+  model_clayton <- create_model(copula_clayton_loss)
+  model_gumbel <- create_model(copula_gumbel_loss)
   
-  model_ce %>% fit(X_train, y_train, epochs=3, batch_size=32, validation_split=0.2, verbose=0)
-  model_cr_gauss %>% fit(X_train, y_train_cr, epochs=3, batch_size=32, validation_split=0.2, verbose=0)
-  model_cr_clayton %>% fit(X_train, y_train_cr, epochs=3, batch_size=32, validation_split=0.2, verbose=0)
-  model_cr_gumbel %>% fit(X_train, y_train_cr, epochs=3, batch_size=32, validation_split=0.2, verbose=0)
+  model_gauss %>% fit(X_train, y_train_cr, epochs=5, batch_size=32, verbose=0)
+  model_clayton %>% fit(X_train, y_train_cr, epochs=5, batch_size=32, verbose=0)
+  model_gumbel %>% fit(X_train, y_train_cr, epochs=5, batch_size=32, verbose=0)
   
   pretrained_all <- list(
-    cox=NULL, ce=model_ce,
-    copula_cr_gauss=model_cr_gauss,
-    copula_cr_clayton=model_cr_clayton,
-    copula_cr_gumbel=model_cr_gumbel
+    copula_gauss=model_gauss,
+    copula_clayton=model_clayton,
+    copula_gumbel=model_gumbel
   )
   
   # ---------- Bootstrap C-index ----------
-  cindex_cause_boot_fn <- function(data, indices, model_type, cause=1){
+  cindex_cause_boot_fn <- function(data, indices, model_name, cause=1){
     d <- data[indices, ]
     y_true <- d$event
     if(sum(y_true==cause)<2) return(NA)
     
-    if(model_type=="cox"){
-      fm <- coxph(Surv(time,event)~., data=df_train[,c("time","event",covariates)])
-      score <- predict(fm, newdata=d)
-    } else {
-      m <- pretrained_all[[model_type]]
-      Xd <- array(as.matrix(d[,covariates]), dim=c(nrow(d),1,length(covariates)))
-      p <- m %>% predict(Xd)
-      score <- p[,min(cause,ncol(p))]
-    }
+    m <- pretrained_all[[model_name]]
+    Xd <- array(as.matrix(d[,covariates]), dim=c(nrow(d),1,length(covariates)))
+    p <- m %>% predict(Xd)
+    score <- p[,cause]
+    
     rcorr.cens(score, Surv(d$time, ifelse(y_true==cause,1,0)))["C Index"]
   }
   
-  ci_safe <- function(b){ if(all(is.na(b$t))||sd(b$t,na.rm=TRUE)==0) c(NA,NA) else boot.ci(b,type="perc")$percent[4:5] }
+  ci_safe <- function(b){ 
+    if(all(is.na(b$t))||sd(b$t,na.rm=TRUE)==0) c(NA,NA) else boot.ci(b,type="perc")$percent[4:5] 
+  }
   
-  boot_models <- c("cox","ce","copula_cr_gauss","copula_cr_clayton","copula_cr_gumbel")
+  boot_models <- c("copula_gauss","copula_clayton","copula_gumbel")
   boot_results_c1 <- lapply(boot_models, function(m) boot(df_test,function(d,i) cindex_cause_boot_fn(d,i,m,cause=1),R=B_boot))
   boot_results_c2 <- lapply(boot_models, function(m) boot(df_test,function(d,i) cindex_cause_boot_fn(d,i,m,cause=2),R=B_boot))
   
   summary_cause_ci <- data.frame(
     Simulation=sim,
-    Model=c("Cox","CE","Copula-CR Gaussian","Copula-CR Clayton","Copula-CR Gumbel"),
+    Model=c("Copula Gaussian","Copula Clayton","Copula Gumbel"),
     C_index_Cause1 = sapply(boot_results_c1,function(b) mean(b$t,na.rm=TRUE)),
     CI_lower_Cause1 = sapply(boot_results_c1,function(b) ci_safe(b)[1]),
     CI_upper_Cause1 = sapply(boot_results_c1,function(b) ci_safe(b)[2]),
@@ -200,446 +176,47 @@ for(sim in 1:n_sim){
   
   cindex_results_list[[sim]] <- summary_cause_ci
   
-  # ---------- Max-risk predictions ----------
-  extract_risk <- function(pred_matrix){
-    data.frame(cause1=pred_matrix[,1], cause2=pred_matrix[,2], survival=1-rowSums(pred_matrix))
+  # ---------- Compute CIF for each model ----------
+  compute_cif <- function(model, df, times){
+    Xd <- array(as.matrix(df[,covariates]), dim=c(nrow(df),1,length(covariates)))
+    p <- model %>% predict(Xd)
+    # p[,1] ~ cause1 probability, p[,2] ~ cause2
+    mean_cif1 <- sapply(times, function(t) mean(p[,1])) # placeholder: static probability
+    mean_cif2 <- sapply(times, function(t) mean(p[,2]))
+    data.frame(Time=times, CIF1=mean_cif1, CIF2=mean_cif2, Model=deparse(substitute(model)))
   }
   
-  max_risk_cause <- function(risk_df_model){
-    apply(risk_df_model,1,function(x){ c("Cause1","Cause2","Survival")[which.max(x)] })
-  }
-  
-  risk_df <- data.frame(
-    risk_gauss=max_risk_cause(extract_risk(model_cr_gauss %>% predict(X_test))),
-    risk_clayton=max_risk_cause(extract_risk(model_cr_clayton %>% predict(X_test))),
-    risk_gumbel=max_risk_cause(extract_risk(model_cr_gumbel %>% predict(X_test))),
-    Simulation=sim
+  cif_results_list[[sim]] <- rbind(
+    compute_cif(model_gauss, df_test, times_eval),
+    compute_cif(model_clayton, df_test, times_eval),
+    compute_cif(model_gumbel, df_test, times_eval)
   )
-  
-  maxrisk_results_list[[sim]] <- risk_df
 }
 
 # ================================================================
-# 5️⃣ Aggregate results
+# 5️⃣ Aggregate and plot CIFs
 # ================================================================
 cindex_all <- do.call(rbind, cindex_results_list)
-maxrisk_all <- do.call(rbind, maxrisk_results_list)
+cif_all <- do.call(rbind, cif_results_list)
 
-# ---------- Preview ----------
-head(cindex_all)
-head(maxrisk_all)
+# ---------- Plot CIF ----------
+ggplot(cif_all, aes(x=Time, y=CIF1, color=Model)) +
+  geom_line() +
+  labs(title="Predicted CIF for Cause 1", y="CIF", x="Time") +
+  theme_minimal()
 
-# ================================================================
-# 6️⃣ & 7️⃣ Visualize simulation results: max-risk and C-index
-# ================================================================
+ggplot(cif_all, aes(x=Time, y=CIF2, color=Model)) +
+  geom_line() +
+  labs(title="Predicted CIF for Cause 2", y="CIF", x="Time") +
+  theme_minimal()
 
-library(dplyr)
-library(ggplot2)
-library(tidyr)
-library(boot)
+# ---------- Show C-index summary ----------
+cindex_all
 
-# ---------- Function to compute bootstrap CI ----------
-bootstrap_ci <- function(x, R=200, conf=0.95){
-  if(length(unique(x)) < 2) return(c(NA, NA))  # not enough variation
-  b <- boot(x, statistic=function(data, i) mean(data[i]), R=R)
-  ci <- boot.ci(b, type="perc")$percent[4:5]
-  return(ci)
-}
-
-# ---------- 6.1 Prepare long format for C-index ----------
-cindex_long <- cindex_all %>%
-  pivot_longer(
-    cols = starts_with("C_index"),
-    names_to = "Cause",
-    values_to = "C_index"
-  ) %>%
-  mutate(
-    Cause = ifelse(Cause == "C_index_Cause1", "Cause 1", "Cause 2"),
-    Model = factor(Model, levels = c("Cox","CE","Copula-CR Gaussian","Copula-CR Clayton","Copula-CR Gumbel"))
-  )
-
-# ---------- 6.2 Summarize C-index with bootstrap CI ----------
-cindex_summary <- cindex_long %>%
-  group_by(Model, Cause) %>%
-  summarise(
-    Mean_C_index = mean(C_index, na.rm=TRUE),
-    CI_lower = bootstrap_ci(C_index)[1],
-    CI_upper = bootstrap_ci(C_index)[2],
-    .groups="drop"
-  )
-
-# ---------- 6.3 Plot C-index with 95% CI ----------
-ggplot(cindex_summary, aes(x = Model, y = Mean_C_index, fill = Cause)) +
-  geom_col(position = position_dodge(0.8)) +
-  geom_errorbar(aes(ymin = CI_lower, ymax = CI_upper),
-                width = 0.2,
-                position = position_dodge(0.8)) +
-  ylim(0,1) +
-  theme_minimal() +
-  theme(axis.text.x = element_text(angle=45, hjust=1)) +
-  labs(
-    title = "Cause-specific C-index with 95% Bootstrap CI",
-    y = "C-index",
-    x = "",
-    fill = "Cause"
-  )
-
-# ---------- 6.4 Prepare max-risk summary ----------
-maxrisk_long <- maxrisk_all %>%
-  pivot_longer(
-    cols = c(risk_gauss, risk_clayton, risk_gumbel),
-    names_to = "Model",
-    values_to = "Max_Risk"
-  ) %>%
-  mutate(
-    Model = factor(Model,
-                   levels = c("risk_gauss","risk_clayton","risk_gumbel"),
-                   labels = c("Copula-CR Gaussian","Copula-CR Clayton","Copula-CR Gumbel"))
-  )
-
-maxrisk_summary <- maxrisk_long %>%
-  group_by(Model, Max_Risk) %>%
-  summarise(Count = n(),
-            Percent = 100*Count/n(),
-            .groups="drop")
-
-# ---------- 6.5 Plot max-risk counts ----------
-ggplot(maxrisk_summary, aes(x = Model, y = Percent, fill = Max_Risk)) +
-  geom_col(position = "dodge") +
-  theme_minimal() +
-  theme(axis.text.x = element_text(angle=45, hjust=1)) +
-  labs(
-    title = "Predicted Maximum Risk Cause Across Simulations",
-    y = "Percentage (%)",
-    x = "",
-    fill = "Max Risk Cause"
-  )
 
 
 # ================================================================
 # 0️⃣ Libraries
-# ================================================================
-library(survival)
-library(dplyr)
-library(tidyr)
-library(keras)
-library(tensorflow)
-library(ggplot2)
-library(MASS)
-library(cmprsk)
-library(survminer)
-library(boot)
-
-# ================================================================
-# 1️⃣ Generate synthetic PBC-like data
-# ================================================================
-set.seed(123)
-n <- 300  # sample size
-
-df <- data.frame(
-  id = 1:n,
-  age = rnorm(n, 50, 10),
-  sex = rbinom(n, 1, 0.6),
-  serChol = rnorm(n, 250, 40),
-  albumin = rnorm(n, 3.5, 0.5),
-  SGOT = rnorm(n, 30, 10),
-  serBilir = rnorm(n, 1, 0.5),
-  spiders = rbinom(n, 1, 0.3),
-  ascites = rbinom(n, 1, 0.2),
-  hepatomegaly = rbinom(n, 1, 0.25)
-)
-
-# Simulate competing-risk times
-baseline_hazard <- 0.05
-df$time <- rexp(n, rate = baseline_hazard)
-df$event <- sample(0:2, n, replace = TRUE, prob = c(0.4, 0.35, 0.25))
-
-covariates <- c("age","sex","serChol","albumin","SGOT","serBilir",
-                "spiders","ascites","hepatomegaly")
-
-# Train/test split
-set.seed(123)
-idx_train <- sample(seq_len(nrow(df)), floor(0.8*nrow(df)))
-df_train <- df[idx_train, ]
-df_test  <- df[-idx_train, ]
-
-# Keras input arrays
-X_train <- array(as.matrix(df_train[, covariates]), dim = c(nrow(df_train), 1, length(covariates)))
-X_test  <- array(as.matrix(df_test[, covariates]), dim = c(nrow(df_test), 1, length(covariates)))
-
-# One-hot encoding for binary event
-df_train$keras_event <- ifelse(df_train$event > 0, 1, 0)
-df_test$keras_event  <- ifelse(df_test$event > 0, 1, 0)
-y_train <- to_categorical(df_train$keras_event, 2)
-y_test  <- to_categorical(df_test$keras_event, 2)
-
-# Cause-specific one-hot for competing risks
-df_train$event1 <- ifelse(df_train$event==1,1,0)
-df_train$event2 <- ifelse(df_train$event==2,1,0)
-y_train_cr <- as.matrix(cbind(1 - df_train$keras_event, df_train$event1, df_train$event2))
-
-df_test$event1 <- ifelse(df_test$event==1,1,0)
-df_test$event2 <- ifelse(df_test$event==2,1,0)
-y_test_cr <- as.matrix(cbind(1 - df_test$keras_event, df_test$event1, df_test$event2))
-
-# ================================================================
-# 2️⃣ Helper functions: Copula / CIF transformation
-# ================================================================
-to_uniform_tf <- function(x){
-  u <- tf$math$sigmoid(tf$cast(x, tf$float32))
-  tf$clip_by_value(u, 1e-6, 1-1e-6)
-}
-
-u_to_z <- function(u){
-  tf$sqrt(2.0) * tf$math$erfinv(2.0*tf$clip_by_value(u,1e-6,1-1e-6) - 1.0)
-}
-
-# Copula-based losses
-copula_gaussian_loss <- function(y_true, y_pred){
-  rho <- tf$constant(0.5, dtype=tf$float32)
-  rho <- tf$clip_by_value(rho, -0.99, 0.99)
-  u <- to_uniform_tf(y_pred)
-  z <- u_to_z(u)
-  z1 <- z[,1]; z2 <- z[,2]
-  detR <- 1 - rho^2
-  invR <- 1 / detR
-  quad <- invR * (z1^2 + z2^2 - 2*rho*z1*z2)
-  loss_term <- -0.5*quad - 0.5*tf$math$log(detR)
-  -tf$reduce_mean(loss_term)
-}
-
-copula_clayton_loss <- function(y_true, y_pred){
-  theta <- tf$constant(1.5, dtype=tf$float32)
-  theta <- tf$maximum(theta, 0.01)
-  u <- to_uniform_tf(y_pred)
-  S <- tf$reduce_sum(u^(-theta), axis=1L)
-  log_c <- tf$math$log(1+theta) - (theta+1)*tf$reduce_sum(tf$math$log(u), axis=1L) - (2 + 1/theta)*tf$math$log(S - 1 + 1e-6)
-  -tf$reduce_mean(log_c)
-}
-
-copula_gumbel_loss <- function(y_true, y_pred){
-  theta <- tf$constant(2.0, dtype=tf$float32)
-  theta <- tf$maximum(theta, 1.001)
-  u <- to_uniform_tf(y_pred)
-  log_u <- -tf$math$log(u)
-  phi <- log_u^theta
-  S <- tf$reduce_sum(phi, axis=1L)
-  log_C <- -S^(1/theta)
-  log_c <- log_C +
-    (1/theta - 1) * tf$math$log(S + 1e-6) +
-    tf$reduce_sum((theta-1)*tf$math$log(log_u + 1e-6) - tf$math$log(u + 1e-6), axis=1L) +
-    tf$math$log(1 + (theta-1)*S^(-1/theta))
-  -tf$reduce_mean(log_c)
-}
-
-# CIF-based competing risks loss
-competing_risks_loss <- function(y_true, y_pred){
-  event_mask <- tf$reduce_sum(y_true[,2:3], axis=1L)
-  cause_mask1 <- y_true[,2]; cause_mask2 <- y_true[,3]
-  u <- to_uniform_tf(y_pred)
-  cif1 <- u[,1]; cif2 <- u[,2]
-  ll1 <- cause_mask1 * tf$math$log(cif1 + 1e-6)
-  ll2 <- cause_mask2 * tf$math$log(cif2 + 1e-6)
-  surv_prob <- 1 - cif1 - cif2
-  ll_cens <- (1 - event_mask) * tf$math$log(surv_prob + 1e-6)
-  -tf$reduce_mean(ll1 + ll2 + ll_cens)
-}
-
-# ================================================================
-# 3️⃣ CNN-LSTM model builder
-# ================================================================
-create_model <- function(loss_fn, n_causes=2){
-  model <- keras_model_sequential() %>%
-    layer_conv_1d(filters=16, kernel_size=1, activation="relu", input_shape=c(1,length(covariates))) %>%
-    layer_conv_1d(filters=16, kernel_size=1, activation="relu") %>%
-    layer_lstm(16) %>%
-    layer_dense(16, activation="relu") %>%
-    layer_dense(n_causes, activation=ifelse(n_causes==1,"softmax","sigmoid"))
-  
-  model %>% compile(loss=loss_fn, optimizer=optimizer_adam(0.001), metrics="accuracy")
-  return(model)
-}
-
-# ================================================================
-# 4️⃣ Train models
-# ================================================================
-model_ce      <- create_model("categorical_crossentropy")
-model_gauss   <- create_model(copula_gaussian_loss)
-model_clayton <- create_model(copula_clayton_loss)
-model_gumbel  <- create_model(copula_gumbel_loss)
-model_cr_gauss   <- create_model(competing_risks_loss, n_causes=2)
-model_cr_clayton <- create_model(competing_risks_loss, n_causes=2)
-model_cr_gumbel  <- create_model(competing_risks_loss, n_causes=2)
-
-history_ce      <- model_ce %>% fit(X_train, y_train, epochs=5, batch_size=32, validation_split=0.2, verbose=1)
-history_gauss   <- model_gauss %>% fit(X_train, y_train, epochs=5, batch_size=32, validation_split=0.2, verbose=1)
-history_clayton <- model_clayton %>% fit(X_train, y_train, epochs=5, batch_size=32, validation_split=0.2, verbose=1)
-history_gumbel  <- model_gumbel %>% fit(X_train, y_train, epochs=5, batch_size=32, validation_split=0.2, verbose=1)
-history_cr_gauss   <- model_cr_gauss %>% fit(X_train, y_train_cr, epochs=5, batch_size=32, validation_split=0.2, verbose=1)
-history_cr_clayton <- model_cr_clayton %>% fit(X_train, y_train_cr, epochs=5, batch_size=32, validation_split=0.2, verbose=1)
-history_cr_gumbel  <- model_cr_gumbel %>% fit(X_train, y_train_cr, epochs=5, batch_size=32, validation_split=0.2, verbose=1)
-
-# ================================================================
-# 5️⃣ Predict on test set
-# ================================================================
-pred_cr_gauss   <- model_cr_gauss %>% predict(X_test)
-pred_cr_clayton <- model_cr_clayton %>% predict(X_test)
-pred_cr_gumbel  <- model_cr_gumbel %>% predict(X_test)
-
-# ---------- Function to extract predicted risk ----------
-extract_risk <- function(pred_matrix) {
-  data.frame(
-    cause1   = pred_matrix[,1],
-    cause2   = pred_matrix[,2],
-    survival = 1 - rowSums(pred_matrix)
-  )
-}
-
-risk_gauss   <- extract_risk(pred_cr_gauss)
-risk_clayton <- extract_risk(pred_cr_clayton)
-risk_gumbel  <- extract_risk(pred_cr_gumbel)
-
-# ---------- Combine into a single data.frame ----------
-risk_df <- data.frame(
-  id = df_test$id,
-  cause1_gauss     = risk_gauss$cause1,
-  cause2_gauss     = risk_gauss$cause2,
-  survival_gauss   = risk_gauss$survival,
-  cause1_clayton   = risk_clayton$cause1,
-  cause2_clayton   = risk_clayton$cause2,
-  survival_clayton = risk_clayton$survival,
-  cause1_gumbel    = risk_gumbel$cause1,
-  cause2_gumbel    = risk_gumbel$cause2,
-  survival_gumbel  = risk_gumbel$survival
-)
-
-# ---------- Function to get predicted highest risk ----------
-max_risk_cause <- function(risk_df_model) {
-  apply(risk_df_model, 1, function(x) {
-    cause_names <- c("Cause1", "Cause2", "Survival")
-    cause_names[which.max(x)]
-  })
-}
-
-risk_df$max_risk_gauss   <- max_risk_cause(risk_gauss)
-risk_df$max_risk_clayton <- max_risk_cause(risk_clayton)
-risk_df$max_risk_gumbel  <- max_risk_cause(risk_gumbel)
-
-# ---------- Function to summarize max-risk counts ----------
-summarize_max_risk <- function(risk_col) {
-  df <- as.data.frame.table(risk_col)
-  colnames(df) <- c("Cause", "Count")
-  df$Percent <- round(100 * df$Count / sum(df$Count), 1)
-  return(df)
-}
-
-summary_gauss   <- summarize_max_risk(risk_df$max_risk_gauss)
-summary_clayton <- summarize_max_risk(risk_df$max_risk_clayton)
-summary_gumbel  <- summarize_max_risk(risk_df$max_risk_gumbel)
-
-summary_gauss$Model   <- "Copula-CR Gaussian"
-summary_clayton$Model <- "Copula-CR Clayton"
-summary_gumbel$Model  <- "Copula-CR Gumbel"
-
-summary_max_risk <- rbind(summary_gauss, summary_clayton, summary_gumbel)
-summary_max_risk <- summary_max_risk[, c("Model", "Cause", "Count", "Percent")]
-
-# ---------- Preview results ----------
-print(summary_max_risk)
-
-
-# ================================================================
-# 6️⃣ Cause-specific C-index + Bootstrap 95% CI
-# ================================================================
-library(Hmisc)  # for rcorr.cens
-
-# Safe bootstrap CI function
-ci_safe <- function(b){
-  if(all(is.na(b$t)) || sd(b$t, na.rm=TRUE)==0){
-    return(c(NA, NA))
-  } else {
-    return(boot.ci(b,type="perc")$percent[4:5])
-  }
-}
-
-# Cause-specific C-index function with event check
-cindex_cause_boot_fn <- function(data, indices, model_type, cause=1, pretrained_models=NULL){
-  d <- data[indices, ]
-  y_true <- d$event
-  
-  # Not enough events → return NA
-  if(sum(y_true==cause) < 2) return(NA)
-  
-  # Cox model
-  if(model_type=="cox"){
-    fm <- coxph(Surv(time,event)~., data=df_train[, c("time","event",covariates)])
-    score <- predict(fm, newdata=d)
-    
-  # Keras-based models
-  } else {
-    m <- pretrained_models[[model_type]]
-    Xd <- array(as.matrix(d[,covariates]), dim=c(nrow(d),1,length(covariates)))
-    p <- m %>% predict(Xd)
-    # If model outputs multiple causes, select appropriate cause
-    score <- p[,min(cause,ncol(p))]
-  }
-  
-  # Compute C-index using Hmisc::rcorr.cens
-  rcorr.cens(score, Surv(d$time, ifelse(y_true==cause,1,0)))["C Index"]
-}
-
-# Pretrained model list
-pretrained_all <- list(
-  cox = NULL,
-  ce = model_ce,
-  copula_cr_gauss = model_cr_gauss,
-  copula_cr_clayton = model_cr_clayton,
-  copula_cr_gumbel = model_cr_gumbel
-)
-
-# Bootstrap
-library(boot)
-B_boot <- 50
-set.seed(2025)
-boot_models <- c("cox","ce","copula_cr_gauss","copula_cr_clayton","copula_cr_gumbel")
-
-boot_results_c1 <- lapply(boot_models, function(m) boot(df_test, function(d,i) cindex_cause_boot_fn(d,i,m,cause=1,pretrained_all), R=B_boot))
-boot_results_c2 <- lapply(boot_models, function(m) boot(df_test, function(d,i) cindex_cause_boot_fn(d,i,m,cause=2,pretrained_all), R=B_boot))
-names(boot_results_c1) <- names(boot_results_c2) <- boot_models
-
-# Summarize C-index + 95% CI
-summary_cause_ci <- data.frame(
-  Model = c("Cox","CE","Copula-CR Gaussian","Copula-CR Clayton","Copula-CR Gumbel"),
-  C_index_Cause1 = sapply(boot_results_c1, function(b) mean(b$t, na.rm=TRUE)),
-  CI_lower_Cause1 = sapply(boot_results_c1, function(b) ci_safe(b)[1]),
-  CI_upper_Cause1 = sapply(boot_results_c1, function(b) ci_safe(b)[2]),
-  C_index_Cause2 = sapply(boot_results_c2, function(b) mean(b$t, na.rm=TRUE)),
-  CI_lower_Cause2 = sapply(boot_results_c2, function(b) ci_safe(b)[1]),
-  CI_upper_Cause2 = sapply(boot_results_c2, function(b) ci_safe(b)[2])
-)
-
-print(summary_cause_ci)
-
-# ================================================================
-# 7️⃣ Optional: Barplot of Cause-specific C-index
-# ================================================================
-df_plot <- summary_cause_ci %>%
-  pivot_longer(cols=c(C_index_Cause1,C_index_Cause2,CI_lower_Cause1,CI_lower_Cause2,CI_upper_Cause1,CI_upper_Cause2),
-               names_to=c(".value","Cause"),
-               names_pattern="(.*)_(Cause[12])") %>%
-  mutate(Cause = ifelse(Cause=="Cause1","Cause 1","Cause 2"))
-
-ggplot(df_plot, aes(x=Model, y=C_index, fill=Cause)) +
-  geom_col(position="dodge") +
-  geom_errorbar(aes(ymin=CI_lower, ymax=CI_upper), width=0.2, position=position_dodge(0.9)) +
-  ylim(0,1) +
-  theme(axis.text.x=element_text(angle=45,hjust=1)) +
-  labs(title="Cause-specific C-index with 95% Bootstrap CI",
-       y="C-index", x="", fill="Cause")
-
-
-# ================================================================
-# Real Dara (PBC)
 # ================================================================
 library(JM)
 library(survival)
@@ -686,41 +263,29 @@ df_test  <- df[-idx_train, ]
 X_train <- array(as.matrix(df_train[, covariates]), dim = c(nrow(df_train), 1, length(covariates)))
 X_test  <- array(as.matrix(df_test[, covariates]), dim = c(nrow(df_test), 1, length(covariates)))
 
-# One-hot encoding for binary event
-df_train$keras_event <- ifelse(df_train$event > 0, 1, 0)
-df_test$keras_event  <- ifelse(df_test$event > 0, 1, 0)
-y_train <- to_categorical(df_train$keras_event, 2)
-y_test  <- to_categorical(df_test$keras_event, 2)
+# One-hot competing-risk events
+df_train$event1 <- ifelse(df_train$event == 1, 1, 0)
+df_train$event2 <- ifelse(df_train$event == 2, 1, 0)
+y_train_cr <- as.matrix(cbind(1 - (df_train$event1 + df_train$event2),
+                              df_train$event1, df_train$event2))
 
-# Cause-specific one-hot for competing risks
-df_train$event1 <- ifelse(df_train$event==1,1,0)
-df_train$event2 <- ifelse(df_train$event==2,1,0)
-y_train_cr <- as.matrix(cbind(1 - df_train$keras_event, df_train$event1, df_train$event2))
-
-df_test$event1 <- ifelse(df_test$event==1,1,0)
-df_test$event2 <- ifelse(df_test$event==2,1,0)
-y_test_cr <- as.matrix(cbind(1 - df_test$keras_event, df_test$event1, df_test$event2))
+df_test$event1 <- ifelse(df_test$event == 1, 1, 0)
+df_test$event2 <- ifelse(df_test$event == 2, 1, 0)
+y_test_cr <- as.matrix(cbind(1 - (df_test$event1 + df_test$event2),
+                             df_test$event1, df_test$event2))
 
 # ================================================================
-# 2️⃣ Helper functions: Copula / CIF transformation
+# 2️⃣ Copula-loss functions
 # ================================================================
 to_uniform_tf <- function(x){
   u <- tf$math$sigmoid(tf$cast(x, tf$float32))
   tf$clip_by_value(u, 1e-6, 1-1e-6)
 }
 
-u_to_z <- function(u){
-  tf$sqrt(2.0) * tf$math$erfinv(2.0*tf$clip_by_value(u,1e-6,1-1e-6) - 1.0)
-}
-
-# Copula-based losses
 copula_gaussian_loss <- function(y_true, y_pred){
   rho <- tf$constant(0.5, dtype=tf$float32)
-  rho <- tf$clip_by_value(rho, -0.99, 0.99)
-  
   u <- to_uniform_tf(y_pred)
-  z <- u_to_z(u)
-  
+  z <- tf$sqrt(2) * tf$math$erfinv(2*u - 1)
   z1 <- z[,1]; z2 <- z[,2]
   detR <- 1 - rho^2
   invR <- 1 / detR
@@ -731,8 +296,6 @@ copula_gaussian_loss <- function(y_true, y_pred){
 
 copula_clayton_loss <- function(y_true, y_pred){
   theta <- tf$constant(1.5, dtype=tf$float32)
-  theta <- tf$maximum(theta, 0.01)
-  
   u <- to_uniform_tf(y_pred)
   S <- tf$reduce_sum(u^(-theta), axis=1L)
   log_c <- tf$math$log(1+theta) - (theta+1)*tf$reduce_sum(tf$math$log(u), axis=1L) - (2 + 1/theta)*tf$math$log(S - 1 + 1e-6)
@@ -741,216 +304,205 @@ copula_clayton_loss <- function(y_true, y_pred){
 
 copula_gumbel_loss <- function(y_true, y_pred){
   theta <- tf$constant(2.0, dtype=tf$float32)
-  theta <- tf$maximum(theta, 1.001)
-  
   u <- to_uniform_tf(y_pred)
   log_u <- -tf$math$log(u)
   phi <- log_u^theta
   S <- tf$reduce_sum(phi, axis=1L)
   log_C <- -S^(1/theta)
-  
   log_c <- log_C +
     (1/theta - 1) * tf$math$log(S + 1e-6) +
     tf$reduce_sum((theta-1)*tf$math$log(log_u + 1e-6) - tf$math$log(u + 1e-6), axis=1L) +
     tf$math$log(1 + (theta-1)*S^(-1/theta))
-  
   -tf$reduce_mean(log_c)
 }
 
-# CIF-based competing risks loss
-competing_risks_loss <- function(y_true, y_pred){
-  event_mask <- tf$reduce_sum(y_true[,2:3], axis=1L)
-  cause_mask1 <- y_true[,2]; cause_mask2 <- y_true[,3]
-  
-  u <- to_uniform_tf(y_pred)
-  cif1 <- u[,1]; cif2 <- u[,2]
-  
-  ll1 <- cause_mask1 * tf$math$log(cif1 + 1e-6)
-  ll2 <- cause_mask2 * tf$math$log(cif2 + 1e-6)
-  surv_prob <- 1 - cif1 - cif2
-  ll_cens <- (1 - event_mask) * tf$math$log(surv_prob + 1e-6)
-  
-  -tf$reduce_mean(ll1 + ll2 + ll_cens)
-}
-
 # ================================================================
-# 3️⃣ CNN-LSTM model builders
+# 3️⃣ CNN-LSTM model builder
 # ================================================================
-create_model <- function(loss_fn, n_causes=2){
-  model <- keras_model_sequential() %>%
-    layer_conv_1d(filters=16, kernel_size=1, activation="relu", input_shape=c(1,length(covariates))) %>%
+create_model <- function(loss_fn, n_features = length(covariates), n_causes = 2){
+  inputs <- layer_input(shape = c(1, n_features))
+  outputs <- inputs %>%
     layer_conv_1d(filters=16, kernel_size=1, activation="relu") %>%
     layer_lstm(16) %>%
     layer_dense(16, activation="relu") %>%
-    layer_dense(n_causes, activation=ifelse(n_causes==1,"softmax","sigmoid"))
+    layer_dense(n_causes, activation="sigmoid")
   
-  model %>% compile(loss=loss_fn, optimizer=optimizer_adam(0.001), metrics="accuracy")
+  model <- keras_model(inputs=inputs, outputs=outputs)
+  model %>% compile(
+    loss = loss_fn,
+    optimizer = optimizer_adam(0.001)
+  )
   return(model)
 }
 
 # ================================================================
-# 4️⃣ Train models
+# 4️⃣ Build and train models
 # ================================================================
-model_ce      <- create_model("categorical_crossentropy")
-model_gauss   <- create_model(copula_gaussian_loss)
+model_gauss <- create_model(copula_gaussian_loss)
 model_clayton <- create_model(copula_clayton_loss)
-model_gumbel  <- create_model(copula_gumbel_loss)
-model_cr_gauss   <- create_model(competing_risks_loss, n_causes=2)
-model_cr_clayton <- create_model(competing_risks_loss, n_causes=2)
-model_cr_gumbel  <- create_model(competing_risks_loss, n_causes=2)
+model_gumbel <- create_model(copula_gumbel_loss)
 
-history_ce      <- model_ce %>% fit(X_train, y_train, epochs=20, batch_size=32, validation_split=0.2, verbose=1)
-history_gauss   <- model_gauss %>% fit(X_train, y_train, epochs=20, batch_size=32, validation_split=0.2, verbose=1)
-history_clayton <- model_clayton %>% fit(X_train, y_train, epochs=20, batch_size=32, validation_split=0.2, verbose=1)
-history_gumbel  <- model_gumbel %>% fit(X_train, y_train, epochs=20, batch_size=32, validation_split=0.2, verbose=1)
-history_cr_gauss   <- model_cr_gauss %>% fit(X_train, y_train_cr, epochs=20, batch_size=32, validation_split=0.2, verbose=1)
-history_cr_clayton <- model_cr_clayton %>% fit(X_train, y_train_cr, epochs=20, batch_size=32, validation_split=0.2, verbose=1)
-history_cr_gumbel  <- model_cr_gumbel %>% fit(X_train, y_train_cr, epochs=20, batch_size=32, validation_split=0.2, verbose=1)
+model_gauss %>% fit(X_train, y_train_cr, epochs=10, batch_size=16, validation_split=0.2, verbose=1)
+model_clayton %>% fit(X_train, y_train_cr, epochs=10, batch_size=16, validation_split=0.2, verbose=1)
+model_gumbel %>% fit(X_train, y_train_cr, epochs=10, batch_size=16, validation_split=0.2, verbose=1)
 
-# ================================================================
-# 5️⃣ Predict on test set
-# ================================================================
-pred_ce      <- model_ce %>% predict(X_test)
-pred_gauss   <- model_gauss %>% predict(X_test)
-pred_clayton <- model_clayton %>% predict(X_test)
-pred_gumbel  <- model_gumbel %>% predict(X_test)
-pred_cr_gauss   <- model_cr_gauss %>% predict(X_test)
-pred_cr_clayton <- model_cr_clayton %>% predict(X_test)
-pred_cr_gumbel  <- model_cr_gumbel %>% predict(X_test)
-
-# ================================================================
-# 6️⃣ Cause-specific C-index + Bootstrap 95% CI
-# ================================================================
 pretrained_all <- list(
-  ce      = model_ce,
-  gauss   = model_gauss,
-  clayton = model_clayton,
-  gumbel  = model_gumbel,
-  copula_cr_gauss   = model_cr_gauss,
-  copula_cr_clayton = model_cr_clayton,
-  copula_cr_gumbel  = model_cr_gumbel
+  copula_gauss = model_gauss,
+  copula_clayton = model_clayton,
+  copula_gumbel = model_gumbel
 )
 
-# Safe bootstrap CI function
-ci_safe <- function(b){
-  if(all(is.na(b$t)) || sd(b$t, na.rm=TRUE)==0){
-    return(c(NA, NA))
-  } else {
-    return(boot.ci(b,type="perc")$percent[4:5])
-  }
-}
-
-# Cause-specific C-index function with event count check
-cindex_cause_boot_fn <- function(data, indices, model_type, cause=1, pretrained_models=NULL){
+# ================================================================
+# 5️⃣ Bootstrap C-index
+# ================================================================
+cindex_cause_boot_fn <- function(data, indices, model_name, cause=1){
   d <- data[indices, ]
   y_true <- d$event
+  if(sum(y_true==cause)<2) return(NA)
   
-  # Not enough events → return NA
-  if(sum(y_true==cause) < 2) return(NA)
+  m <- pretrained_all[[model_name]]
+  Xd <- array(as.matrix(d[,covariates]), dim=c(nrow(d),1,length(covariates)))
+  p <- m %>% predict(Xd)
+  score <- p[,cause]
   
-  if(model_type=="cox"){
-    fm <- coxph(Surv(time,event)~., data=df_train[, c("time","event",covariates)])
-    score <- predict(fm, newdata=d)
-  } else {
-    m <- pretrained_models[[model_type]]
-    Xd <- array(as.matrix(d[,covariates]), dim=c(nrow(d),1,length(covariates)))
-    p <- m %>% predict(Xd)
-    # Adjust for n_causes difference
-    score <- p[,min(cause,ncol(p))]
-  }
-  
-  concordance(Surv(d$time, ifelse(y_true==cause,1,0)) ~ score)$concordance
+  rcorr.cens(score, Surv(d$time, ifelse(y_true==cause,1,0)))["C Index"]
 }
 
-B_boot <- 50
-set.seed(2025)
-boot_models <- c("cox","ce","gauss","clayton","gumbel",
-                 "copula_cr_gauss","copula_cr_clayton","copula_cr_gumbel")
+ci_safe <- function(b){ 
+  if(all(is.na(b$t))||sd(b$t,na.rm=TRUE)==0) c(NA,NA) else boot.ci(b,type="perc")$percent[4:5] 
+}
 
-boot_results_c1 <- lapply(boot_models, function(m) boot(df_test, function(d,i) cindex_cause_boot_fn(d,i,m,cause=1,pretrained_all), R=B_boot))
-boot_results_c2 <- lapply(boot_models, function(m) boot(df_test, function(d,i) cindex_cause_boot_fn(d,i,m,cause=2,pretrained_all), R=B_boot))
-names(boot_results_c1) <- names(boot_results_c2) <- boot_models
+boot_models <- c("copula_gauss","copula_clayton","copula_gumbel")
+boot_results_c1 <- lapply(boot_models, function(m) boot(df_test, function(d,i) cindex_cause_boot_fn(d,i,m,cause=1), R=50))
+boot_results_c2 <- lapply(boot_models, function(m) boot(df_test, function(d,i) cindex_cause_boot_fn(d,i,m,cause=2), R=50))
 
-summary_cause_ci <- data.frame(
-  Model = c("Cox","CE","Copula CE","Copula Clayton","Copula Gumbel",
-            "Copula-CR Gaussian","Copula-CR Clayton","Copula-CR Gumbel"),
-  C_index_Cause1 = sapply(boot_results_c1, function(b) mean(b$t, na.rm=TRUE)),
-  CI_lower_Cause1 = sapply(boot_results_c1, function(b) ci_safe(b)[1]),
-  CI_upper_Cause1 = sapply(boot_results_c1, function(b) ci_safe(b)[2]),
-  C_index_Cause2 = sapply(boot_results_c2, function(b) mean(b$t, na.rm=TRUE)),
-  CI_lower_Cause2 = sapply(boot_results_c2, function(b) ci_safe(b)[1]),
-  CI_upper_Cause2 = sapply(boot_results_c2, function(b) ci_safe(b)[2])
+summary_cindex <- data.frame(
+  Model = c("Copula Gaussian","Copula Clayton","Copula Gumbel"),
+  C_index_Cause1 = sapply(boot_results_c1,function(b) mean(b$t,na.rm=TRUE)),
+  CI_lower_Cause1 = sapply(boot_results_c1,function(b) ci_safe(b)[1]),
+  CI_upper_Cause1 = sapply(boot_results_c1,function(b) ci_safe(b)[2]),
+  C_index_Cause2 = sapply(boot_results_c2,function(b) mean(b$t,na.rm=TRUE)),
+  CI_lower_Cause2 = sapply(boot_results_c2,function(b) ci_safe(b)[1]),
+  CI_upper_Cause2 = sapply(boot_results_c2,function(b) ci_safe(b)[2])
 )
-print(summary_cause_ci)
+
+print(summary_cindex)
 
 # ================================================================
-# 7️⃣ Barplot: Cause-specific C-index with 95% CI
+# 6️⃣ Compute cause-specific CIFs for test set
 # ================================================================
-df_plot <- summary_cause_ci %>%
-  pivot_longer(cols=c(C_index_Cause1,C_index_Cause2,CI_lower_Cause1,CI_lower_Cause2,CI_upper_Cause1,CI_upper_Cause2),
-               names_to=c(".value","Cause"),
-               names_pattern="(.*)_(Cause[12])") %>%
-  mutate(Cause = ifelse(Cause=="Cause1","Cause 1","Cause 2"))
+library(survival)
+library(cmprsk)
+library(ggplot2)
+library(dplyr)
 
-ggplot(df_plot, aes(x=Model, y=C_index, fill=Cause)) +
-  geom_col(position="dodge") +
-  geom_errorbar(aes(ymin=CI_lower, ymax=CI_upper), width=0.2, position=position_dodge(0.9)) +
-  ylim(0,1) +
-  theme(axis.text.x=element_text(angle=45,hjust=1)) +
-  labs(title="Cause-specific C-index with 95% Bootstrap CI",
-       y="C-index", x="", fill="Cause")
+# Function to approximate discrete-time CIFs from model predictions
+compute_cif <- function(model, X_data, max_time = 15, time_step = 0.25){
+  # X_data: array of shape (n_samples,1,n_features)
+  n <- dim(X_data)[1]
+  times <- seq(0, max_time, by=time_step)
+  n_times <- length(times)
+  
+  # Initialize matrices for CIFs
+  cif1 <- matrix(0, nrow=n, ncol=n_times)
+  cif2 <- matrix(0, nrow=n, ncol=n_times)
+  surv_prob <- matrix(1, nrow=n, ncol=n_times)
+  
+  # Predict per-interval risks
+  preds <- model %>% predict(X_data)
+  # Ensure numeric & 2 causes
+  if(ncol(preds) < 2) stop("Model prediction must have 2 causes")
+  
+  for(t in 1:n_times){
+    # Discrete hazard approximation
+    h1 <- preds[,1] * time_step
+    h2 <- preds[,2] * time_step
+    s_prev <- if(t==1) rep(1,n) else surv_prob[,t-1]
+    
+    cif1[,t] <- if(t==1) h1 else cif1[,t-1] + h1 * s_prev
+    cif2[,t] <- if(t==1) h2 else cif2[,t-1] + h2 * s_prev
+    surv_prob[,t] <- 1 - cif1[,t] - cif2[,t]
+  }
+  
+  list(times = times, CIF1 = cif1, CIF2 = cif2)
+}
 
-# ---------- Function to extract predicted risk (safe version) ----------
-extract_risk <- function(pred_matrix) {
-  # pred_matrix: n x 2 matrix from competing risks model
-  # columns: 1=cause1, 2=cause2
+# Compute CIFs for each model
+cif_gauss   <- compute_cif(pretrained_all$copula_gauss, X_test)
+cif_clayton <- compute_cif(pretrained_all$copula_clayton, X_test)
+cif_gumbel  <- compute_cif(pretrained_all$copula_gumbel, X_test)
+
+# ================================================================
+# 7️⃣ Summarize and plot mean CIF curves
+# ================================================================
+mean_cif <- function(cif_obj){
   data.frame(
-    cause1   = pred_matrix[,1],
-    cause2   = pred_matrix[,2],
-    survival = 1 - rowSums(pred_matrix)
+    time = cif_obj$times,
+    CIF1 = colMeans(cif_obj$CIF1),
+    CIF2 = colMeans(cif_obj$CIF2)
   )
 }
 
-# ---------- Extract risks for all CR models ----------
-risk_gauss   <- extract_risk(pred_cr_gauss)
-risk_clayton <- extract_risk(pred_cr_clayton)
-risk_gumbel  <- extract_risk(pred_cr_gumbel)
+df_cif_gauss   <- mean_cif(cif_gauss)   %>% mutate(Model="Copula Gaussian")
+df_cif_clayton <- mean_cif(cif_clayton) %>% mutate(Model="Copula Clayton")
+df_cif_gumbel  <- mean_cif(cif_gumbel)  %>% mutate(Model="Copula Gumbel")
 
-# ---------- Combine into a single data.frame ----------
-risk_df <- data.frame(
-  id = df_test$id,
-  
-  cause1_gauss     = risk_gauss$cause1,
-  cause2_gauss     = risk_gauss$cause2,
-  survival_gauss   = risk_gauss$survival,
-  
-  cause1_clayton   = risk_clayton$cause1,
-  cause2_clayton   = risk_clayton$cause2,
-  survival_clayton = risk_clayton$survival,
-  
-  cause1_gumbel    = risk_gumbel$cause1,
-  cause2_gumbel    = risk_gumbel$cause2,
-  survival_gumbel  = risk_gumbel$survival
-)
+df_plot <- bind_rows(df_cif_gauss, df_cif_clayton, df_cif_gumbel) %>%
+  tidyr::pivot_longer(cols=c("CIF1","CIF2"), names_to="Cause", values_to="CIF")
 
-# ---------- Preview ----------
-head(risk_df)
+# Plot mean CIF curves
+ggplot(df_plot, aes(x=time, y=CIF, color=Model, linetype=Cause)) +
+  geom_line(size=1) +
+  theme_minimal() +
+  labs(title="Predicted Cause-specific CIFs (PBC Test Set)",
+       x="Time (years)",
+       y="Cumulative incidence function",
+       color="Model",
+       linetype="Cause") +
+  theme(axis.text=element_text(size=12),
+        axis.title=element_text(size=13),
+        legend.text=element_text(size=12),
+        legend.title=element_text(size=13))
 
-# ---------- Function to get predicted highest risk ----------
-max_risk_cause <- function(risk_df_model) {
-  apply(risk_df_model, 1, function(x) {
-    cause_names <- c("Cause1", "Cause2", "Survival")
-    cause_names[which.max(x)]
-  })
+# ================================================================
+# 8️⃣ Predicted CIF distributions
+# ================================================================
+
+# Function to create long-format CIF for all subjects at a given time
+cif_long_format <- function(cif_obj, model_name, selected_time = 5){
+  # selected_time: year at which to extract CIF
+  time_idx <- which.min(abs(cif_obj$times - selected_time))
+  
+  data.frame(
+    Subject = 1:nrow(cif_obj$CIF1),
+    CIF1 = cif_obj$CIF1[,time_idx],
+    CIF2 = cif_obj$CIF2[,time_idx],
+    Model = model_name
+  ) %>%
+    tidyr::pivot_longer(cols = c("CIF1","CIF2"), names_to = "Cause", values_to = "CIF")
 }
 
-# ---------- Add highest-risk cause columns ----------
-risk_df$max_risk_gauss   <- max_risk_cause(risk_gauss)
-risk_df$max_risk_clayton <- max_risk_cause(risk_clayton)
-risk_df$max_risk_gumbel  <- max_risk_cause(risk_gumbel)
+# Extract CIF distributions at 5 years
+df_cif_gauss_dist   <- cif_long_format(cif_gauss, "Copula Gaussian", selected_time = 5)
+df_cif_clayton_dist <- cif_long_format(cif_clayton, "Copula Clayton", selected_time = 5)
+df_cif_gumbel_dist  <- cif_long_format(cif_gumbel, "Copula Gumbel", selected_time = 5)
 
-# ---------- Preview ----------
-head(risk_df[, c("id",
-                 "cause1_gauss", "cause2_gauss", "survival_gauss", "max_risk_gauss",
-                 "cause1_clayton", "cause2_clayton", "survival_clayton", "max_risk_clayton",
-                 "cause1_gumbel", "cause2_gumbel", "survival_gumbel", "max_risk_gumbel")])
+df_cif_dist <- bind_rows(df_cif_gauss_dist,
+                         df_cif_clayton_dist,
+                         df_cif_gumbel_dist)
+
+# ================================================================
+# 8.1 Plot CIF distributions by model and cause
+# ================================================================
+ggplot(df_cif_dist, aes(x = CIF, fill = Model)) +
+  geom_histogram(alpha = 0.5, position = "identity", bins = 20) +
+  facet_wrap(~Cause) +
+  theme_minimal() +
+  labs(title = "Predicted CIF Distribution at 5 years (PBC Test Set)",
+       x = "Cumulative Incidence Function",
+       y = "Count",
+       fill = "Model") +
+  theme(axis.text = element_text(size=12),
+        axis.title = element_text(size=13),
+        legend.text = element_text(size=12),
+        legend.title = element_text(size=13))

@@ -15,7 +15,7 @@ library(knitr)
 # ================================================================
 # 1️⃣ Simulation parameters
 # ================================================================
-n_sim <- 10      # number of simulations
+n_sim <- 100      # number of simulations
 n <- 1000        # sample size
 B_boot <- 50     # bootstrap iterations
 covariates <- c("x1","x2","x3","x4")

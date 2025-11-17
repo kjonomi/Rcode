@@ -213,6 +213,36 @@ ggplot(cif_all, aes(x=Time, y=CIF2, color=Model)) +
 # ---------- Show C-index summary ----------
 cindex_all
 
+library(dplyr)
+library(tidyr)
+library(knitr)
+
+# Pivot to long format
+cindex_long <- cindex_all %>%
+  pivot_longer(
+    cols = c(C_index_Cause1, C_index_Cause2),
+    names_to = "Cause",
+    values_to = "C_index"
+  ) %>%
+  mutate(
+    Cause = ifelse(Cause == "C_index_Cause1", "Cause 1", "Cause 2")
+  )
+
+# Summarize mean and CI per model and cause
+cindex_summary_table <- cindex_long %>%
+  group_by(Model, Cause) %>%
+  summarise(
+    Mean_C_index = mean(C_index, na.rm = TRUE),
+    CI_lower = mean(ifelse(Cause=="Cause 1", CI_lower_Cause1, CI_lower_Cause2), na.rm = TRUE),
+    CI_upper = mean(ifelse(Cause=="Cause 1", CI_upper_Cause1, CI_upper_Cause2), na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(Model, Cause)
+
+# Show table
+kable(cindex_summary_table, digits = 3,
+      caption = "Cause-specific C-index with 95% Bootstrap CI")
+
 
 
 # ================================================================

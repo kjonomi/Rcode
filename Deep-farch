@@ -303,63 +303,86 @@ agg_results <- bind_rows(results_list, .id="Iteration") %>%
   group_by(Model) %>% summarise(across(c(RMSE,MAE,MAPE,MSLE,Corr), mean))
 print(agg_results)
 
+# =========================================================
+# --- AGGREGATED VOLATILITY CURVES FOR ALL MODELS (NO PROXY)
+# =========================================================
 
-# ============================================================
-# PLOT: Mean ± SD bands across 100 iterations for plot_day
-# ============================================================
-make_band <- function(arr) {
-  list(
-    mean = apply(arr, c(2,3), mean),
-    sd   = apply(arr, c(2,3), sd)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+# ---------------------------------------------------------
+# 1) EXPECTED OBJECTS:
+#    band_farch_fpca      : list of vectors (length L) × 100 iterations
+#    band_cfarch_fpca     : same
+#    band_deep_farch      : same
+#    band_deep_cfarch     : same
+# ---------------------------------------------------------
+
+# ---------------------------------------------------------
+# Convert lists into mean curves
+# ---------------------------------------------------------
+make_mean_curve <- function(mat_list) {
+  mat <- do.call(rbind, mat_list)   # (iters × L)
+  data.frame(
+    x    = 1:ncol(mat),
+    mean = apply(mat, 2, mean)
   )
 }
 
-band_true        <- make_band(curve_store$true)
-band_farch_fpca  <- make_band(curve_store$farch_fpca)
-band_cfarch_fpca <- make_band(curve_store$cfarch_fpca)
-band_deep_farch  <- make_band(curve_store$deep_farch)
-band_deep_cfarch <- make_band(curve_store$deep_cfarch)
+band_farch_fpca_df     <- make_mean_curve(band_farch_fpca)
+band_cfarch_fpca_df    <- make_mean_curve(band_cfarch_fpca)
+band_deep_farch_df     <- make_mean_curve(band_deep_farch)
+band_deep_cfarch_df    <- make_mean_curve(band_deep_cfarch)
 
-# -------------------------
-# Plotting Function
-# -------------------------
-plot_band_day <- function(day_index, model_name, band, true_band) {
-  df <- data.frame(
-    t = 1:L,
-    mean = band$mean[day_index,],
-    lower = band$mean[day_index,] - band$sd[day_index,],
-    upper = band$mean[day_index,] + band$sd[day_index,],
-    true = true_band$mean[day_index,]
-  )
-  ggplot(df, aes(t, mean)) +
-    geom_ribbon(aes(ymin=lower, ymax=upper), fill="grey80", alpha=0.5) +
-    geom_line(color="blue", size=1) +
-    geom_line(aes(y=true), color="red", size=1, linetype="dashed") +
-    ggtitle(paste("Day", plot_day[day_index], "-", model_name)) +
-    theme_minimal()
-}
-
-# -------------------------
-# Generate plots
-# -------------------------
-plots <- list()
-model_list <- list(
-  "FPCA fARCH"=band_farch_fpca,
-  "FPCA Copula-fARCH"=band_cfarch_fpca,
-  "Deep-PCA fARCH"=band_deep_farch,
-  "Deep-PCA Copula-fARCH"=band_deep_cfarch
+# Name models for easy looping
+model_means <- list(
+  "FPCA fARCH"             = band_farch_fpca_df,
+  "FPCA Copula-fARCH"      = band_cfarch_fpca_df,
+  "Deep-PCA fARCH"         = band_deep_farch_df,
+  "Deep-PCA Copula-fARCH"  = band_deep_cfarch_df
 )
 
-for (m in names(model_list)) {
-  for (i in 1:length(plot_day)) {
-    plots[[paste0(m,"_day",plot_day[i])]] <-
-      plot_band_day(i, m, model_list[[m]], band_true)
-  }
+colors <- c(
+  "FPCA fARCH"             = "red",
+  "FPCA Copula-fARCH"      = "blue",
+  "Deep-PCA fARCH"         = "darkgreen",
+  "Deep-PCA Copula-fARCH"  = "purple"
+)
+
+# ---------------------------------------------------------
+# --- MASTER FUNCTION: ONE FIGURE FOR ALL MODELS (NO BANDS)
+# ---------------------------------------------------------
+plot_all_models_day <- function(daynum) {
+
+  df_all <- bind_rows(
+    lapply(names(model_means), function(m) {
+      df <- model_means[[m]]
+      df$model <- m
+      return(df)
+    })
+  )
+
+  ggplot(df_all, aes(x = x, y = mean, color = model)) +
+    geom_line(size = 1.3) +
+    scale_color_manual(values = colors) +
+    labs(title = paste("Intraday Volatility – All Models (Day", daynum, ")"),
+         x = "Intraday time",
+         y = "Volatility (mean)") +
+    theme_minimal(base_size = 15) +
+    theme(legend.position = "bottom")
 }
 
-# SHOW TWO KEY PLOTS
-print(plots[[paste0("Deep-PCA Copula-fARCH_day", plot_day[1])]])
-print(plots[[paste0("Deep-PCA Copula-fARCH_day", plot_day[2])]])
+# ---------------------------------------------------------
+# Generate plots for the two selected days
+# ---------------------------------------------------------
+
+plot_all_models_day30 <- plot_all_models_day(plot_day[1])
+plot_all_models_day60 <- plot_all_models_day(plot_day[2])
+
+print(plot_all_models_day30)
+print(plot_all_models_day60)
+
 
 # =========================================================
 # --- Full script: FPCA & Deep-PCA models (100 iterations)

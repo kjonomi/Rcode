@@ -1,4 +1,3 @@
-
 ###############################
 ## Simulation
 ###############################
@@ -311,7 +310,7 @@ print(agg_results)
 # ================================================
 # ---- Plot intraday volatility for two days ----
 # ================================================
-plot_day <- c(30, 60)
+plot_day <- c(30, 90)
 
 # Assemble all models into a named list
 model_list <- list(
@@ -337,7 +336,7 @@ prepare_plot_df <- function(day_index) {
   return(df)
 }
 
-# ---- Generate plots for day 30 and 60 ----
+# ---- Generate plots for day 30 and 90 ----
 for (day in plot_day) {
   df_day <- prepare_plot_df(day)
 

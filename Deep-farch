@@ -2,350 +2,7 @@
 ###############################
 ## Simulation
 ###############################
-
-# =========================================================
-# --- Full script: FPCA & Deep-PCA models with simulated data
-# =========================================================
-
-# clean
-rm(list = ls()); gc()
-
-# libraries
-library(keras)
-library(keras3)
-library(tensorflow)
-library(fda)
-library(fdapace)
-library(MASS)
-library(ggplot2)
-library(copula)
-library(DEoptim)
-library(reshape2)
-library(dplyr)
-library(scales)
-
-# -------------------------
-# user params
-# -------------------------
-latent_dim <- 5L        # deep PCA latent dimension
-epochs_ae  <- 80        # autoencoder epochs
-batch_size <- 32
-nbasis <- 32
-norder <- 4
-p_fpca <- 2             # number of FPCA harmonics used in FPCA models
-eps <- 1e-8
-set.seed(123)
-
-# -------------------------
-# --- Simulate high-correlated intraday returns
-# -------------------------
-N <- 100     # number of days
-L <- 50      # intraday points per day
-rho <- 0.9   # high correlation between intraday points
-
-# covariance matrix
-Sigma <- matrix(rho, nrow = L, ncol = L)
-diag(Sigma) <- 1
-
-# simulate multivariate normal returns
-returns_use <- mvrnorm(n = N, mu = rep(0, L), Sigma = Sigma)  # N x L
-returns_use <- 100 * returns_use  # scale like percentage returns
-
-# proxy squared returns
-proxy_vol <- returns_use^2
-
-cat(sprintf("Simulated data: %d days × %d intraday points, correlation rho=%.2f\n", N, L, rho))
-
-# ---------------------------------------------------------
-# 1) FPCA-based fARCH & Copula-fARCH
-# ---------------------------------------------------------
-estimate_farch_fpca <- function(y_old, L, p = p_fpca, nbasis = nbasis, norder = norder, lambda = 1e-6) {
-  N <- nrow(y_old)
-  times <- seq(0, 1, length.out = L)
-  basis <- create.bspline.basis(rangeval = c(0,1), nbasis = nbasis, norder = norder)
-  fd_par <- fdPar(basis, Lfd = 2, lambda = lambda)
-  sigma_out_squared <- matrix(NA, N - 2, L)
-  
-  for (out in 2:(N - 1)) {
-    cat("FPCA-fARCH Day:", out, "/", N - 1, "\n")
-    y <- y_old[-out, , drop = FALSE]
-    smooth_res <- smooth.basis(argvals = times, y = t(y^2), fdParobj = fd_par)
-    fd_y2 <- smooth_res$fd
-    pca_obj <- pca.fd(fdobj = fd_y2, nharm = p, center = TRUE)
-    Z <- t(pca_obj$scores)   # p x (N-1)
-    
-    part1 <- matrix(0, p, p); part2 <- matrix(0, p, p)
-    for (k in 2:ncol(Z)) {
-      part1 <- part1 + Z[, k] %*% t(Z[, k - 1])
-      part2 <- part2 + Z[, k - 1] %*% t(Z[, k - 1])
-    }
-    M <- tryCatch(part1 %*% solve(part2), error = function(e) part1 %*% MASS::ginv(part2))
-    
-    eigenfun_list <- lapply(1:p, function(i) eval.fd(times, pca_obj$harmonics[i]))
-    beta_matrix_estimated <- Reduce(`+`, lapply(1:p, function(k) {
-      Reduce(`+`, lapply(1:p, function(ell) {
-        M[k, ell] * (eigenfun_list[[k]] %*% t(eigenfun_list[[ell]]))
-      }))
-    }))
-    beta_hat <- function(x) t(beta_matrix_estimated %*% t(x)) / L
-    mean_fd_vals <- t(as.matrix(eval.fd(times, pca_obj$meanfd)))
-    estimated_delta <- mean_fd_vals - beta_hat(mean_fd_vals)
-    sigma_out_squared[out - 1, ] <- as.numeric(estimated_delta + beta_hat(t(y_old[out - 1, ]^2)))
-  }
-  return(sigma_out_squared)
-}
-
-estimate_cfarch_fpca <- function(y_old, L, p = p_fpca, nbasis = nbasis, norder = norder, lambda = 1e-4) {
-  set.seed(123)
-  N <- nrow(y_old)
-  times <- seq(0, 1, length.out = L)
-  basis <- create.bspline.basis(rangeval = c(0,1), nbasis = nbasis, norder = norder)
-  fd_par <- fdPar(basis, Lfd = 2, lambda = lambda)
-  sigma_out_squared <- matrix(NA, N - 2, L)
-  
-  for (out in 2:(N - 1)) {
-    cat("FPCA-Copula-fARCH Day:", out, "/", N - 1, "\n")
-    y <- y_old[-out, , drop = FALSE]
-    smooth_res <- smooth.basis(argvals = times, y = t(y^2), fdParobj = fd_par)
-    fd_y2 <- smooth_res$fd
-    pca_obj <- pca.fd(fdobj = fd_y2, nharm = p, center = TRUE)
-    Z <- t(pca_obj$scores)   # p x (N-1)
-    
-    u_data <- pobs(t(Z))  # rows=observations
-    sims_list <- list()
-    for (cop_type in c("gaussian", "clayton")) {
-      fit_cop <- tryCatch({
-        cop_obj <- switch(cop_type,
-                          "gaussian" = normalCopula(dim = p, dispstr = "un"),
-                          "clayton"  = claytonCopula(dim = p))
-        fitCopula(cop_obj, data = u_data, method = "ml")
-      }, error = function(e) NULL)
-      if (!is.null(fit_cop)) {
-        sim_cop <- rCopula(nrow(u_data), fit_cop@copula)
-        sims_list[[ length(sims_list) + 1 ]] <- qnorm(sim_cop)
-      }
-    }
-    
-    if (length(sims_list) > 0) {
-      avg_sim <- Reduce(`+`, sims_list) / length(sims_list)
-      Z_used <- t(avg_sim)
-    } else {
-      Z_used <- Z
-    }
-    
-    part1 <- matrix(0, p, p); part2 <- matrix(0, p, p)
-    for (k in 2:ncol(Z_used)) {
-      part1 <- part1 + Z_used[, k] %*% t(Z_used[, k - 1])
-      part2 <- part2 + Z_used[, k - 1] %*% t(Z_used[, k - 1])
-    }
-    M <- tryCatch(part1 %*% solve(part2), error = function(e) part1 %*% MASS::ginv(part2))
-    
-    eigenfun_list <- lapply(1:p, function(i) eval.fd(times, pca_obj$harmonics[i]))
-    beta_matrix_estimated <- Reduce(`+`, lapply(1:p, function(k) {
-      Reduce(`+`, lapply(1:p, function(ell) {
-        M[k, ell] * (eigenfun_list[[k]] %*% t(eigenfun_list[[ell]]))
-      }))
-    }))
-    beta_hat <- function(x) t(beta_matrix_estimated %*% t(x)) / L
-    mean_fd_vals <- t(as.matrix(eval.fd(times, pca_obj$meanfd)))
-    estimated_delta <- mean_fd_vals - beta_hat(mean_fd_vals)
-    sigma_out_squared[out - 1, ] <- as.numeric(estimated_delta + beta_hat(t(y_old[out - 1, ]^2)))
-  }
-  return(sigma_out_squared)
-}
-
-# run FPCA models
-sigma_farch_fpca  <- estimate_farch_fpca(returns_use, L, p = p_fpca, nbasis = nbasis, norder = norder, lambda = 1e-6)
-sigma_cfarch_fpca <- estimate_cfarch_fpca(returns_use, L, p = p_fpca, nbasis = nbasis, norder = norder, lambda = 1e-4)
-
-# ---------------------------------------------------------
-# 2) Deep-PCA autoencoder (train on squared returns)
-# ---------------------------------------------------------
-Y <- proxy_vol   # N x L
-Y_scaled <- scale(Y)
-scale_center <- attr(Y_scaled, "scaled:center")
-scale_scale  <- attr(Y_scaled, "scaled:scale")
-scale_scale[is.na(scale_scale) | scale_scale == 0] <- 1
-
-inverse_scale_row <- function(x_scaled_row) {
-  x_un <- x_scaled_row * scale_scale + scale_center
-  return(as.numeric(x_un))
-}
-
-# build autoencoder
-input_layer <- layer_input(shape = c(L))
-encoded <- input_layer %>%
-  layer_dense(units = 128, activation = "relu") %>%
-  layer_dense(units = 64, activation = "relu") %>%
-  layer_dense(units = latent_dim, activation = "linear", name = "latent")
-decoded <- encoded %>%
-  layer_dense(units = 64, activation = "relu") %>%
-  layer_dense(units = 128, activation = "relu") %>%
-  layer_dense(units = L, activation = "linear", name = "decoder_out")
-
-autoencoder <- keras_model(inputs = input_layer, outputs = decoded)
-encoder <- keras_model(inputs = input_layer, outputs = encoded)
-
-# explicit decoder model
-latent_input <- layer_input(shape = latent_dim)
-decoder <- latent_input %>%
-  layer_dense(units = 64, activation = "relu") %>%
-  layer_dense(units = 128, activation = "relu") %>%
-  layer_dense(units = L, activation = "linear")
-decoder_model <- keras_model(inputs = latent_input, outputs = decoder)
-
-autoencoder %>% compile(optimizer = optimizer_adam(learning_rate = 0.001), loss = "mse")
-autoencoder %>% fit(
-  x = as.matrix(Y_scaled),
-  y = as.matrix(Y_scaled),
-  epochs = epochs_ae,
-  batch_size = batch_size,
-  validation_split = 0.05,
-  verbose = 1
-)
-
-deep_scores <- encoder %>% predict(as.matrix(Y_scaled))   # N x latent_dim
-deep_scores <- scale(deep_scores)
-
-# helper: transition M estimator
-estimate_M_from_Z <- function(Z) {
-  p <- nrow(Z)
-  part1 <- matrix(0, p, p); part2 <- matrix(0, p, p)
-  for (k in 2:ncol(Z)) {
-    part1 <- part1 + Z[, k] %*% t(Z[, k - 1])
-    part2 <- part2 + Z[, k - 1] %*% t(Z[, k - 1])
-  }
-  M <- tryCatch(part1 %*% solve(part2), error = function(e) part1 %*% MASS::ginv(part2))
-  return(M)
-}
-
-# Deep-PCA fARCH
-sigma_deep_farch <- matrix(NA, nrow = N - 2, ncol = L)
-for (out in 2:(N - 1)) {
-  cat("Deep-fARCH predicting day", out, "of", N - 1, "\n")
-  Z_train <- deep_scores[-out, , drop = FALSE]
-  Z_train_t <- t(Z_train)
-  M <- estimate_M_from_Z(Z_train_t)
-  z_last <- as.numeric(deep_scores[out - 1, ])
-  z_pred <- as.numeric(M %*% z_last)
-  recon_scaled <- decoder_model %>% predict(matrix(z_pred, nrow = 1))
-  recon_orig <- inverse_scale_row(as.numeric(recon_scaled))
-  recon_orig[recon_orig < eps] <- eps
-  sigma_deep_farch[out - 1, ] <- recon_orig
-}
-
-# Deep-PCA Copula-fARCH
-sigma_deep_cfarch <- matrix(NA, nrow = N - 2, ncol = L)
-for (out in 2:(N - 1)) {
-  cat("Deep-Copula-fARCH predicting day", out, "of", N - 1, "\n")
-  Z_train <- deep_scores[-out, , drop = FALSE]
-  u_data <- pobs(Z_train)
-  sims_list <- list()
-  for (cop_type in c("gaussian", "clayton")) {
-    fit_cop <- tryCatch({
-      cop_obj <- switch(cop_type,
-                        "gaussian" = normalCopula(dim = latent_dim, dispstr = "un"),
-                        "clayton"  = claytonCopula(dim = latent_dim))
-      fitCopula(cop_obj, data = u_data, method = "ml")
-    }, error = function(e) NULL)
-    if (!is.null(fit_cop)) {
-      sim_cop <- rCopula(nrow(u_data), fit_cop@copula)
-      sims_list[[ length(sims_list) + 1 ]] <- qnorm(sim_cop)
-    }
-  }
-  if (length(sims_list) > 0) {
-    avg_sim <- Reduce(`+`, sims_list) / length(sims_list)
-    Z_used <- t(avg_sim)
-  } else {
-    Z_used <- t(Z_train)
-  }
-  M <- estimate_M_from_Z(Z_used)
-  z_last <- as.numeric(deep_scores[out - 1, ])
-  z_pred <- as.numeric(M %*% z_last)
-  recon_scaled <- decoder_model %>% predict(matrix(z_pred, nrow = 1))
-  recon_orig <- inverse_scale_row(as.numeric(recon_scaled))
-  recon_orig[recon_orig < eps] <- eps
-  sigma_deep_cfarch[out - 1, ] <- recon_orig
-}
-
-# -------------------------
-# Align predictions and true proxy to same dims
-# -------------------------
-true_cut <- proxy_vol[2:(N - 1), , drop = FALSE]
-
-pred_farch_fpca  <- sigma_farch_fpca
-pred_cfarch_fpca <- sigma_cfarch_fpca
-pred_farch_deep  <- sigma_deep_farch
-pred_cfarch_deep <- sigma_deep_cfarch
-
-min_rows <- min(nrow(true_cut), nrow(pred_farch_fpca), nrow(pred_cfarch_fpca), nrow(pred_farch_deep), nrow(pred_cfarch_deep))
-min_cols <- min(ncol(true_cut), ncol(pred_farch_fpca), ncol(pred_cfarch_fpca), ncol(pred_farch_deep), ncol(pred_cfarch_deep))
-
-true_cut <- true_cut[1:min_rows, 1:min_cols, drop = FALSE]
-pred_farch_fpca  <- pred_farch_fpca[1:min_rows, 1:min_cols, drop = FALSE]
-pred_cfarch_fpca <- pred_cfarch_fpca[1:min_rows, 1:min_cols, drop = FALSE]
-pred_farch_deep  <- pred_farch_deep[1:min_rows, 1:min_cols, drop = FALSE]
-pred_cfarch_deep <- pred_cfarch_deep[1:min_rows, 1:min_cols, drop = FALSE]
-
-# -------------------------
-# evaluation function
-# -------------------------
-evaluate_model <- function(est, proxy) {
-  proxy_sub <- proxy[1:nrow(est), , drop = FALSE]
-  error <- est - proxy_sub
-  
-  rmse <- sqrt(mean(error^2, na.rm = TRUE))
-  mse  <- mean(error^2, na.rm = TRUE)
-  mae  <- mean(abs(error), na.rm = TRUE)
-  mape <- mean(abs((proxy_sub - est) / ifelse(proxy_sub == 0, NA, proxy_sub)), na.rm = TRUE) * 100
-  
-  log_est <- log1p(pmax(est, 0))
-  log_proxy <- log1p(pmax(proxy_sub, 0))
-  msle <- mean((log_est - log_proxy)^2, na.rm = TRUE)
-  
-  corr <- mean(sapply(1:nrow(est), function(i) cor(est[i, ], proxy_sub[i, ], use = "complete.obs")), na.rm = TRUE)
-  
-  return(list(RMSE = rmse, MSE = mse, MAE = mae, MAPE = mape, MSLE = msle, Corr = corr))
-}
-
-# evaluate all four
-eval_fpca_farch  <- evaluate_model(pred_farch_fpca, true_cut)
-eval_fpca_cfarch <- evaluate_model(pred_cfarch_fpca, true_cut)
-eval_deep_farch  <- evaluate_model(pred_farch_deep, true_cut)
-eval_deep_cfarch <- evaluate_model(pred_cfarch_deep, true_cut)
-
-metrics <- data.frame(
-  Model = c("FPCA fARCH", "FPCA Copula-fARCH", "Deep-PCA fARCH", "Deep-PCA Copula-fARCH"),
-  RMSE = c(eval_fpca_farch$RMSE, eval_fpca_cfarch$RMSE, eval_deep_farch$RMSE, eval_deep_cfarch$RMSE),
-  MAE  = c(eval_fpca_farch$MAE, eval_fpca_cfarch$MAE, eval_deep_farch$MAE, eval_deep_cfarch$MAE),
-  MAPE = c(eval_fpca_farch$MAPE, eval_fpca_cfarch$MAPE, eval_deep_farch$MAPE, eval_deep_cfarch$MAPE),
-  MSLE = c(eval_fpca_farch$MSLE, eval_fpca_cfarch$MSLE, eval_deep_farch$MSLE, eval_deep_cfarch$MSLE),
-  Corr = c(eval_fpca_farch$Corr, eval_fpca_cfarch$Corr, eval_deep_farch$Corr, eval_deep_cfarch$Corr)
-)
-print(metrics)
-
-# -------------------------
-# plots: average intraday pattern
-# -------------------------
-plot_T <- min(30, nrow(true_cut))
-plot_L <- min(50, ncol(true_cut))
-
-df_plot <- data.frame(
-  Time = 1:plot_L,
-  True = colMeans(true_cut[1:plot_T, 1:plot_L, drop = FALSE]),
-  FPCA_fARCH = colMeans(pred_farch_fpca[1:plot_T, 1:plot_L, drop = FALSE]),
-  FPCA_Copula_fARCH = colMeans(pred_cfarch_fpca[1:plot_T, 1:plot_L, drop = FALSE]),
-  Deep_fARCH = colMeans(pred_farch_deep[1:plot_T, 1:plot_L, drop = FALSE]),
-  Deep_Copula_fARCH = colMeans(pred_cfarch_deep[1:plot_T, 1:plot_L, drop = FALSE])
-)
-
-df_melt <- reshape2::melt(df_plot, id.vars = "Time")
-ggplot(df_melt, aes(x = Time, y = value, color = variable)) +
-  geom_line(size = 1) + theme_minimal() +
-  labs(title = "Average Intraday Squared Returns: True vs Models",
-       x = "Intraday Point", y = "Squared Return", color = "Series")
-
-## 100 iterations
+## Simulation Study
 # =========================================================
 # --- Full script: FPCA & Deep-PCA models (100 iterations)
 # =========================================================
@@ -650,6 +307,54 @@ agg_results <- bind_rows(results_list, .id = "Iteration") %>%
   summarise(across(c(RMSE, MAE, MAPE, MSLE, Corr), mean, na.rm = TRUE))
 
 print(agg_results)
+
+# ================================================
+# ---- Plot intraday volatility for two days ----
+# ================================================
+plot_day <- c(30, 60)
+
+# Assemble all models into a named list
+model_list <- list(
+  "True"                  = true_cut,
+  "FPCA fARCH"            = pred_farch_fpca,
+  "FPCA Copula-fARCH"     = pred_cfarch_fpca,
+  "Deep-PCA fARCH"        = pred_farch_deep,
+  "Deep-PCA Copula-fARCH" = pred_cfarch_deep
+)
+
+# Function to prepare data frame for plotting
+prepare_plot_df <- function(day_index) {
+  time_points <- 1:ncol(true_cut)
+
+  df_list <- lapply(names(model_list), function(model_name) {
+    data.frame(
+      Time = time_points,
+      Vol  = as.numeric(model_list[[model_name]][day_index, ]),
+      Model = model_name
+    )
+  })
+  df <- bind_rows(df_list)
+  return(df)
+}
+
+# ---- Generate plots for day 30 and 60 ----
+for (day in plot_day) {
+  df_day <- prepare_plot_df(day)
+
+  plt <- ggplot(df_day, aes(x = Time, y = Vol, color = Model, linetype = Model)) +
+    geom_line(size = 1.0) +
+    theme_minimal(base_size = 14) +
+    labs(
+      title = paste("Intraday Volatility Curves - Day", day),
+      x = "Intraday Time Index",
+      y = "Volatility",
+      color = "Model",
+      linetype = "Model"
+    ) +
+    theme(legend.position = "bottom")
+
+  print(plt)
+}
 
 ### fpca-(farch and copula farch), deep learning pca farch and copula farch
 

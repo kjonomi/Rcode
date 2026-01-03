@@ -1,141 +1,199 @@
 ## Applied Economics Letters (under review) 
 ## Bitcoin 5 minutes
 # Required libraries
-library(fda)
-library(fdapace)
-library(sde)
+# --- Clean Environment ---
+rm(list = ls()); gc()
+
+
+## ---- Libraries ----
 library(fda)
 library(fdapace)
 library(MASS)
 library(ggplot2)
 library(copula)
 library(fGarch)
-library(CompGLM)  # For Conway-Maxwell-Poisson distribution
+library(tscount)
 
-# Step 1: Read CSV data (replace path if needed)
+## ---- Steps 1-6: Data Prep ----
 df <- read.csv("BIT5min.csv", stringsAsFactors = FALSE)
-
-# Step 2: Convert time to POSIXct
 df$Time <- as.POSIXct(df$Time, format = "%Y-%m-%d %H:%M:%OS", tz = "UTC")
-
-# Step 3: Choose column - use either Buys or Sells
-count_series <- df$Buys  # Or df$Sells
-count_series <- df$Sells
-
-# Step 4: Determine number of days and intervals (assuming 283 intervals per day)
+count_series <- df$Buys
 L <- 283
 N <- floor(length(count_series) / L)
-h<-1
-p <- 2                   # Number of functional principal components
-nbasis <- 200            # Number of B-spline basis functions
-lambda <- 1e-4           # Smoothing parameter
+p <- 2
+nbasis <- 200
+lambda <- 1e-4
+count_matrix <- matrix(count_series[1:(L * N)], nrow = N, byrow = TRUE)
+y <- t(apply(count_matrix, 1, diff))   # N × (L-1)
+grid <- seq(0, 1, length.out = L-1)
 
-# Step 5: Reshape into N x L matrix
-count_matrix <- matrix(count_series[1:(L*N)], nrow = N, byrow = TRUE)
-
-
-# Step 6: Compute raw differences
-y <- t(apply(count_matrix, 1, function(x) diff(x)))  # N x (L-1) matrix
-
-
-# Copula-based Functional GARCH modeling function
-copula_fgarch_estimation <- function(y, p, L, N, lambda, nbasis, model_type = "poisson") {
-  sigma_out_squared = matrix(0, N-2, L)
-  basis = create.bspline.basis(rangeval = c(0,1), nbasis = nbasis, norder = 5)
-  fd_par_obj = fdPar(basis, lambda = lambda, Lfdobj = 2)
-  log_likelihoods = numeric(N-2)
+############################################################
+## Copula–fGARCH Estimation Function (Poisson & NB)
+############################################################
+copula_fgarch_estimation <- function(y, count_matrix, p, L, N, lambda, nbasis, model_type = "poisson") {
+  iter_n <- N - 2
+  sigma_out_squared <- matrix(NA, iter_n, L-1)
+  log_likelihoods <- rep(NA, iter_n)
+  grid <- seq(0, 1, length.out = L-1)
+  basis <- create.bspline.basis(c(0,1), nbasis = nbasis)
+  fd_par <- fdPar(basis, lambda = lambda, Lfdobj = 2)
   
-  for (out in 2:(N-1)) {
-    y_current = y[-out, , drop = FALSE]
-    y_sq_fdsmooth = smooth.basis(argvals = seq(0, 1, length.out = L), 
-                                 y = matrix(t(y_current^2), nrow = L), 
-                                 fdParobj = fd_par_obj)
+  for (i in 1:iter_n) {
+    out <- i + 1
+    y_current <- y[-out, ]
+    y_sq_fd <- smooth.basis(argvals = grid, y = t(y_current^2), fdParobj = fd_par)$fd
+    fpca <- pca.fd(y_sq_fd, nharm = p)
+    mean_fd <- mean.fd(y_sq_fd)
     
-    functional_y_squared = y_sq_fdsmooth$fd
-    functional_y_squared_matrix = functional_y_squared$coefs
+    # Copula
+    u_data <- pobs(fpca$scores)
+    fit_g <- try(fitCopula(normalCopula(dim = p), u_data, method = "ml"), silent = TRUE)
+    copula_effect <- if(inherits(fit_g, "try-error")) rep(1, L-1) else rCopula(L-1, fit_g@copula)[,1]
     
-    # Perform Functional PCA
-    functional_y_squared_recreated = fd(coef = functional_y_squared_matrix, basisobj = basis)
-    principal_components = pca.fd(fdobj = functional_y_squared_recreated, nharm = p)
-    eigenfunctions = principal_components$harmonics
-    mean_fd = mean.fd(functional_y_squared_recreated)
-    
-    # Compute functional principal component scores
-    Z = matrix(0, p, ncol(functional_y_squared_matrix))
-    for (i in 1:p) {
-      Z[i, ] = sapply(1:ncol(functional_y_squared_matrix), function(k) {
-        if (k > ncol(functional_y_squared_matrix)) return(NA)
-        inprod(fd(coef = functional_y_squared_matrix[, k, drop = FALSE], basisobj = basis), eigenfunctions[i]) - 
-          inprod(mean_fd, eigenfunctions[i])
-      })
+    # Poisson or NB
+    current_counts <- as.numeric(count_matrix[out, ])
+    garch_var <- rep(1, L-1)
+    model_fit <- try(tsglm(current_counts, model = list(past_obs = 1), distr = model_type), silent = TRUE)
+    if (!inherits(model_fit, "try-error")) {
+      garch_var <- head(fitted(model_fit), L-1)
+      log_likelihoods[i] <- as.numeric(logLik(model_fit))
     }
-    Z = Z[, colSums(is.na(Z)) == 0]  # Remove NA values
     
-    # Apply Copula-based modeling
-    if (ncol(Z) > 1) {
-      u_data = pobs(t(Z))  # Transform to pseudo-observations (Uniform [0,1] margins)
-      
-      # Fit Gaussian and Clayton Copulas
-      fit_gaussian = fitCopula(normalCopula(dim = p), u_data, method = "ml")
-      fit_clayton = fitCopula(claytonCopula(dim = p), u_data, method = "ml")
-      emp_copula = empCopula(u_data)
-      
-      # Simulate from fitted copulas
-      sim_gaussian = rCopula(ncol(Z), fit_gaussian@copula)
-      sim_clayton = rCopula(ncol(Z), fit_clayton@copula)
-      sim_empirical = rCopula(ncol(Z), emp_copula)
-      
-      # Combine copula-simulated values
-      combined_copula_effect = rowMeans(cbind(sim_gaussian[,1], sim_clayton[,1], sim_empirical[,1]))
-      
-      # Apply GARCH model based on model type
-      garch_model <- if (model_type == "poisson") {
-        garchFit(~ garch(1,1), data = count_data[, out-1], trace = FALSE)
-      } else if (model_type == "nb") {
-        garchFit(~ garch(1,1), data = count_data[, out-1] + rnbinom(L, size=10, mu=10), trace = FALSE)
-      } else {
-        garchFit(~ garch(1,1), data = count_data[, out-1] + rcomp(L, lam = 10, nu = 1.5, sumTo = 100L), trace = FALSE)
-      }
-      garch_volatility = fitted(garch_model)
-      log_likelihoods[out-1] = garch_model@fit$llh  # Extract log-likelihood correctly
-      
-      # Fix dimension mismatch
-      if (length(combined_copula_effect) != L) {
-        combined_copula_effect = rep(combined_copula_effect, length.out = L)
-      }
-      
-      # Compute estimated volatility using copula-adjusted GARCH scores
-      estimated_delta = eval.fd(seq(0, 1, length.out = L), mean_fd) * 
-        rep_len(combined_copula_effect, L) * 
-        rep_len(garch_volatility, L)
-      sigma_out_squared[out-1, ] = estimated_delta
-    }
+    # Reconstruct volatility curve
+    mean_curve <- as.vector(eval.fd(grid, mean_fd))
+    sigma_out_squared[i, ] <- mean_curve * copula_effect * garch_var
   }
-  aic = -2 * sum(log_likelihoods) + 2 * length(log_likelihoods)
-  bic = -2 * sum(log_likelihoods) + length(log_likelihoods) * log(N-2)
-  return(list(sigma_out_squared = sigma_out_squared, AIC = aic, BIC = bic, logLik = sum(log_likelihoods)))
+  
+  return(list(
+    sigma_out_squared = sigma_out_squared,
+    logLik = sum(log_likelihoods, na.rm = TRUE),
+    AIC = -2 * sum(log_likelihoods, na.rm = TRUE) + 2 * (p+2) * (N-2),
+    BIC = -2 * sum(log_likelihoods, na.rm = TRUE) + log(L-1) * (p+2) * (N-2)
+  ))
 }
 
-# Apply models without log-transformed data
-results_poisson = copula_fgarch_estimation(y, p, L, N, lambda, nbasis, model_type = "poisson")
-results_nb = copula_fgarch_estimation(y, p, L, N, lambda, nbasis, model_type = "nb")
-results_cmp = copula_fgarch_estimation(y, p, L, N, lambda, nbasis, model_type = "cmp")
+# Run models
+res_pois <- copula_fgarch_estimation(y, count_matrix, p, L, N, lambda, nbasis, "poisson")
+res_nb   <- copula_fgarch_estimation(y, count_matrix, p, L, N, lambda, nbasis, "nbinom")
 
-# Compare AIC, BIC, and Log-Likelihood
-comparison_df = data.frame(Model = c("Poisson", "Negative Binomial", "Conway-Maxwell-Poisson"),
-                           AIC = c(results_poisson$AIC, results_nb$AIC, results_cmp$AIC),
-                           BIC = c(results_poisson$BIC, results_nb$BIC, results_cmp$BIC),
-                           LogLikelihood = c(results_poisson$logLik, results_nb$logLik, results_cmp$logLik))
+# Comparison
+comparison_df <- data.frame(
+  Model = c("Poisson (INGARCH)", "NegBinom (INGARCH)"),
+  AIC = c(res_pois$AIC, res_nb$AIC),
+  BIC = c(res_pois$BIC, res_nb$BIC),
+  LogLik = c(res_pois$logLik, res_nb$logLik)
+)
 print(comparison_df)
 
-# Load necessary libraries
+############################################################
+## Plot reconstructed intraday volatility curves
+############################################################
+# Average across all days
+sigma_pois_mean <- colMeans(res_pois$sigma_out_squared, na.rm = TRUE)
+sigma_nb_mean   <- colMeans(res_nb$sigma_out_squared, na.rm = TRUE)
+
+plot_df <- data.frame(
+  Time = grid,
+  Poisson = sigma_pois_mean,
+  NegBinom = sigma_nb_mean
+)
+
+library(reshape2)
+plot_df_melt <- melt(plot_df, id.vars = "Time", variable.name = "Model", value.name = "Volatility")
+
+ggplot(plot_df_melt, aes(x = Time, y = Volatility, color = Model)) +
+  geom_line(size = 1) +
+  labs(title = "Intraday Functional Volatility (Copula–fGARCH)",
+       x = "Normalized Intraday Time",
+       y = "Squared Volatility") +
+  theme_minimal() +
+  theme(text = element_text(size = 12))
+
+############################################################
+## 1. DATA AGGREGATION & STATISTICS
+############################################################
+# Calculate Mean (Baseline) and Max (Spike) Dynamics
+sigma_pois_mean <- colMeans(res_pois$sigma_out_squared, na.rm = TRUE)
+sigma_nb_mean   <- colMeans(res_nb$sigma_out_squared, na.rm = TRUE)
+
+# Indexing the days with highest total energy (integral of volatility)
+idx_max_pois <- which.max(rowSums(res_pois$sigma_out_squared, na.rm = TRUE))
+idx_max_nb   <- which.max(rowSums(res_nb$sigma_out_squared, na.rm = TRUE))
+
+sigma_pois_max <- res_pois$sigma_out_squared[idx_max_pois, ]
+sigma_nb_max   <- res_nb$sigma_out_squared[idx_max_nb, ]
+
+############################################################
+## 2. TIDY DATA TRANSFORMATION
+############################################################
+library(reshape2)
+library(dplyr)
+
+plot_df <- data.frame(
+  Time            = grid,
+  Poisson_Mean    = sigma_pois_mean,
+  NegBinom_Mean   = sigma_nb_mean,
+  Poisson_Max     = sigma_pois_max,
+  NegBinom_Max    = sigma_nb_max
+)
+
+# Convert to long format for ggplot2
+plot_tidy <- melt(plot_df, id.vars = "Time", value.name = "Volatility") %>%
+  mutate(
+    Model = ifelse(grepl("Poisson", variable), "Poisson Model", "Neg-Binomial Model"),
+    Metric = ifelse(grepl("Mean", variable), "Daily Average", "Maximum Daily Spike")
+  )
+
+############################################################
+## 3. PROFESSIONAL VISUALIZATION (FACETED)
+############################################################
+ggplot(plot_tidy, aes(x = Time, y = Volatility, color = Model)) +
+  # Main Volatility Lines
+  geom_line(size = 1.1) +
+  
+  # Add a subtle area fill under the curves
+  geom_area(aes(fill = Model), alpha = 0.1, position = "identity") +
+  
+  # Faceting creates separate panels for Mean vs Max Day
+  facet_wrap(~ Metric, scales = "free_y") +
+  
+  # Custom Colors (Financial Blues and Reds)
+  scale_color_manual(values = c("Poisson Model" = "#d73027", "Neg-Binomial Model" = "#4575b4")) +
+  scale_fill_manual(values = c("Poisson Model" = "#d73027", "Neg-Binomial Model" = "#4575b4")) +
+  
+  # Labels
+  labs(
+    title = "Functional Intraday Volatility Surfaces",
+    subtitle = "Comparison of Poisson vs. Negative Binomial Copula-fGARCH Estimation",
+    x = "Intraday Normalized Time (Market Open to Close)",
+    y = expression(Estimated ~ Intensity ~ sigma^2),
+    caption = paste("Max Spike identified on Day Index:", idx_max_nb)
+  ) +
+  
+  # Advanced Theming
+  theme_minimal(base_family = "sans") +
+  theme(
+    legend.position = "top",
+    strip.text = element_text(face = "bold", size = 12),
+    plot.title = element_text(face = "bold", size = 16, margin = margin(b=10)),
+    plot.subtitle = element_text(size = 11, color = "grey40"),
+    panel.spacing = unit(2, "lines"),
+    panel.grid.minor = element_blank(),
+    axis.line = element_line(color = "grey80")
+  )
+
+############################################################
+## Load Libraries
+############################################################
 library(ggplot2)
 library(changepoint)
 
-# ---------- Function: 2-Sigma Control Chart with Out-of-Control Count ----------
+############################################################
+## 1. 2-Sigma Control Chart & Out-of-Control Logic
+############################################################
 control_chart_2sigma <- function(estimated_volatility, dist_name, changepoints_list = NULL) {
-  mean_volatility <- mean(estimated_volatility)
-  sd_volatility <- sd(estimated_volatility)
+  mean_volatility <- mean(estimated_volatility, na.rm = TRUE)
+  sd_volatility   <- sd(estimated_volatility, na.rm = TRUE)
   
   upper_limit <- mean_volatility + 2 * sd_volatility
   lower_limit <- mean_volatility - 2 * sd_volatility
@@ -146,82 +204,99 @@ control_chart_2sigma <- function(estimated_volatility, dist_name, changepoints_l
     OutOfControl = estimated_volatility > upper_limit | estimated_volatility < lower_limit
   )
   
-  out_of_control_count <- sum(df$OutOfControl)
+  out_of_control_count <- sum(df$OutOfControl, na.rm = TRUE)
   
   p <- ggplot(df, aes(x = Time, y = Volatility)) +
-    geom_line(color = "blue") +
-    geom_point(data = subset(df, OutOfControl), aes(x = Time, y = Volatility), color = "orange", size = 1.5) +
-    geom_hline(yintercept = mean_volatility, linetype = "dashed", color = "red") +
-    geom_hline(yintercept = upper_limit, linetype = "dashed", color = "green") +
-    geom_hline(yintercept = lower_limit, linetype = "dashed", color = "green") +
+    geom_line(color = "#377eb8", size = 0.8) +
+    geom_point(data = subset(df, OutOfControl), aes(x = Time, y = Volatility), color = "#e41a1c", size = 2) +
+    geom_hline(yintercept = mean_volatility, linetype = "dashed", color = "black") +
+    geom_hline(yintercept = upper_limit, linetype = "dotted", color = "darkgreen", size = 1) +
+    geom_hline(yintercept = lower_limit, linetype = "dotted", color = "darkgreen", size = 1) +
     annotate("text", x = Inf, y = Inf, label = paste("Out-of-control points:", out_of_control_count),
              hjust = 1.1, vjust = 2, size = 4, color = "black", fontface = "bold") +
-    labs(title = paste("2-Sigma Control Chart for", dist_name, "Distribution"),
-         x = "Time", y = "Volatility") +
+    labs(title = paste("2-Sigma Control Chart:", dist_name, "Volatility"),
+         subtitle = "Dashed line: Mean | Dotted lines: +/- 2 Sigma Limits",
+         x = "Intraday Interval", y = "Estimated Volatility") +
     theme_minimal()
   
-  # Add text labels on out-of-control points (showing their indices)
+  # Add text labels on out-of-control points
   p <- p + geom_text(data = subset(df, OutOfControl), aes(x = Time, y = Volatility, label = Time), 
-                     color = "orange", size = 3, vjust = -0.5, fontface = "bold")
+                     color = "#e41a1c", size = 3, vjust = -0.7, fontface = "bold")
   
   # Add changepoints if provided
   if (!is.null(changepoints_list)) {
     method_colors <- c(PELT = "purple", BinSeg = "darkred", SegNeigh = "brown")
     for (method in names(changepoints_list)) {
       cps <- changepoints_list[[method]]
-      for (cp in cps) {
-        p <- p + geom_vline(xintercept = cp, linetype = "dotted", color = method_colors[method], alpha = 0.7)
+      if(length(cps) > 0) {
+        p <- p + geom_vline(xintercept = cps, linetype = "solid", color = method_colors[method], alpha = 0.5)
       }
     }
   }
   
   print(p)
-  
   return(list(upper_limit = upper_limit, lower_limit = lower_limit, data = df))
 }
 
-# ---------- Function: ARL Calculation ----------
+############################################################
+## 2. ARL (Average Run Length) Calculation
+############################################################
 calculate_arl <- function(estimated_volatility, upper_limit, lower_limit) {
   out_of_control_points <- which(estimated_volatility > upper_limit | estimated_volatility < lower_limit)
+  
+  if(length(out_of_control_points) == 0) return(list(ARL_Mean = Inf, ARL_SD = NA))
+  
   arl_values <- diff(c(0, out_of_control_points))
-  arl_mean <- mean(arl_values)
-  arl_sd <- sd(arl_values)
-  return(list(ARL_Mean = arl_mean, ARL_SD = arl_sd))
+  return(list(ARL_Mean = mean(arl_values), ARL_SD = sd(arl_values)))
 }
 
-# ---------- Function: Multi-Method Changepoint Detection ----------
+############################################################
+## 3. Multi-Method Changepoint Detection
+############################################################
 changepoint_detection_all <- function(series, Q = 5) {
+  # Handling potential constant series or NA
+  if(var(series, na.rm = TRUE) == 0) return(list(PELT=NULL, BinSeg=NULL, SegNeigh=NULL))
+  
   methods <- list(
-    PELT = cpt.meanvar(series, method = "PELT"),
-    BinSeg = cpt.meanvar(series, method = "BinSeg", Q = Q),
+    PELT     = cpt.meanvar(series, method = "PELT"),
+    BinSeg   = cpt.meanvar(series, method = "BinSeg", Q = Q),
     SegNeigh = suppressWarnings(cpt.meanvar(series, method = "SegNeigh", Q = Q, penalty = "BIC"))
   )
-  result <- lapply(methods, function(x) cpts(x))
-  return(result)
+  return(lapply(methods, cpts))
 }
 
-# ---------- Function: Run Complete Pipeline ----------
+############################################################
+## 4. Run Complete Pipeline
+############################################################
 run_pipeline <- function(sigma_matrix, dist_name) {
+  # Select the last valid estimated day (N-2 is standard in your LOO setup)
   N <- nrow(sigma_matrix)
-  volatility <- sigma_matrix[N - 2, ]
+  volatility <- sigma_matrix[N, ] 
+  
+  # Clean NA if any
+  volatility <- volatility[!is.na(volatility)]
   
   changepoints <- changepoint_detection_all(volatility)
   control_output <- control_chart_2sigma(volatility, dist_name, changepoints)
   arl <- calculate_arl(volatility, control_output$upper_limit, control_output$lower_limit)
   
-  cat("\n=========== Results for", dist_name, "============\n")
-  print(arl)
-  cat("Changepoints - PELT:\n"); print(changepoints$PELT)
-  cat("Changepoints - BinSeg:\n"); print(changepoints$BinSeg)
-  cat("Changepoints - SegNeigh:\n"); print(changepoints$SegNeigh)
+  cat("\n==============================================\n")
+  cat("RESULTS FOR:", toupper(dist_name), "\n")
+  cat("==============================================\n")
+  cat("ARL Mean:", arl$ARL_Mean, "| ARL SD:", arl$ARL_SD, "\n")
+  cat("----------------------------------------------\n")
+  cat("Changepoints Found:\n")
+  cat("PELT:    ", paste(changepoints$PELT, collapse=", "), "\n")
+  cat("BinSeg:  ", paste(changepoints$BinSeg, collapse=", "), "\n")
+  cat("SegNeigh:", paste(changepoints$SegNeigh, collapse=", "), "\n")
 }
 
-# ---------- Apply to All Three Distributions ----------
-# Assumes these three result objects are already loaded in your environment:
-# - results_poisson
-# - results_nb
-# - results_cmp
+############################################################
+## Execute for Poisson and Negative Binomial
+############################################################
 
-run_pipeline(results_poisson$sigma_out_squared, "Poisson")
-run_pipeline(results_nb$sigma_out_squared, "Negative Binomial")
-run_pipeline(results_cmp$sigma_out_squared, "COM-Poisson")
+# Run for Poisson results
+run_pipeline(res_pois$sigma_out_squared, "Poisson")
+
+# Run for Negative Binomial results
+run_pipeline(res_nb$sigma_out_squared, "Negative Binomial")

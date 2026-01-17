@@ -1422,7 +1422,7 @@ if(exists("Emp.index")){
 ###############################
 library(alphavantager)
 
-av_api_key("XCENNGJQEVBVP06T") # YOUR_API_KEY 
+av_api_key("API_KEY") # YOUR_API_KEY 
 AAPL5m8<-av_get(symbol="AAPL",av_fun="TIME_SERIES_INTRADAY",interval="5min",outputsize="full", extended_hours="false", month="2023-08")
 MSFT5m8<-av_get(symbol="MSFT",av_fun="TIME_SERIES_INTRADAY",interval="5min",outputsize="full", extended_hours="false", month="2023-08")
 AMZN5m8<-av_get(symbol="AMZN",av_fun="TIME_SERIES_INTRADAY",interval="5min",outputsize="full", extended_hours="false", month="2023-08")

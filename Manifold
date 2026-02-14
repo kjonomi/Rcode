@@ -1,0 +1,1414 @@
+# ==========================================================
+# 0️⃣ Libraries
+# ==========================================================
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(keras)
+library(tensorflow)
+library(MASS)
+library(umap)
+library(Rtsne)
+library(vegan)
+library(gemini.R)
+
+set.seed(123)
+
+# Set your Gemini key before running:
+Sys.setenv(GEMINI_API_KEY="Your GEMINI_API_KEY")
+
+# ==========================================================
+# 1️⃣ Global Toggles
+# ==========================================================
+RUN_BOOTSTRAP      <- TRUE
+RUN_SHIFT_CURVE    <- TRUE
+RUN_LLM            <- TRUE
+LLM_SUBSAMPLE_SIZE <- 50   # control API cost
+
+# ==========================================================
+# 2️⃣ Synthetic Interaction DGP
+# ==========================================================
+n <- 1000
+num_features <- 20
+K <- 4
+
+X_num <- matrix(rnorm(n*num_features), n, num_features)
+colnames(X_num) <- paste0("f",1:num_features)
+
+all_combos <- as.matrix(expand.grid(replicate(K, c(0,1), simplify=FALSE)))
+T_mat <- all_combos[sample(1:nrow(all_combos), n, replace=TRUE),]
+
+beta <- runif(num_features,-1,1)
+tau  <- runif(K,0.3,0.8)
+
+interaction_tt_coef <- 0.7
+interaction_xt_coef <- 0.8
+
+interaction_tt <- T_mat[,1]*T_mat[,2]*interaction_tt_coef
+interaction_xt <- X_num[,1]*T_mat[,1]*interaction_xt_coef
+
+linear_pred <- X_num %*% beta +
+  T_mat %*% tau +
+  interaction_tt +
+  interaction_xt
+
+prob <- 1/(1+exp(-linear_pred))
+Y <- rbinom(n,1,prob)
+
+# Second outcome
+gamma <- runif(num_features,-0.5,0.5)
+lin2 <- X_num %*% gamma + T_mat %*% (tau*0.5)
+prob2 <- 1/(1+exp(-lin2))
+Y2 <- rbinom(n,1,prob2)
+
+# ==========================================================
+# 3️⃣ Manifold Embeddings
+# ==========================================================
+X_scaled <- scale(X_num)
+
+umap_fit <- umap(X_scaled)
+manifold_umap <- umap_fit$layout
+
+tsne_fit <- Rtsne(X_scaled, dims=2, perplexity=30, verbose=FALSE)
+manifold_tsne <- tsne_fit$Y
+
+iso_fit <- isomap(dist(X_scaled), k=10, ndim=2)
+manifold_iso <- scores(iso_fit)
+
+X_full <- cbind(X_scaled, manifold_umap, manifold_tsne, manifold_iso)
+
+# ==========================================================
+# 4️⃣ Train/Test Split
+# ==========================================================
+train_idx <- sample(1:n, 0.8*n)
+
+X_train <- X_full[train_idx,]
+X_test  <- X_full[-train_idx,]
+
+T_train <- T_mat[train_idx,]
+T_test  <- T_mat[-train_idx,]
+
+Y_train <- Y[train_idx]
+Y_test  <- Y[-train_idx]
+
+Y2_train <- Y2[train_idx]
+Y2_test  <- Y2[-train_idx]
+
+# ==========================================================
+# 5️⃣ CCDN Model
+# ==========================================================
+input_dim <- ncol(X_train) + K
+
+inputs <- layer_input(shape=input_dim)
+x <- inputs %>%
+  layer_dense(64,activation="relu") %>%
+  layer_dense(64,activation="relu") %>%
+  layer_dense(64,activation="relu")
+
+output1 <- layer_dense(x,1,activation="sigmoid")
+model <- keras_model(inputs,output1)
+
+model %>% compile(
+  optimizer=optimizer_adam(0.001),
+  loss="binary_crossentropy"
+)
+
+model %>% fit(cbind(X_train,T_train),
+              Y_train,
+              epochs=10,
+              batch_size=64,
+              verbose=0)
+
+# ==========================================================
+# 6️⃣ Multi-Outcome Model
+# ==========================================================
+output_multi <- layer_dense(x,2,activation="sigmoid")
+model_multi <- keras_model(inputs,output_multi)
+
+model_multi %>% compile(
+  optimizer="adam",
+  loss="binary_crossentropy"
+)
+
+model_multi %>% fit(cbind(X_train,T_train),
+                    cbind(Y_train,Y2_train),
+                    epochs=10,
+                    batch_size=64,
+                    verbose=0)
+
+# ==========================================================
+# 7️⃣ Policy Helpers (Upgraded with All Policies)
+# ==========================================================
+predict_all <- function(X, mdl, combos=all_combos){
+  sapply(1:nrow(X), function(i){
+    apply(combos, 1, function(combo){
+      as.numeric(mdl %>% predict(matrix(c(X[i,], combo),1), verbose=0))
+    })
+  })
+}
+
+greedy_policy <- function(X, mdl=model){
+  preds <- predict_all(X, mdl)
+  apply(preds, 2, which.max)
+}
+
+thompson_policy <- function(X, mdl=model, sigma=0.05){
+  preds <- predict_all(X, mdl)
+  preds <- preds + matrix(rnorm(length(preds), 0, sigma), nrow=nrow(all_combos))
+  apply(preds, 2, which.max)
+}
+
+epsilon_greedy_policy <- function(X, mdl=model, epsilon=0.1){
+  preds <- predict_all(X, mdl)
+  apply(preds, 2, function(p){
+    if(runif(1) < epsilon) sample(1:nrow(all_combos),1)
+    else which.max(p)
+  })
+}
+
+random_policy <- function(X){
+  sample(1:nrow(all_combos), nrow(X), replace=TRUE)
+}
+
+# ==========================================================
+# 1️⃣ LLM Thompson Policy (Uncertainty-Aware)
+# ==========================================================
+if(exists("RUN_LLM") && RUN_LLM){
+  
+  PROB_SCHEMA <- list(
+    type="OBJECT",
+    properties=list(PredictedProbability=list(type="NUMBER")),
+    required=c("PredictedProbability")
+  )
+  
+  llm_predict_raw <- function(x_row, combo){
+    api_key <- Sys.getenv("GEMINI_API_KEY")
+    if(nchar(api_key) < 10) return(0.5)
+    prompt <- paste(
+      "Predict probability (0-1) of binary outcome.",
+      "Covariates:", paste(round(x_row,3), collapse=","),
+      "Treatments:", paste(combo, collapse=",")
+    )
+    resp <- tryCatch({
+      gemini_structured(prompt=prompt, schema=PROB_SCHEMA, temperature=0)
+    }, error=function(e) NULL)
+    if(!is.null(resp)) p <- resp$PredictedProbability else p <- 0.5
+    min(max(as.numeric(p),0.001),0.999)
+  }
+  
+  # Calibration
+  cal_preds <- sapply(1:LLM_SUBSAMPLE_SIZE, function(i)
+    llm_predict_raw(X_train[i,], T_train[i,]))
+  cal_df <- data.frame(p=cal_preds, y=Y_train[1:LLM_SUBSAMPLE_SIZE])
+  cal_model <- glm(y~p, data=cal_df, family=binomial)
+  llm_calibrate <- function(p) plogis(predict(cal_model, newdata=data.frame(p=p)))
+  
+  # Generate LLM predictions for all test samples
+  LLM_pred_matrix <- t(sapply(1:nrow(X_test), function(i){
+    sapply(1:nrow(all_combos), function(j){
+      llm_calibrate(llm_predict_raw(X_test[i,], all_combos[j,]))
+    })
+  }))
+  
+  # LLM Thompson Sampling Policy
+  llm_thompson_policy <- function(pred_matrix, strength=20){
+    apply(pred_matrix, 1, function(preds){
+      alpha <- preds * strength
+      beta_par <- (1 - preds) * strength
+      sampled <- rbeta(length(preds), alpha, beta_par)
+      which.max(sampled)
+    })
+  }
+  
+  llm_idx <- llm_thompson_policy(LLM_pred_matrix)
+}
+
+# ==========================================================
+# 2️⃣ Oracle + Policy Values
+# ==========================================================
+policy_value <- function(policy_idx, X_test, mdl, combos){
+  n <- length(policy_idx)
+  combos_selected <- combos[policy_idx, , drop=FALSE]
+  # Vectorized prediction
+  pred_matrix <- t(sapply(1:n, function(i){
+    as.numeric(mdl %>% predict(matrix(c(X_test[i,], combos_selected[i,]),1), verbose=0))
+  }))
+  mean(pred_matrix)
+}
+
+oracle_idx <- greedy_policy(X_test, model)
+greedy_idx <- greedy_policy(X_test, model)
+thomp_idx  <- thompson_policy(X_test, model)
+eps_idx    <- epsilon_greedy_policy(X_test, model)
+rand_idx   <- random_policy(X_test)
+
+policy_list <- list(
+  Greedy=greedy_idx,
+  Thompson=thomp_idx,
+  EpsilonGreedy=eps_idx,
+  Random=rand_idx
+)
+if(exists("llm_idx")) policy_list$LLM_Thompson <- llm_idx
+
+policy_vals <- sapply(policy_list, function(idx) policy_value(idx, X_test, model, all_combos))
+oracle_val <- policy_value(oracle_idx, X_test, model, all_combos)
+
+regret_df <- data.frame(
+  Policy = names(policy_list),
+  Regret = oracle_val - policy_vals
+)
+print(regret_df)
+
+# ==========================================================
+# 3️⃣ IPS + DR Estimators (Vectorized)
+# ==========================================================
+propensity <- 1 / nrow(all_combos)
+
+# Find logged indices
+logged_idx <- apply(T_test, 1, function(row){
+  which(apply(all_combos, 1, function(combo) all(combo == row)))
+})
+
+ips_estimator <- function(policy_idx, Y_test, logged_idx, propensity){
+  mean((policy_idx == logged_idx) * Y_test / propensity)
+}
+
+dr_estimator <- function(policy_idx, X_test, Y_test, logged_idx, mdl, combos, propensity){
+  n <- length(policy_idx)
+  combos_pi <- combos[policy_idx, , drop=FALSE]
+  combos_logged <- combos[logged_idx, , drop=FALSE]
+  
+  m_hat_pi <- sapply(1:n, function(i) as.numeric(mdl %>% predict(matrix(c(X_test[i,], combos_pi[i,]),1), verbose=0)))
+  m_hat_logged <- sapply(1:n, function(i) as.numeric(mdl %>% predict(matrix(c(X_test[i,], combos_logged[i,]),1), verbose=0)))
+  
+  mean(m_hat_pi + (policy_idx == logged_idx) * (Y_test - m_hat_logged) / propensity)
+}
+
+ips_vals <- sapply(policy_list, function(idx) ips_estimator(idx, Y_test, logged_idx, propensity))
+dr_vals  <- sapply(policy_list, function(idx) dr_estimator(idx, X_test, Y_test, logged_idx, model, all_combos, propensity))
+
+cat("IPS Values:\n"); print(ips_vals)
+cat("DR Values:\n");  print(dr_vals)
+
+# ==========================================================
+# 4️⃣ True Expected Reward Function
+# ==========================================================
+true_expected <- function(Xrow, combo){
+  Xrow <- as.numeric(Xrow)
+  combo <- as.numeric(combo)
+  p <- min(length(Xrow), length(beta))
+  q <- min(length(combo), length(tau))
+  interaction_tt <- combo[1]*combo[2]*interaction_tt_coef
+  interaction_xt <- Xrow[1]*combo[1]*interaction_xt_coef
+  sum(Xrow[1:p]*beta[1:p]) + sum(combo[1:q]*tau[1:q]) + interaction_tt + interaction_xt
+}
+
+# ==========================================================
+# 5️⃣ Robust Policy-Specific CATE RMSE
+# ==========================================================
+compute_cate_rmse <- function(policy_list, X_test, all_combos, model=NULL, LLM_pred_matrix=NULL){
+  n_test <- nrow(X_test)
+  
+  sapply(names(policy_list), function(pol){
+    idx <- policy_list[[pol]]
+    
+    est_cate <- sapply(1:n_test, function(i){
+      preds <- if(!is.null(LLM_pred_matrix) && pol=="LLM_Thompson"){
+        LLM_pred_matrix[i,]
+      } else {
+        apply(all_combos, 1, function(combo){
+          as.numeric(model %>% predict(matrix(c(X_test[i,], combo),1), verbose=0))
+        })
+      }
+      preds[idx[i]] - min(preds)
+    })
+    
+    true_gap <- sapply(1:n_test, function(i){
+      vals <- apply(all_combos, 1, function(combo) true_expected(X_test[i,], combo))
+      vals[idx[i]] - min(vals)
+    })
+    
+    sqrt(mean((true_gap - est_cate)^2))
+  })
+}
+
+cate_rmse <- compute_cate_rmse(policy_list, X_test, all_combos, model, LLM_pred_matrix)
+
+# ==========================================================
+# 6️⃣ Summary Dataframe
+# ==========================================================
+summary_df <- data.frame(
+  Policy = names(policy_list),
+  Regret = oracle_val - policy_vals,
+  IPS = ips_vals,
+  DR = dr_vals,
+  CATE_RMSE = cate_rmse
+)
+print(summary_df)
+
+# ==========================================================
+# 13️⃣ Prepare Data for Plotting
+# ==========================================================
+library(ggplot2)
+library(reshape2)
+
+# Melt summary table for ggplot
+summary_melt <- melt(summary_df, id.vars = "Policy",
+                     variable.name = "Metric",
+                     value.name = "Value")
+
+# ==========================================================
+# 14️⃣ Plot Policy Comparison
+# ==========================================================
+ggplot(summary_melt, aes(x = Policy, y = Value, fill = Policy)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  facet_wrap(~ Metric, scales = "free_y") +
+  theme_minimal(base_size = 14) +
+  labs(title = "Policy Comparison Across Metrics",
+       y = "Value",
+       x = "Policy") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none") +
+  scale_fill_brewer(palette = "Set2")
+
+
+
+# ==========================================================
+# 0️⃣ Libraries
+# ==========================================================
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(keras)
+library(tensorflow)
+library(umap)
+library(httr)
+library(jsonlite)
+library(reshape2)
+
+set.seed(123)
+
+# ==========================================================
+# 1️⃣ Toggles
+# ==========================================================
+RUN_LLM <- TRUE
+LLM_SUBSAMPLE_SIZE <- 50
+
+# Set securely in real use
+Sys.setenv(GEMINI_API_KEY="Your GEMINI_API_KEY")
+
+# ==========================================================
+# 2️⃣ Load Adult Dataset
+# ==========================================================
+adult <- fread(
+  "adult.data.txt",
+  header = FALSE,
+  sep = ",",
+  na.strings = "?",
+  strip.white = TRUE
+)
+
+colnames(adult) <- c(
+  "age","workclass","fnlwgt","education","education_num",
+  "marital_status","occupation","relationship","race","sex",
+  "capital_gain","capital_loss","hours_per_week",
+  "native_country","income"
+)
+
+adult <- na.omit(adult)
+adult[, income_binary := ifelse(trimws(income)==">50K",1,0)]
+
+if(nrow(adult) > 30000)
+  adult <- adult[sample(.N,30000)]
+
+# ==========================================================
+# 3️⃣ Feature Engineering
+# ==========================================================
+numeric_covs <- c("age","fnlwgt","education_num",
+                  "capital_gain","capital_loss","hours_per_week")
+
+cat_covs <- setdiff(names(adult),
+                    c(numeric_covs,"income","income_binary"))
+
+for(col in cat_covs)
+  adult[, (col) := as.numeric(factor(get(col)))]
+
+feature_cols <- c(numeric_covs,cat_covs)
+X_num <- scale(as.matrix(adult[,..feature_cols]))
+
+Y1 <- adult$income_binary
+n  <- nrow(X_num)
+num_features <- ncol(X_num)
+K <- 4
+
+# ==========================================================
+# 4️⃣ Simulated Treatments
+# ==========================================================
+all_combos <- as.matrix(expand.grid(replicate(K,c(0,1),simplify=FALSE)))
+T_mat <- all_combos[sample(1:nrow(all_combos),n,replace=TRUE),]
+
+# ==========================================================
+# 5️⃣ Multi-Outcome Construction
+# ==========================================================
+latent <- rnorm(n)
+Y2 <- as.numeric(plogis(0.7*scale(X_num[,1])+
+                          0.5*scale(X_num[,2])+
+                          latent)>0.5)
+
+Y_mat <- cbind(Y1,Y2)
+
+# ==========================================================
+# 6️⃣ UMAP Manifold Integration
+# ==========================================================
+umap_fit <- umap(X_num)
+manifold_umap <- umap_fit$layout
+X_aug <- cbind(X_num,manifold_umap)
+
+# ==========================================================
+# 7️⃣ Train/Test Split
+# ==========================================================
+train_idx <- sample(1:n,0.8*n)
+
+X_train <- X_aug[train_idx,]
+X_test  <- X_aug[-train_idx,]
+
+T_train <- T_mat[train_idx,]
+T_test  <- T_mat[-train_idx,]
+
+Y_train <- Y_mat[train_idx,]
+Y_test  <- Y_mat[-train_idx,]
+
+X_train_full <- cbind(X_train,T_train)
+X_test_full  <- cbind(X_test,T_test)
+
+# ==========================================================
+# 8️⃣ Multi-Outcome CCDN
+# ==========================================================
+input_dim <- ncol(X_train_full)
+
+inputs <- layer_input(shape=input_dim)
+
+shared <- inputs %>%
+  layer_dense(128,activation="relu") %>%
+  layer_dense(64,activation="relu")
+
+out1 <- shared %>% layer_dense(1,activation="sigmoid")
+out2 <- shared %>% layer_dense(1,activation="sigmoid")
+
+model <- keras_model(inputs,list(out1,out2))
+
+model %>% compile(
+  optimizer=optimizer_adam(0.001),
+  loss=list("binary_crossentropy","binary_crossentropy")
+)
+
+model %>% fit(
+  X_train_full,
+  list(Y_train[,1],Y_train[,2]),
+  epochs=15,
+  batch_size=64,
+  validation_split=0.2,
+  verbose=1
+)
+
+# ==========================================================
+# 9️⃣ Prediction Helper
+# ==========================================================
+w1 <- 0.6
+w2 <- 0.4
+
+predict_all <- function(X){
+  sapply(1:nrow(X),function(i){
+    inputs <- cbind(
+      matrix(X[i,],nrow=nrow(all_combos),byrow=TRUE),
+      all_combos
+    )
+    preds <- model %>% predict(inputs,verbose=0)
+    w1*as.numeric(preds[[1]]) +
+      w2*as.numeric(preds[[2]])
+  })
+}
+
+
+
+# ==========================================================
+# 6️⃣ Policy Helpers
+# ==========================================================
+predict_all <- function(X, mdl, combos=all_combos){
+  sapply(1:nrow(X), function(i){
+    apply(combos, 1, function(combo){
+      as.numeric(mdl %>% predict(matrix(c(X[i,], combo),1), verbose=0))
+    })
+  })
+}
+
+greedy_policy <- function(X, mdl=model){
+  preds <- predict_all(X, mdl)
+  apply(preds, 2, which.max)
+}
+
+thompson_policy <- function(X, mdl=model, sigma=0.05){
+  preds <- predict_all(X, mdl)
+  preds <- preds + matrix(rnorm(length(preds), 0, sigma),
+                          nrow=nrow(all_combos))
+  apply(preds, 2, which.max)
+}
+
+epsilon_greedy_policy <- function(X, mdl=model, epsilon=0.1){
+  preds <- predict_all(X, mdl)
+  apply(preds, 2, function(p){
+    if(runif(1) < epsilon)
+      sample(1:nrow(all_combos),1)
+    else
+      which.max(p)
+  })
+}
+
+random_policy <- function(X){
+  sample(1:nrow(all_combos), nrow(X), replace=TRUE)
+}
+
+# ==========================================================
+# 7️⃣ Oracle + Regret
+# ==========================================================
+policy_value <- function(policy_idx, X_test, mdl, combos){
+  n <- length(policy_idx)
+  vals <- numeric(n)
+  for(i in 1:n){
+    combo <- combos[policy_idx[i], ]
+    vals[i] <- as.numeric(
+      mdl %>% predict(matrix(c(X_test[i, ], combo), 1), verbose=0)
+    )
+  }
+  mean(vals)
+}
+
+oracle_idx <- greedy_policy(X_test, model)
+greedy_idx <- greedy_policy(X_test, model)
+thomp_idx  <- thompson_policy(X_test, model)
+eps_idx    <- epsilon_greedy_policy(X_test, model)
+rand_idx   <- random_policy(X_test)
+
+policy_list <- list(
+  Greedy=greedy_idx,
+  Thompson=thomp_idx,
+  EpsilonGreedy=eps_idx,
+  Random=rand_idx
+)
+
+# ==========================================================
+# 8️⃣ LLM Thompson Policy (Subset)
+# ==========================================================
+if(RUN_LLM){
+  
+  PROB_SCHEMA <- list(
+    type="OBJECT",
+    properties=list(PredictedProbability=list(type="NUMBER")),
+    required=c("PredictedProbability")
+  )
+  
+  llm_predict_raw <- function(x_row, combo){
+    api_key <- Sys.getenv("GEMINI_API_KEY")
+    if(nchar(api_key) < 10) return(0.5)
+    prompt <- paste(
+      "Predict probability (0-1) of binary outcome.",
+      "Covariates:", paste(round(x_row,3), collapse=","),
+      "Treatments:", paste(combo, collapse=",")
+    )
+    resp <- tryCatch({
+      gemini_structured(prompt=prompt, schema=PROB_SCHEMA, temperature=0)
+    }, error=function(e) NULL)
+    if(!is.null(resp)) p <- resp$PredictedProbability else p <- 0.5
+    min(max(as.numeric(p),0.001),0.999)
+  }
+  
+  # Calibration on small subset
+  cal_preds <- sapply(1:min(LLM_SUBSAMPLE_SIZE, nrow(X_train)), function(i)
+    llm_predict_raw(X_train[i,], T_train[i,]))
+  cal_df <- data.frame(p=cal_preds, y=Y_train[1:length(cal_preds)])
+  cal_model <- glm(y~p, data=cal_df, family=binomial)
+  llm_calibrate <- function(p) plogis(predict(cal_model, newdata=data.frame(p=p)))
+  
+  # Run LLM Thompson only on subset
+  llm_idx <- sapply(1:min(LLM_SUBSAMPLE_SIZE, nrow(X_test)), function(i){
+    preds <- sapply(1:nrow(all_combos), function(j){
+      llm_calibrate(llm_predict_raw(X_test[i,], all_combos[j,]))
+    })
+    alpha <- preds * 20
+    beta_par <- (1 - preds) * 20
+    sampled <- rbeta(length(preds), alpha, beta_par)
+    which.max(sampled)
+  })
+  
+  policy_list$LLM_Thompson <- llm_idx
+}
+
+# ==========================================================
+# 9️⃣ IPS + DR Estimators
+# ==========================================================
+propensity <- 1 / nrow(all_combos)
+logged_idx <- apply(T_test, 1, function(row){
+  which(apply(all_combos, 1, function(combo) all(combo == row)))
+})
+
+ips_estimator <- function(policy_idx){
+  mean((policy_idx == logged_idx[1:length(policy_idx)]) * Y_test[1:length(policy_idx)] / propensity)
+}
+
+dr_estimator <- function(policy_idx){
+  n <- length(policy_idx)
+  m_hat_pi <- numeric(n)
+  m_hat_logged <- numeric(n)
+  for(i in 1:n){
+    combo_pi <- all_combos[policy_idx[i], ]
+    combo_logged <- all_combos[logged_idx[i], ]
+    m_hat_pi[i] <- as.numeric(model %>% predict(matrix(c(X_test[i, ], combo_pi), 1), verbose=0))
+    m_hat_logged[i] <- as.numeric(model %>% predict(matrix(c(X_test[i, ], combo_logged), 1), verbose=0))
+  }
+  mean(m_hat_pi + (policy_idx == logged_idx[1:n]) * (Y_test[1:n] - m_hat_logged) / propensity)
+}
+
+ips_vals <- sapply(policy_list, ips_estimator)
+dr_vals  <- sapply(policy_list, dr_estimator)
+
+# ==========================================================
+# 10️⃣ True CATE Function
+# ==========================================================
+interaction_tt_coef <- 0.7
+interaction_xt_coef <- 0.8
+beta <- runif(num_features, -1, 1)
+tau  <- runif(K, 0.3, 0.8)
+
+true_expected <- function(Xrow, combo){
+  Xrow <- as.numeric(Xrow)
+  combo <- as.numeric(combo)
+  p <- min(length(Xrow), length(beta))
+  q <- min(length(combo), length(tau))
+  interaction_tt <- combo[1]*combo[2]*interaction_tt_coef
+  interaction_xt <- Xrow[1]*combo[1]*interaction_xt_coef
+  mu <- sum(Xrow[1:p]*beta[1:p]) + sum(combo[1:q]*tau[1:q]) + interaction_tt + interaction_xt
+  return(mu)
+}
+
+# True CATE (max-min)
+true_cate <- sapply(1:nrow(X_test), function(i){
+  vals <- apply(all_combos, 1, function(combo) true_expected(X_test[i, ], combo))
+  max(vals) - min(vals)
+})
+
+# ==========================================================
+# 11️⃣ Policy-Specific CATE RMSE
+# ==========================================================
+cate_rmse <- sapply(policy_list, function(idx){
+  n_idx <- length(idx)
+  
+  est_cate_policy <- sapply(1:n_idx, function(i){
+    preds <- apply(all_combos, 1, function(combo){
+      as.numeric(model %>% predict(matrix(c(X_test[i, ], combo),1), verbose=0))
+    })
+    preds[idx[i]] - min(preds)
+  })
+  
+  true_gap_policy <- sapply(1:n_idx, function(i){
+    vals <- apply(all_combos, 1, function(combo) true_expected(X_test[i, ], combo))
+    vals[idx[i]] - min(vals)
+  })
+  
+  sqrt(mean((true_gap_policy - est_cate_policy)^2))
+})
+
+# ==========================================================
+# 12️⃣ Summary Table
+# ==========================================================
+summary_df <- data.frame(
+  Policy = names(policy_list),
+  Regret = sapply(policy_list, function(idx) policy_value(idx, X_test, model, all_combos)),
+  IPS    = ips_vals,
+  DR     = dr_vals,
+  CATE_RMSE = cate_rmse
+)
+
+print(summary_df)
+
+# ==========================================================
+# 13️⃣ Plot Policy Comparison
+# ==========================================================
+summary_melt <- melt(summary_df,
+                     id.vars="Policy",
+                     variable.name="Metric",
+                     value.name="Value")
+
+ggplot(summary_melt,
+       aes(x=Policy, y=Value, fill=Policy)) +
+  geom_bar(stat="identity") +
+  facet_wrap(~Metric, scales="free_y") +
+  theme_minimal(base_size=14) +
+  labs(title="Policy Comparison (Adult Dataset)",
+       y="Value",
+       x="Policy") +
+  theme(axis.text.x=element_text(angle=45,hjust=1),
+        legend.position="none") +
+  scale_fill_brewer(palette="Set2")
+
+# ==========================================================
+# 0️⃣ Libraries
+# ==========================================================
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(keras)
+library(tensorflow)
+library(umap)
+library(Rtsne)
+library(vegan)
+library(reshape2)
+
+set.seed(123)
+
+# ==========================================================
+# 1️⃣ Global Toggles
+# ==========================================================
+RUN_BOOTSTRAP      <- TRUE
+RUN_LLM            <- TRUE
+LLM_SUBSAMPLE_SIZE <- 50   # subset for LLM calibration
+Sys.setenv(GEMINI_API_KEY="YOUR_GEMINI_KEY_HERE")  # Gemini key
+
+# ==========================================================
+# 2️⃣ Load & Prepare Wine Quality Dataset
+# ==========================================================
+wine <- fread("winequality-red.csv", sep=";")
+
+Y <- as.numeric(wine$quality >= 6)   # binary outcome
+wine <- dplyr::select(wine, -quality)
+
+X_num <- scale(as.matrix(wine))
+n <- nrow(X_num)
+num_features <- ncol(X_num)
+K <- 4  # number of binary treatment dimensions
+
+# Simulated multi-binary treatments
+all_combos <- as.matrix(expand.grid(replicate(K, c(0,1), simplify=FALSE)))
+T_mat <- all_combos[sample(1:nrow(all_combos), n, replace=TRUE),]
+
+
+# ==========================================================
+# 3️⃣ Manifold Embeddings (UMAP + t-SNE)
+# ==========================================================
+
+library(umap)
+library(Rtsne)
+
+# -------------------------------
+# 1. Scale features
+# -------------------------------
+X_scaled <- scale(X_num)
+
+# -------------------------------
+# 2. UMAP embedding
+# -------------------------------
+umap_fit <- umap(X_scaled)
+manifold_umap <- umap_fit$layout
+dim(manifold_umap)   # should be n x 2
+
+# -------------------------------
+# 3. t-SNE embedding
+# -------------------------------
+# t-SNE cannot handle exact duplicate rows, so add tiny jitter
+set.seed(123)
+jitter_sd <- 1e-6  # very small noise
+X_scaled_jitter <- X_scaled + matrix(rnorm(nrow(X_scaled) * ncol(X_scaled), 
+                                           mean=0, sd=jitter_sd),
+                                     nrow=nrow(X_scaled))
+
+tsne_fit <- Rtsne(X_scaled_jitter, dims = 2, perplexity = 30, verbose = TRUE)
+manifold_tsne <- tsne_fit$Y
+dim(manifold_tsne)   # should be n x 2
+
+# -------------------------------
+# 4. Quick check
+# -------------------------------
+head(manifold_umap)
+head(manifold_tsne)
+
+# 80/20 train/test split
+set.seed(123)  # for reproducibility
+train_idx <- sample(1:n, size = 0.8*n)
+
+X_train <- X_num[train_idx, ]  # use X_num or X_scaled
+X_test  <- X_num[-train_idx, ]
+
+# Similarly for treatment and outcome matrices
+T_train <- T_mat[train_idx, ]
+T_test  <- T_mat[-train_idx, ]
+
+Y_train <- Y[train_idx]
+Y_test  <- Y[-train_idx]
+
+
+# ==========================================================
+# 5️⃣ CCDN Model
+# ==========================================================
+input_dim <- ncol(X_train) + K
+
+inputs <- layer_input(shape=input_dim)
+x <- inputs %>%
+  layer_dense(64, activation="relu") %>%
+  layer_dense(64, activation="relu") %>%
+  layer_dense(64, activation="relu")
+
+output <- layer_dense(x,1,activation="sigmoid")
+model <- keras_model(inputs, output)
+
+model %>% compile(
+  optimizer=optimizer_adam(0.001),
+  loss="binary_crossentropy"
+)
+
+model %>% fit(
+  cbind(X_train, T_train),
+  Y_train,
+  epochs=15,
+  batch_size=64,
+  verbose=0
+)
+
+
+# ==========================================================
+# 6️⃣ Policy Helpers
+# ==========================================================
+predict_all <- function(X, mdl, combos=all_combos){
+  sapply(1:nrow(X), function(i){
+    apply(combos, 1, function(combo){
+      as.numeric(mdl %>% predict(matrix(c(X[i,], combo),1), verbose=0))
+    })
+  })
+}
+
+greedy_policy <- function(X, mdl=model){
+  preds <- predict_all(X, mdl)
+  apply(preds, 2, which.max)
+}
+
+thompson_policy <- function(X, mdl=model, sigma=0.05){
+  preds <- predict_all(X, mdl)
+  preds <- preds + matrix(rnorm(length(preds), 0, sigma),
+                          nrow=nrow(all_combos))
+  apply(preds, 2, which.max)
+}
+
+epsilon_greedy_policy <- function(X, mdl=model, epsilon=0.1){
+  preds <- predict_all(X, mdl)
+  apply(preds, 2, function(p){
+    if(runif(1) < epsilon)
+      sample(1:nrow(all_combos),1)
+    else
+      which.max(p)
+  })
+}
+
+random_policy <- function(X){
+  sample(1:nrow(all_combos), nrow(X), replace=TRUE)
+}
+
+# ==========================================================
+# 7️⃣ Oracle + Regret
+# ==========================================================
+policy_value <- function(policy_idx, X_test, mdl, combos){
+  n <- length(policy_idx)
+  vals <- numeric(n)
+  for(i in 1:n){
+    combo <- combos[policy_idx[i], ]
+    vals[i] <- as.numeric(
+      mdl %>% predict(matrix(c(X_test[i, ], combo), 1), verbose=0)
+    )
+  }
+  mean(vals)
+}
+
+oracle_idx <- greedy_policy(X_test, model)
+greedy_idx <- greedy_policy(X_test, model)
+thomp_idx  <- thompson_policy(X_test, model)
+eps_idx    <- epsilon_greedy_policy(X_test, model)
+rand_idx   <- random_policy(X_test)
+
+policy_list <- list(
+  Greedy=greedy_idx,
+  Thompson=thomp_idx,
+  EpsilonGreedy=eps_idx,
+  Random=rand_idx
+)
+
+# ==========================================================
+# 8️⃣ LLM Thompson Policy (Subset)
+# ==========================================================
+if(RUN_LLM){
+  
+  PROB_SCHEMA <- list(
+    type="OBJECT",
+    properties=list(PredictedProbability=list(type="NUMBER")),
+    required=c("PredictedProbability")
+  )
+  
+  llm_predict_raw <- function(x_row, combo){
+    api_key <- Sys.getenv("GEMINI_API_KEY")
+    if(nchar(api_key) < 10) return(0.5)
+    prompt <- paste(
+      "Predict probability (0-1) of binary outcome.",
+      "Covariates:", paste(round(x_row,3), collapse=","),
+      "Treatments:", paste(combo, collapse=",")
+    )
+    resp <- tryCatch({
+      gemini_structured(prompt=prompt, schema=PROB_SCHEMA, temperature=0)
+    }, error=function(e) NULL)
+    if(!is.null(resp)) p <- resp$PredictedProbability else p <- 0.5
+    min(max(as.numeric(p),0.001),0.999)
+  }
+  
+  # Calibration on small subset
+  cal_preds <- sapply(1:min(LLM_SUBSAMPLE_SIZE, nrow(X_train)), function(i)
+    llm_predict_raw(X_train[i,], T_train[i,]))
+  cal_df <- data.frame(p=cal_preds, y=Y_train[1:length(cal_preds)])
+  cal_model <- glm(y~p, data=cal_df, family=binomial)
+  llm_calibrate <- function(p) plogis(predict(cal_model, newdata=data.frame(p=p)))
+  
+  # Run LLM Thompson only on subset
+  llm_idx <- sapply(1:min(LLM_SUBSAMPLE_SIZE, nrow(X_test)), function(i){
+    preds <- sapply(1:nrow(all_combos), function(j){
+      llm_calibrate(llm_predict_raw(X_test[i,], all_combos[j,]))
+    })
+    alpha <- preds * 20
+    beta_par <- (1 - preds) * 20
+    sampled <- rbeta(length(preds), alpha, beta_par)
+    which.max(sampled)
+  })
+  
+  policy_list$LLM_Thompson <- llm_idx
+}
+
+# ==========================================================
+# 9️⃣ IPS + DR Estimators
+# ==========================================================
+propensity <- 1 / nrow(all_combos)
+logged_idx <- apply(T_test, 1, function(row){
+  which(apply(all_combos, 1, function(combo) all(combo == row)))
+})
+
+ips_estimator <- function(policy_idx){
+  mean((policy_idx == logged_idx[1:length(policy_idx)]) * Y_test[1:length(policy_idx)] / propensity)
+}
+
+dr_estimator <- function(policy_idx){
+  n <- length(policy_idx)
+  m_hat_pi <- numeric(n)
+  m_hat_logged <- numeric(n)
+  for(i in 1:n){
+    combo_pi <- all_combos[policy_idx[i], ]
+    combo_logged <- all_combos[logged_idx[i], ]
+    m_hat_pi[i] <- as.numeric(model %>% predict(matrix(c(X_test[i, ], combo_pi), 1), verbose=0))
+    m_hat_logged[i] <- as.numeric(model %>% predict(matrix(c(X_test[i, ], combo_logged), 1), verbose=0))
+  }
+  mean(m_hat_pi + (policy_idx == logged_idx[1:n]) * (Y_test[1:n] - m_hat_logged) / propensity)
+}
+
+ips_vals <- sapply(policy_list, ips_estimator)
+dr_vals  <- sapply(policy_list, dr_estimator)
+
+# ==========================================================
+# 10️⃣ True CATE Function
+# ==========================================================
+interaction_tt_coef <- 0.7
+interaction_xt_coef <- 0.8
+beta <- runif(num_features, -1, 1)
+tau  <- runif(K, 0.3, 0.8)
+
+true_expected <- function(Xrow, combo){
+  Xrow <- as.numeric(Xrow)
+  combo <- as.numeric(combo)
+  p <- min(length(Xrow), length(beta))
+  q <- min(length(combo), length(tau))
+  interaction_tt <- combo[1]*combo[2]*interaction_tt_coef
+  interaction_xt <- Xrow[1]*combo[1]*interaction_xt_coef
+  mu <- sum(Xrow[1:p]*beta[1:p]) + sum(combo[1:q]*tau[1:q]) + interaction_tt + interaction_xt
+  return(mu)
+}
+
+# True CATE (max-min)
+true_cate <- sapply(1:nrow(X_test), function(i){
+  vals <- apply(all_combos, 1, function(combo) true_expected(X_test[i, ], combo))
+  max(vals) - min(vals)
+})
+
+# ==========================================================
+# 11️⃣ Policy-Specific CATE RMSE
+# ==========================================================
+cate_rmse <- sapply(policy_list, function(idx){
+  n_idx <- length(idx)
+  
+  est_cate_policy <- sapply(1:n_idx, function(i){
+    preds <- apply(all_combos, 1, function(combo){
+      as.numeric(model %>% predict(matrix(c(X_test[i, ], combo),1), verbose=0))
+    })
+    preds[idx[i]] - min(preds)
+  })
+  
+  true_gap_policy <- sapply(1:n_idx, function(i){
+    vals <- apply(all_combos, 1, function(combo) true_expected(X_test[i, ], combo))
+    vals[idx[i]] - min(vals)
+  })
+  
+  sqrt(mean((true_gap_policy - est_cate_policy)^2))
+})
+
+# ==========================================================
+# 12️⃣ Summary Table
+# ==========================================================
+summary_df <- data.frame(
+  Policy = names(policy_list),
+  Regret = sapply(policy_list, function(idx) policy_value(idx, X_test, model, all_combos)),
+  IPS    = ips_vals,
+  DR     = dr_vals,
+  CATE_RMSE = cate_rmse
+)
+
+print(summary_df)
+
+# ==========================================================
+# 13️⃣ Plot Policy Comparison
+# ==========================================================
+summary_melt <- melt(summary_df,
+                     id.vars="Policy",
+                     variable.name="Metric",
+                     value.name="Value")
+
+ggplot(summary_melt,
+       aes(x=Policy, y=Value, fill=Policy)) +
+  geom_bar(stat="identity") +
+  facet_wrap(~Metric, scales="free_y") +
+  theme_minimal(base_size=14) +
+  labs(title="Policy Comparison (Wine Dataset)",
+       y="Value",
+       x="Policy") +
+  theme(axis.text.x=element_text(angle=45,hjust=1),
+        legend.position="none") +
+  scale_fill_brewer(palette="Set2")
+
+
+# ==========================================================
+# 0️⃣ Libraries
+# ==========================================================
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(keras)
+library(tensorflow)
+library(umap)
+library(Rtsne)
+library(vegan)
+library(reshape2)
+
+set.seed(123)
+
+# ==========================================================
+# 1️⃣ Global Toggles
+# ==========================================================
+RUN_BOOTSTRAP      <- TRUE
+RUN_LLM            <- TRUE
+LLM_SUBSAMPLE_SIZE <- 50   # control API cost
+Sys.setenv(GEMINI_API_KEY="YOUR_GEMINI_KEY_HERE")
+
+# ==========================================================
+# 2️⃣ Load Boston Dataset
+# ==========================================================
+data("Boston", package="MASS")
+boston <- as.data.table(Boston)
+
+# Binary outcome: expensive house
+Y <- as.numeric(boston$medv >= median(boston$medv))
+boston[, medv := NULL]
+
+X_num <- scale(as.matrix(boston))
+feature_cols <- colnames(X_num)
+
+n <- nrow(X_num)
+num_features <- ncol(X_num)
+K <- 4   # number of binary treatment dimensions
+
+# Simulated multi-binary treatments
+all_combos <- as.matrix(expand.grid(replicate(K, c(0,1), simplify=FALSE)))
+T_mat <- all_combos[sample(1:nrow(all_combos), n, replace=TRUE),]
+
+# ==========================================================
+# 3️⃣ Manifold Embeddings
+# ==========================================================
+X_scaled <- scale(X_num)
+
+umap_fit <- umap(X_scaled)
+manifold_umap <- umap_fit$layout
+
+tsne_fit <- Rtsne(X_scaled, dims=2, perplexity=30, verbose=FALSE)
+manifold_tsne <- tsne_fit$Y
+
+iso_fit <- isomap(dist(X_scaled), k=10, ndim=2)
+manifold_iso <- scores(iso_fit)
+
+X_full <- cbind(X_scaled, manifold_umap, manifold_tsne, manifold_iso)
+
+# ==========================================================
+# 4️⃣ Train/Test Split
+# ==========================================================
+train_idx <- sample(1:n, 0.8*n)
+
+X_train <- X_full[train_idx,]
+X_test  <- X_full[-train_idx,]
+
+T_train <- T_mat[train_idx,]
+T_test  <- T_mat[-train_idx,]
+
+Y_train <- Y[train_idx]
+Y_test  <- Y[-train_idx]
+
+# ==========================================================
+# 5️⃣ CCDN Model
+# ==========================================================
+input_dim <- ncol(X_train) + K
+
+inputs <- layer_input(shape=input_dim)
+x <- inputs %>%
+  layer_dense(64, activation="relu") %>%
+  layer_dense(64, activation="relu") %>%
+  layer_dense(64, activation="relu")
+
+output <- layer_dense(x,1,activation="sigmoid")
+model <- keras_model(inputs, output)
+
+model %>% compile(
+  optimizer=optimizer_adam(0.001),
+  loss="binary_crossentropy"
+)
+
+model %>% fit(
+  cbind(X_train, T_train),
+  Y_train,
+  epochs=15,
+  batch_size=64,
+  verbose=0
+)
+
+# ==========================================================
+# 6️⃣ Policy Helpers
+# ==========================================================
+predict_all <- function(X, mdl, combos=all_combos){
+  sapply(1:nrow(X), function(i){
+    apply(combos, 1, function(combo){
+      as.numeric(mdl %>% predict(matrix(c(X[i,], combo),1), verbose=0))
+    })
+  })
+}
+
+greedy_policy <- function(X, mdl=model){
+  preds <- predict_all(X, mdl)
+  apply(preds, 2, which.max)
+}
+
+thompson_policy <- function(X, mdl=model, sigma=0.05){
+  preds <- predict_all(X, mdl)
+  preds <- preds + matrix(rnorm(length(preds), 0, sigma),
+                          nrow=nrow(all_combos))
+  apply(preds, 2, which.max)
+}
+
+epsilon_greedy_policy <- function(X, mdl=model, epsilon=0.1){
+  preds <- predict_all(X, mdl)
+  apply(preds, 2, function(p){
+    if(runif(1) < epsilon)
+      sample(1:nrow(all_combos),1)
+    else
+      which.max(p)
+  })
+}
+
+random_policy <- function(X){
+  sample(1:nrow(all_combos), nrow(X), replace=TRUE)
+}
+
+# ==========================================================
+# 7️⃣ Oracle + Regret
+# ==========================================================
+policy_value <- function(policy_idx, X_test, mdl, combos){
+  n <- length(policy_idx)
+  vals <- numeric(n)
+  for(i in 1:n){
+    combo <- combos[policy_idx[i], ]
+    vals[i] <- as.numeric(
+      mdl %>% predict(matrix(c(X_test[i, ], combo), 1), verbose=0)
+    )
+  }
+  mean(vals)
+}
+
+oracle_idx <- greedy_policy(X_test, model)
+greedy_idx <- greedy_policy(X_test, model)
+thomp_idx  <- thompson_policy(X_test, model)
+eps_idx    <- epsilon_greedy_policy(X_test, model)
+rand_idx   <- random_policy(X_test)
+
+policy_list <- list(
+  Greedy=greedy_idx,
+  Thompson=thomp_idx,
+  EpsilonGreedy=eps_idx,
+  Random=rand_idx
+)
+
+# ==========================================================
+# 8️⃣ LLM Thompson Policy (Subset)
+# ==========================================================
+if(RUN_LLM){
+  
+  PROB_SCHEMA <- list(
+    type="OBJECT",
+    properties=list(PredictedProbability=list(type="NUMBER")),
+    required=c("PredictedProbability")
+  )
+  
+  llm_predict_raw <- function(x_row, combo){
+    api_key <- Sys.getenv("Your GEMINI_API_KEY")
+    if(nchar(api_key) < 10) return(0.5)
+    prompt <- paste(
+      "Predict probability (0-1) of binary outcome.",
+      "Covariates:", paste(round(x_row,3), collapse=","),
+      "Treatments:", paste(combo, collapse=",")
+    )
+    resp <- tryCatch({
+      gemini_structured(prompt=prompt, schema=PROB_SCHEMA, temperature=0)
+    }, error=function(e) NULL)
+    if(!is.null(resp)) p <- resp$PredictedProbability else p <- 0.5
+    min(max(as.numeric(p),0.001),0.999)
+  }
+  
+  # Calibration on small subset
+  cal_preds <- sapply(1:min(LLM_SUBSAMPLE_SIZE, nrow(X_train)), function(i)
+    llm_predict_raw(X_train[i,], T_train[i,]))
+  cal_df <- data.frame(p=cal_preds, y=Y_train[1:length(cal_preds)])
+  cal_model <- glm(y~p, data=cal_df, family=binomial)
+  llm_calibrate <- function(p) plogis(predict(cal_model, newdata=data.frame(p=p)))
+  
+  # Run LLM Thompson only on subset
+  llm_idx <- sapply(1:min(LLM_SUBSAMPLE_SIZE, nrow(X_test)), function(i){
+    preds <- sapply(1:nrow(all_combos), function(j){
+      llm_calibrate(llm_predict_raw(X_test[i,], all_combos[j,]))
+    })
+    alpha <- preds * 20
+    beta_par <- (1 - preds) * 20
+    sampled <- rbeta(length(preds), alpha, beta_par)
+    which.max(sampled)
+  })
+  
+  policy_list$LLM_Thompson <- llm_idx
+}
+
+# ==========================================================
+# 9️⃣ IPS + DR Estimators
+# ==========================================================
+propensity <- 1 / nrow(all_combos)
+logged_idx <- apply(T_test, 1, function(row){
+  which(apply(all_combos, 1, function(combo) all(combo == row)))
+})
+
+ips_estimator <- function(policy_idx){
+  mean((policy_idx == logged_idx[1:length(policy_idx)]) * Y_test[1:length(policy_idx)] / propensity)
+}
+
+dr_estimator <- function(policy_idx){
+  n <- length(policy_idx)
+  m_hat_pi <- numeric(n)
+  m_hat_logged <- numeric(n)
+  for(i in 1:n){
+    combo_pi <- all_combos[policy_idx[i], ]
+    combo_logged <- all_combos[logged_idx[i], ]
+    m_hat_pi[i] <- as.numeric(model %>% predict(matrix(c(X_test[i, ], combo_pi), 1), verbose=0))
+    m_hat_logged[i] <- as.numeric(model %>% predict(matrix(c(X_test[i, ], combo_logged), 1), verbose=0))
+  }
+  mean(m_hat_pi + (policy_idx == logged_idx[1:n]) * (Y_test[1:n] - m_hat_logged) / propensity)
+}
+
+ips_vals <- sapply(policy_list, ips_estimator)
+dr_vals  <- sapply(policy_list, dr_estimator)
+
+# ==========================================================
+# 10️⃣ True CATE Function
+# ==========================================================
+interaction_tt_coef <- 0.7
+interaction_xt_coef <- 0.8
+beta <- runif(num_features, -1, 1)
+tau  <- runif(K, 0.3, 0.8)
+
+true_expected <- function(Xrow, combo){
+  Xrow <- as.numeric(Xrow)
+  combo <- as.numeric(combo)
+  p <- min(length(Xrow), length(beta))
+  q <- min(length(combo), length(tau))
+  interaction_tt <- combo[1]*combo[2]*interaction_tt_coef
+  interaction_xt <- Xrow[1]*combo[1]*interaction_xt_coef
+  mu <- sum(Xrow[1:p]*beta[1:p]) + sum(combo[1:q]*tau[1:q]) + interaction_tt + interaction_xt
+  return(mu)
+}
+
+# True CATE (max-min)
+true_cate <- sapply(1:nrow(X_test), function(i){
+  vals <- apply(all_combos, 1, function(combo) true_expected(X_test[i, ], combo))
+  max(vals) - min(vals)
+})
+
+# ==========================================================
+# 11️⃣ Policy-Specific CATE RMSE
+# ==========================================================
+cate_rmse <- sapply(policy_list, function(idx){
+  n_idx <- length(idx)
+  
+  est_cate_policy <- sapply(1:n_idx, function(i){
+    preds <- apply(all_combos, 1, function(combo){
+      as.numeric(model %>% predict(matrix(c(X_test[i, ], combo),1), verbose=0))
+    })
+    preds[idx[i]] - min(preds)
+  })
+  
+  true_gap_policy <- sapply(1:n_idx, function(i){
+    vals <- apply(all_combos, 1, function(combo) true_expected(X_test[i, ], combo))
+    vals[idx[i]] - min(vals)
+  })
+  
+  sqrt(mean((true_gap_policy - est_cate_policy)^2))
+})
+
+# ==========================================================
+# 12️⃣ Summary Table
+# ==========================================================
+summary_df <- data.frame(
+  Policy = names(policy_list),
+  Regret = sapply(policy_list, function(idx) policy_value(idx, X_test, model, all_combos)),
+  IPS    = ips_vals,
+  DR     = dr_vals,
+  CATE_RMSE = cate_rmse
+)
+
+print(summary_df)
+
+# ==========================================================
+# 13️⃣ Plot Policy Comparison
+# ==========================================================
+summary_melt <- melt(summary_df,
+                     id.vars="Policy",
+                     variable.name="Metric",
+                     value.name="Value")
+
+ggplot(summary_melt,
+       aes(x=Policy, y=Value, fill=Policy)) +
+  geom_bar(stat="identity") +
+  facet_wrap(~Metric, scales="free_y") +
+  theme_minimal(base_size=14) +
+  labs(title="Policy Comparison (Boston Dataset)",
+       y="Value",
+       x="Policy") +
+  theme(axis.text.x=element_text(angle=45,hjust=1),
+        legend.position="none") +
+  scale_fill_brewer(palette="Set2")

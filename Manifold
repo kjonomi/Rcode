@@ -698,36 +698,31 @@ true_cate <- sapply(1:nrow(X_test), function(i){
 # 11️⃣ Policy-Specific CATE RMSE
 # ==========================================================
 cate_rmse <- sapply(policy_list, function(idx){
-  n_idx <- length(idx)
   
-  est_cate_policy <- sapply(1:n_idx, function(i){
-    preds <- apply(all_combos, 1, function(combo){
-      as.numeric(model %>% predict(matrix(c(X_test[i, ], combo),1), verbose=0))
-    })
-    preds[idx[i]] - min(preds)
-  })
+  # Predicted treatment gap under policy
+  pred_gap <- pred_matrix[cbind(1:n_test, idx)] -
+    apply(pred_matrix, 1, min)
   
-  true_gap_policy <- sapply(1:n_idx, function(i){
-    vals <- apply(all_combos, 1, function(combo) true_expected(X_test[i, ], combo))
-    vals[idx[i]] - min(vals)
-  })
+  # True treatment gap under policy
+  true_gap <- true_matrix[cbind(1:n_test, idx)] -
+    apply(true_matrix, 1, min)
   
-  sqrt(mean((true_gap_policy - est_cate_policy)^2))
+  sqrt(mean((true_gap - pred_gap)^2))
 })
 
 # ==========================================================
 # 12️⃣ Summary Table
 # ==========================================================
+
 summary_df <- data.frame(
   Policy = names(policy_list),
-  Regret = sapply(policy_list, function(idx) policy_value(idx, X_test, model, all_combos)),
+  Regret = regret_vals,
   IPS    = ips_vals,
   DR     = dr_vals,
   CATE_RMSE = cate_rmse
 )
 
 print(summary_df)
-
 
 # ==========================================================
 # 1️⃣5️⃣ Plot Policy Comparison

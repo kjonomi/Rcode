@@ -593,6 +593,7 @@ policy_values <- sapply(policy_list, policy_value,
 
 oracle_value <- policy_value(oracle_idx, X_test, model, all_combos, w1=0.6, w2=0.4)
 regret_vals <- oracle_value - policy_values
+
 # ==========================================================
 # 1️⃣2️⃣ LLM Thompson Policy (Subset)
 # ==========================================================
@@ -604,7 +605,8 @@ if(RUN_LLM){
   )
   
   llm_predict_raw <- function(x_row, combo){
-    api_key <- Sys.getenv("GEMINI_API_KEY")
+    #    api_key <- Sys.getenv("GEMINI_API_KEY")
+    api_key <- Sys.getenv("AIzaSyBTAKrvvaP2CyQAMt2EwXpK-1MapwAVB0U")
     if(nchar(api_key) < 10) return(0.5)
     prompt <- paste(
       "Predict probability (0-1) of binary outcome.",
@@ -640,24 +642,27 @@ if(RUN_LLM){
 }
 
 # ==========================================================
-# 1️⃣3️⃣ IPS + DR Estimators
+# 9️⃣ IPS + DR Estimators
 # ==========================================================
 propensity <- 1 / nrow(all_combos)
-
 logged_idx <- apply(T_test, 1, function(row){
   which(apply(all_combos, 1, function(combo) all(combo == row)))
 })
 
 ips_estimator <- function(policy_idx){
-  n <- length(policy_idx)
-  mean((policy_idx == logged_idx[1:n]) * Y_test[1:n] / propensity)
+  mean((policy_idx == logged_idx[1:length(policy_idx)]) * Y_test[1:length(policy_idx)] / propensity)
 }
 
 dr_estimator <- function(policy_idx){
   n <- length(policy_idx)
-  pred_mat <- predict_matrix(X_test[1:n,], model, all_combos)
-  m_hat_pi <- pred_mat[cbind(1:n, policy_idx)]
-  m_hat_logged <- pred_mat[cbind(1:n, logged_idx[1:n])]
+  m_hat_pi <- numeric(n)
+  m_hat_logged <- numeric(n)
+  for(i in 1:n){
+    combo_pi <- all_combos[policy_idx[i], ]
+    combo_logged <- all_combos[logged_idx[i], ]
+    m_hat_pi[i] <- as.numeric(model %>% predict(matrix(c(X_test[i, ], combo_pi), 1), verbose=0))
+    m_hat_logged[i] <- as.numeric(model %>% predict(matrix(c(X_test[i, ], combo_logged), 1), verbose=0))
+  }
   mean(m_hat_pi + (policy_idx == logged_idx[1:n]) * (Y_test[1:n] - m_hat_logged) / propensity)
 }
 
@@ -665,16 +670,64 @@ ips_vals <- sapply(policy_list, ips_estimator)
 dr_vals  <- sapply(policy_list, dr_estimator)
 
 # ==========================================================
-# 1️⃣4️⃣ Summary Table
+# 10️⃣ True CATE Function
+# ==========================================================
+interaction_tt_coef <- 0.7
+interaction_xt_coef <- 0.8
+beta <- runif(num_features, -1, 1)
+tau  <- runif(K, 0.3, 0.8)
+
+true_expected <- function(Xrow, combo){
+  Xrow <- as.numeric(Xrow)
+  combo <- as.numeric(combo)
+  p <- min(length(Xrow), length(beta))
+  q <- min(length(combo), length(tau))
+  interaction_tt <- combo[1]*combo[2]*interaction_tt_coef
+  interaction_xt <- Xrow[1]*combo[1]*interaction_xt_coef
+  mu <- sum(Xrow[1:p]*beta[1:p]) + sum(combo[1:q]*tau[1:q]) + interaction_tt + interaction_xt
+  return(mu)
+}
+
+# True CATE (max-min)
+true_cate <- sapply(1:nrow(X_test), function(i){
+  vals <- apply(all_combos, 1, function(combo) true_expected(X_test[i, ], combo))
+  max(vals) - min(vals)
+})
+
+# ==========================================================
+# 11️⃣ Policy-Specific CATE RMSE
+# ==========================================================
+cate_rmse <- sapply(policy_list, function(idx){
+  n_idx <- length(idx)
+  
+  est_cate_policy <- sapply(1:n_idx, function(i){
+    preds <- apply(all_combos, 1, function(combo){
+      as.numeric(model %>% predict(matrix(c(X_test[i, ], combo),1), verbose=0))
+    })
+    preds[idx[i]] - min(preds)
+  })
+  
+  true_gap_policy <- sapply(1:n_idx, function(i){
+    vals <- apply(all_combos, 1, function(combo) true_expected(X_test[i, ], combo))
+    vals[idx[i]] - min(vals)
+  })
+  
+  sqrt(mean((true_gap_policy - est_cate_policy)^2))
+})
+
+# ==========================================================
+# 12️⃣ Summary Table
 # ==========================================================
 summary_df <- data.frame(
   Policy = names(policy_list),
-  Regret = regret_vals,
-  IPS = ips_vals,
-  DR  = dr_vals
+  Regret = sapply(policy_list, function(idx) policy_value(idx, X_test, model, all_combos)),
+  IPS    = ips_vals,
+  DR     = dr_vals,
+  CATE_RMSE = cate_rmse
 )
 
 print(summary_df)
+
 
 # ==========================================================
 # 1️⃣5️⃣ Plot Policy Comparison
@@ -694,6 +747,7 @@ ggplot(summary_melt,
   theme(axis.text.x=element_text(angle=45,hjust=1),
         legend.position="none") +
   scale_fill_brewer(palette="Set2")
+
 
 # ==========================================================
 # 0️⃣ Libraries

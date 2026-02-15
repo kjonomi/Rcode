@@ -564,14 +564,15 @@ random_policy <- function(X){
 }
 
 # ==========================================================
-# 1️⃣1️⃣ Oracle + Regret
+# 1️⃣1️⃣ Oracle + Regret (fixed)
 # ==========================================================
-policy_value <- function(policy_idx, X_test, mdl, combos, w1=w1, w2=w2){
+policy_value <- function(policy_idx, X_test, mdl, combos, w1, w2){
   pred_mat <- predict_matrix(X_test, mdl, combos, w1, w2)
   chosen_vals <- pred_mat[cbind(1:nrow(pred_mat), policy_idx)]
   mean(chosen_vals)
 }
 
+# Policy indices
 oracle_idx <- greedy_policy(X_test)
 greedy_idx <- greedy_policy(X_test)
 thomp_idx  <- thompson_policy(X_test)
@@ -585,12 +586,13 @@ policy_list <- list(
   Random = rand_idx
 )
 
+# Pass w1 and w2 explicitly
 policy_values <- sapply(policy_list, policy_value,
                         X_test = X_test, mdl = model,
-                        combos = all_combos)
-oracle_value <- policy_value(oracle_idx, X_test, model, all_combos)
-regret_vals <- oracle_value - policy_values
+                        combos = all_combos, w1 = 0.6, w2 = 0.4)
 
+oracle_value <- policy_value(oracle_idx, X_test, model, all_combos, w1=0.6, w2=0.4)
+regret_vals <- oracle_value - policy_values
 # ==========================================================
 # 1️⃣2️⃣ LLM Thompson Policy (Subset)
 # ==========================================================

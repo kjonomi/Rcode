@@ -1,722 +1,1047 @@
-################################
-## Univariate Outcomes R code
-################################
+############################################################
+## Multivariate Contextual Bandit
+## DR + IPS + Empirical Copula (Boston Housing)
+############################################################
 
-# Boston Housing dataset
-# --- Libraries ---
-library(MASS)       
+library(MASS)
 library(keras)
 library(tensorflow)
-library(tidyverse)
+library(dplyr)
 
-# --- Parameters ---
+set.seed(123)
+
+# ==========================================================
+# 1️⃣ PARAMETERS
+# ==========================================================
+n <- 500
 T_steps <- 10
-n <- 200
-epsilon <- 1.0
-epsilon_decay <- 0.99
-epsilon_min <- 0.1
-episodes <- 150
-gamma <- 0.95
+episodes <- 400
+epsilon <- 1
+epsilon_decay <- 0.995
+epsilon_min <- 0.05
 alpha <- 0.001
+rho <- 0.7          # AR(1) temporal correlation
+K_out <- 4          # number of outcomes
 
-# --- Prepare Data ---
+# ==========================================================
+# 2️⃣ Load Boston Housing Dataset
+# ==========================================================
 data("Boston")
-# --- Sample n rows from Boston dataset ---
 df <- Boston
 p <- ncol(df)
-set.seed(123)  # for reproducibility
+
+# Sample n rows with replacement if needed
 df_sampled <- df[sample(1:nrow(df), n, replace = TRUE), ]
+X_num <- scale(as.matrix(df_sampled)) # all numeric columns
 
-# --- Simulate time series structure ---
-X_long <- array(0, dim = c(n, T_steps, p))
-for (t in 1:T_steps) {
-  noise <- matrix(rnorm(n * p, 0, 0.01), nrow = n)
-  X_long[, t, ] <- as.matrix(df_sampled) + noise
+# ==========================================================
+# 3️⃣ AR(1) TEMPORAL PROCESS
+# ==========================================================
+X_long <- array(0, c(n, T_steps, p))
+X_long[,1,] <- X_num
+
+for(t in 2:T_steps){
+  noise <- matrix(rnorm(n*p, 0, 0.1), n)
+  X_long[,t,] <- rho*X_long[,t-1,] + noise
 }
 
-# Normalize per feature and time
-X_scaled <- X_long
-for (j in 1:p) {
-  for (t in 1:T_steps) {
-    mean_val <- mean(X_scaled[, t, j])
-    sd_val <- sd(X_scaled[, t, j])
-    X_scaled[, t, j] <- (X_scaled[, t, j] - mean_val) / sd_val
-  }
+X_scaled <- array_reshape(scale(array_reshape(X_long, c(n*T_steps, p))),
+                          c(n, T_steps, p))
+
+# ==========================================================
+# 4️⃣ MULTI-CONFOUNDER PROPENSITY MODEL
+# ==========================================================
+rm_avg    <- apply(X_scaled[,,which(colnames(df)=="rm")], 1, mean)
+lstat_avg <- apply(X_scaled[,,which(colnames(df)=="lstat")], 1, mean)
+crim_avg  <- apply(X_scaled[,,which(colnames(df)=="crim")], 1, mean)
+
+lin_pred <- 1.2*rm_avg - 1.0*lstat_avg + 0.7*crim_avg
+propensity <- plogis(lin_pred)
+
+W <- rbinom(n, 1, propensity)
+
+# ==========================================================
+# 5️⃣ NONLINEAR MULTIVARIATE POTENTIAL OUTCOMES
+# ==========================================================
+Y0_mat <- matrix(0, n, K_out)
+Y1_mat <- matrix(0, n, K_out)
+
+for(k in 1:K_out){
+  base_k <- sin(rm_avg + k*0.2) +
+    log(abs(lstat_avg)+1) +
+    rnorm(n,0,0.2)
+  tau_k <- 1.5 + 0.5*k + 0.8*(rm_avg^2) - 0.3*lstat_avg
+  Y0_mat[,k] <- base_k
+  Y1_mat[,k] <- base_k + tau_k
 }
 
-# Simulate treatment
-rm_avg <- apply(X_scaled[, , which(colnames(df) == "rm")], 1, mean)
-W <- rbinom(n, 1, plogis(5 * (rm_avg - 0.5)))
+# ==========================================================
+# 6️⃣ EMPIRICAL COPULA TRANSFORMATION
+# ==========================================================
+empirical_copula <- function(Y){
+  apply(Y, 2, function(col){
+    rank(col, ties.method="average")/length(col)
+  })
+}
 
-# Simulate outcomes
-base_outcome <- apply(X_scaled[, , 1:3], 1, mean) * 5 + rnorm(n, 0, 0.2)
-treatment_effect <- 2 + 4 * apply(X_scaled[, , which(colnames(df) == "lstat")], 1, mean)
+Y0_cop <- empirical_copula(Y0_mat)
+Y1_cop <- empirical_copula(Y1_mat)
 
-Y0 <- base_outcome
-Y1 <- base_outcome + treatment_effect
-Y_obs <- ifelse(W == 1, Y1, Y0)
+# Observed outcomes
+Y_obs_mat <- Y0_cop
+Y_obs_mat[W==1, ] <- Y1_cop[W==1, ]
 
-# Split into train/test
-train_idx <- sample(1:n, floor(0.7 * n))
-test_idx <- setdiff(1:n, train_idx)
+reward_scalar <- rowMeans(Y_obs_mat)
 
-X_train <- X_scaled[train_idx, , ]
-X_test <- X_scaled[test_idx, , ]
-Y0_test <- Y0[test_idx]
-Y1_test <- Y1[test_idx]
+# ==========================================================
+# 7️⃣ TRAIN / TEST SPLIT
+# ==========================================================
+train_idx <- sample(1:n, 0.7*n)
+test_idx  <- setdiff(1:n, train_idx)
 
-# --- Deep Q Network Model ---
-create_dqn_model <- function(input_shape) {
-  model <- keras_model_sequential() %>%
-    layer_conv_1d(filters = 32, kernel_size = 3, activation = 'relu',
-                  input_shape = input_shape) %>%
-    layer_max_pooling_1d(pool_size = 2) %>%
-    layer_lstm(units = 32, return_sequences = FALSE) %>%
-    layer_dense(units = 32, activation = 'relu') %>%
-    layer_dense(units = 2, activation = 'linear')  # Q-values for 2 actions
+X_train <- X_scaled[train_idx,,]
+X_test  <- X_scaled[test_idx,,]
+
+# ==========================================================
+# 8️⃣ CONTEXTUAL BANDIT NETWORK
+# ==========================================================
+create_model <- function(input_shape){
+  keras_model_sequential() %>%
+    layer_conv_1d(32, 3, activation="relu", input_shape=input_shape) %>%
+    layer_lstm(32) %>%
+    layer_dense(32, activation="relu") %>%
+    layer_dense(2, activation="linear") %>%
+    compile(loss="mse", optimizer=optimizer_adam(alpha))
+}
+
+model <- create_model(c(T_steps, p))
+
+# ==========================================================
+# 9️⃣ TRAINING LOOP
+# ==========================================================
+for(ep in 1:episodes){
+  i <- sample(train_idx, 1)
+  idx_i <- which(train_idx == i)
   
-  model %>% compile(
-    loss = 'mse',
-    optimizer = optimizer_adam(learning_rate = alpha)
+  state <- array_reshape(X_train[idx_i,,], c(1, T_steps, p))
+  
+  if(runif(1) < epsilon){
+    action <- sample(0:1,1)
+  } else{
+    qvals <- model %>% predict(state, verbose=0)
+    action <- which.max(qvals)-1
+  }
+  
+  reward <- if(action==1) mean(Y1_cop[i,]) else mean(Y0_cop[i,])
+  
+  qvals <- model %>% predict(state, verbose=0)
+  qvals[1, action+1] <- reward
+  
+  model %>% fit(state, qvals, epochs=1, verbose=0)
+  
+  epsilon <- max(epsilon*epsilon_decay, epsilon_min)
+}
+
+# ==========================================================
+# 🔟 POLICY EVALUATION
+# ==========================================================
+q_test <- model %>% predict(X_test, verbose=0)
+pi_hat <- apply(q_test,1,which.max)-1
+
+# Preserve matrix structure for multivariate reward
+Y_policy_mat <- Y0_cop[test_idx, ]
+Y_policy_mat[pi_hat==1, ] <- Y1_cop[test_idx, ][pi_hat==1, ]
+
+R_policy <- rowMeans(Y_policy_mat)
+R_opt <- rowMeans(pmax(Y0_cop[test_idx, ], Y1_cop[test_idx, ]))
+
+cat("Mean Policy Reward:", mean(R_policy), "\n")
+cat("Mean Regret:", mean(R_opt - R_policy), "\n")
+
+# ==========================================================
+# 1️⃣2️⃣ IPS ESTIMATOR
+# ==========================================================
+Y_obs_scalar <- rowMeans(Y_obs_mat)
+
+IPS <- mean(
+  ifelse(pi_hat==W[test_idx],
+         Y_obs_scalar[test_idx] / ifelse(W[test_idx]==1, propensity[test_idx], 1-propensity[test_idx]),
+         0)
+)
+
+cat("IPS Estimate:", IPS, "\n")
+
+# ==========================================================
+# 1️⃣3️⃣ DOUBLY ROBUST ESTIMATOR
+# ==========================================================
+DR_vec <- numeric(K_out)
+
+for(k in 1:K_out){
+  df_out <- data.frame(
+    Y = Y_obs_mat[,k],
+    rm_avg = rm_avg,
+    lstat_avg = lstat_avg,
+    crim_avg = crim_avg,
+    W = W
   )
-  return(model)
+  
+  outcome_model <- lm(Y ~ rm_avg + lstat_avg + crim_avg + W, data=df_out)
+  
+  mu1 <- predict(outcome_model,
+                 newdata = data.frame(
+                   rm_avg = rm_avg[test_idx],
+                   lstat_avg = lstat_avg[test_idx],
+                   crim_avg = crim_avg[test_idx],
+                   W = 1))
+  
+  mu0 <- predict(outcome_model,
+                 newdata = data.frame(
+                   rm_avg = rm_avg[test_idx],
+                   lstat_avg = lstat_avg[test_idx],
+                   crim_avg = crim_avg[test_idx],
+                   W = 0))
+  
+  DR_vec[k] <- mean(
+    ifelse(pi_hat==1, mu1, mu0) +
+      ifelse(pi_hat==W[test_idx],
+             (Y_obs_mat[test_idx,k] - ifelse(W[test_idx]==1, mu1, mu0)) /
+               ifelse(W[test_idx]==1, propensity[test_idx], 1-propensity[test_idx]),
+             0)
+  )
 }
 
-input_shape <- c(T_steps, p)
-model <- create_dqn_model(input_shape)
+DR_estimate <- mean(DR_vec)
+cat("DR Estimate (multivariate):", DR_estimate, "\n")
 
-# --- Q-learning Loop ---
-rewards <- c()
-actions <- c()
+# ==========================================================
+# 1️⃣4️⃣ BASELINES
+# ==========================================================
+always_treat <- mean(rowMeans(Y1_cop[test_idx, ]))
+never_treat  <- mean(rowMeans(Y0_cop[test_idx, ]))
 
-for (i in 1:episodes) {
-  idx <- sample(1:dim(X_train)[1], 1)
-  state <- array_reshape(X_train[idx, , ], dim = c(1, T_steps, p))
+rand_choice <- rbinom(length(test_idx), 1, 0.5)
+Y_rand_mat <- Y0_cop[test_idx, ]
+Y_rand_mat[rand_choice==1, ] <- Y1_cop[test_idx, ][rand_choice==1, ]
+random_pol <- mean(rowMeans(Y_rand_mat))
+
+
+# ----------------------------------------------------------
+# PRINT RESULTS
+# ----------------------------------------------------------
+cat("Mean Policy Reward:", mean(R_policy), "\n")
+cat("Mean Regret:", mean(R_opt - R_policy), "\n")
+cat("IPS Estimate:", IPS, "\n")
+cat("DR Estimate (multivariate):", DR_estimate, "\n")
+cat("Always Treat:", always_treat, "\n")
+cat("Never Treat:", never_treat, "\n")
+cat("Random Policy:", random_pol, "\n")
+
+# ----------------------------------------------------------
+# VISUALIZATIONS
+# ----------------------------------------------------------
+policy_rewards <- data.frame(
+  Policy = c("Always Treat","Never Treat","Random","Learned Policy"),
+  Reward = c(always_treat, never_treat, random_pol, mean(R_policy))
+)
+
+ggplot(policy_rewards, aes(x=Policy, y=Reward, fill=Policy)) +
+  geom_bar(stat="identity") +
+  theme_minimal() +
+  ggtitle("Mean Policy Rewards (Boston Housing)") +
+  ylab("Mean Reward") +
+  theme(legend.position="none")
+
+estimates <- data.frame(
+  Estimator = c("IPS","Doubly Robust"),
+  Value = c(IPS, DR_estimate)
+)
+
+ggplot(estimates, aes(x=Estimator, y=Value, fill=Estimator)) +
+  geom_bar(stat="identity") +
+  theme_minimal() +
+  ggtitle("Policy Value Estimates (Boston Housing)") +
+  ylab("Estimated Reward") +
+  theme(legend.position="none")
+
+regret_vals <- R_opt - R_policy
+ggplot(data.frame(Regret=regret_vals), aes(x=Regret)) +
+  geom_histogram(bins=20, fill="steelblue", color="black", alpha=0.7) +
+  theme_minimal() +
+  ggtitle("Histogram of Regret (Boston Housing)") +
+  xlab("Regret") +
+  ylab("Frequency")
+
+# ==========================================================
+# 2️⃣ Track episode-wise rewards (optional)
+# ==========================================================
+# For demonstration, we can track mean reward every 20 episodes
+episode_rewards <- numeric(episodes)
+epsilon_tmp <- epsilon
+for(ep in 1:episodes){
+  i <- sample(train_idx,1)
+  idx_i <- which(train_idx==i)
   
-  if (runif(1) < epsilon) {
-    action <- sample(0:1, 1)
-  } else {
-    q_values <- model %>% predict(state, verbose = 0)
-    action <- which.max(q_values) - 1
+  state <- array_reshape(X_train[idx_i,,], c(1,T_steps,p))
+  if(runif(1)<epsilon_tmp){
+    action <- sample(0:1,1)
+  } else{
+    qvals <- model %>% predict(state, verbose=0)
+    action <- which.max(qvals)-1
   }
   
-  reward <- ifelse(action == 1, Y1[train_idx[idx]], Y0[train_idx[idx]])
-  rewards <- c(rewards, reward)
-  actions <- c(actions, action)
+  reward <- if(action==1) mean(Y1_cop[i,]) else mean(Y0_cop[i,])
+  episode_rewards[ep] <- reward
   
-  # Target Q-value (single-step, no future reward here)
-  target <- reward
-  q_vals <- model %>% predict(state, verbose = 0)
-  q_vals[1, action + 1] <- target
-  
-  # Train the model on this single sample
-  model %>% fit(state, q_vals, verbose = 0, epochs = 1)
-  
-  # Epsilon decay
-  epsilon <- max(epsilon * epsilon_decay, epsilon_min)
+  epsilon_tmp <- max(epsilon_tmp*epsilon_decay, epsilon_min)
 }
 
-# --- Evaluation ---
-q_preds <- model %>% predict(X_test, verbose = 0)
-policy_actions <- apply(q_preds, 1, which.max) - 1
-rewards_pred <- ifelse(policy_actions == 1, Y1_test, Y0_test)
 
-cat("Total reward collected on test set:", sum(rewards_pred), "\n")
-cat("Average reward on test set:", mean(rewards_pred), "\n")
-cat("Action frequencies on test set:\n")
-print(table(policy_actions))
-
-# --- Summary Tables ---
-
-# Reward summary on training episodes
-reward_summary <- data.frame(
-  Statistic = c("Total Reward", "Average Reward", "Min Reward", "Max Reward"),
-  Value = c(sum(rewards), mean(rewards), min(rewards), max(rewards))
-)
-print("Reward Summary (Training Episodes):")
-print(reward_summary)
-
-# Action frequencies on training episodes
-action_table <- table(actions)
-action_prop <- prop.table(action_table)
-action_summary <- data.frame(
-  Action = as.integer(names(action_table)),
-  Frequency = as.vector(action_table),
-  Proportion = round(as.vector(action_prop), 3)
-)
-print("Action Frequencies (Training Episodes):")
-print(action_summary)
-
-# Action frequencies on test set (evaluation)
-eval_action_table <- table(policy_actions)
-eval_action_prop <- prop.table(eval_action_table)
-eval_action_summary <- data.frame(
-  Action = as.integer(names(eval_action_table)),
-  Frequency = as.vector(eval_action_table),
-  Proportion = round(as.vector(eval_action_prop), 3)
-)
-print("Action Frequencies (Test Set):")
-print(eval_action_summary)
-
-# Reward summary on test set
-eval_reward_summary <- data.frame(
-  Statistic = c("Total Reward", "Average Reward"),
-  Value = c(sum(rewards_pred), mean(rewards_pred))
-)
-print("Reward Summary (Test Set):")
-print(eval_reward_summary)
-
-# Q-value statistics on test set
-qvalue_summary <- data.frame(
-  Statistic = c("Mean", "SD", "Min", "Max"),
-  Q0 = c(mean(q_preds[,1]), sd(q_preds[,1]), min(q_preds[,1]), max(q_preds[,1])),
-  Q1 = c(mean(q_preds[,2]), sd(q_preds[,2]), min(q_preds[,2]), max(q_preds[,2]))
-)
-print("Q-value Summary (Test Set):")
-print(qvalue_summary)
-
-# --- Q-value Plot ---
-q_df <- data.frame(
-  Q0 = q_preds[, 1],
-  Q1 = q_preds[, 2],
-  action = factor(policy_actions)
+episode_df <- data.frame(
+  Episode = 1:episodes,
+  Reward = episode_rewards
 )
 
-ggplot(q_df, aes(x = Q0, y = Q1, color = action)) +
-  geom_point(alpha = 0.6, size = 3) +
-  labs(title = "Q-values per state under learned policy", x = "Q0", y = "Q1") +
+ggplot(episode_df, aes(x=Episode, y=Reward)) +
+  geom_line(color="blue") +
+  geom_smooth(method="loess", color="red", se=FALSE) +
+  ggtitle("Episode-wise Reward Learning (Boston Housing)") +
   theme_minimal()
 
-# Wine Quality Dataset
 
-# --- Libraries ---
+############################################################
+## Multivariate Contextual Bandit
+## DR + IPS + Empirical Copula
+## Wine Quality Dataset
+############################################################
+
 library(data.table)
 library(keras)
 library(tensorflow)
 library(tidyverse)
 
-# --- Parameters ---
-T_steps <- 10
-n <- 200
-epsilon <- 1.0
-epsilon_decay <- 0.99
-epsilon_min <- 0.1
-episodes <- 150
-gamma <- 0.95
-alpha <- 0.001
-
-# --- Load and Prepare Wine Dataset ---
-wine_url <- "https://archive.ics.uci.edu/ml/machine-learning-databases/wine-quality/winequality-red.csv"
-wine <- fread(wine_url, sep = ";")
-p <- ncol(wine) - 1  # Exclude 'quality' as it's the target
-features <- setdiff(names(wine), "quality")
-df_sampled <- wine[sample(1:nrow(wine), n, replace = TRUE), ..features]
-
-# --- Simulate Time Series from Static Features ---
-X_long <- array(0, dim = c(n, T_steps, p))
-for (t in 1:T_steps) {
-  noise <- matrix(rnorm(n * p, 0, 0.01), nrow = n)
-  X_long[, t, ] <- as.matrix(df_sampled) + noise
-}
-
-# --- Normalize (feature-wise, time-wise) ---
-X_scaled <- X_long
-for (j in 1:p) {
-  for (t in 1:T_steps) {
-    mean_val <- mean(X_scaled[, t, j])
-    sd_val <- sd(X_scaled[, t, j])
-    X_scaled[, t, j] <- (X_scaled[, t, j] - mean_val) / sd_val
-  }
-}
-
-# --- Simulate Treatment Assignment ---
-alcohol_avg <- apply(X_scaled[, , which(features == "alcohol")], 1, mean)
-W <- rbinom(n, 1, plogis(2 * (alcohol_avg - mean(alcohol_avg))))
-
-# --- Simulate Outcomes ---
-# Y0 = baseline outcome; Y1 = treatment effect
-base_outcome <- apply(X_scaled[, , 1:3], 1, mean) * 5 + rnorm(n, 0, 0.2)
-sulphate_avg <- apply(X_scaled[, , which(features == "sulphates")], 1, mean)
-treatment_effect <- 2 + 3 * sulphate_avg
-
-Y0 <- base_outcome
-Y1 <- base_outcome + treatment_effect
-Y_obs <- ifelse(W == 1, Y1, Y0)
-
-# --- Train/Test Split ---
-train_idx <- sample(1:n, floor(0.7 * n))
-test_idx <- setdiff(1:n, train_idx)
-
-X_train <- X_scaled[train_idx, , ]
-X_test <- X_scaled[test_idx, , ]
-Y0_test <- Y0[test_idx]
-Y1_test <- Y1[test_idx]
-
-# --- Deep Q Network ---
-create_dqn_model <- function(input_shape) {
-  keras_model_sequential() %>%
-    layer_conv_1d(filters = 32, kernel_size = 3, activation = 'relu',
-                  input_shape = input_shape) %>%
-    layer_max_pooling_1d(pool_size = 2) %>%
-    layer_lstm(units = 32, return_sequences = FALSE) %>%
-    layer_dense(units = 32, activation = 'relu') %>%
-    layer_dense(units = 2, activation = 'linear') %>%
-    compile(loss = 'mse', optimizer = optimizer_adam(learning_rate = alpha))
-}
-
-input_shape <- c(T_steps, p)
-model <- create_dqn_model(input_shape)
-
-# --- Q-learning Loop ---
-rewards <- c()
-actions <- c()
-
-for (i in 1:episodes) {
-  idx <- sample(1:dim(X_train)[1], 1)
-  state <- array_reshape(X_train[idx, , ], dim = c(1, T_steps, p))
-  
-  # ε-greedy action
-  if (runif(1) < epsilon) {
-    action <- sample(0:1, 1)
-  } else {
-    q_values <- model %>% predict(state, verbose = 0)
-    action <- which.max(q_values) - 1
-  }
-  
-  # Reward
-  reward <- ifelse(action == 1, Y1[train_idx[idx]], Y0[train_idx[idx]])
-  rewards <- c(rewards, reward)
-  actions <- c(actions, action)
-  
-  # Update Q-values
-  q_vals <- model %>% predict(state, verbose = 0)
-  q_vals[1, action + 1] <- reward
-  model %>% fit(state, q_vals, verbose = 0, epochs = 1)
-  
-  # Decay epsilon
-  epsilon <- max(epsilon * epsilon_decay, epsilon_min)
-}
-
-# --- Evaluation ---
-q_preds <- model %>% predict(X_test, verbose = 0)
-policy_actions <- apply(q_preds, 1, which.max) - 1
-rewards_pred <- ifelse(policy_actions == 1, Y1_test, Y0_test)
-
-# --- Summaries ---
-cat("Total reward collected on test set:", sum(rewards_pred), "\n")
-cat("Average reward on test set:", mean(rewards_pred), "\n")
-
-# Action Frequencies
-print("Action Frequencies (Test Set):")
-print(table(policy_actions))
-
-# Reward summary (training episodes)
-reward_summary <- data.frame(
-  Statistic = c("Total", "Average", "Min", "Max"),
-  Reward = c(sum(rewards), mean(rewards), min(rewards), max(rewards))
-)
-print(reward_summary)
-
-# Action summary (training)
-action_summary <- data.frame(
-  Action = as.integer(names(table(actions))),
-  Frequency = as.vector(table(actions)),
-  Proportion = round(prop.table(table(actions)), 3)
-)
-print(action_summary)
-
-# Action summary (test)
-eval_action_summary <- data.frame(
-  Action = as.integer(names(table(policy_actions))),
-  Frequency = as.vector(table(policy_actions)),
-  Proportion = round(prop.table(table(policy_actions)), 3)
-)
-print(eval_action_summary)
-
-# Test set reward summary
-eval_reward_summary <- data.frame(
-  Statistic = c("Total Reward", "Average Reward"),
-  Value = c(sum(rewards_pred), mean(rewards_pred))
-)
-print(eval_reward_summary)
-
-# Q-value stats
-qvalue_summary <- data.frame(
-  Statistic = c("Mean", "SD", "Min", "Max"),
-  Q0 = c(mean(q_preds[,1]), sd(q_preds[,1]), min(q_preds[,1]), max(q_preds[,1])),
-  Q1 = c(mean(q_preds[,2]), sd(q_preds[,2]), min(q_preds[,2]), max(q_preds[,2]))
-)
-print(qvalue_summary)
-
-# --- Q-value Plot ---
-q_df <- data.frame(
-  Q0 = q_preds[, 1],
-  Q1 = q_preds[, 2],
-  action = factor(policy_actions)
-)
-ggplot(q_df, aes(x = Q0, y = Q1, color = action)) +
-  geom_point(alpha = 0.6, size = 3) +
-  labs(title = "Q-values per state under learned policy", x = "Q0", y = "Q1") +
-  theme_minimal()
-
-################################
-## Multivariate Outcomes R code
-################################
-
-## Boston Housing
-# --- Libraries ---
-library(MASS)
-library(keras)
-library(tensorflow)
-library(tidyverse)
-library(ggplot2)
-
-# --- Parameters ---
-T_steps <- 10
-n <- 200
-epsilon <- 1.0
-epsilon_decay <- 0.99
-epsilon_min <- 0.1
-episodes <- 150
-gamma <- 0.95
-alpha <- 0.001
-
-# --- Prepare Data ---
-data("Boston")
-df <- Boston
-p <- ncol(df)
 set.seed(123)
-df_sampled <- df[sample(1:nrow(df), n, replace = TRUE), ]
 
-# --- Simulate temporal structure ---
-X_long <- array(0, dim = c(n, T_steps, p))
-for (t in 1:T_steps) {
-  noise <- matrix(rnorm(n * p, 0, 0.01), nrow = n)
-  X_long[, t, ] <- as.matrix(df_sampled) + noise
+# ----------------------------------------------------------
+# PARAMETERS
+# ----------------------------------------------------------
+n <- 500
+T_steps <- 10
+episodes <- 400
+epsilon <- 1
+epsilon_decay <- 0.995
+epsilon_min <- 0.05
+alpha <- 0.001
+rho <- 0.7          # AR(1)
+K_out <- 4          # number of outcomes
+
+# ----------------------------------------------------------
+# LOAD WINE QUALITY DATA
+# ----------------------------------------------------------
+wine <- fread("winequality-red.csv", sep=";")
+Y_target <- as.numeric(wine$quality >= 6)
+wine[, quality := NULL]  # remove the column
+
+if(nrow(wine) > 3000)  # downsample for speed
+  wine <- wine[sample(1:nrow(wine), 3000), ]
+
+p <- ncol(wine)
+
+# Sample n rows
+df_sampled <- wine[sample(1:nrow(wine), n, replace=TRUE), ]
+
+# ----------------------------------------------------------
+# AR(1) TEMPORAL PROCESS
+# ----------------------------------------------------------
+X_long <- array(0, c(n,T_steps,p))
+X_long[,1,] <- as.matrix(df_sampled)
+
+for(t in 2:T_steps){
+  noise <- matrix(rnorm(n*p,0,0.1), n)
+  X_long[,t,] <- rho*X_long[,t-1,] + noise
 }
-X_scaled <- X_long
-for (j in 1:p) {
-  for (t in 1:T_steps) {
-    mu <- mean(X_scaled[, t, j])
-    sigma <- sd(X_scaled[, t, j])
-    X_scaled[, t, j] <- (X_scaled[, t, j] - mu) / sigma
-  }
+
+# Global standardization
+X_scaled <- scale(array_reshape(X_long,c(n*T_steps,p)))
+X_scaled <- array(X_scaled,c(n,T_steps,p))
+
+# ----------------------------------------------------------
+# MULTI-CONFOUNDER PROPENSITY MODEL (using first 3 features)
+# ----------------------------------------------------------
+feat1_avg <- apply(X_scaled[,,1],1,mean)
+feat2_avg <- apply(X_scaled[,,2],1,mean)
+feat3_avg <- apply(X_scaled[,,3],1,mean)
+
+lin_pred <- 1.2*feat1_avg - 0.8*feat2_avg + 0.5*feat3_avg
+propensity <- plogis(lin_pred)
+
+W <- rbinom(n,1,propensity)
+
+# ----------------------------------------------------------
+# NONLINEAR MULTIVARIATE POTENTIAL OUTCOMES
+# ----------------------------------------------------------
+Y0_mat <- matrix(0,n,K_out)
+Y1_mat <- matrix(0,n,K_out)
+
+for(k in 1:K_out){
+  base_k <- sin(feat1_avg + k*0.2) +
+    log(abs(feat2_avg)+1) +
+    rnorm(n,0,0.2)
+  
+  tau_k <- 1.5 + 0.5*k +
+    0.8*(feat1_avg^2) -
+    0.3*feat2_avg
+  
+  Y0_mat[,k] <- base_k
+  Y1_mat[,k] <- base_k + tau_k
 }
 
-# --- Simulate Treatment Assignment ---
-rm_avg <- apply(X_scaled[, , which(colnames(df) == "rm")], 1, mean)
-W <- rbinom(n, 1, plogis(5 * (rm_avg - 0.5)))
-
-# --- Simulate 8 Outcomes ---
-set.seed(123)
-Y_list <- list()
-for (k in 1:6) {
-  base_k <- apply(X_scaled[, , (k %% p + 1):(k %% p + 3)], 1, mean) + rnorm(n, 0, 0.1)
-  effect_k <- runif(1, 1.5, 3.5) * apply(X_scaled[, , which(colnames(df) == "lstat")], 1, mean)
-  Y0_k <- base_k
-  Y1_k <- base_k + effect_k
-  Y_list[[k]] <- list(Y0 = Y0_k, Y1 = Y1_k)
-}
-
-# --- Stack and Transform Outcomes ---
-Y0_mat <- do.call(cbind, lapply(Y_list, function(y) y$Y0))
-Y1_mat <- do.call(cbind, lapply(Y_list, function(y) y$Y1))
-
-# --- Apply Empirical Copula Transformation ---
-empirical_copula <- function(Y_mat) {
-  apply(Y_mat, 2, function(col) {
-    rank(col, ties.method = "average") / length(col)
+# ----------------------------------------------------------
+# EMPIRICAL COPULA TRANSFORMATION
+# ----------------------------------------------------------
+empirical_copula <- function(Y){
+  apply(Y,2,function(col){
+    rank(col,ties.method="average")/length(col)
   })
 }
-Y0_copula <- empirical_copula(Y0_mat)
-Y1_copula <- empirical_copula(Y1_mat)
 
-# --- Observed Copula-Transformed Outcomes by Action ---
-Y_obs_all <- matrix(0, n, 6)
-for (i in 1:n) {
-  Y_obs_all[i, ] <- if (W[i] == 1) Y1_copula[i, ] else Y0_copula[i, ]
+Y0_cop <- empirical_copula(Y0_mat)
+Y1_cop <- empirical_copula(Y1_mat)
+
+# Observed outcomes
+Y_obs_mat <- matrix(0, n, K_out)
+for(i in 1:n){
+  Y_obs_mat[i,] <- if(W[i]==1) Y1_cop[i,] else Y0_cop[i,]
 }
 
-# --- Train/Test Split ---
-train_idx <- sample(1:n, floor(0.7 * n))
-test_idx <- setdiff(1:n, train_idx)
-X_train <- X_scaled[train_idx, , ]
-X_test <- X_scaled[test_idx, , ]
-Y0_test <- Y0_copula[test_idx, ]
-Y1_test <- Y1_copula[test_idx, ]
+# Scalar reward for training
+reward_scalar <- rowMeans(Y_obs_mat)
 
-# --- Q-Network ---
-create_dqn_model <- function(input_shape) {
+# ----------------------------------------------------------
+# TRAIN / TEST SPLIT
+# ----------------------------------------------------------
+train_idx <- sample(1:n, 0.7*n)
+test_idx  <- setdiff(1:n, train_idx)
+
+X_train <- X_scaled[train_idx,,]
+X_test  <- X_scaled[test_idx,,]
+
+# ----------------------------------------------------------
+# CONTEXTUAL BANDIT NETWORK
+# ----------------------------------------------------------
+create_model <- function(input_shape){
   keras_model_sequential() %>%
-    layer_conv_1d(filters = 32, kernel_size = 3, activation = 'relu',
-                  input_shape = input_shape) %>%
-    layer_max_pooling_1d(pool_size = 2) %>%
-    layer_lstm(units = 32, return_sequences = FALSE) %>%
-    layer_dense(units = 32, activation = 'relu') %>%
-    layer_dense(units = 2, activation = 'linear') %>%
-    compile(loss = 'mse', optimizer = optimizer_adam(learning_rate = alpha))
+    layer_conv_1d(32,3,activation="relu", input_shape=input_shape) %>%
+    layer_lstm(32) %>%
+    layer_dense(32,activation="relu") %>%
+    layer_dense(2,activation="linear") %>%
+    compile(loss="mse", optimizer=optimizer_adam(alpha))
 }
 
-model <- create_dqn_model(c(T_steps, p))
+model <- create_model(c(T_steps,p))
 
-# --- Training Loop ---
-for (i in 1:episodes) {
-  idx <- sample(1:dim(X_train)[1], 1)
-  state <- array_reshape(X_train[idx, , ], dim = c(1, T_steps, p))
+# ----------------------------------------------------------
+# TRAINING LOOP
+# ----------------------------------------------------------
+episode_rewards <- numeric(episodes)  # track per-episode reward
+
+for(ep in 1:episodes){
+  i <- sample(train_idx,1)
+  idx_i <- which(train_idx==i)
   
-  if (runif(1) < epsilon) {
-    action <- sample(0:1, 1)
-  } else {
-    q_values <- model %>% predict(state, verbose = 0)
-    action <- which.max(q_values) - 1
+  state <- array_reshape(X_train[idx_i,,], c(1,T_steps,p))
+  
+  if(runif(1)<epsilon){
+    action <- sample(0:1,1)
+  } else{
+    qvals <- model %>% predict(state,verbose=0)
+    action <- which.max(qvals)-1
   }
   
-  reward_vec <- if (action == 1) Y1_copula[train_idx[idx], ] else Y0_copula[train_idx[idx], ]
-  reward_total <- mean(reward_vec)
+  reward <- if(action==1) mean(Y1_cop[i,]) else mean(Y0_cop[i,])
+  episode_rewards[ep] <- reward
   
-  q_vals <- model %>% predict(state, verbose = 0)
-  q_vals[1, action + 1] <- reward_total
-  model %>% fit(state, q_vals, verbose = 0, epochs = 1)
+  qvals <- model %>% predict(state,verbose=0)
+  qvals[1,action+1] <- reward
   
-  epsilon <- max(epsilon * epsilon_decay, epsilon_min)
+  model %>% fit(state, qvals, epochs=1, verbose=0)
+  
+  epsilon <- max(epsilon*epsilon_decay, epsilon_min)
 }
 
-# --- Evaluation ---
-q_preds <- model %>% predict(X_test, verbose = 0)
-policy_actions <- apply(q_preds, 1, which.max) - 1
 
-regret_vec <- numeric(6)
-reward_vec <- numeric(6)
-for (k in 1:6) {
-  R_policy <- ifelse(policy_actions == 1, Y1_test[, k], Y0_test[, k])
-  R_opt <- pmax(Y0_test[, k], Y1_test[, k])
-  regret_vec[k] <- mean(R_opt - R_policy)
-  reward_vec[k] <- mean(R_policy)
+# ----------------------------------------------------------
+# POLICY EVALUATION
+# ----------------------------------------------------------
+q_test <- model %>% predict(X_test, verbose=0)
+pi_hat <- apply(q_test,1,which.max)-1  # greedy policy
+
+# Assign outcomes according to policy
+Y1_test <- Y1_cop[test_idx,,drop=FALSE]
+Y0_test <- Y0_cop[test_idx,,drop=FALSE]
+Y_policy_mat <- matrix(0, nrow=length(test_idx), ncol=K_out)
+
+for(j in 1:length(test_idx)){
+  Y_policy_mat[j,] <- if(pi_hat[j]==1) Y1_test[j,] else Y0_test[j,]
 }
 
-# --- Optimize Weights for Equal Regret ---
-fair_loss <- function(w) {
-  w <- pmax(w, 0)
-  w <- w / sum(w)
-  sum((w * regret_vec - mean(w * regret_vec))^2)
-}
+# Policy reward
+R_policy <- rowMeans(Y_policy_mat)
+# Oracle reward
+R_opt <- rowMeans(pmax(Y0_test, Y1_test))
 
-opt_fair <- optim(par = rep(1, 6), fn = fair_loss, method = "L-BFGS-B", lower = 0.01, upper = 5)
-w_opt <- opt_fair$par / sum(opt_fair$par)
+cat("Mean Policy Reward:", mean(R_policy), "\n")
+cat("Mean Regret:", mean(R_opt - R_policy), "\n")
 
-weighted_reward <- sum(w_opt * reward_vec)
-weighted_regret <- sum(w_opt * regret_vec)
+# ----------------------------------------------------------
+# IPS ESTIMATOR
+# ----------------------------------------------------------
+Y_obs_scalar <- rowMeans(Y_obs_mat)
 
-cat("\n--- Multi-Outcome Evaluation (Empirical Copula) ---\n")
-cat("Optimized Weights (Equal Regret):\n")
-print(round(w_opt, 3))
-cat("Weighted Reward:", round(weighted_reward, 4), "\n")
-cat("Weighted Regret:", round(weighted_regret, 4), "\n")
-
-# --- Save Results ---
-result_summary <- data.frame(
-  Outcome = paste0("Y", 1:6),
-  Reward = round(reward_vec, 3),
-  Regret = round(regret_vec, 3),
-  Weight = round(w_opt, 3)
+IPS <- mean(
+  ifelse(pi_hat==W[test_idx],
+         Y_obs_scalar[test_idx]/
+           ifelse(W[test_idx]==1, propensity[test_idx], 1-propensity[test_idx]),
+         0)
 )
-print(result_summary)
+
+cat("IPS Estimate:", IPS, "\n")
+
+# ----------------------------------------------------------
+# DOUBLY ROBUST ESTIMATOR
+# ----------------------------------------------------------
+DR_vec <- numeric(K_out)
+
+for(k in 1:K_out){
+  df_out <- data.frame(
+    Y = Y_obs_mat[,k],
+    feat1_avg = feat1_avg,
+    feat2_avg = feat2_avg,
+    feat3_avg = feat3_avg,
+    W = W
+  )
+  
+  outcome_model <- lm(Y ~ feat1_avg + feat2_avg + feat3_avg + W, data=df_out)
+  
+  mu1 <- predict(outcome_model, newdata=data.frame(
+    feat1_avg = feat1_avg[test_idx],
+    feat2_avg = feat2_avg[test_idx],
+    feat3_avg = feat3_avg[test_idx],
+    W = 1
+  ))
+  
+  mu0 <- predict(outcome_model, newdata=data.frame(
+    feat1_avg = feat1_avg[test_idx],
+    feat2_avg = feat2_avg[test_idx],
+    feat3_avg = feat3_avg[test_idx],
+    W = 0
+  ))
+  
+  DR_vec[k] <- mean(
+    ifelse(pi_hat==1, mu1, mu0) +
+      ifelse(pi_hat==W[test_idx],
+             (Y_obs_mat[test_idx,k] - ifelse(W[test_idx]==1, mu1, mu0)) /
+               ifelse(W[test_idx]==1, propensity[test_idx], 1-propensity[test_idx]),
+             0)
+  )
+}
+
+DR_estimate <- mean(DR_vec)
+cat("DR Estimate (multivariate):", DR_estimate, "\n")
 
 
+# ==========================================================
+# 1️⃣4️⃣ BASELINES
+# ==========================================================
+always_treat <- mean(rowMeans(Y1_cop[test_idx, ]))
+never_treat  <- mean(rowMeans(Y0_cop[test_idx, ]))
 
-gg1 <- ggplot(result_summary, aes(x = Outcome, y = Reward)) +
-  geom_bar(stat = "identity", fill = "steelblue") +
-  ylim(0, 1) + theme_minimal() + ggtitle("Per-Outcome Rewards")
+# Correct random policy
+rand_choice <- rbinom(length(test_idx), 1, 0.5)
+Y_rand_mat <- Y0_cop[test_idx, ]
+Y_rand_mat[rand_choice == 1, ] <- Y1_cop[test_idx, ][rand_choice == 1, ]
+random_pol <- mean(rowMeans(Y_rand_mat))
 
-gg2 <- ggplot(result_summary, aes(x = Outcome, y = Regret)) +
-  geom_bar(stat = "identity", fill = "darkred") +
-  ylim(0, 1) + theme_minimal() + ggtitle("Per-Outcome Regrets")
+cat("Always Treat:", always_treat, "\n")
+cat("Never Treat:", never_treat, "\n")
+cat("Random Policy:", random_pol, "\n")
 
-gg3 <- ggplot(result_summary, aes(x = Outcome, y = Weight)) +
-  geom_bar(stat = "identity", fill = "darkgreen") +
-  ylim(0, 1) + theme_minimal() + ggtitle("Optimized Weights")
+# ----------------------------------------------------------
+# IPS ESTIMATOR
+# ----------------------------------------------------------
+IPS <- mean(
+  ifelse(pi_hat==W[test_idx],
+         reward_scalar[test_idx]/ifelse(W[test_idx]==1,propensity[test_idx],1-propensity[test_idx]),
+         0)
+)
+
+# ----------------------------------------------------------
+# DOUBLY ROBUST ESTIMATOR
+# ----------------------------------------------------------
+DR_vec <- numeric(K_out)
+
+for(k in 1:K_out){
+  df_out <- data.frame(
+    Y = Y_obs_mat[,k],
+    feat1_avg = feat1_avg,
+    feat2_avg = feat2_avg,
+    feat3_avg = feat3_avg,
+    W = W
+  )
+  
+  outcome_model <- lm(Y ~ feat1_avg + feat2_avg + feat3_avg + W, data=df_out)
+  
+  mu1 <- predict(outcome_model, newdata=data.frame(
+    feat1_avg = feat1_avg[test_idx],
+    feat2_avg = feat2_avg[test_idx],
+    feat3_avg = feat3_avg[test_idx],
+    W = 1
+  ))
+  
+  mu0 <- predict(outcome_model, newdata=data.frame(
+    feat1_avg = feat1_avg[test_idx],
+    feat2_avg = feat2_avg[test_idx],
+    feat3_avg = feat3_avg[test_idx],
+    W = 0
+  ))
+  
+  DR_vec[k] <- mean(
+    ifelse(pi_hat==1, mu1, mu0) +
+      ifelse(pi_hat==W[test_idx],
+             (Y_obs_mat[test_idx,k] - ifelse(W[test_idx]==1, mu1, mu0)) /
+               ifelse(W[test_idx]==1, propensity[test_idx], 1-propensity[test_idx]),
+             0)
+  )
+}
+
+DR_estimate <- mean(DR_vec)
+cat("DR Estimate (multivariate):", DR_estimate, "\n")
+
+# ----------------------------------------------------------
+# PRINT RESULTS
+# ----------------------------------------------------------
+cat("Mean Policy Reward:", mean(R_policy), "\n")
+cat("Mean Regret:", mean(R_opt - R_policy), "\n")
+cat("IPS Estimate:", IPS, "\n")
+cat("DR Estimate (multivariate):", DR_estimate, "\n")
+cat("Always Treat:", always_treat, "\n")
+cat("Never Treat:", never_treat, "\n")
+cat("Random Policy:", random_pol, "\n")
+
+# ----------------------------------------------------------
+# VISUALIZATIONS
+# ----------------------------------------------------------
+policy_rewards <- data.frame(
+  Policy = c("Always Treat","Never Treat","Random","Learned Policy"),
+  Reward = c(always_treat, never_treat, random_pol, mean(R_policy))
+)
+
+ggplot(policy_rewards, aes(x=Policy, y=Reward, fill=Policy)) +
+  geom_bar(stat="identity") +
+  theme_minimal() +
+  ggtitle("Mean Policy Rewards (Wine Quality Dataset)") +
+  ylab("Mean Reward") +
+  theme(legend.position="none")
+
+estimates <- data.frame(
+  Estimator = c("IPS","Doubly Robust"),
+  Value = c(IPS, DR_estimate)
+)
+
+ggplot(estimates, aes(x=Estimator, y=Value, fill=Estimator)) +
+  geom_bar(stat="identity") +
+  theme_minimal() +
+  ggtitle("Policy Value Estimates (Wine Quality Dataset)") +
+  ylab("Estimated Reward") +
+  theme(legend.position="none")
+
+regret_vals <- R_opt - R_policy
+ggplot(data.frame(Regret=regret_vals), aes(x=Regret)) +
+  geom_histogram(bins=20, fill="steelblue", color="black", alpha=0.7) +
+  theme_minimal() +
+  ggtitle("Histogram of Regret (Wine Quality Dataset)") +
+  xlab("Regret") +
+  ylab("Frequency")
+
+# ==========================================================
+# 2️⃣ Track episode-wise rewards (optional)
+# ==========================================================
+# For demonstration, we can track mean reward every 20 episodes
+episode_rewards <- numeric(episodes)
+epsilon_tmp <- epsilon
+for(ep in 1:episodes){
+  i <- sample(train_idx,1)
+  idx_i <- which(train_idx==i)
+  
+  state <- array_reshape(X_train[idx_i,,], c(1,T_steps,p))
+  if(runif(1)<epsilon_tmp){
+    action <- sample(0:1,1)
+  } else{
+    qvals <- model %>% predict(state, verbose=0)
+    action <- which.max(qvals)-1
+  }
+  
+  reward <- if(action==1) mean(Y1_cop[i,]) else mean(Y0_cop[i,])
+  episode_rewards[ep] <- reward
+  
+  epsilon_tmp <- max(epsilon_tmp*epsilon_decay, epsilon_min)
+}
 
 
-#install.packages("patchwork")  # Only if not yet installed
-library(patchwork)
+episode_df <- data.frame(
+  Episode = 1:episodes,
+  Reward = episode_rewards
+)
 
-gg1 + gg2 + gg3 + plot_layout(nrow = 1)
+ggplot(episode_df, aes(x=Episode, y=Reward)) +
+  geom_line(color="blue") +
+  geom_smooth(method="loess", color="red", se=FALSE) +
+  ggtitle("Episode-wise Reward Learning (Wine Quality Dataset)") +
+  theme_minimal()
 
+############################################################
+## Multivariate Contextual Bandit
+## DR + IPS + Empirical Copula (Adult Dataset)
+############################################################
 
-
-## Wine Quality Data
-# --- Libraries ---
+library(data.table)
+library(dplyr)
 library(keras)
 library(tensorflow)
 library(tidyverse)
-library(igraph)
-library(RColorBrewer)
-library(patchwork)
 
-# --- Parameters ---
+set.seed(123)
+
+# ==========================================================
+# 1️⃣ PARAMETERS
+# ==========================================================
+n <- 500
 T_steps <- 10
-n <- 200
-epsilon <- 1.0
-epsilon_decay <- 0.99
-epsilon_min <- 0.1
-episodes <- 150
-gamma <- 0.95
+episodes <- 400
+epsilon <- 1
+epsilon_decay <- 0.995
+epsilon_min <- 0.05
 alpha <- 0.001
+rho <- 0.7          # AR(1) temporal correlation
+K_out <- 4          # number of outcomes
 
-# --- Load Wine Quality Data ---
-wine_url <- "https://archive.ics.uci.edu/ml/machine-learning-databases/wine-quality/winequality-red.csv"
-df <- read.csv(wine_url, sep = ";")
-df$quality <- NULL  # remove quality column
-p <- ncol(df)
-
-# --- Sample Data ---
-set.seed(123)
-df_sampled <- df[sample(1:nrow(df), n, replace = TRUE), ]
-
-# --- Simulate Temporal Structure ---
-X_long <- array(0, dim = c(n, T_steps, p))
-for (t in 1:T_steps) {
-  noise <- matrix(rnorm(n * p, 0, 0.01), nrow = n)
-  X_long[, t, ] <- as.matrix(df_sampled) + noise
-}
-
-# --- Scale ---
-X_scaled <- X_long
-for (j in 1:p) {
-  for (t in 1:T_steps) {
-    mu <- mean(X_scaled[, t, j])
-    sigma <- sd(X_scaled[, t, j])
-    X_scaled[, t, j] <- (X_scaled[, t, j] - mu) / sigma
-  }
-}
-
-# --- Simulate Treatment Assignment ---
-volatile_col <- "alcohol"  # replace with feature of interest
-W <- rbinom(n, 1, plogis(5 * (apply(X_scaled[, , which(colnames(df) == volatile_col)], 1, mean) - 0.5)))
-
-# --- Simulate 6 Outcomes ---
-set.seed(123)
-Y_list <- list()
-for (k in 1:5) {
-  base_k <- apply(X_scaled[, , (k %% p + 1):(k %% p + 3)], 1, mean) + rnorm(n, 0, 0.1)
-  effect_k <- runif(1, 1.5, 3.5) * apply(X_scaled[, , which(colnames(df) == "citric.acid")], 1, mean)
-  Y0_k <- base_k
-  Y1_k <- base_k + effect_k
-  Y_list[[k]] <- list(Y0 = Y0_k, Y1 = Y1_k)
-}
-
-# --- Stack and Transform Outcomes ---
-Y0_mat <- do.call(cbind, lapply(Y_list, function(y) y$Y0))
-Y1_mat <- do.call(cbind, lapply(Y_list, function(y) y$Y1))
-
-empirical_copula <- function(Y_mat) {
-  apply(Y_mat, 2, function(col) rank(col, ties.method = "average") / length(col))
-}
-
-Y0_copula <- empirical_copula(Y0_mat)
-Y1_copula <- empirical_copula(Y1_mat)
-
-# --- Observed Outcomes by Action ---
-Y_obs_all <- matrix(0, n, 5)
-for (i in 1:n) {
-  Y_obs_all[i, ] <- if (W[i] == 1) Y1_copula[i, ] else Y0_copula[i, ]
-}
-
-# --- Train/Test Split ---
-train_idx <- sample(1:n, floor(0.7 * n))
-test_idx <- setdiff(1:n, train_idx)
-X_train <- X_scaled[train_idx, , ]
-X_test <- X_scaled[test_idx, , ]
-Y0_test <- Y0_copula[test_idx, ]
-Y1_test <- Y1_copula[test_idx, ]
-
-# --- Q-Network ---
-create_dqn_model <- function(input_shape) {
-  keras_model_sequential() %>%
-    layer_conv_1d(filters = 32, kernel_size = 3, activation = 'relu',
-                  input_shape = input_shape) %>%
-    layer_max_pooling_1d(pool_size = 2) %>%
-    layer_lstm(units = 32, return_sequences = FALSE) %>%
-    layer_dense(units = 32, activation = 'relu') %>%
-    layer_dense(units = 2, activation = 'linear') %>%
-    compile(loss = 'mse', optimizer = optimizer_adam(learning_rate = alpha))
-}
-
-model <- create_dqn_model(c(T_steps, p))
-
-# --- Training Loop ---
-for (i in 1:episodes) {
-  idx <- sample(1:dim(X_train)[1], 1)
-  state <- array_reshape(X_train[idx, , ], dim = c(1, T_steps, p))
-  
-  if (runif(1) < epsilon) {
-    action <- sample(0:1, 1)
-  } else {
-    q_values <- model %>% predict(state, verbose = 0)
-    action <- which.max(q_values) - 1
-  }
-  
-  reward_vec <- if (action == 1) Y1_copula[train_idx[idx], ] else Y0_copula[train_idx[idx], ]
-  reward_total <- mean(reward_vec)
-  
-  q_vals <- model %>% predict(state, verbose = 0)
-  q_vals[1, action + 1] <- reward_total
-  model %>% fit(state, q_vals, verbose = 0, epochs = 1)
-  
-  epsilon <- max(epsilon * epsilon_decay, epsilon_min)
-}
-
-# --- Evaluation ---
-q_preds <- model %>% predict(X_test, verbose = 0)
-policy_actions <- apply(q_preds, 1, which.max) - 1
-
-regret_vec <- numeric(5)
-reward_vec <- numeric(5)
-for (k in 1:5) {
-  R_policy <- ifelse(policy_actions == 1, Y1_test[, k], Y0_test[, k])
-  R_opt <- pmax(Y0_test[, k], Y1_test[, k])
-  regret_vec[k] <- mean(R_opt - R_policy)
-  reward_vec[k] <- mean(R_policy)
-}
-
-# --- Optimize Weights for Equal Regret ---
-fair_loss <- function(w) {
-  w <- pmax(w, 0)
-  w <- w / sum(w)
-  sum((w * regret_vec - mean(w * regret_vec))^2)
-}
-opt_fair <- optim(par = rep(1, 5), fn = fair_loss, method = "L-BFGS-B", lower = 0.01, upper = 5)
-w_opt <- opt_fair$par / sum(opt_fair$par)
-weighted_reward <- sum(w_opt * reward_vec)
-weighted_regret <- sum(w_opt * regret_vec)
-
-cat("\n--- Multi-Outcome Evaluation (Empirical Copula) ---\n")
-cat("Optimized Weights (Equal Regret):\n")
-print(round(w_opt, 3))
-cat("Weighted Reward:", round(weighted_reward, 4), "\n")
-cat("Weighted Regret:", round(weighted_regret, 4), "\n")
-
-# --- Results Summary ---
-result_summary <- data.frame(
-  Outcome = paste0("Y", 1:5),
-  Reward = round(reward_vec, 3),
-  Regret = round(regret_vec, 3),
-  Weight = round(w_opt, 3)
+# ==========================================================
+# 2️⃣ Load Adult Dataset
+# ==========================================================
+adult <- fread(
+  "adult.data.txt",
+  header = FALSE,
+  sep = ",",
+  na.strings = "?",
+  strip.white = TRUE
 )
-print(result_summary)
 
-# --- Visualization ---
-gg1 <- ggplot(result_summary, aes(x = Outcome, y = Reward)) +
-  geom_bar(stat = "identity", fill = "steelblue") +
-  ylim(0, 1) + theme_minimal() + ggtitle("Per-Outcome Rewards")
+colnames(adult) <- c(
+  "age","workclass","fnlwgt","education","education_num",
+  "marital_status","occupation","relationship","race","sex",
+  "capital_gain","capital_loss","hours_per_week","native_country","income"
+)
 
-gg2 <- ggplot(result_summary, aes(x = Outcome, y = Regret)) +
-  geom_bar(stat = "identity", fill = "darkred") +
-  ylim(0, 1) + theme_minimal() + ggtitle("Per-Outcome Regrets")
+adult <- na.omit(adult)
+adult[, income_binary := ifelse(trimws(income) == ">50K", 1, 0)]
 
-gg3 <- ggplot(result_summary, aes(x = Outcome, y = Weight)) +
-  geom_bar(stat = "identity", fill = "darkgreen") +
-  ylim(0, 1) + theme_minimal() + ggtitle("Optimized Weights")
+if(nrow(adult) > 30000)
+  adult <- adult[sample(.N, 30000)]
 
-gg1 + gg2 + gg3 + plot_layout(nrow = 1)
+# ==========================================================
+# 3️⃣ Feature Engineering
+# ==========================================================
+numeric_covs <- c("age","fnlwgt","education_num",
+                  "capital_gain","capital_loss","hours_per_week")
 
+cat_covs <- setdiff(names(adult),
+                    c(numeric_covs,"income","income_binary"))
+
+for(col in cat_covs)
+  adult[, (col) := as.numeric(factor(get(col)))]
+
+feature_cols <- c(numeric_covs, cat_covs)
+X_num <- scale(as.matrix(adult[, ..feature_cols]))
+p <- ncol(X_num)
+
+# ==========================================================
+# 4️⃣ AR(1) TEMPORAL PROCESS
+# ==========================================================
+X_long <- array(0, c(n, T_steps, p))
+X_long[,1,] <- X_num[sample(1:nrow(X_num), n), ]
+
+for(t in 2:T_steps){
+  noise <- matrix(rnorm(n*p, 0, 0.1), n)
+  X_long[,t,] <- rho*X_long[,t-1,] + noise
+}
+
+X_scaled <- array_reshape(scale(array_reshape(X_long, c(n*T_steps, p))),
+                          c(n,T_steps,p))
+
+# ==========================================================
+# 5️⃣ MULTI-CONFOUNDER PROPENSITY MODEL
+# ==========================================================
+rm_avg    <- apply(X_scaled[,,which(colnames(X_num)=="age")],1,mean)
+lstat_avg <- apply(X_scaled[,,which(colnames(X_num)=="education_num")],1,mean)
+crim_avg  <- apply(X_scaled[,,which(colnames(X_num)=="fnlwgt")],1,mean)
+
+lin_pred <- 1.2*rm_avg - 1.0*lstat_avg + 0.7*crim_avg
+propensity <- plogis(lin_pred)
+
+W <- rbinom(n,1,propensity)
+
+# ==========================================================
+# 6️⃣ NONLINEAR MULTIVARIATE POTENTIAL OUTCOMES
+# ==========================================================
+Y0_mat <- matrix(0, n, K_out)
+Y1_mat <- matrix(0, n, K_out)
+
+for(k in 1:K_out){
+  base_k <- sin(rm_avg + k*0.2) +
+    log(abs(lstat_avg)+1) +
+    rnorm(n,0,0.2)
+  
+  tau_k <- 1.5 + 0.5*k +
+    0.8*(rm_avg^2) -
+    0.3*lstat_avg
+  
+  Y0_mat[,k] <- base_k
+  Y1_mat[,k] <- base_k + tau_k
+}
+
+# ==========================================================
+# 7️⃣ EMPIRICAL COPULA TRANSFORMATION
+# ==========================================================
+empirical_copula <- function(Y){
+  apply(Y, 2, function(col){
+    rank(col, ties.method="average")/length(col)
+  })
+}
+
+Y0_cop <- empirical_copula(Y0_mat)
+Y1_cop <- empirical_copula(Y1_mat)
+
+# Observed outcomes (preserve matrix structure)
+Y_obs_mat <- Y0_cop
+Y_obs_mat[W==1, ] <- Y1_cop[W==1, ]
+
+reward_scalar <- rowMeans(Y_obs_mat)
+
+# ==========================================================
+# 8️⃣ TRAIN / TEST SPLIT
+# ==========================================================
+train_idx <- sample(1:n, 0.7*n)
+test_idx  <- setdiff(1:n, train_idx)
+
+X_train <- X_scaled[train_idx,,]
+X_test  <- X_scaled[test_idx,,]
+
+# ==========================================================
+# 9️⃣ CONTEXTUAL BANDIT NETWORK
+# ==========================================================
+create_model <- function(input_shape){
+  keras_model_sequential() %>%
+    layer_conv_1d(32,3,activation="relu", input_shape=input_shape) %>%
+    layer_lstm(32) %>%
+    layer_dense(32,activation="relu") %>%
+    layer_dense(2,activation="linear") %>%
+    compile(loss="mse", optimizer=optimizer_adam(alpha))
+}
+
+model <- create_model(c(T_steps,p))
+
+# ==========================================================
+# 🔟 TRAINING LOOP
+# ==========================================================
+for(ep in 1:episodes){
+  i <- sample(train_idx,1)
+  idx_i <- which(train_idx==i)
+  
+  state <- array_reshape(X_train[idx_i,,], c(1,T_steps,p))
+  
+  if(runif(1)<epsilon){
+    action <- sample(0:1,1)
+  } else{
+    qvals <- model %>% predict(state,verbose=0)
+    action <- which.max(qvals)-1
+  }
+  
+  reward <- if(action==1)
+    mean(Y1_cop[i,]) else mean(Y0_cop[i,])
+  
+  qvals <- model %>% predict(state,verbose=0)
+  qvals[1,action+1] <- reward
+  
+  model %>% fit(state, qvals, epochs=1, verbose=0)
+  
+  epsilon <- max(epsilon*epsilon_decay, epsilon_min)
+}
+
+# ==========================================================
+# 1️⃣1️⃣ POLICY EVALUATION
+# ==========================================================
+q_test <- model %>% predict(X_test, verbose=0)
+pi_hat <- apply(q_test,1,which.max)-1
+
+Y_policy_mat <- Y0_cop[test_idx, ]
+Y_policy_mat[pi_hat==1, ] <- Y1_cop[test_idx, ][pi_hat==1, ]
+
+R_policy <- rowMeans(Y_policy_mat)
+R_opt <- rowMeans(pmax(Y0_cop[test_idx, ], Y1_cop[test_idx, ]))
+
+cat("Mean Policy Reward:", mean(R_policy), "\n")
+cat("Mean Regret:", mean(R_opt - R_policy), "\n")
+
+# ==========================================================
+# 1️⃣2️⃣ IPS ESTIMATOR
+# ==========================================================
+Y_obs_scalar <- rowMeans(Y_obs_mat)
+
+IPS <- mean(
+  ifelse(pi_hat==W[test_idx],
+         Y_obs_scalar[test_idx] /
+           ifelse(W[test_idx]==1, propensity[test_idx], 1-propensity[test_idx]),
+         0)
+)
+
+cat("IPS Estimate:", IPS, "\n")
+
+# ==========================================================
+# 1️⃣3️⃣ DOUBLY ROBUST ESTIMATOR
+# ==========================================================
+DR_vec <- numeric(K_out)
+
+for(k in 1:K_out){
+  df_out <- data.frame(
+    Y = Y_obs_mat[,k],
+    rm_avg = rm_avg,
+    lstat_avg = lstat_avg,
+    crim_avg = crim_avg,
+    W = W
+  )
+  
+  outcome_model <- lm(Y ~ rm_avg + lstat_avg + crim_avg + W, data=df_out)
+  
+  mu1 <- predict(outcome_model,
+                 newdata=data.frame(
+                   rm_avg = rm_avg[test_idx],
+                   lstat_avg = lstat_avg[test_idx],
+                   crim_avg = crim_avg[test_idx],
+                   W = 1))
+  
+  mu0 <- predict(outcome_model,
+                 newdata=data.frame(
+                   rm_avg = rm_avg[test_idx],
+                   lstat_avg = lstat_avg[test_idx],
+                   crim_avg = crim_avg[test_idx],
+                   W = 0))
+  
+  DR_vec[k] <- mean(
+    ifelse(pi_hat==1, mu1, mu0) +
+      ifelse(pi_hat==W[test_idx],
+             (Y_obs_mat[test_idx,k] - ifelse(W[test_idx]==1, mu1, mu0)) /
+               ifelse(W[test_idx]==1, propensity[test_idx], 1-propensity[test_idx]),
+             0)
+  )
+}
+
+DR_estimate <- mean(DR_vec)
+cat("DR Estimate (multivariate):", DR_estimate, "\n")
+
+# ==========================================================
+# 1️⃣4️⃣ BASELINES
+# ==========================================================
+always_treat <- mean(rowMeans(Y1_cop[test_idx, ]))
+never_treat  <- mean(rowMeans(Y0_cop[test_idx, ]))
+
+# Correct random policy
+rand_choice <- rbinom(length(test_idx), 1, 0.5)
+Y_rand_mat <- Y0_cop[test_idx, ]
+Y_rand_mat[rand_choice == 1, ] <- Y1_cop[test_idx, ][rand_choice == 1, ]
+random_pol <- mean(rowMeans(Y_rand_mat))
+
+cat("Always Treat:", always_treat, "\n")
+cat("Never Treat:", never_treat, "\n")
+cat("Random Policy:", random_pol, "\n")
+
+
+# ----------------------------------------------------------
+# PRINT RESULTS
+# ----------------------------------------------------------
+cat("Mean Policy Reward:", mean(R_policy), "\n")
+cat("Mean Regret:", mean(R_opt - R_policy), "\n")
+cat("IPS Estimate:", IPS, "\n")
+cat("DR Estimate (multivariate):", DR_estimate, "\n")
+cat("Always Treat:", always_treat, "\n")
+cat("Never Treat:", never_treat, "\n")
+cat("Random Policy:", random_pol, "\n")
+
+# ----------------------------------------------------------
+# VISUALIZATIONS
+# ----------------------------------------------------------
+policy_rewards <- data.frame(
+  Policy = c("Always Treat","Never Treat","Random","Learned Policy"),
+  Reward = c(always_treat, never_treat, random_pol, mean(R_policy))
+)
+
+ggplot(policy_rewards, aes(x=Policy, y=Reward, fill=Policy)) +
+  geom_bar(stat="identity") +
+  theme_minimal() +
+  ggtitle("Mean Policy Rewards (Adult Dataset)") +
+  ylab("Mean Reward") +
+  theme(legend.position="none")
+
+estimates <- data.frame(
+  Estimator = c("IPS","Doubly Robust"),
+  Value = c(IPS, DR_estimate)
+)
+
+ggplot(estimates, aes(x=Estimator, y=Value, fill=Estimator)) +
+  geom_bar(stat="identity") +
+  theme_minimal() +
+  ggtitle("Policy Value Estimates (Adult Dataset)") +
+  ylab("Estimated Reward") +
+  theme(legend.position="none")
+
+regret_vals <- R_opt - R_policy
+ggplot(data.frame(Regret=regret_vals), aes(x=Regret)) +
+  geom_histogram(bins=20, fill="steelblue", color="black", alpha=0.7) +
+  theme_minimal() +
+  ggtitle("Histogram of Regret (Adult Dataset)") +
+  xlab("Regret") +
+  ylab("Frequency")
+
+# ==========================================================
+# 2️⃣ Track episode-wise rewards (optional)
+# ==========================================================
+# For demonstration, we can track mean reward every 20 episodes
+episode_rewards <- numeric(episodes)
+epsilon_tmp <- epsilon
+for(ep in 1:episodes){
+  i <- sample(train_idx,1)
+  idx_i <- which(train_idx==i)
+  
+  state <- array_reshape(X_train[idx_i,,], c(1,T_steps,p))
+  if(runif(1)<epsilon_tmp){
+    action <- sample(0:1,1)
+  } else{
+    qvals <- model %>% predict(state, verbose=0)
+    action <- which.max(qvals)-1
+  }
+  
+  reward <- if(action==1) mean(Y1_cop[i,]) else mean(Y0_cop[i,])
+  episode_rewards[ep] <- reward
+  
+  epsilon_tmp <- max(epsilon_tmp*epsilon_decay, epsilon_min)
+}
+
+
+episode_df <- data.frame(
+  Episode = 1:episodes,
+  Reward = episode_rewards
+)
+
+ggplot(episode_df, aes(x=Episode, y=Reward)) +
+  geom_line(color="blue") +
+  geom_smooth(method="loess", color="red", se=FALSE) +
+  ggtitle("Episode-wise Reward Learning (Adult Dataset)") +
+  theme_minimal()

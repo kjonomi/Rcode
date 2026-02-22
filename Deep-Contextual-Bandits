@@ -1,6 +1,6 @@
 
 ################################################################################
-## Boston Housing: Manifold Causal Deep Networks & Policy Evaluation
+## Boston Housing
 ## Full Integrated Suite: SIPS, DR, Regret, Calibration, and Sensitivity
 ################################################################################
 
@@ -206,7 +206,7 @@ p5 <- ggplot(sens_df, aes(x = Rho, y = DR, color = Model)) + geom_line() + geom_
 print(p1); print(p2); print(p3); print(p4); print(p5)
 
 ################################################################################
-## Wine Quality: Manifold Causal Deep Networks & Policy Evaluation
+## Wine Quality
 ## Full Integrated Suite: SIPS, DR, Regret, Calibration, and Sensitivity
 ################################################################################
 
@@ -377,7 +377,7 @@ p5 <- ggplot(sens_df, aes(x = Rho, y = DR, color = Model)) + geom_line() + geom_
 print(p1); print(p2); print(p3); print(p4); print(p5)
 
 ################################################################################
-## Adult Data: Manifold Causal Deep Networks & Policy Evaluation
+## Adult Data
 ## Full Integrated Suite: SIPS, DR, Regret, Calibration, and Sensitivity
 ################################################################################
 

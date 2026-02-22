@@ -227,7 +227,7 @@ df_sampled <- wine[sample(.N, n, replace=TRUE), ]
 X_raw <- scale(as.matrix(df_sampled))
 p <- ncol(X_raw)
 
-# Generate AR(1) Sequential Features (Temporal Manifold)
+# Generate AR(1) Sequential Features (Temporal)
 X_long <- array(0, c(n, T_steps, p))
 X_long[,1,] <- X_raw
 for(t in 2:T_steps) X_long[,t,] <- rho_param * X_long[,t-1,] + matrix(rnorm(n*p, 0, 0.1), n)
@@ -408,7 +408,7 @@ feature_cols <- c(numeric_covs, cat_covs)
 X_num <- scale(as.matrix(adult[, ..feature_cols]))
 p <- ncol(X_num)
 
-# AR(1) Temporal Manifold
+# AR(1) Temporal
 X_long <- array(0, c(n, T_steps, p))
 X_long[,1,] <- X_num[sample(1:nrow(X_num), n), ]
 for(t in 2:T_steps) X_long[,t,] <- rho_param * X_long[,t-1,] + matrix(rnorm(n*p, 0, 0.1), n)
@@ -434,7 +434,7 @@ gen_outcomes <- function(X) {
 }
 
 Y0_cop <- gen_outcomes(X_avg)
-Y1_cop <- empirical_copula_transform(Y0_cop + 0.12)
+Y1_cop <- empirical_copula_transform(Y0_cop)
 
 # Matrix Fix for Observed Reward calculation
 R_obs_matrix <- Y0_cop

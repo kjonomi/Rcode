@@ -1,3 +1,286 @@
+# March 3 2026
+############################################################
+# ENTROPY–VARIANCE WEIGHTED DQN (FIXED & OPTIMIZED)
+############################################################
+
+Sys.setenv(CUDA_VISIBLE_DEVICES = "")
+Sys.setenv(TF_CPP_MIN_LOG_LEVEL = "2")
+
+library(keras)
+library(tensorflow)
+library(tidyverse)
+library(R6)
+library(pwr)
+
+set.seed(123)
+
+############################
+# 1️⃣ Simulation Setup
+############################
+T_steps <- 10
+n <- 200
+p <- 6
+
+X_long <- array(0, dim = c(n, T_steps, p))
+X_base <- matrix(rnorm(n * p), nrow = n)
+
+for (t in 1:T_steps) {
+  noise <- matrix(rnorm(n * p, 0, 0.1), nrow = n)
+  X_long[, t, ] <- X_base + noise
+}
+
+# Proper Scaling
+for (j in 1:p) {
+  X_long[,,j] <- scale(as.vector(X_long[,,j]))
+}
+
+x1_avg <- rowMeans(X_long[, , 1])
+x2_avg <- rowMeans(X_long[, , 2])
+base_outcome <- sin(x1_avg) * 3 + rnorm(n, 0, 0.5)
+
+tau0 <- 0
+tau1 <- 1.5 + 2 * x2_avg - x1_avg
+tau2 <- -2 + 3.5 * x1_avg - 0.5 * x2_avg
+
+Y_matrix <- cbind(base_outcome + tau0, base_outcome + tau1, base_outcome + tau2)
+
+train_idx <- sample(1:n, floor(0.7*n))
+test_idx <- setdiff(1:n, train_idx)
+
+X_train <- X_long[train_idx,,]
+X_test  <- X_long[test_idx,,]
+Y_train <- Y_matrix[train_idx,]
+Y_test  <- Y_matrix[test_idx,]
+
+############################
+# 2️⃣ Replay Buffer
+############################
+ReplayBuffer <- R6Class(
+  "ReplayBuffer",
+  public = list(
+    capacity = NULL,
+    buffer = NULL,
+    position = 1,
+    initialize = function(capacity) {
+      self$capacity <- capacity
+      self$buffer <- vector("list", capacity)
+    },
+    push = function(state, action, reward) {
+      self$buffer[[self$position]] <- list(state = state, action = action, reward = reward)
+      self$position <- ifelse(self$position == self$capacity, 1, self$position + 1)
+    },
+    sample_indices = function(batch_size, weights = NULL) {
+      filled <- which(!sapply(self$buffer, is.null))
+      if(length(filled) < batch_size) return(NULL)
+      
+      if(is.null(weights)) {
+        return(sample(filled, batch_size))
+      } else {
+        # Ensure weights match filled buffer length
+        w <- weights[filled]
+        return(sample(filled, batch_size, prob = w/sum(w)))
+      }
+    }
+  )
+)
+
+############################
+# 3️⃣ Model & Uncertainty
+############################
+build_model <- function(input_shape) {
+  model <- keras_model_sequential() %>%
+    layer_conv_1d(filters = 32, kernel_size = 3, activation = "relu", input_shape = input_shape) %>%
+    layer_lstm(units = 32) %>%
+    layer_dense(units = 64, activation = "relu") %>%
+    layer_dense(units = 3) # 3 Actions
+  
+  model %>% compile(optimizer = optimizer_adam(learning_rate = 0.001), loss = "mse")
+  return(model)
+}
+
+############################
+# 4️⃣ Training Function
+############################
+train_dqn <- function(X, Y, episodes=50, batch_size=32, method="uniform", alpha=0.5) {
+  input_dims <- dim(X)[2:3]
+  model <- build_model(input_dims)
+  buffer <- ReplayBuffer$new(2000)
+  epsilon <- 1.0
+  
+  for(ep in 1:episodes) {
+    # 1. Collect Experience
+    for(i in 1:dim(X)[1]) {
+      state <- X[i,,]
+      if(runif(1) < epsilon) {
+        action <- sample(0:2, 1)
+      } else {
+        q_vals <- predict(model, array(state, dim=c(1, input_dims)), verbose=0)
+        action <- which.max(q_vals) - 1
+      }
+      reward <- Y[i, action + 1]
+      buffer$push(state, action, reward)
+    }
+    
+    # 2. Sample and Train
+    filled_idx <- which(!sapply(buffer$buffer, is.null))
+    if(length(filled_idx) < batch_size) next
+    
+    # Calculate Sampling Weights
+    weights <- rep(1, length(filled_idx))
+    if(method != "uniform") {
+      # Extract states for weighting
+      all_s <- array(0, dim=c(length(filled_idx), input_dims))
+      for(k in seq_along(filled_idx)) all_s[k,,] <- buffer$buffer[[filled_idx[k]]]$state
+      
+      q_all <- predict(model, all_s, verbose=0)
+      
+      if(method == "entropy") {
+        prob <- t(apply(q_all, 1, function(x) exp(x)/sum(exp(x))))
+        entropy <- -rowSums(prob * log(prob + 1e-8))
+        qvar <- apply(q_all, 1, var)
+        weights <- alpha * entropy + (1-alpha) * qvar
+      } else if(method == "per") {
+        # Simple TD Error weighting
+        actual_rewards <- sapply(filled_idx, function(idx) buffer$buffer[[idx]]$reward)
+        actual_actions <- sapply(filled_idx, function(idx) buffer$buffer[[idx]]$action)
+        pred_val <- q_all[cbind(1:nrow(q_all), actual_actions + 1)]
+        weights <- abs(actual_rewards - pred_val) + 1e-5
+      }
+    }
+    
+    # Perform Sample
+    idx <- buffer$sample_indices(batch_size, weights)
+    samples <- buffer$buffer[idx]
+    
+    batch_s <- array(0, dim=c(batch_size, input_dims))
+    batch_y <- matrix(0, nrow=batch_size, ncol=3)
+    
+    for(j in 1:batch_size) {
+      batch_s[j,,] <- samples[[j]]$state
+      current_q <- predict(model, array(samples[[j]]$state, dim=c(1, input_dims)), verbose=0)
+      current_q[1, samples[[j]]$action + 1] <- samples[[j]]$reward
+      batch_y[j,] <- current_q
+    }
+    
+    model %>% fit(batch_s, batch_y, epochs=1, verbose=0)
+    epsilon <- max(0.1, epsilon * 0.95)
+  }
+  return(model)
+}
+
+evaluate_model <- function(model, X, Y_true) {
+  q_preds <- predict(model, X, verbose=0)
+  actions <- apply(q_preds, 1, which.max)
+  rewards <- sapply(1:nrow(Y_true), function(i) Y_true[i, actions[i]])
+  return(mean(rewards))
+}
+
+############################
+# 5️⃣ Execution
+############################
+# Reduced n_runs for demonstration; change back to 100 for final
+n_runs <- 5 
+results <- data.frame(uniform=numeric(n_runs), entropy=numeric(n_runs), per=numeric(n_runs))
+
+for(r in 1:n_runs) {
+  message("Starting Run: ", r)
+  results$uniform[r] <- evaluate_model(train_dqn(X_train, Y_train, method="uniform"), X_test, Y_test)
+  results$entropy[r] <- evaluate_model(train_dqn(X_train, Y_train, method="entropy"), X_test, Y_test)
+  results$per[r]     <- evaluate_model(train_dqn(X_train, Y_train, method="per"), X_test, Y_test)
+}
+
+print(colMeans(results))
+
+library(ggplot2)
+library(tidyr)
+
+# 1. Comparison Plot
+res_long <- results %>%
+  pivot_longer(cols = everything(), names_to = "Method", values_to = "Reward")
+
+ggplot(res_long, aes(x = Method, y = Reward, fill = Method)) +
+  geom_boxplot() +
+  theme_minimal() +
+  labs(title = "Reward Distribution by Sampling Method",
+       subtitle = "Comparison of Uniform, Entropy, and PER",
+       y = "Average Reward")
+
+# 2. Alpha Sensitivity Plot
+alpha_df <- data.frame(alpha = alpha_grid, performance = alpha_perf)
+
+ggplot(alpha_df, aes(x = alpha, y = performance)) +
+  geom_line(color = "steelblue", size = 1) +
+  geom_point(size = 3) +
+  theme_minimal() +
+  labs(title = "Sensitivity to Alpha (Entropy vs Variance Weighting)",
+       x = expression(alpha),
+       y = "Mean Reward")
+
+############################################################
+# 11️⃣ GENERATING SUMMARY TABLES
+############################################################
+
+# Ensure you have these libraries installed
+# install.packages(c("knitr", "kableExtra", "broom"))
+library(knitr)
+library(kableExtra)
+library(broom)
+
+# --- 1. Main Performance Summary Table ---
+# Based on the 'results' dataframe from Step 7
+summary_stats <- data.frame(
+  Model = c("Uniform Sampling", "Entropy-Variance", "PER (TD-Error)"),
+  Mean_Reward = colMeans(results),
+  SD = apply(results, 2, sd)
+)
+
+# Calculate Improvement vs Uniform Baseline
+baseline <- summary_stats$Mean_Reward[1]
+summary_stats$Improvement <- paste0(round((summary_stats$Mean_Reward / baseline - 1) * 100, 2), "%")
+
+summary_stats %>%
+  kable(caption = "Table 1: DQN Performance Comparison (100-Run Average)", 
+        digits = 3, format = "html") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+  row_spec(2, bold = TRUE, color = "white", background = "#2c3e50") # Highlight Entropy-Variance
+
+# --- 2. Alpha Sensitivity Table ---
+# Based on the 'alpha_grid' and 'alpha_perf' from Step 9
+alpha_summary <- data.frame(
+  Alpha = alpha_grid,
+  Focus = c("Pure Variance", "High Var/Low Ent", "Balanced", "Low Var/High Ent", "Pure Entropy"),
+  Mean_Reward = alpha_perf
+)
+
+alpha_summary %>%
+  kable(caption = "Table 2: Sensitivity to Alpha (Entropy vs. Variance)", 
+        digits = 3) %>%
+  kable_classic(full_width = F, html_font = "Arial")
+
+# --- 3. Statistical Significance Table ---
+# Tidying up the t-test and power results
+t_test_results <- t.test(results$entropy, results$uniform, paired = TRUE)
+tidy_t <- tidy(t_test_results)
+
+stat_summary <- data.frame(
+  Metric = c("P-Value", "T-Statistic", "Cohen's d", "Bayes Factor"),
+  Value = c(
+    tidy_t$p.value, 
+    tidy_t$statistic, 
+    cohen_d, 
+    bayes_factor(results$entropy, results$uniform)
+  )
+)
+
+stat_summary %>%
+  kable(caption = "Table 3: Statistical Significance (Entropy vs. Uniform)", 
+        digits = 4) %>%
+  kable_styling(latex_options = "hold_position")
+
+# For LaTeX output (copy-paste into Overleaf/Texmaker)
+kable(summary_stats, format = "latex", booktabs = TRUE)
+
+
 # Paper titled "Quantum-Inspired Deep Q-Learning for Multivalued Treatment Policy Optimization" under review.
 # Weighted model corresponds to a "quantum-inspired" weighted sampling approach to improve exploration/exploitation, 
 # Uniform model is standard Q-learning with uniform random sampling during training.

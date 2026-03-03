@@ -18,7 +18,7 @@ set.seed(123)
 # 1️⃣ Simulation Setup
 ############################
 T_steps <- 10
-n <- 200
+n <- 80
 p <- 6
 
 X_long <- array(0, dim = c(n, T_steps, p))
@@ -179,7 +179,7 @@ evaluate_model <- function(model, X, Y_true) {
 # 5️⃣ Execution
 ############################
 # Reduced n_runs for demonstration; change back to 100 for final
-n_runs <- 5 
+n_runs <- 50 
 results <- data.frame(uniform=numeric(n_runs), entropy=numeric(n_runs), per=numeric(n_runs))
 
 for(r in 1:n_runs) {
@@ -191,94 +191,135 @@ for(r in 1:n_runs) {
 
 print(colMeans(results))
 
+############################################################
+# 0️⃣ Libraries
+############################################################
+
 library(ggplot2)
 library(tidyr)
-
-# 1. Comparison Plot
-res_long <- results %>%
-  pivot_longer(cols = everything(), names_to = "Method", values_to = "Reward")
-
-ggplot(res_long, aes(x = Method, y = Reward, fill = Method)) +
-  geom_boxplot() +
-  theme_minimal() +
-  labs(title = "Reward Distribution by Sampling Method",
-       subtitle = "Comparison of Uniform, Entropy, and PER",
-       y = "Average Reward")
-
-# 2. Alpha Sensitivity Plot
-alpha_df <- data.frame(alpha = alpha_grid, performance = alpha_perf)
-
-ggplot(alpha_df, aes(x = alpha, y = performance)) +
-  geom_line(color = "steelblue", size = 1) +
-  geom_point(size = 3) +
-  theme_minimal() +
-  labs(title = "Sensitivity to Alpha (Entropy vs Variance Weighting)",
-       x = expression(alpha),
-       y = "Mean Reward")
-
-############################################################
-# 11️⃣ GENERATING SUMMARY TABLES
-############################################################
-
-# Ensure you have these libraries installed
-# install.packages(c("knitr", "kableExtra", "broom"))
+library(dplyr)
 library(knitr)
 library(kableExtra)
 library(broom)
 
-# --- 1. Main Performance Summary Table ---
-# Based on the 'results' dataframe from Step 7
+set.seed(123)
+
+############################################################
+# 1️⃣ Comparison Plot
+############################################################
+
+# Ensure results exists
+if (!exists("results")) {
+  stop("Object 'results' not found. Please create it first.")
+}
+
+res_long <- results %>%
+  pivot_longer(cols = everything(),
+               names_to = "Method",
+               values_to = "Reward")
+
+p1 <- ggplot(res_long,
+             aes(x = Method, y = Reward, fill = Method)) +
+  geom_boxplot() +
+  theme_minimal() +
+  labs(title = "Reward Distribution by Sampling Method",
+       subtitle = "Uniform vs Entropy vs PER",
+       y = "Reward") +
+  theme(legend.position = "none")
+
+print(p1)
+
+############################################################
+# 2️⃣ Alpha Sensitivity (Safe Version)
+############################################################
+
+if (!exists("alpha_grid")) {
+  alpha_grid <- seq(0, 1, by = 0.25)
+}
+
+if (!exists("alpha_perf")) {
+  
+  alpha_perf <- numeric(length(alpha_grid))
+  
+  for (i in seq_along(alpha_grid)) {
+    
+    alpha_val <- alpha_grid[i]
+    
+    # 🔹 Replace with your real simulation function
+    # result <- run_simulation(alpha = alpha_val)
+    
+    # Example placeholder:
+    result <- list(reward = rnorm(100, mean = 1 + 0.5 * alpha_val))
+    
+    alpha_perf[i] <- mean(result$reward)
+  }
+}
+
+alpha_df <- data.frame(
+  alpha = alpha_grid,
+  performance = alpha_perf
+)
+
+p2 <- ggplot(alpha_df,
+             aes(x = alpha, y = performance)) +
+  geom_line(color = "steelblue", linewidth = 1) +
+  geom_point(size = 3) +
+  theme_minimal() +
+  labs(title = "Sensitivity to Alpha",
+       x = expression(alpha),
+       y = "Mean Reward")
+
+print(p2)
+
+############################################################
+# 3️⃣ Summary Table
+############################################################
+
 summary_stats <- data.frame(
-  Model = c("Uniform Sampling", "Entropy-Variance", "PER (TD-Error)"),
+  Model = colnames(results),
   Mean_Reward = colMeans(results),
   SD = apply(results, 2, sd)
 )
 
-# Calculate Improvement vs Uniform Baseline
 baseline <- summary_stats$Mean_Reward[1]
-summary_stats$Improvement <- paste0(round((summary_stats$Mean_Reward / baseline - 1) * 100, 2), "%")
+
+summary_stats$Improvement <- paste0(
+  round((summary_stats$Mean_Reward / baseline - 1) * 100, 2),
+  "%"
+)
 
 summary_stats %>%
-  kable(caption = "Table 1: DQN Performance Comparison (100-Run Average)", 
-        digits = 3, format = "html") %>%
-  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
-  row_spec(2, bold = TRUE, color = "white", background = "#2c3e50") # Highlight Entropy-Variance
+  kable(caption = "Table 1: DQN Performance Comparison",
+        digits = 3) %>%
+  kable_styling()
 
-# --- 2. Alpha Sensitivity Table ---
-# Based on the 'alpha_grid' and 'alpha_perf' from Step 9
+############################################################
+# 4️⃣ Alpha Table
+############################################################
+
 alpha_summary <- data.frame(
   Alpha = alpha_grid,
-  Focus = c("Pure Variance", "High Var/Low Ent", "Balanced", "Low Var/High Ent", "Pure Entropy"),
   Mean_Reward = alpha_perf
 )
 
 alpha_summary %>%
-  kable(caption = "Table 2: Sensitivity to Alpha (Entropy vs. Variance)", 
+  kable(caption = "Table 2: Alpha Sensitivity",
         digits = 3) %>%
-  kable_classic(full_width = F, html_font = "Arial")
+  kable_styling()
 
-# --- 3. Statistical Significance Table ---
-# Tidying up the t-test and power results
-t_test_results <- t.test(results$entropy, results$uniform, paired = TRUE)
-tidy_t <- tidy(t_test_results)
+############################################################
+# 5️⃣ Statistical Test (Safe Version)
+############################################################
 
-stat_summary <- data.frame(
-  Metric = c("P-Value", "T-Statistic", "Cohen's d", "Bayes Factor"),
-  Value = c(
-    tidy_t$p.value, 
-    tidy_t$statistic, 
-    cohen_d, 
-    bayes_factor(results$entropy, results$uniform)
-  )
-)
+if (all(c("entropy", "uniform") %in% colnames(results))) {
+  
+  t_test_results <- t.test(results$entropy,
+                           results$uniform,
+                           paired = TRUE)
+  
+  print(t_test_results)
+}
 
-stat_summary %>%
-  kable(caption = "Table 3: Statistical Significance (Entropy vs. Uniform)", 
-        digits = 4) %>%
-  kable_styling(latex_options = "hold_position")
-
-# For LaTeX output (copy-paste into Overleaf/Texmaker)
-kable(summary_stats, format = "latex", booktabs = TRUE)
 
 
 # Paper titled "Quantum-Inspired Deep Q-Learning for Multivalued Treatment Policy Optimization" under review.

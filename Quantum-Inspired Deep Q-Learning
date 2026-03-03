@@ -322,6 +322,7 @@ if (all(c("entropy", "uniform") %in% colnames(results))) {
 
 
 
+
 # Paper titled "Quantum-Inspired Deep Q-Learning for Multivalued Treatment Policy Optimization" under review.
 # Weighted model corresponds to a "quantum-inspired" weighted sampling approach to improve exploration/exploitation, 
 # Uniform model is standard Q-learning with uniform random sampling during training.

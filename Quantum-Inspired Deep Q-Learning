@@ -1,7 +1,4 @@
-# March 3 2026
-############################################################
-# ENTROPY–VARIANCE WEIGHTED DQN (FIXED & OPTIMIZED)
-############################################################
+# March 4 2026
 
 Sys.setenv(CUDA_VISIBLE_DEVICES = "")
 Sys.setenv(TF_CPP_MIN_LOG_LEVEL = "2")
@@ -18,7 +15,7 @@ set.seed(123)
 # 1️⃣ Simulation Setup
 ############################
 T_steps <- 10
-n <- 80
+n <- 50
 p <- 6
 
 X_long <- array(0, dim = c(n, T_steps, p))
@@ -179,7 +176,7 @@ evaluate_model <- function(model, X, Y_true) {
 # 5️⃣ Execution
 ############################
 # Reduced n_runs for demonstration; change back to 100 for final
-n_runs <- 50 
+n_runs <- 100 
 results <- data.frame(uniform=numeric(n_runs), entropy=numeric(n_runs), per=numeric(n_runs))
 
 for(r in 1:n_runs) {
@@ -319,6 +316,195 @@ if (all(c("entropy", "uniform") %in% colnames(results))) {
   
   print(t_test_results)
 }
+
+############################################################
+# Publication-Quality Comparison Plot
+############################################################
+
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+# Convert to long format
+res_long <- results %>%
+  pivot_longer(cols = everything(),
+               names_to = "Method",
+               values_to = "Reward")
+
+# Summary statistics
+summary_df <- res_long %>%
+  group_by(Method) %>%
+  summarise(
+    Mean = mean(Reward),
+    SD = sd(Reward),
+    N = n(),
+    SE = SD / sqrt(N),
+    CI = qt(0.975, df = N-1) * SE
+  )
+
+p1 <- ggplot(summary_df,
+             aes(x = Method, y = Mean, fill = Method)) +
+  geom_bar(stat = "identity", width = 0.6, alpha = 0.8) +
+  geom_errorbar(aes(ymin = Mean - CI,
+                    ymax = Mean + CI),
+                width = 0.2,
+                size = 1) +
+  theme_classic(base_size = 14) +
+  labs(title = "DQN Sampling Strategy Comparison",
+       subtitle = "Mean Test Reward ± 95% CI",
+       y = "Mean Reward",
+       x = "") +
+  theme(legend.position = "none")
+
+print(p1)
+
+p2 <- ggplot(res_long,
+             aes(x = Method, y = Reward, fill = Method)) +
+  geom_boxplot(alpha = 0.6, outlier.shape = NA) +
+  geom_jitter(width = 0.1, alpha = 0.4) +
+  stat_summary(fun = mean,
+               geom = "point",
+               shape = 18,
+               size = 4,
+               color = "black") +
+  theme_minimal(base_size = 14) +
+  labs(title = "Reward Distribution Across 100 Runs",
+       y = "Test Reward",
+       x = "") +
+  theme(legend.position = "none")
+
+print(p2)
+
+baseline <- mean(results$uniform)
+
+summary_df <- summary_df %>%
+  mutate(Improvement = 100 * (Mean / baseline - 1))
+
+p3 <- ggplot(summary_df,
+             aes(x = Method, y = Improvement, fill = Method)) +
+  geom_bar(stat="identity", width=0.6) +
+  geom_hline(yintercept = 0, linetype="dashed") +
+  theme_classic(base_size = 14) +
+  labs(title = "Relative Improvement Over Uniform",
+       y = "Improvement (%)",
+       x = "") +
+  theme(legend.position = "none")
+
+print(p3)
+
+t_test <- t.test(results$per,
+                 results$uniform,
+                 paired = TRUE)
+
+print(t_test)
+
+
+############################################################
+# Enhanced Comparison Plot
+############################################################
+
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+
+res_long <- results %>%
+  pivot_longer(cols = everything(),
+               names_to = "Method",
+               values_to = "Reward")
+
+p11 <- ggplot(res_long,
+             aes(x = Method, y = Reward, fill = Method)) +
+  geom_boxplot(alpha = 0.6, width = 0.5, outlier.shape = NA) +
+  geom_jitter(width = 0.1, alpha = 0.4, size = 1.5) +
+  stat_summary(fun = mean, geom = "point",
+               shape = 18, size = 4, color = "black") +
+  theme_classic(base_size = 14) +
+  labs(title = "DQN Performance Comparison",
+       subtitle = "Uniform vs Entropy vs Prioritized Replay",
+       y = "Test Reward",
+       x = "") +
+  theme(legend.position = "none")
+
+print(p11)
+
+############################################################
+# Mean + 95% CI Plot
+############################################################
+
+summary_df <- res_long %>%
+  group_by(Method) %>%
+  summarise(
+    Mean = mean(Reward),
+    SD = sd(Reward),
+    N = n(),
+    SE = SD / sqrt(N),
+    CI = qt(0.975, df = N-1) * SE
+  )
+
+p12 <- ggplot(summary_df,
+             aes(x = Method, y = Mean, fill = Method)) +
+  geom_bar(stat = "identity", alpha = 0.7, width = 0.6) +
+  geom_errorbar(aes(ymin = Mean - CI,
+                    ymax = Mean + CI),
+                width = 0.2, size = 1) +
+  theme_minimal(base_size = 14) +
+  labs(title = "Mean Test Reward ± 95% CI",
+       y = "Mean Reward",
+       x = "") +
+  theme(legend.position = "none")
+
+print(p12)
+
+############################################################
+# Cumulative Average Learning Curve
+############################################################
+
+learning_df <- results %>%
+  mutate(Run = 1:n()) %>%
+  pivot_longer(-Run,
+               names_to = "Method",
+               values_to = "Reward") %>%
+  group_by(Method) %>%
+  arrange(Run) %>%
+  mutate(CumMean = cumsum(Reward) / Run)
+
+p13 <- ggplot(learning_df,
+             aes(x = Run, y = CumMean, color = Method)) +
+  geom_line(linewidth = 1.2) +
+  theme_minimal(base_size = 14) +
+  labs(title = "Cumulative Mean Reward Across Runs",
+       y = "Cumulative Mean Reward")
+
+print(p13)
+
+############################################################
+# Cohen's d Effect Size
+############################################################
+
+cohen_d <- function(x, y){
+  pooled_sd <- sqrt((sd(x)^2 + sd(y)^2)/2)
+  (mean(x) - mean(y)) / pooled_sd
+}
+
+d_entropy <- cohen_d(results$entropy, results$uniform)
+d_per     <- cohen_d(results$per, results$uniform)
+
+effect_df <- data.frame(
+  Method = c("Entropy vs Uniform", "PER vs Uniform"),
+  EffectSize = c(d_entropy, d_per)
+)
+
+p14 <- ggplot(effect_df,
+             aes(x = Method, y = EffectSize)) +
+  geom_bar(stat="identity", fill="steelblue", width=0.5) +
+  geom_hline(yintercept = 0, linetype="dashed") +
+  theme_classic(base_size = 14) +
+  labs(title = "Effect Size (Cohen's d)",
+       y = "Effect Size")
+
+print(p14)
+
+
 
 
 

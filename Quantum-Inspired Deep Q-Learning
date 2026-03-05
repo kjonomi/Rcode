@@ -16,7 +16,7 @@ set.seed(123)
 # 1️⃣ Simulation Setup
 ############################
 T_steps <- 10
-n <- 50
+n <- 100
 p <- 6
 
 X_long <- array(0, dim = c(n, T_steps, p))
@@ -177,7 +177,7 @@ evaluate_model <- function(model, X, Y_true) {
 # 5️⃣ Execution
 ############################
 # Reduced n_runs for demonstration; change back to 100 for final
-n_runs <- 50 
+n_runs <- 5 
 results <- data.frame(uniform=numeric(n_runs), entropy=numeric(n_runs), per=numeric(n_runs))
 
 for(r in 1:n_runs) {
@@ -365,7 +365,7 @@ p2 <- ggplot(res_long,
                size = 4,
                color = "black") +
   theme_minimal(base_size = 14) +
-  labs(title = "Reward Distribution Across 50 Runs",
+  labs(title = "Reward Distribution Across 5 Runs",
        y = "Test Reward",
        x = "") +
   theme(legend.position = "none")

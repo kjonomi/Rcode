@@ -528,9 +528,9 @@ set.seed(123)
 T_steps <- 10
 n <- 500
 
-wine_url <- "https://archive.ics.uci.edu/ml/machine-learning-databases/wine-quality/winequality-red.csv"
-wine <- fread(wine_url, sep=";")
-
+#wine_url <- "https://archive.ics.uci.edu/ml/machine-learning-databases/wine-quality/winequality-red.csv"
+#wine <- fread(wine_url, sep=";")
+wine <- fread("winequality-red.csv", sep=";") 
 p <- ncol(wine)
 
 df_sampled <- wine[sample(1:nrow(wine), n, replace=TRUE),]

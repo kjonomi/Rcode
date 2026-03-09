@@ -887,6 +887,401 @@ summary_stats %>%
         caption="DQN Performance Comparison") %>%
   kable_styling()
 
+############################################################
+# 0️⃣ Environment Setup
+############################################################
+
+Sys.setenv(CUDA_VISIBLE_DEVICES = "")
+Sys.setenv(TF_CPP_MIN_LOG_LEVEL = "2")
+
+library(MASS)
+library(keras)
+library(tensorflow)
+library(tidyverse)
+library(R6)
+library(ggplot2)
+library(knitr)
+library(kableExtra)
+
+set.seed(123)
+
+############################################################
+# 1️⃣ Boston Housing Dataset Simulation
+############################################################
+
+T_steps <- 10
+n <- 1000
+
+data("Boston")
+df <- Boston
+p <- ncol(df)
+
+df_sampled <- df[sample(1:nrow(df), n, replace = TRUE), ]
+
+################################
+# Build Time Series Context
+################################
+
+X_long <- array(0, dim = c(n, T_steps, p))
+
+for (t in 1:T_steps) {
+  noise <- matrix(rnorm(n * p, 0, 0.01), nrow = n)
+  X_long[, t, ] <- as.matrix(df_sampled) + noise
+}
+
+################################
+# Feature Scaling
+################################
+
+X_scaled <- X_long
+
+for (j in 1:p) {
+  for (t in 1:T_steps) {
+    mean_val <- mean(X_scaled[, t, j])
+    sd_val <- sd(X_scaled[, t, j])
+    X_scaled[, t, j] <- (X_scaled[, t, j] - mean_val) / sd_val
+  }
+}
+
+################################
+# Context Variables
+################################
+
+rm_avg <- apply(X_scaled[, , which(colnames(df) == "rm")], 1, mean)
+ptratio_avg <- apply(X_scaled[, , which(colnames(df) == "ptratio")], 1, mean)
+
+################################
+# Treatment Assignment
+################################
+
+logits <- cbind(
+  3.5 * rm_avg,
+  3.5 * ptratio_avg,
+  -3.5 * rm_avg
+)
+
+exp_logits <- exp(logits)
+prob_mat <- exp_logits / rowSums(exp_logits)
+
+W <- apply(prob_mat, 1, function(p) sample(0:2, 1, prob = p))
+
+################################
+# Heterogeneous Outcome Model
+################################
+
+base_outcome <- sin(apply(X_scaled[, , 1:3], 1, mean)) * 3 + rnorm(n, 0, 0.5)
+
+tau0 <- 0
+tau1 <- 1.5 + 2 * ptratio_avg - rm_avg
+tau2 <- -2 + 3.5 * rm_avg - 0.5 * ptratio_avg
+
+Y0 <- base_outcome + tau0
+Y1 <- base_outcome + tau1
+Y2 <- base_outcome + tau2
+
+Y_obs <- ifelse(W == 0, Y0,
+         ifelse(W == 1, Y1, Y2))
+
+Y_matrix <- cbind(Y0, Y1, Y2)
+
+################################
+# Train/Test Split
+################################
+
+train_idx <- sample(1:n, floor(0.7 * n))
+test_idx <- setdiff(1:n, train_idx)
+
+X_train <- X_scaled[train_idx,,]
+X_test  <- X_scaled[test_idx,,]
+
+Y_train <- Y_matrix[train_idx,]
+Y_test  <- Y_matrix[test_idx,]
+
+############################################################
+# 2️⃣ Replay Buffer
+############################################################
+
+ReplayBuffer <- R6Class(
+  "ReplayBuffer",
+  public = list(
+    capacity = NULL,
+    buffer = NULL,
+    position = 1,
+    
+    initialize = function(capacity){
+      self$capacity <- capacity
+      self$buffer <- vector("list", capacity)
+    },
+    
+    push = function(state, action, reward){
+      self$buffer[[self$position]] <- list(
+        state = state,
+        action = action,
+        reward = reward
+      )
+      
+      self$position <- ifelse(
+        self$position == self$capacity,
+        1,
+        self$position + 1
+      )
+    },
+    
+    sample_indices = function(batch_size, weights=NULL){
+      
+      filled <- which(!sapply(self$buffer, is.null))
+      
+      if(length(filled) < batch_size) return(NULL)
+      
+      if(is.null(weights)){
+        sample(filled, batch_size)
+      } else {
+        w <- weights[filled]
+        sample(filled, batch_size, prob = w/sum(w))
+      }
+    }
+  )
+)
+
+############################################################
+# 3️⃣ CNN + LSTM DQN Model
+############################################################
+
+build_model <- function(input_shape){
+  
+  model <- keras_model_sequential() %>%
+    
+    layer_conv_1d(
+      filters = 32,
+      kernel_size = 3,
+      activation = "relu",
+      input_shape = input_shape
+    ) %>%
+    
+    layer_lstm(32) %>%
+    
+    layer_dense(64, activation = "relu") %>%
+    
+    layer_dense(3)
+  
+  model %>% compile(
+    optimizer = optimizer_adam(learning_rate = 0.001),
+    loss = "mse"
+  )
+  
+  model
+}
+
+############################################################
+# 4️⃣ Train DQN
+############################################################
+
+train_dqn <- function(X, Y, episodes=30,
+                      batch_size=32,
+                      method="uniform",
+                      alpha=0.5){
+  
+  input_dims <- dim(X)[2:3]
+  
+  model <- build_model(input_dims)
+  
+  buffer <- ReplayBuffer$new(2000)
+  
+  epsilon <- 1.0
+  
+  for(ep in 1:episodes){
+    
+    ################################
+    # Experience Collection
+    ################################
+    
+    for(i in 1:dim(X)[1]){
+      
+      state <- X[i,,]
+      
+      if(runif(1) < epsilon){
+        action <- sample(0:2,1)
+      } else {
+        q_vals <- predict(model,
+                          array(state, dim=c(1,input_dims)),
+                          verbose=0)
+        action <- which.max(q_vals) - 1
+      }
+      
+      reward <- Y[i, action+1]
+      
+      buffer$push(state, action, reward)
+    }
+    
+    ################################
+    # Training Step
+    ################################
+    
+    filled_idx <- which(!sapply(buffer$buffer, is.null))
+    
+    if(length(filled_idx) < batch_size) next
+    
+    weights <- rep(1, length(filled_idx))
+    
+    if(method != "uniform"){
+      
+      all_s <- array(0, dim=c(length(filled_idx), input_dims))
+      
+      for(k in seq_along(filled_idx))
+        all_s[k,,] <- buffer$buffer[[filled_idx[k]]]$state
+      
+      q_all <- predict(model, all_s, verbose=0)
+      
+      if(method == "entropy"){
+        
+        prob <- t(apply(q_all,1,function(x) exp(x)/sum(exp(x))))
+        entropy <- -rowSums(prob * log(prob + 1e-8))
+        qvar <- apply(q_all,1,var)
+        
+        weights <- alpha*entropy + (1-alpha)*qvar
+        
+      } else if(method == "per"){
+        
+        actual_rewards <- sapply(filled_idx,
+                                 function(idx) buffer$buffer[[idx]]$reward)
+        
+        actual_actions <- sapply(filled_idx,
+                                 function(idx) buffer$buffer[[idx]]$action)
+        
+        pred_val <- q_all[cbind(1:nrow(q_all), actual_actions+1)]
+        
+        weights <- abs(actual_rewards - pred_val) + 1e-5
+      }
+    }
+    
+    idx <- buffer$sample_indices(batch_size, weights)
+    
+    samples <- buffer$buffer[idx]
+    
+    batch_s <- array(0, dim=c(batch_size,input_dims))
+    batch_y <- matrix(0, batch_size, 3)
+    
+    for(j in 1:batch_size){
+      
+      batch_s[j,,] <- samples[[j]]$state
+      
+      current_q <- predict(model,
+                           array(samples[[j]]$state,
+                                 dim=c(1,input_dims)),
+                           verbose=0)
+      
+      current_q[1, samples[[j]]$action+1] <- samples[[j]]$reward
+      
+      batch_y[j,] <- current_q
+    }
+    
+    model %>% fit(batch_s, batch_y, epochs=1, verbose=0)
+    
+    epsilon <- max(0.1, epsilon*0.95)
+  }
+  
+  model
+}
+
+############################################################
+# 5️⃣ Policy Evaluation
+############################################################
+
+evaluate_model <- function(model, X, Y_true){
+  
+  q_preds <- predict(model, X, verbose=0)
+  
+  actions <- apply(q_preds,1,which.max)
+  
+  rewards <- sapply(1:nrow(Y_true), function(i){
+    Y_true[i, actions[i]]
+  })
+  
+  mean(rewards)
+}
+
+############################################################
+# 6️⃣ Run Experiment
+############################################################
+
+n_runs <- 20
+
+results <- data.frame(
+  uniform=numeric(n_runs),
+  entropy=numeric(n_runs),
+  per=numeric(n_runs)
+)
+
+for(r in 1:n_runs){
+  
+  message("Run ", r)
+  
+  results$uniform[r] <- evaluate_model(
+    train_dqn(X_train,Y_train,method="uniform"),
+    X_test,Y_test
+  )
+  
+  results$entropy[r] <- evaluate_model(
+    train_dqn(X_train,Y_train,method="entropy"),
+    X_test,Y_test
+  )
+  
+  results$per[r] <- evaluate_model(
+    train_dqn(X_train,Y_train,method="per"),
+    X_test,Y_test
+  )
+}
+
+print(colMeans(results))
+
+############################################################
+# 7️⃣ Visualization
+############################################################
+
+res_long <- results %>%
+  pivot_longer(cols = everything(),
+               names_to = "Method",
+               values_to = "Reward")
+
+ggplot(res_long,
+       aes(Method,Reward,fill=Method))+
+  geom_boxplot(alpha=0.6)+
+  geom_jitter(width=0.1,alpha=0.4)+
+  stat_summary(fun=mean,
+               geom="point",
+               shape=18,
+               size=4,
+               color="black")+
+  theme_classic(base_size=14)+
+  labs(title="DQN Sampling Strategy Comparison",
+       y="Test Reward")
+
+############################################################
+# 8️⃣ Statistical Test
+############################################################
+
+t_test <- t.test(results$per,
+                 results$uniform,
+                 paired=TRUE)
+
+print(t_test)
+
+############################################################
+# 9️⃣ Summary Table
+############################################################
+
+summary_stats <- data.frame(
+  Model = colnames(results),
+  Mean_Reward = colMeans(results),
+  SD = apply(results,2,sd)
+)
+
+summary_stats %>%
+  kable(digits=3,
+        caption="DQN Performance Comparison") %>%
+  kable_styling()
+
+
 
 # Paper titled "Quantum-Inspired Deep Q-Learning for Multivalued Treatment Policy Optimization" under review.
 # Weighted model corresponds to a "quantum-inspired" weighted sampling approach to improve exploration/exploitation, 

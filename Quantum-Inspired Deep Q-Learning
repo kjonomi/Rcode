@@ -784,7 +784,7 @@ evaluate_model <- function(model,X,Y_true){
 # 6️⃣ Simulation Runs
 ############################################################
 
-n_runs <- 20
+n_runs <- 5
 
 results <- data.frame(
   uniform=numeric(n_runs),
@@ -1204,7 +1204,7 @@ evaluate_model <- function(model, X, Y_true){
 # 6️⃣ Run Experiment
 ############################################################
 
-n_runs <- 20
+n_runs <- 5
 
 results <- data.frame(
   uniform=numeric(n_runs),

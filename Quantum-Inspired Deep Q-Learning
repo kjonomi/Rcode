@@ -503,6 +503,390 @@ print(p14)
 
 
 
+############################################################
+# 0️⃣ Environment Setup
+############################################################
+
+Sys.setenv(CUDA_VISIBLE_DEVICES = "")
+Sys.setenv(TF_CPP_MIN_LOG_LEVEL = "2")
+
+library(data.table)
+library(keras)
+library(tensorflow)
+library(tidyverse)
+library(R6)
+library(ggplot2)
+library(knitr)
+library(kableExtra)
+
+set.seed(123)
+
+############################################################
+# 1️⃣ Wine Dataset + Time Series Construction
+############################################################
+
+T_steps <- 10
+n <- 500
+
+wine_url <- "https://archive.ics.uci.edu/ml/machine-learning-databases/wine-quality/winequality-red.csv"
+wine <- fread(wine_url, sep=";")
+
+p <- ncol(wine)
+
+df_sampled <- wine[sample(1:nrow(wine), n, replace=TRUE),]
+
+################################
+# Build Temporal Input
+################################
+
+X_long <- array(0, dim=c(n, T_steps, p))
+
+for(t in 1:T_steps){
+  noise <- matrix(rnorm(n*p,0,0.01),nrow=n)
+  X_long[,t,] <- as.matrix(df_sampled) + noise
+}
+
+################################
+# Global Scaling
+################################
+
+for(j in 1:p){
+  X_long[,,j] <- scale(as.vector(X_long[,,j]))
+}
+
+################################
+# Context Variables
+################################
+
+alcohol_idx <- which(colnames(wine)=="alcohol")
+ph_idx <- which(colnames(wine)=="pH")
+
+alcohol_avg <- rowMeans(X_long[,,alcohol_idx])
+ph_avg <- rowMeans(X_long[,,ph_idx])
+
+################################
+# Nonlinear HTE Outcome Model
+################################
+
+base_outcome <- sin(rowMeans(X_long[,,1:3]))*3 + rnorm(n,0,0.5)
+
+tau0 <- 0
+tau1 <- 1.5 + 2*ph_avg - 1*alcohol_avg
+tau2 <- -2 + 3.5*alcohol_avg - 0.5*ph_avg
+
+Y_matrix <- cbind(
+  base_outcome + tau0,
+  base_outcome + tau1,
+  base_outcome + tau2
+)
+
+################################
+# Train/Test Split
+################################
+
+train_idx <- sample(1:n, floor(0.7*n))
+test_idx <- setdiff(1:n, train_idx)
+
+X_train <- X_long[train_idx,,]
+X_test  <- X_long[test_idx,,]
+
+Y_train <- Y_matrix[train_idx,]
+Y_test  <- Y_matrix[test_idx,]
+
+############################################################
+# 2️⃣ Replay Buffer
+############################################################
+
+ReplayBuffer <- R6Class(
+  "ReplayBuffer",
+  public=list(
+    capacity=NULL,
+    buffer=NULL,
+    position=1,
+    
+    initialize=function(capacity){
+      self$capacity <- capacity
+      self$buffer <- vector("list", capacity)
+    },
+    
+    push=function(state,action,reward){
+      self$buffer[[self$position]] <- list(
+        state=state,
+        action=action,
+        reward=reward
+      )
+      self$position <- ifelse(self$position==self$capacity,1,self$position+1)
+    },
+    
+    sample_indices=function(batch_size,weights=NULL){
+      filled <- which(!sapply(self$buffer,is.null))
+      
+      if(length(filled) < batch_size) return(NULL)
+      
+      if(is.null(weights)){
+        return(sample(filled,batch_size))
+      }else{
+        w <- weights[filled]
+        return(sample(filled,batch_size,prob=w/sum(w)))
+      }
+    }
+  )
+)
+
+############################################################
+# 3️⃣ DQN Model
+############################################################
+
+build_model <- function(input_shape){
+  
+  model <- keras_model_sequential() %>%
+    
+    layer_conv_1d(
+      filters=32,
+      kernel_size=3,
+      activation="relu",
+      input_shape=input_shape
+    ) %>%
+    
+    layer_lstm(32) %>%
+    
+    layer_dense(64,activation="relu") %>%
+    
+    layer_dense(3)
+  
+  model %>% compile(
+    optimizer=optimizer_adam(learning_rate=0.001),
+    loss="mse"
+  )
+  
+  return(model)
+}
+
+############################################################
+# 4️⃣ DQN Training
+############################################################
+
+train_dqn <- function(X,Y,episodes=40,batch_size=32,method="uniform",alpha=0.5){
+  
+  input_dims <- dim(X)[2:3]
+  
+  model <- build_model(input_dims)
+  
+  buffer <- ReplayBuffer$new(2000)
+  
+  epsilon <- 1.0
+  
+  for(ep in 1:episodes){
+    
+    ################################
+    # Collect Experience
+    ################################
+    
+    for(i in 1:dim(X)[1]){
+      
+      state <- X[i,,]
+      
+      if(runif(1) < epsilon){
+        action <- sample(0:2,1)
+      }else{
+        q_vals <- predict(model,array(state,dim=c(1,input_dims)),verbose=0)
+        action <- which.max(q_vals) - 1
+      }
+      
+      reward <- Y[i,action+1]
+      
+      buffer$push(state,action,reward)
+    }
+    
+    ################################
+    # Training
+    ################################
+    
+    filled_idx <- which(!sapply(buffer$buffer,is.null))
+    
+    if(length(filled_idx) < batch_size) next
+    
+    weights <- rep(1,length(filled_idx))
+    
+    if(method!="uniform"){
+      
+      all_s <- array(0,dim=c(length(filled_idx),input_dims))
+      
+      for(k in seq_along(filled_idx)){
+        all_s[k,,] <- buffer$buffer[[filled_idx[k]]]$state
+      }
+      
+      q_all <- predict(model,all_s,verbose=0)
+      
+      if(method=="entropy"){
+        
+        prob <- t(apply(q_all,1,function(x) exp(x)/sum(exp(x))))
+        entropy <- -rowSums(prob*log(prob+1e-8))
+        qvar <- apply(q_all,1,var)
+        
+        weights <- alpha*entropy + (1-alpha)*qvar
+        
+      }else if(method=="per"){
+        
+        actual_rewards <- sapply(filled_idx,function(idx) buffer$buffer[[idx]]$reward)
+        actual_actions <- sapply(filled_idx,function(idx) buffer$buffer[[idx]]$action)
+        
+        pred_val <- q_all[cbind(1:nrow(q_all),actual_actions+1)]
+        
+        weights <- abs(actual_rewards - pred_val) + 1e-5
+      }
+    }
+    
+    idx <- buffer$sample_indices(batch_size,weights)
+    
+    samples <- buffer$buffer[idx]
+    
+    batch_s <- array(0,dim=c(batch_size,input_dims))
+    batch_y <- matrix(0,nrow=batch_size,ncol=3)
+    
+    for(j in 1:batch_size){
+      
+      batch_s[j,,] <- samples[[j]]$state
+      
+      current_q <- predict(model,array(samples[[j]]$state,dim=c(1,input_dims)),verbose=0)
+      
+      current_q[1,samples[[j]]$action+1] <- samples[[j]]$reward
+      
+      batch_y[j,] <- current_q
+    }
+    
+    model %>% fit(batch_s,batch_y,epochs=1,verbose=0)
+    
+    epsilon <- max(0.1,epsilon*0.95)
+  }
+  
+  return(model)
+}
+
+############################################################
+# 5️⃣ Policy Evaluation
+############################################################
+
+evaluate_model <- function(model,X,Y_true){
+  
+  q_preds <- predict(model,X,verbose=0)
+  
+  actions <- apply(q_preds,1,which.max)
+  
+  rewards <- sapply(1:nrow(Y_true),function(i){
+    Y_true[i,actions[i]]
+  })
+  
+  mean(rewards)
+}
+
+############################################################
+# 6️⃣ Simulation Runs
+############################################################
+
+n_runs <- 20
+
+results <- data.frame(
+  uniform=numeric(n_runs),
+  entropy=numeric(n_runs),
+  per=numeric(n_runs)
+)
+
+for(r in 1:n_runs){
+  
+  message("Run ",r)
+  
+  results$uniform[r] <- evaluate_model(
+    train_dqn(X_train,Y_train,method="uniform"),
+    X_test,Y_test
+  )
+  
+  results$entropy[r] <- evaluate_model(
+    train_dqn(X_train,Y_train,method="entropy"),
+    X_test,Y_test
+  )
+  
+  results$per[r] <- evaluate_model(
+    train_dqn(X_train,Y_train,method="per"),
+    X_test,Y_test
+  )
+}
+
+print(colMeans(results))
+
+############################################################
+# 7️⃣ Visualization
+############################################################
+
+res_long <- results %>%
+  pivot_longer(cols=everything(),
+               names_to="Method",
+               values_to="Reward")
+
+p1 <- ggplot(res_long,
+             aes(Method,Reward,fill=Method))+
+  geom_boxplot(alpha=0.6)+
+  geom_jitter(width=0.1,alpha=0.4)+
+  stat_summary(fun=mean,
+               geom="point",
+               shape=18,
+               size=4,
+               color="black")+
+  theme_classic(base_size=14)+
+  labs(title="DQN Sampling Strategy Comparison",
+       y="Test Reward")
+
+print(p1)
+
+############################################################
+# 8️⃣ Mean + 95% CI Plot
+############################################################
+
+summary_df <- res_long %>%
+  group_by(Method) %>%
+  summarise(
+    Mean=mean(Reward),
+    SD=sd(Reward),
+    N=n(),
+    SE=SD/sqrt(N),
+    CI=qt(0.975,df=N-1)*SE
+  )
+
+p2 <- ggplot(summary_df,
+             aes(Method,Mean,fill=Method))+
+  geom_bar(stat="identity",alpha=0.7,width=0.6)+
+  geom_errorbar(aes(ymin=Mean-CI,ymax=Mean+CI),
+                width=0.2,size=1)+
+  theme_minimal(base_size=14)+
+  labs(title="Mean Test Reward ±95% CI")
+
+print(p2)
+
+############################################################
+# 9️⃣ Statistical Test
+############################################################
+
+t_test <- t.test(results$per,
+                 results$uniform,
+                 paired=TRUE)
+
+print(t_test)
+
+############################################################
+# 🔟 Summary Table
+############################################################
+
+summary_stats <- data.frame(
+  Model=colnames(results),
+  Mean_Reward=colMeans(results),
+  SD=apply(results,2,sd)
+)
+
+summary_stats %>%
+  kable(digits=3,
+        caption="DQN Performance Comparison") %>%
+  kable_styling()
+
 
 # Paper titled "Quantum-Inspired Deep Q-Learning for Multivalued Treatment Policy Optimization" under review.
 # Weighted model corresponds to a "quantum-inspired" weighted sampling approach to improve exploration/exploitation, 

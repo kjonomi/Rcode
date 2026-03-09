@@ -1,0 +1,761 @@
+# ==========================================================
+# 0️⃣ Libraries & Global Setup
+# ==========================================================
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(keras)
+library(tensorflow)
+library(tidyr)
+
+# Force CPU to avoid GPU overhead for small networks
+Sys.setenv(CUDA_VISIBLE_DEVICES = "-1")
+
+# ==========================================================
+# 1️⃣ Simulation Function
+# ==========================================================
+run_single_sim <- function(iter_id) {
+  set.seed(123 + iter_id) # Unique but reproducible seed per run
+  
+  # --- Data Generation ---
+  n <- 800
+  num_features <- 12
+  num_blocks <- 6
+  K <- 4
+  
+  block_id <- sample(1:num_blocks, n, replace=TRUE)
+  X_num <- matrix(rnorm(n * num_features), n, num_features)
+  colnames(X_num) <- paste0("f", 1:num_features)
+  
+  all_combos <- as.matrix(expand.grid(replicate(K, c(0,1), simplify=FALSE)))
+  num_t <- nrow(all_combos)
+  target_t <- num_t
+  
+  block_treat_map <- lapply(1:num_blocks, function(x) {
+    c(target_t, sample(setdiff(1:num_t, target_t), 5))
+  })
+  
+  T_idx_obs <- sapply(block_id, function(b) sample(block_treat_map[[b]], 1))
+  T_mat <- all_combos[T_idx_obs, ]
+  block_sizes <- sapply(block_treat_map, length)
+  pi_it <- 1 / block_sizes[block_id]
+  
+  # --- Complex DGP ---
+  X_quad <- X_num^2
+  X_sin  <- sin(X_num)
+  X_inter <- NULL
+  for(i in 1:5) {
+    for(j in (i+1):5) { X_inter <- cbind(X_inter, X_num[,i]*X_num[,j]) }
+  }
+  X_design <- cbind(X_num, X_quad, X_sin, X_inter)
+  
+  beta <- runif(ncol(X_design), -0.5, 0.5)
+  tau_main <- runif(K, 0.2, 0.8)
+  tau_cate <- matrix(runif(ncol(X_design)*K, -0.3, 0.3), ncol=K)
+  
+  lin_stage1 <- X_design %*% beta + T_mat %*% tau_main
+  cate_effect <- rowSums(X_design * tau_cate[,1])
+  linear_pred <- lin_stage1 + cate_effect + T_mat %*% tau_main
+  prob <- 1/(1+exp(-linear_pred))
+  Y <- rbinom(n, 1, prob)
+  
+  # --- True Target Value ---
+  t_effect <- as.numeric(all_combos[target_t,] %*% tau_main)
+  true_val <- mean(1/(1+exp(-(X_design %*% beta + t_effect))))
+  
+  # --- Modeling ---
+  df <- data.frame(Y=Y, X_design, T_idx=factor(T_idx_obs))
+  glm_mod <- glm(Y~., data=df, family=binomial())
+  m_hat <- predict(glm_mod, newdata=df, type="response")
+  
+  X_nn <- as.matrix(X_design)
+  storage.mode(X_nn) <- "double"
+  
+  # Helper to build/train/predict Keras
+  fit_nn <- function(layers_list, dropout=0, l2=0) {
+    mod <- keras_model_sequential()
+    for(i in 1:length(layers_list)) {
+      reg <- if(l2 > 0) regularizer_l2(l2) else NULL
+      mod %>% layer_dense(layers_list[i], activation="relu", 
+                          input_shape=if(i==1) ncol(X_nn) else NULL,
+                          kernel_regularizer=reg)
+      if(dropout > 0) mod %>% layer_dropout(dropout)
+    }
+    mod %>% layer_dense(1, activation="sigmoid")
+    mod %>% compile(optimizer="adam", loss="binary_crossentropy")
+    mod %>% fit(X_nn, Y, epochs=15, verbose=0)
+    res <- predict(mod, X_nn)
+    k_clear_session() # Critical for memory
+    return(mean(res))
+  }
+  
+  # Gather Estimates
+  res_list <- list(
+    "HT"         = mean(((T_idx_obs==target_t)*Y)/pi_it),
+    "Hajek"      = sum(((T_idx_obs==target_t)*Y)/pi_it) / sum((T_idx_obs==target_t)/pi_it),
+    "DR_GLM"     = mean(m_hat + ((T_idx_obs==target_t)*(Y-m_hat))/pi_it),
+    "FNN"        = fit_nn(c(64, 32)),
+    "Deep_NN"    = fit_nn(c(128, 64, 32)),
+    "Dropout_NN" = fit_nn(c(64, 32), dropout=0.3),
+    "L2_NN"      = fit_nn(c(64, 32), l2=0.001)
+  )
+  
+  return(data.frame(Method = names(res_list), 
+                    Estimate = unlist(res_list), 
+                    True_Val = true_val,
+                    Iter = iter_id))
+}
+
+# ==========================================================
+# 2️⃣ Execute Loop (100 Times)
+# ==========================================================
+n_sims <- 100
+results_all <- lapply(1:n_sims, function(i) {
+  if(i %% 10 == 0) cat("Starting Iteration:", i, "\n")
+  run_single_sim(i)
+}) %>% bind_rows()
+
+# ==========================================================
+# 3️⃣ Summarize and Visualize
+# ==========================================================
+summary_stats <- results_all %>%
+  group_by(Method) %>%
+  summarise(
+    Mean_Estimate = mean(Estimate),
+    True_Value = mean(True_Val),
+    Bias = mean(Estimate - True_Val),
+    RMSE = sqrt(mean((Estimate - True_Val)^2)),
+    SD = sd(Estimate)
+  )
+
+print(summary_stats)
+
+# Plot 1: Distribution of Estimates
+p1 <- ggplot(results_all, aes(x=Method, y=Estimate, fill=Method)) +
+  geom_boxplot(alpha=0.7) +
+  geom_hline(aes(yintercept=mean(True_Val)), color="red", linetype="dashed", size=1) +
+  theme_minimal() +
+  labs(title="Distribution of Treatment Effect Estimates (100 Runs)",
+       subtitle="Red line indicates average True Value across simulations") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Plot 2: Bias Comparison
+p2 <- ggplot(summary_stats, aes(x=reorder(Method, Bias), y=Bias, fill=Method)) +
+  geom_bar(stat="identity") +
+  coord_flip() +
+  theme_minimal() +
+  labs(title="Average Bias by Method", x="Method", y="Mean Bias (Estimate - True)")
+
+print(p1)
+print(p2)
+
+# ==========================================================
+# 0️⃣ Libraries & Setup
+# ==========================================================
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(keras)
+library(tensorflow)
+
+Sys.setenv(CUDA_VISIBLE_DEVICES = "-1")
+set.seed(123)
+
+# ==========================================================
+# 1️⃣ Load and Prepare Adult Data
+# ==========================================================
+adult <- fread("adult.data.txt", header = FALSE, col.names = c(
+  "age", "workclass", "fnlwgt", "education", "education_num", "marital_status",
+  "occupation", "relationship", "race", "sex", "capital_gain", "capital_loss",
+  "hours_per_week", "native_country", "income"
+))
+
+adult$Y <- ifelse(trimws(adult$income) == ">50K", 1, 0)
+adult$T_obs <- ifelse(adult$education_num >= 13, 1, 0)
+
+X_cols <- c("age", "education_num", "capital_gain",
+            "capital_loss", "hours_per_week")
+
+adult_scaled <- adult %>%
+  dplyr::mutate(across(dplyr::all_of(X_cols), scale)) %>%
+  dplyr::select(Y, T_obs, dplyr::all_of(X_cols)) %>%
+  na.omit()
+
+# Convert to data.table (important for ..X_cols syntax)
+adult_scaled <- as.data.table(adult_scaled)
+
+# ==========================================================
+# 2️⃣ Simulation Function
+# ==========================================================
+run_single_sim <- function(iter_id) {
+  
+  set.seed(1000 + iter_id)
+  
+  # Bootstrap sample
+  df <- adult_scaled[sample(.N, size = 800, replace = TRUE)]
+  
+  Y <- df$Y
+  T_obs <- df$T_obs
+  
+  # FIX: correct data.table column selection
+  X <- as.matrix(df[, ..X_cols])
+  storage.mode(X) <- "double"
+  
+  # ------------------------------
+  # Propensity model
+  # ------------------------------
+  prop_mod <- glm(T_obs ~ ., 
+                  data = as.data.frame(df[, c("T_obs", X_cols), with = FALSE]),
+                  family = binomial())
+  
+  pi_hat <- predict(prop_mod, type = "response")
+  pi_hat <- pmin(pmax(pi_hat, 0.05), 0.95)
+  
+  # ------------------------------
+  # True value proxy
+  # ------------------------------
+  full_mod <- glm(Y ~ T_obs + ., 
+                  data = as.data.frame(df),
+                  family = binomial())
+  
+  df1 <- copy(df)
+  df1$T_obs <- 1
+  
+  true_val <- mean(predict(full_mod,
+                           newdata = as.data.frame(df1),
+                           type = "response"))
+  
+  # ------------------------------
+  # Outcome model
+  # ------------------------------
+  out_mod <- glm(Y ~ ., 
+                 data = as.data.frame(df),
+                 family = binomial())
+  
+  m_hat <- predict(out_mod, type = "response")
+  
+  # ======================================================
+  # Neural Network
+  # ======================================================
+  fit_nn <- function(layers_list, dropout = 0, l2 = 0) {
+    
+    mod <- keras_model_sequential()
+    
+    for(i in 1:length(layers_list)) {
+      
+      reg <- if(l2 > 0) regularizer_l2(l2) else NULL
+      
+      mod %>%
+        layer_dense(
+          units = layers_list[i],
+          activation = "relu",
+          input_shape = if(i == 1) ncol(X) else NULL,
+          kernel_regularizer = reg
+        )
+      
+      if(dropout > 0)
+        mod %>% layer_dropout(rate = dropout)
+    }
+    
+    mod %>% layer_dense(1, activation = "sigmoid")
+    
+    mod %>% compile(
+      optimizer = "adam",
+      loss = "binary_crossentropy"
+    )
+    
+    mod %>% fit(X, Y,
+                epochs = 15,
+                batch_size = 32,
+                verbose = 0)
+    
+    preds <- predict(mod, X)
+    k_clear_session()
+    
+    return(mean(preds))
+  }
+  
+  # ======================================================
+  # Estimators
+  # ======================================================
+  HT <- mean((T_obs * Y) / pi_hat)
+  
+  Hajek <- sum((T_obs * Y) / pi_hat) /
+    sum(T_obs / pi_hat)
+  
+  DR <- mean(m_hat +
+               (T_obs * (Y - m_hat)) / pi_hat)
+  
+  FNN        <- fit_nn(c(64, 32))
+  Deep_NN    <- fit_nn(c(128, 64, 32))
+  Dropout_NN <- fit_nn(c(64, 32), dropout = 0.3)
+  L2_NN      <- fit_nn(c(64, 32), l2 = 0.001)
+  
+  res <- c(
+    HT = HT,
+    Hajek = Hajek,
+    DR_GLM = DR,
+    FNN = FNN,
+    Deep_NN = Deep_NN,
+    Dropout_NN = Dropout_NN,
+    L2_NN = L2_NN
+  )
+  
+  data.frame(
+    Method = names(res),
+    Estimate = res,
+    True_Val = true_val,
+    Iter = iter_id
+  )
+}
+
+# ==========================================================
+# 3️⃣ Run 100 Simulations
+# ==========================================================
+n_sims <- 100
+
+results_all <- rbindlist(lapply(1:n_sims, function(i) {
+  if(i %% 10 == 0) cat("Iteration:", i, "\n")
+  run_single_sim(i)
+}))
+
+# ==========================================================
+# 4️⃣ Summary
+# ==========================================================
+summary_stats <- results_all[, .(
+  Mean_Estimate = mean(Estimate),
+  True_Value    = mean(True_Val),
+  Bias          = mean(Estimate - True_Val),
+  RMSE          = sqrt(mean((Estimate - True_Val)^2)),
+  SD            = sd(Estimate)
+), by = Method]
+
+print(summary_stats)
+
+# ==========================================================
+# 5️⃣ Plots
+# ==========================================================
+p1 <- ggplot(results_all,
+             aes(x = Method, y = Estimate, fill = Method)) +
+  geom_boxplot(alpha = 0.7) +
+  geom_hline(
+    yintercept = mean(results_all$True_Val),
+    color = "red",
+    linetype = "dashed",
+    linewidth = 1
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Adult Dataset: Distribution of Estimates",
+       y = "Estimated E[Y(1)]")
+
+print(p1)
+
+p2 <- ggplot(summary_stats,
+             aes(x = reorder(Method, Bias),
+                 y = Bias,
+                 fill = Method)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  theme_minimal() +
+  labs(title = "Adult Dataset: Mean Bias Comparison",
+       x = "Method",
+       y = "Bias")
+
+print(p2)
+
+
+
+# ==========================================================
+# 0️⃣ Libraries & Global Setup
+# ==========================================================
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(keras)
+library(tensorflow)
+
+# Suppress TF logs for cleaner output
+Sys.setenv(CUDA_VISIBLE_DEVICES = "-1")
+tf$get_logger()$setLevel('ERROR')
+
+# ==========================================================
+# 1️⃣ Data Loading & Preprocessing
+# ==========================================================
+# Replace "adult.data.txt" with your actual file path string
+if(!file.exists("adult.data.txt")){
+  stop("File 'adult.data.txt' not found. Please ensure it is in your working directory.")
+}
+
+adult <- fread("adult.data.txt", header = FALSE, col.names = c(
+  "age", "workclass", "fnlwgt", "education", "education_num", "marital_status",
+  "occupation", "relationship", "race", "sex", "capital_gain", "capital_loss",
+  "hours_per_week", "native_country", "income"
+))
+
+# Clean and Scale
+adult$Y <- ifelse(trimws(adult$income) == ">50K", 1, 0)
+adult$T_obs <- ifelse(adult$education_num >= 13, 1, 0) # 1 if Bachelors or higher
+X_cols <- c("age", "education_num", "capital_gain", "capital_loss", "hours_per_week")
+adult_scaled <- adult %>% mutate(across(all_of(X_cols), scale))
+
+# ==========================================================
+# 2️⃣ Simulation Function (100 Iterations)
+# ==========================================================
+run_iteration <- function(iter_id) {
+  # Subsample for variance
+  set.seed(123 + iter_id)
+  d_sub <- adult_scaled[sample(1:nrow(adult_scaled), 1000), ]
+  X_mat <- as.matrix(d_sub[, ..X_cols])
+  
+  # --- Step A: Propensity Score (g-model) ---
+  g_mod <- glm(T_obs ~ age + education_num + capital_gain, 
+               data = d_sub, family = binomial())
+  pi_hat <- predict(g_mod, type = "response")
+  pi_hat <- pmax(pmin(pi_hat, 0.95), 0.05) # Positivity bounding
+  
+  # --- Step B: Outcome Model (Q-model) ---
+  q_mod <- glm(Y ~ T_obs + age + education_num + capital_gain, 
+               data = d_sub, family = binomial())
+  
+  # Counterfactual: What if everyone was Treated (T=1)?
+  d_treated <- d_sub; d_treated$T_obs <- 1
+  Q1 <- predict(q_mod, newdata = d_treated, type = "response")
+  # Initial prediction for observed state
+  Q_obs <- predict(q_mod, type = "response")
+  
+  # --- Step C: TMLE Update ---
+  # Calculate "Clever Covariate"
+  H1 <- d_sub$T_obs / pi_hat
+  # Fluctuation step
+  eps <- glm(d_sub$Y ~ -1 + H1, offset = qlogis(Q_obs), family = binomial())$coefficients
+  # Targeted counterfactual prediction
+  Q1_star <- plogis(qlogis(Q1) + eps * (1/pi_hat))
+  
+  # --- Step D: Neural Network Logic ---
+  fit_nn <- function(nodes, drop = 0) {
+    k_clear_session()
+    model <- keras_model_sequential() %>%
+      layer_dense(nodes[1], activation="relu", input_shape=ncol(X_mat)) %>%
+      layer_dense(nodes[2], activation="relu") %>%
+      layer_dense(1, activation="sigmoid")
+    model %>% compile(optimizer="adam", loss="binary_crossentropy")
+    model %>% fit(X_mat, d_sub$Y, epochs=10, verbose=0)
+    return(mean(predict(model, X_mat)))
+  }
+  
+  # --- Aggregate results ---
+  target_mask <- (d_sub$T_obs == 1)
+  data.frame(
+    Iter = iter_id,
+    Method = c("HT", "Hajek", "DR (GLM)", "TMLE", "FNN", "Deep NN"),
+    Estimate = c(
+      mean((target_mask * d_sub$Y) / pi_hat),
+      sum((target_mask * d_sub$Y) / pi_hat) / sum(target_mask / pi_hat),
+      mean(Q_obs + (target_mask * (d_sub$Y - Q_obs)) / pi_hat),
+      mean(Q1_star),
+      fit_nn(c(64, 32)),
+      fit_nn(c(128, 64))
+    )
+  )
+}
+
+# ==========================================================
+# 3️⃣ Run and Plot Results
+# ==========================================================
+all_runs <- lapply(1:100, function(i) {
+  if(i %% 10 == 0) message("Iteration ", i)
+  run_iteration(i)
+}) %>% bind_rows()
+
+# Summary Table
+summary_table <- all_runs %>%
+  group_by(Method) %>%
+  summarise(Mean = mean(Estimate), SD = sd(Estimate))
+
+print(summary_table)
+
+# Visualizing Stability
+ggplot(all_runs, aes(x = Method, y = Estimate, fill = Method)) +
+  geom_boxplot(outlier.alpha = 0.5) +
+  theme_minimal() +
+  labs(title = "Causal Inference Benchmarking (Adult Dataset)",
+       subtitle = "Estimating E[Y|do(T=1)]: Expected High-Income probability if all had Degrees",
+       y = "Estimated Probability")
+
+# ==========================================================
+# 0️⃣ Libraries
+# ==========================================================
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(umap)
+library(MASS)
+library(keras)
+library(tensorflow)
+
+Sys.setenv(CUDA_VISIBLE_DEVICES = "-1")
+set.seed(123)
+
+# ==========================================================
+# 1️⃣ Simulation Setup
+# ==========================================================
+n <- 800
+num_features <- 12
+num_blocks <- 6
+K <- 4
+
+block_id <- sample(1:num_blocks, n, replace=TRUE)
+
+# Covariates
+X_num <- matrix(rnorm(n * num_features), n, num_features)
+colnames(X_num) <- paste0("f", 1:num_features)
+
+# ==========================================================
+# 2️⃣ Treatment Space (Guaranteed Positivity)
+# ==========================================================
+all_combos <- as.matrix(
+  expand.grid(replicate(K, c(0,1), simplify=FALSE))
+)
+
+num_t <- nrow(all_combos)
+target_t <- num_t
+
+block_treat_map <- lapply(1:num_blocks, function(x) {
+  c(target_t,
+    sample(setdiff(1:num_t, target_t), 5))
+})
+
+T_idx_obs <- sapply(block_id,
+                    function(b)
+                      sample(block_treat_map[[b]], 1))
+
+T_mat <- all_combos[T_idx_obs, ]
+
+block_sizes <- sapply(block_treat_map, length)
+pi_it <- 1 / block_sizes[block_id]
+
+# ==========================================================
+# 3️⃣ NONLINEAR + INTERACTION + CATE + DYNAMIC DGP
+# ==========================================================
+
+X_quad <- X_num^2
+X_sin  <- sin(X_num)
+
+X_inter <- NULL
+for(i in 1:5){
+  for(j in (i+1):5){
+    X_inter <- cbind(X_inter,
+                     X_num[,i]*X_num[,j])
+  }
+}
+
+X_design <- cbind(X_num,
+                  X_quad,
+                  X_sin,
+                  X_inter)
+
+beta <- runif(ncol(X_design),
+              -0.5,0.5)
+
+tau_main <- runif(K,0.2,0.8)
+
+tau_cate <- matrix(runif(ncol(X_design)*K,
+                         -0.3,0.3),
+                   ncol=K)
+
+# Multi-stage structure
+lin_stage1 <- X_design %*% beta +
+  T_mat %*% tau_main
+
+cate_effect <- rowSums(X_design *
+                         tau_cate[,1])
+
+linear_pred <- lin_stage1 +
+  cate_effect +
+  T_mat %*% tau_main
+
+prob <- 1/(1+exp(-linear_pred))
+Y <- rbinom(n,1,prob)
+
+# ==========================================================
+# 4️⃣ True Target Value
+# ==========================================================
+t_effect <- as.numeric(
+  all_combos[target_t,] %*% tau_main)
+
+linear_target <- X_design %*% beta +
+  t_effect
+
+true_val <- mean(1/(1+exp(-linear_target)))
+
+# ==========================================================
+# 5️⃣ Classical GLM Model
+# ==========================================================
+df <- data.frame(Y=Y,
+                 X_design,
+                 T_idx=factor(T_idx_obs))
+
+glm_mod <- glm(Y~.,
+               data=df,
+               family=binomial())
+
+m_hat <- predict(glm_mod,
+                 newdata=df,
+                 type="response")
+
+# ==========================================================
+# 6️⃣ Deep Learning Models
+# ==========================================================
+X_nn <- as.matrix(X_design)
+storage.mode(X_nn) <- "double"
+
+input_dim <- ncol(X_nn)
+
+# ---- FNN ----
+model_fnn <- keras_model_sequential() %>%
+  layer_dense(64, activation="relu",
+              input_shape=input_dim) %>%
+  layer_dense(32, activation="relu") %>%
+  layer_dense(1, activation="sigmoid")
+
+model_fnn %>% compile(
+  optimizer="adam",
+  loss="binary_crossentropy")
+
+model_fnn %>% fit(X_nn,Y,epochs=10,verbose=0)
+
+pred_fnn <- predict(model_fnn,X_nn)
+
+# ---- Deep NN ----
+model_deep <- keras_model_sequential() %>%
+  layer_dense(128, activation="relu",
+              input_shape=input_dim) %>%
+  layer_dense(64, activation="relu") %>%
+  layer_dense(32, activation="relu") %>%
+  layer_dense(1, activation="sigmoid")
+
+model_deep %>% compile(
+  optimizer="adam",
+  loss="binary_crossentropy")
+
+model_deep %>% fit(X_nn,Y,epochs=10,verbose=0)
+
+pred_deep <- predict(model_deep,X_nn)
+
+# ---- Dropout NN ----
+model_dropout <- keras_model_sequential() %>%
+  layer_dense(64, activation="relu",
+              input_shape=input_dim) %>%
+  layer_dropout(0.3) %>%
+  layer_dense(32, activation="relu") %>%
+  layer_dropout(0.3) %>%
+  layer_dense(1, activation="sigmoid")
+
+model_dropout %>% compile(
+  optimizer="adam",
+  loss="binary_crossentropy")
+
+model_dropout %>% fit(X_nn,Y,epochs=10,verbose=0)
+
+pred_dropout <- predict(model_dropout,X_nn)
+
+# ---- L2 NN ----
+model_l2 <- keras_model_sequential() %>%
+  layer_dense(64, activation="relu",
+              kernel_regularizer=regularizer_l2(0.001),
+              input_shape=input_dim) %>%
+  layer_dense(32, activation="relu",
+              kernel_regularizer=regularizer_l2(0.001)) %>%
+  layer_dense(1, activation="sigmoid")
+
+model_l2 %>% compile(
+  optimizer="adam",
+  loss="binary_crossentropy")
+
+model_l2 %>% fit(X_nn,Y,epochs=10,verbose=0)
+
+pred_l2 <- predict(model_l2,X_nn)
+
+# ==========================================================
+# 7️⃣ Estimators
+# ==========================================================
+calc_ht <- function(Y,obs,target,pi)
+  mean(((obs==target)*Y)/pi)
+
+calc_hajek <- function(Y,obs,target,pi){
+  mask <- (obs==target)
+  sum((mask*Y)/pi) /
+    sum(mask/pi)
+}
+
+calc_dr <- function(Y,obs,target,pi,m_pred){
+  mask <- (obs==target)
+  mean(m_pred +
+         (mask*(Y-m_pred))/pi)
+}
+
+mask <- (T_idx_obs==target_t)
+
+ht_val <- calc_ht(Y,T_idx_obs,target_t,pi_it)
+hajek_val <- calc_hajek(Y,T_idx_obs,target_t,pi_it)
+dr_val <- calc_dr(Y,T_idx_obs,target_t,pi_it,m_hat)
+
+# ==========================================================
+# 8️⃣ Bootstrap SE Function
+# ==========================================================
+bootstrap_se <- function(pred){
+  B <- 200
+  vals <- numeric(B)
+  for(b in 1:B){
+    idx <- sample(1:n,n,replace=TRUE)
+    vals[b] <- mean(pred[idx])
+  }
+  sd(vals)
+}
+
+# ==========================================================
+# 9️⃣ Results Table
+# ==========================================================
+results <- data.frame(
+  Method=c("HT","Hájek","DR (GLM)",
+           "FNN","Deep NN",
+           "Dropout NN","L2 NN"),
+  Estimate=c(ht_val,
+             hajek_val,
+             dr_val,
+             mean(pred_fnn),
+             mean(pred_deep),
+             mean(pred_dropout),
+             mean(pred_l2))
+)
+
+results$True_Value <- true_val
+results$Bias <- results$Estimate - true_val
+
+print(results)
+
+# ==========================================================
+# 🔟 Plots
+# ==========================================================
+
+ggplot(results,
+       aes(x=Method,y=Estimate,
+           fill=Method))+
+  geom_bar(stat="identity")+
+  geom_hline(yintercept=true_val,
+             linetype="dashed",
+             color="red")+
+  theme_minimal()+
+  ggtitle("Model Comparison")
+
+ggplot(results,
+       aes(x=Method,y=Bias,
+           fill=Method))+
+  geom_bar(stat="identity")+
+  geom_hline(yintercept=0,
+             linetype="dashed")+
+  theme_minimal()+
+  ggtitle("Bias Comparison")
+
+

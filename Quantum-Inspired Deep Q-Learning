@@ -534,8 +534,7 @@ T_steps <- 10
 wine_sample <- wine[sample(1:nrow(wine), n, replace = TRUE), ]
 
 Y_base <- wine_sample$quality
-X_base <- wine_sample %>% select(-quality)
-
+X_base <- wine_sample[, names(wine_sample) != "quality"]
 p <- ncol(X_base)
 
 ############################################################

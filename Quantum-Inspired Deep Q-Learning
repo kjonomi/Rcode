@@ -877,63 +877,51 @@ for(r in 1:n_runs){
 
 print(colMeans(results))
 
+
+
 ############################################################
-# 8️⃣ Visualization
+# 7️⃣ Comparison Plot
 ############################################################
 
 res_long <- results %>%
   pivot_longer(cols = everything(),
-               names_to="Method",
-               values_to="Reward")
+               names_to = "Method",
+               values_to = "Reward")
 
 ggplot(res_long,
-       aes(Method, Reward, fill=Method)) +
-  geom_boxplot(alpha=0.6) +
-  geom_jitter(width=0.1, alpha=0.4) +
-  theme_classic(base_size=14) +
-  labs(
-    title="Wine Quality DQN Policy Performance",
-    y="Average Reward"
-  )
-
-p1 <- ggplot(res_long,
-             aes(Method,Reward,fill=Method))+
-  geom_boxplot(alpha=0.6)+
-  geom_jitter(width=0.1,alpha=0.4)+
-  stat_summary(fun=mean,
-               geom="point",
-               shape=18,
-               size=4,
-               color="black")+
-  theme_classic(base_size=14)+
+       aes(Method, Reward, fill = Method)) +
+  geom_boxplot(alpha = 0.6) +
+  geom_jitter(width = 0.1, alpha = 0.4) +
+  stat_summary(fun = mean,
+               geom = "point",
+               shape = 18,
+               size = 4,
+               color = "black") +
+  theme_classic(base_size = 14) +
   labs(title="DQN Sampling Strategy Comparison",
        y="Test Reward")
 
-print(p1)
-
 ############################################################
-# 8️⃣ Mean + 95% CI Plot
+# 8️⃣ Summary Table
 ############################################################
 
-summary_df <- res_long %>%
-  group_by(Method) %>%
-  summarise(
-    Mean=mean(Reward),
-    SD=sd(Reward),
-    N=n(),
-    SE=SD/sqrt(N),
-    CI=qt(0.975,df=N-1)*SE
-  )
+summary_stats <- data.frame(
+  Model = colnames(results),
+  Mean_Reward = colMeans(results),
+  SD = apply(results,2,sd)
+)
 
-p2 <- ggplot(summary_df,
-             aes(Method,Mean,fill=Method))+
-  geom_bar(stat="identity",alpha=0.7,width=0.6)+
-  geom_errorbar(aes(ymin=Mean-CI,ymax=Mean+CI),
-                width=0.2,size=1)+
-  theme_minimal(base_size=14)+
-  labs(title="Mean Test Reward ±95% CI")
+baseline <- summary_stats$Mean_Reward[1]
 
-print(p2)
+summary_stats$Improvement <- paste0(
+  round((summary_stats$Mean_Reward / baseline - 1) * 100,2),
+  "%"
+)
+
+summary_stats %>%
+  kable(caption="DQN Performance Comparison",
+        digits=3) %>%
+  kable_styling()
 
 ############################################################
 # 9️⃣ Statistical Test
@@ -946,19 +934,30 @@ t_test <- t.test(results$per,
 print(t_test)
 
 ############################################################
-# 🔟 Summary Table
+# 🔟 Effect Size (Cohen's d)
 ############################################################
 
-summary_stats <- data.frame(
-  Model=colnames(results),
-  Mean_Reward=colMeans(results),
-  SD=apply(results,2,sd)
+cohen_d <- function(x, y){
+  pooled_sd <- sqrt((sd(x)^2 + sd(y)^2)/2)
+  (mean(x) - mean(y)) / pooled_sd
+}
+
+d_entropy <- cohen_d(results$entropy, results$uniform)
+d_per <- cohen_d(results$per, results$uniform)
+
+effect_df <- data.frame(
+  Method=c("Entropy vs Uniform","PER vs Uniform"),
+  EffectSize=c(d_entropy, d_per)
 )
 
-summary_stats %>%
-  kable(digits=3,
-        caption="DQN Performance Comparison") %>%
-  kable_styling()
+ggplot(effect_df,
+       aes(Method, EffectSize))+
+  geom_bar(stat="identity", fill="steelblue", width=0.5)+
+  geom_hline(yintercept=0, linetype="dashed")+
+  theme_classic(base_size=14)+
+  labs(title="Effect Size (Cohen's d)",
+       y="Effect Size")
+
 
 
 ############################################################

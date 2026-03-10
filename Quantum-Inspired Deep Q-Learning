@@ -528,9 +528,9 @@ set.seed(123)
 T_steps <- 10
 n <- 500
 
-# --- Load Wine Quality Dataset ---
-wine_url <- "https://archive.ics.uci.edu/ml/machine-learning-databases/wine-quality/winequality-red.csv"
-wine <- fread(wine_url, sep = ";")
+# Load Wine Quality Red Data
+# Dataset: https://archive.ics.uci.edu/ml/datasets/wine+quality
+wine <- fread("winequality-red.csv", sep=";") 
 
 p <- ncol(wine)
 

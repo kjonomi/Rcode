@@ -1,6 +1,200 @@
 # March 12 2026
+
 ############################################################
 # LIBRARIES
+############################################################
+library(keras)
+library(tensorflow)
+library(tidyverse)
+library(lubridate)
+library(copula)
+library(purrr)
+library(leaflet)
+library(dplyr)
+
+############################################################
+# DOWNLOAD & PREPROCESS CHICAGO CRIME DATA
+############################################################
+endpoint <- "https://data.cityofchicago.org/resource/ijzp-q8t2.csv?$limit=200000"
+crime_raw <- read_csv(endpoint)
+
+crime <- crime_raw %>%
+  filter(!is.na(longitude), !is.na(latitude)) %>%
+  mutate(
+    Date = as.POSIXct(date, tz = "UTC"),
+    Year = lubridate::year(Date),
+    Hour = lubridate::hour(Date),
+    Day = lubridate::wday(Date, label = TRUE)
+  ) %>%
+  filter(Year == 2025) %>%
+  select(Date, Hour, Day, Longitude = longitude, Latitude = latitude, PrimaryType = primary_type)
+
+crime_scaled <- crime %>%
+  mutate(
+    X = scales::rescale(Longitude, to = c(0, 2)),
+    Y = scales::rescale(Latitude, to = c(0, 2))
+  )
+
+# Top 10 densest crime spots as obstacles
+hotspots <- crime_scaled %>%
+  mutate(Xr = round(X, 1), Yr = round(Y, 1)) %>%
+  count(Xr, Yr, sort = TRUE) %>%
+  head(10) %>%
+  mutate(coord = map2(Xr, Yr, ~c(.x, .y))) %>%
+  pull(coord)
+
+############################################################
+# ENVIRONMENT
+############################################################
+env_bounds <- c(0, 2)
+goal <- c(1.5, 1.5)
+goal_threshold <- 0.8
+
+is_in_obstacle <- function(pos) {
+  any(sapply(hotspots, function(o) sum((pos - o)^2) < 0.02))
+}
+
+env_step_2d <- function(state, action, step_size = 0.2) {
+  next_state <- state + step_size * tanh(action)
+  next_state <- pmax(env_bounds[1], pmin(env_bounds[2], next_state))
+  
+  if (is_in_obstacle(next_state)) {
+    reward <- -1; done <- TRUE
+  } else if (sum((next_state - goal)^2) < goal_threshold^2) {
+    reward <- 2; done <- TRUE
+  } else {
+    reward <- -0.01 + 0.05 * (1 - sqrt(sum((next_state - goal)^2)) / 2)
+    done <- FALSE
+  }
+  
+  list(state = next_state, reward = reward, done = done)
+}
+
+############################################################
+# STATE ENCODING & COPULA
+############################################################
+phase_embed <- function(state) {
+  sin_enc <- sin(state * pi)
+  cos_enc <- cos(state * pi)
+  c(state, sin_enc, cos_enc)
+}
+
+entangled_state <- function(state, other_states) {
+  avg_other <- colMeans(do.call(rbind, other_states))
+  phase_embed((state + avg_other) / 2)
+}
+
+copula_transform <- function(actions_matrix) {
+  apply(actions_matrix, 2, rank) / (nrow(actions_matrix) + 1)
+}
+
+############################################################
+# ACTOR & CRITIC MODELS
+############################################################
+define_actor_model <- function(input_dim) {
+  keras_model_sequential() %>%
+    layer_dense(16, activation = 'relu', input_shape = input_dim) %>%
+    layer_dense(2, activation = 'tanh') %>%
+    compile(optimizer = optimizer_adam(0.01), loss = 'mse')
+}
+
+define_critic_model <- function(input_dim) {
+  keras_model_sequential() %>%
+    layer_dense(32, activation = 'relu', input_shape = input_dim) %>%
+    layer_dense(16, activation = 'relu') %>%
+    layer_dense(1) %>%
+    compile(optimizer = optimizer_adam(0.001), loss = 'mse')
+}
+
+############################################################
+# SIMULATION FUNCTION (WITH COPULA & ENTANGLEMENT TOGGLE)
+############################################################
+run_simulation <- function(n_agents = 6,
+                           use_copula = TRUE,
+                           use_entanglement = TRUE,
+                           max_steps = 300) {
+  
+  set.seed(42)
+  input_dim <- length(phase_embed(c(0,0)))
+  
+  actors <- replicate(n_agents, define_actor_model(input_dim), simplify = FALSE)
+  critic <- define_critic_model(input_dim + 2)
+  
+  # Initialize agents
+  agents <- lapply(1:n_agents, function(i) runif(2, 0, 1))
+  total_rewards <- rep(0, n_agents)
+  done_flags <- rep(FALSE, n_agents)
+  
+  for (t in 1:max_steps) {
+    
+    # --- State embedding ---
+    states_embed <- lapply(seq_along(agents), function(i) {
+      if (use_entanglement) {
+        entangled_state(agents[[i]], agents[-i])
+      } else {
+        phase_embed(agents[[i]])
+      }
+    })
+    
+    # --- Actor predictions ---
+    actions <- lapply(seq_along(actors), function(i) {
+      as.numeric(predict(actors[[i]], matrix(states_embed[[i]], nrow = 1)))
+    })
+    
+    actions_matrix <- do.call(rbind, actions)
+    
+    # --- Copula dependence ---
+    if (use_copula) {
+      actions_matrix <- copula_transform(actions_matrix)
+      actions_matrix <- 2*actions_matrix - 1
+    }
+    
+    actions_list <- split(actions_matrix, seq(nrow(actions_matrix)))
+    
+    # --- Step environment ---
+    results <- lapply(seq_along(agents), function(i) {
+      env_step_2d(agents[[i]], actions_list[[i]])
+    })
+    
+    # --- Update agents & rewards ---
+    for (i in seq_along(agents)) {
+      agents[[i]] <- results[[i]]$state
+      total_rewards[i] <- total_rewards[i] + results[[i]]$reward
+      done_flags[i] <- done_flags[i] || results[[i]]$done
+    }
+    
+    # --- Shared reward for critic ---
+    shared_reward <- max(sapply(results, function(r) r$reward))
+    for (i in seq_along(actors)) {
+      critic_input <- c(states_embed[[i]], actions_list[[i]])
+      critic %>% fit(matrix(critic_input, nrow = 1), matrix(shared_reward, ncol = 1), verbose = 0)
+    }
+    
+    if (all(done_flags)) break
+  }
+  
+  mean(total_rewards)
+}
+
+############################################################
+# ABLATION STUDY
+############################################################
+n_trials <- 20
+
+reward_copula <- replicate(n_trials, run_simulation(use_copula = TRUE, use_entanglement = TRUE))
+reward_no_copula <- replicate(n_trials, run_simulation(use_copula = FALSE, use_entanglement = TRUE))
+reward_baseline <- replicate(n_trials, run_simulation(use_copula = FALSE, use_entanglement = FALSE))
+
+results <- tibble(
+  Model = c("Copula Model", "No Copula", "Baseline"),
+  Mean_Reward = c(mean(reward_copula), mean(reward_no_copula), mean(reward_baseline)),
+  SD = c(sd(reward_copula), sd(reward_no_copula), sd(reward_baseline))
+)
+
+print(results)
+
+############################################################
+# LIBRARIES (Simulation Study)
 ############################################################
 library(keras)
 library(tensorflow)

@@ -194,6 +194,219 @@ results <- tibble(
 print(results)
 
 ############################################################
+# TRAJECTORY SIMULATION FUNCTION (RETURN AGENT PATHS)
+############################################################
+run_simulation_trajectories <- function(n_agents = 6,
+                                        use_copula = TRUE,
+                                        use_entanglement = TRUE,
+                                        max_steps = 300) {
+  
+  set.seed(42)
+  input_dim <- length(phase_embed(c(0,0)))
+  
+  actors <- replicate(n_agents, define_actor_model(input_dim), simplify = FALSE)
+  critic <- define_critic_model(input_dim + 2)
+  
+  # Initialize agents
+  agents <- lapply(1:n_agents, function(i) runif(2, 0, 1))
+  trajectories <- lapply(agents, function(start) matrix(start, nrow = 1))
+  done_flags <- rep(FALSE, n_agents)
+  total_rewards <- rep(0, n_agents)
+  
+  for (t in 1:max_steps) {
+    
+    # State embeddings
+    states_embed <- lapply(seq_along(agents), function(i) {
+      if (use_entanglement) {
+        entangled_state(agents[[i]], agents[-i])
+      } else {
+        phase_embed(agents[[i]])
+      }
+    })
+    
+    # Actor predictions
+    actions <- lapply(seq_along(actors), function(i) {
+      as.numeric(predict(actors[[i]], matrix(states_embed[[i]], nrow = 1)))
+    })
+    
+    actions_matrix <- do.call(rbind, actions)
+    
+    # Copula transform
+    if (use_copula) {
+      actions_matrix <- copula_transform(actions_matrix)
+      actions_matrix <- 2*actions_matrix - 1
+    }
+    
+    actions_list <- split(actions_matrix, seq(nrow(actions_matrix)))
+    
+    # Step environment
+    results <- lapply(seq_along(agents), function(i) {
+      env_step_2d(agents[[i]], actions_list[[i]])
+    })
+    
+    # Update agents & trajectories
+    for (i in seq_along(agents)) {
+      agents[[i]] <- results[[i]]$state
+      trajectories[[i]] <- rbind(trajectories[[i]], agents[[i]])
+      total_rewards[i] <- total_rewards[i] + results[[i]]$reward
+      done_flags[i] <- done_flags[i] || results[[i]]$done
+    }
+    
+    # Shared critic reward
+    shared_reward <- max(sapply(results, function(r) r$reward))
+    for (i in seq_along(actors)) {
+      critic_input <- c(states_embed[[i]], actions_list[[i]])
+      critic %>% fit(matrix(critic_input,nrow=1), matrix(shared_reward,ncol=1), verbose=0)
+    }
+    
+    if (all(done_flags)) break
+  }
+  
+  list(trajectories = trajectories, total_rewards = total_rewards)
+}
+
+############################################################
+# RESCALE FUNCTION BACK TO LONG/LAT
+############################################################
+rescale_back <- function(scaled_vals, original_min, original_max){
+  original_min + (scaled_vals/2) * (original_max - original_min)
+}
+
+############################################################
+# RUN & VISUALIZE TRAJECTORIES ON MAP
+############################################################
+visualize_trajectories <- function(sim_result, title = "Multi-Agent Paths"){
+  
+  trajectories <- sim_result$trajectories
+  n_agents <- length(trajectories)
+  
+  agent_trajs_longlat <- lapply(trajectories, function(traj){
+    lon <- rescale_back(traj[,1], min(crime$Longitude), max(crime$Longitude))
+    lat <- rescale_back(traj[,2], min(crime$Latitude), max(crime$Latitude))
+    data.frame(Longitude = lon, Latitude = lat)
+  })
+  
+  traj_df <- bind_rows(lapply(seq_along(agent_trajs_longlat), function(i){
+    df <- agent_trajs_longlat[[i]]
+    df$Agent <- paste0("Agent_", i)
+    df$Step <- seq_len(nrow(df))
+    df
+  }))
+  
+  # Top 10 Hotspots
+  hotspot_points <- crime_scaled %>%
+    mutate(Xr = round(X,1), Yr = round(Y,1)) %>%
+    count(Xr, Yr, sort = TRUE) %>%
+    head(10) %>%
+    mutate(
+      Longitude = rescale_back(Xr, min(crime$Longitude), max(crime$Longitude)),
+      Latitude = rescale_back(Yr, min(crime$Latitude), max(crime$Latitude))
+    )
+  
+  agent_colors <- rainbow(n_agents)
+  
+  map <- leaflet() %>%
+    addTiles() %>%
+    addCircleMarkers(data = crime, lng = ~Longitude, lat = ~Latitude,
+                     radius = 1, color = "gray", opacity = 0.3, fillOpacity = 0.1)
+  
+  # Plot agent paths
+  for(i in 1:n_agents){
+    map <- map %>% addPolylines(data = traj_df %>% filter(Agent == paste0("Agent_", i)),
+                                lng = ~Longitude, lat = ~Latitude,
+                                color = agent_colors[i], weight = 4, opacity = 1)
+  }
+  
+  # Start & goal points
+  map <- map %>%
+    addCircleMarkers(data = traj_df %>% group_by(Agent) %>% slice(1),
+                     lng = ~Longitude, lat = ~Latitude,
+                     color = ~agent_colors[as.numeric(factor(Agent))],
+                     radius = 5, label = ~Agent) %>%
+    addCircleMarkers(lng = rescale_back(goal[1], min(crime$Longitude), max(crime$Longitude)),
+                     lat = rescale_back(goal[2], min(crime$Latitude), max(crime$Latitude)),
+                     color = "green", radius = 7, label = "Goal")
+  
+  # Hotspots
+  map <- map %>% addCircleMarkers(data = hotspot_points,
+                                  lng = ~Longitude, lat = ~Latitude,
+                                  radius = 8, color = "red", fillOpacity = 0.5,
+                                  label = ~paste0("Hotspot: ", n))
+  
+  map
+}
+
+############################################################
+# EXAMPLES: RUN VISUALIZATION
+############################################################
+sim_copula <- run_simulation_trajectories(use_copula = TRUE, use_entanglement = TRUE)
+sim_no_copula <- run_simulation_trajectories(use_copula = FALSE, use_entanglement = TRUE)
+sim_baseline <- run_simulation_trajectories(use_copula = FALSE, use_entanglement = FALSE)
+
+# Interactive leaflet maps
+visualize_trajectories(sim_copula, title = "Copula Model")
+visualize_trajectories(sim_no_copula, title = "No Copula")
+visualize_trajectories(sim_baseline, title = "Baseline Model")
+
+############################################################
+# FUNCTION TO COMPUTE COORDINATION METRIC
+############################################################
+compute_coordination <- function(trajectories){
+  n_agents <- length(trajectories)
+  n_steps <- min(sapply(trajectories, nrow))
+  
+  # Compute average pairwise distance per step
+  avg_distances <- sapply(1:n_steps, function(t){
+    states <- sapply(trajectories, function(traj) traj[t, ])
+    # states is 2 x n_agents
+    combs <- combn(n_agents, 2)
+    mean(apply(combs, 2, function(pair){
+      sum((states[, pair[1]] - states[, pair[2]])^2)^0.5
+    }))
+  })
+  
+  mean(avg_distances)  # lower = more coordinated
+}
+
+############################################################
+# RUN SIMULATIONS AND COLLECT METRICS
+############################################################
+n_trials <- 10  # number of trials per model
+models <- list(
+  "Copula Model" = list(use_copula = TRUE, use_entanglement = TRUE),
+  "No Copula" = list(use_copula = FALSE, use_entanglement = TRUE),
+  "Baseline" = list(use_copula = FALSE, use_entanglement = FALSE)
+)
+
+summary_results <- tibble()
+
+for (model_name in names(models)) {
+  cfg <- models[[model_name]]
+  rewards <- numeric(n_trials)
+  coordination <- numeric(n_trials)
+  
+  for (i in 1:n_trials) {
+    sim <- run_simulation_trajectories(use_copula = cfg$use_copula,
+                                       use_entanglement = cfg$use_entanglement)
+    rewards[i] <- mean(sim$total_rewards)
+    coordination[i] <- compute_coordination(sim$trajectories)
+  }
+  
+  summary_results <- summary_results %>%
+    bind_rows(tibble(
+      Model = model_name,
+      Mean_Reward = mean(rewards),
+      SD_Reward = sd(rewards),
+      Mean_Coordination = mean(coordination),
+      SD_Coordination = sd(coordination)
+    ))
+}
+
+############################################################
+# PRINT SUMMARY TABLE
+############################################################
+print(summary_results)
+############################################################
 # LIBRARIES (Simulation Study)
 ############################################################
 library(keras)

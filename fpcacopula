@@ -263,6 +263,7 @@ reconstructed_log <- fpc_forecast %*% t(fpca_res$phi[, 1:3])
 # 🔴 Transform back to volatility
 reconstructed <- exp(reconstructed_log)
 
+par(mfrow=c(1,1))
 plot(fpca_res$workGrid, reconstructed,
      type = "l", col = "darkred", lwd = 2,
      main = "Forecasted Intraday Log-Volatility Curve",

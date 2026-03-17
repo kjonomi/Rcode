@@ -108,8 +108,8 @@ reconstructed <- fpc_forecast %*% t(fpca_res$phi[, 1:3])
 
 plot(fpca_res$workGrid, reconstructed,
      type = "l", col = "darkred", lwd = 2,
-     main = "Forecasted Intraday Log-Volatility Curve",
-     xlab = "Time", ylab = "Log-Volatility")
+     main = "Forecasted Intraday Volatility Curve",
+     xlab = "Time", ylab = "Volatility")
 
 # ---- PART E: CLUSTERING USING VINE COPULA DISTANCES ----
 U_data <- pobs(scores[, 1:3])  # Uniform pseudo-observations

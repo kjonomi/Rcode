@@ -96,22 +96,6 @@ preds <- predict(rf_model, test_data)
 cat("Accuracy: ", mean(preds == test_data$Regime), "\n")
 table(Predicted = preds, Actual = test_data$Regime)
 
-# ---- PART D: FORECASTING FPC SCORES & RECONSTRUCTION ----
-var_data <- as.data.frame(scores[, 1:3])
-colnames(var_data) <- c("FPC1", "FPC2", "FPC3")
-var_model <- VAR(var_data, p = 1, type = "const")
-forecast_scores <- predict(var_model, n.ahead = 1)$fcst
-fpc_forecast <- c(forecast_scores$FPC1[1],
-                  forecast_scores$FPC2[1],
-                  forecast_scores$FPC3[1])
-reconstructed <- fpc_forecast %*% t(fpca_res$phi[, 1:3])
-reconstructed <- pmax(reconstructed, 0)
-
-plot(fpca_res$workGrid, reconstructed,
-     type = "l", col = "darkred", lwd = 2,
-     main = "Forecasted Intraday Volatility Curve",
-     xlab = "Time", ylab = "Volatility")
-
 # ---- PART E: CLUSTERING USING VINE COPULA DISTANCES ----
 U_data <- pobs(scores[, 1:3])  # Uniform pseudo-observations
 
@@ -243,3 +227,44 @@ for (k in 1:num_clusters) {
 
 # Print the summary table
 print(hc_summary)
+
+
+# ---- FORECASTING FPC SCORES & RECONSTRUCTION ----
+data <- read.csv("KOSPI_15min_RV_data_updated.csv")
+data_matrix <- as.matrix(data)
+
+# 🔴 ADD: log-transform (avoid log(0))
+data_matrix <- log(data_matrix + 1e-6)
+
+data_matrix_t <- t(data_matrix)  # Rows = time, Cols = days
+
+Lt <- replicate(ncol(data_matrix_t), time_numeric, simplify = FALSE)
+Ly <- lapply(1:ncol(data_matrix_t), function(i) data_matrix_t[, i])
+
+fpca_res <- FPCA(Ly = Ly, Lt = Lt,
+                 list(dataType = 'Dense', maxK = 5, nRegGrid = 51))
+
+scores <- fpca_res$xiEst
+
+var_data <- as.data.frame(scores[, 1:3])
+colnames(var_data) <- c("FPC1", "FPC2", "FPC3")
+
+var_model <- VAR(var_data, p = 1, type = "const")
+
+forecast_scores <- predict(var_model, n.ahead = 1)$fcst
+
+fpc_forecast <- c(forecast_scores$FPC1[1],
+                  forecast_scores$FPC2[1],
+                  forecast_scores$FPC3[1])
+
+# 🔴 Reconstruction is now on LOG scale
+reconstructed_log <- fpc_forecast %*% t(fpca_res$phi[, 1:3])
+
+# 🔴 Transform back to volatility
+reconstructed <- exp(reconstructed_log)
+
+plot(fpca_res$workGrid, reconstructed,
+     type = "l", col = "darkred", lwd = 2,
+     main = "Forecasted Intraday Log-Volatility Curve",
+     xlab = "Time", ylab = "Log-Volatility")
+

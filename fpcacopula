@@ -105,6 +105,7 @@ fpc_forecast <- c(forecast_scores$FPC1[1],
                   forecast_scores$FPC2[1],
                   forecast_scores$FPC3[1])
 reconstructed <- fpc_forecast %*% t(fpca_res$phi[, 1:3])
+reconstructed <- pmax(reconstructed, 0)
 
 plot(fpca_res$workGrid, reconstructed,
      type = "l", col = "darkred", lwd = 2,

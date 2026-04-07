@@ -1,0 +1,761 @@
+# ==========================================================
+# 0️⃣ Libraries
+# ==========================================================
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(keras)
+library(tensorflow)
+library(umap)
+library(Rtsne)
+library(vegan)
+library(reshape2)
+library(grf)
+
+set.seed(123)
+
+# ==========================================================
+# 1️⃣ SIMULATED DATA (HIGH CORRELATION)
+# ==========================================================
+n <- 1000
+p <- 30
+
+Z <- matrix(rnorm(n * 3), n, 3)
+
+X <- Z %*% matrix(rnorm(3 * p), 3, p) +
+  matrix(rnorm(n * p, 0, 0.88), n, p)
+
+X <- scale(X)
+colnames(X) <- paste0("f", 1:p)
+
+ps_true <- plogis(X[,1] - 0.5 * X[,2] + 0.3 * X[,3])
+T <- rbinom(n, 1, ps_true)
+
+true_cate <- 2 * sin(X[,1]) + 0.5 * X[,2]^2 - X[,3]
+
+Y <- true_cate * T + (1 - T) * (-true_cate) + rnorm(n)
+
+# ==========================================================
+# 2️⃣ MANIFOLD FEATURES
+# ==========================================================
+X_scaled <- scale(X)
+
+umap_fit <- umap(X_scaled)
+tsne_fit <- Rtsne(X_scaled, dims=2, perplexity=30, verbose=FALSE)
+iso_fit <- isomap(dist(X_scaled), k=10, ndim=2)
+
+X_full <- cbind(
+  X_scaled,
+  umap_fit$layout,
+  tsne_fit$Y,
+  scores(iso_fit)
+)
+
+# ==========================================================
+# 3️⃣ COPULA TRANSFORM
+# ==========================================================
+copula_transform <- function(X){
+  n <- nrow(X)
+  apply(X, 2, function(col) rank(col)/(n+1))
+}
+
+# ==========================================================
+# 4️⃣ PROPENSITY ESTIMATION
+# ==========================================================
+estimate_ps <- function(X, T){
+  df <- data.frame(T=T, X)
+  model <- glm(T ~ ., data=df, family=binomial)
+  ps <- predict(model, type="response")
+  pmin(pmax(ps, 0.01), 0.99)
+}
+
+# ==========================================================
+# 5️⃣ TENSOR BUILDER
+# ==========================================================
+build_tensor_matrix <- function(X, T){
+  
+  X_tensor <- tf$constant(X, dtype=tf$float32)
+  T_tensor <- tf$constant(T, dtype=tf$float32)
+  
+  T_tensor <- tf$reshape(T_tensor, shape = c(-1L, 1L))
+  T_rep <- tf$tile(T_tensor, multiples = c(1L, ncol(X)))
+  
+  interaction <- X_tensor * T_rep
+  
+  tf$concat(list(X_tensor, T_rep, interaction), axis=1L)
+}
+
+# ==========================================================
+# 6️⃣ MODEL
+# ==========================================================
+build_model <- function(input_dim){
+  
+  inputs <- layer_input(shape = input_dim)
+  
+  x <- inputs %>%
+    layer_dense(256, activation="relu") %>%
+    layer_dense(128, activation="relu") %>%
+    layer_dropout(0.3) %>%
+    layer_dense(64, activation="relu")
+  
+  outputs <- layer_dense(x, 1)
+  
+  model <- keras_model(inputs, outputs)
+  
+  model %>% compile(
+    optimizer = optimizer_adam(0.001),
+    loss = "mse"
+  )
+  
+  model
+}
+
+# ==========================================================
+# 7️⃣ PREDICTION
+# ==========================================================
+predict_tensor_fast <- function(X, T, model){
+  X_tensor <- build_tensor_matrix(X, T)
+  as.vector(model %>% predict(X_tensor, verbose=0))
+}
+
+# ==========================================================
+# 8️⃣ CATE ESTIMATION
+# ==========================================================
+estimate_cate <- function(X, model){
+  
+  T0 <- matrix(0, nrow=nrow(X), ncol=1)
+  T1 <- matrix(1, nrow=nrow(X), ncol=1)
+  
+  y0 <- predict_tensor_fast(X, T0, model)
+  y1 <- predict_tensor_fast(X, T1, model)
+  
+  y1 - y0
+}
+
+# ==========================================================
+# 9️⃣ METRICS
+# ==========================================================
+compute_metrics <- function(est, truth){
+  bias <- mean(est - truth)
+  rmse <- sqrt(mean((est - truth)^2))
+  se <- sd(est - truth)/sqrt(length(est))
+  
+  lower <- est - 1.96 * se
+  upper <- est + 1.96 * se
+  
+  coverage <- mean((truth >= lower) & (truth <= upper))
+  
+  c(Bias=bias, RMSE=rmse, Coverage=coverage)
+}
+
+# ==========================================================
+# 🔟 IPS & DR
+# ==========================================================
+compute_ips <- function(Y, T, ps, cate_hat){
+  pi_hat <- ifelse(cate_hat > 0, 1, 0)
+  
+  mean((T == pi_hat) * Y / (T * ps + (1 - T) * (1 - ps)))
+}
+
+compute_dr <- function(Y, T, ps, cate_hat, mu0, mu1){
+  
+  pi_hat <- ifelse(cate_hat > 0, 1, 0)
+  
+  mean(
+    (mu1 - mu0) * pi_hat +
+      (T == pi_hat) * (Y - (T * mu1 + (1 - T) * mu0)) /
+      (T * ps + (1 - T) * (1 - ps))
+  )
+}
+
+# ==========================================================
+# 1️⃣1️⃣ EXPERIMENT
+# ==========================================================
+run_experiment <- function(seed){
+  
+  set.seed(seed)
+  
+  idx <- sample(1:n, 0.8*n)
+  
+  X_train <- X_full[idx,]
+  X_test  <- X_full[-idx,]
+  
+  T_train <- matrix(T[idx], ncol=1)
+  T_test  <- T[-idx]
+  
+  Y_train <- Y[idx]
+  Y_test  <- Y[-idx]
+  
+  ps_train <- estimate_ps(X_train, T[idx])
+  ps_test  <- estimate_ps(X_test, T_test)
+  
+  # Copula
+  X_train_cop <- copula_transform(X_train)
+  X_test_cop  <- copula_transform(X_test)
+  
+  # Tensor
+  X_tensor <- build_tensor_matrix(X_train, T_train)
+  X_tensor_cop <- build_tensor_matrix(X_train_cop, T_train)
+  
+  # Models
+  m1 <- build_model(ncol(X_tensor))
+  m2 <- build_model(ncol(X_tensor_cop))
+  
+  m1 %>% fit(X_tensor, Y_train, epochs=10, batch_size=64, verbose=0)
+  m2 %>% fit(X_tensor_cop, Y_train, epochs=10, batch_size=64, verbose=0)
+  
+  # CATE
+  cate_raw <- estimate_cate(X_test, m1)
+  cate_cop <- estimate_cate(X_test_cop, m2)
+  
+  # Potential outcomes
+  mu0_raw <- predict_tensor_fast(X_test, matrix(0, nrow(X_test),1), m1)
+  mu1_raw <- predict_tensor_fast(X_test, matrix(1, nrow(X_test),1), m1)
+  
+  mu0_cop <- predict_tensor_fast(X_test_cop, matrix(0, nrow(X_test),1), m2)
+  mu1_cop <- predict_tensor_fast(X_test_cop, matrix(1, nrow(X_test),1), m2)
+  
+  truth <- true_cate[-idx]
+  
+  # Metrics
+  metrics_raw <- compute_metrics(cate_raw, truth)
+  metrics_cop <- compute_metrics(cate_cop, truth)
+  
+  # IPS / DR
+  ips_raw <- compute_ips(Y_test, T_test, ps_test, cate_raw)
+  ips_cop <- compute_ips(Y_test, T_test, ps_test, cate_cop)
+  
+  dr_raw <- compute_dr(Y_test, T_test, ps_test, cate_raw, mu0_raw, mu1_raw)
+  dr_cop <- compute_dr(Y_test, T_test, ps_test, cate_cop, mu0_cop, mu1_cop)
+  
+  rbind(
+    data.frame(Model="No Copula",
+               Bias=metrics_raw[1],
+               RMSE=metrics_raw[2],
+               Coverage=metrics_raw[3],
+               IPS=ips_raw,
+               DR=dr_raw),
+    
+    data.frame(Model="Copula",
+               Bias=metrics_cop[1],
+               RMSE=metrics_cop[2],
+               Coverage=metrics_cop[3],
+               IPS=ips_cop,
+               DR=dr_cop)
+  )
+}
+
+# ==========================================================
+# 1️⃣2️⃣ MONTE CARLO
+# ==========================================================
+results <- lapply(1:1000, run_experiment)
+results_df <- do.call(rbind, results)
+
+# ==========================================================
+# 1️⃣3️⃣ SUMMARY (MEAN + SD)
+# ==========================================================
+summary_results <- results_df %>%
+  group_by(Model) %>%
+  summarise(
+    Bias_mean = mean(Bias),
+    Bias_sd   = sd(Bias),
+    
+    RMSE_mean = mean(RMSE),
+    RMSE_sd   = sd(RMSE),
+    
+    IPS_mean  = mean(IPS),
+    IPS_sd    = sd(IPS),
+    
+    DR_mean   = mean(DR),
+    DR_sd     = sd(DR),
+    
+    Coverage = mean(Coverage)
+  )
+
+print(summary_results)
+
+# ==========================================================
+# 📊 PLOTS
+# ==========================================================
+
+# RMSE
+ggplot(results_df, aes(x=Model, y=RMSE, fill=Model)) +
+  geom_boxplot() +
+  theme_minimal() +
+  ggtitle("RMSE Comparison")
+
+# Bias
+ggplot(results_df, aes(x=Model, y=Bias, fill=Model)) +
+  geom_boxplot() +
+  theme_minimal() +
+  ggtitle("Bias Comparison")
+
+# IPS
+ggplot(results_df, aes(x=Model, y=IPS, fill=Model)) +
+  geom_boxplot() +
+  theme_minimal() +
+  ggtitle("IPS Comparison")
+
+# DR
+ggplot(results_df, aes(x=Model, y=DR, fill=Model)) +
+  geom_boxplot() +
+  theme_minimal() +
+  ggtitle("DR Comparison")
+
+# SD comparison
+sd_df <- summary_results %>%
+  dplyr::select(Model, RMSE_sd, IPS_sd, DR_sd) %>%
+  reshape2::melt(id.vars="Model")
+
+ggplot(sd_df, aes(x=Model, y=value, fill=variable)) +
+  geom_bar(stat="identity", position="dodge") +
+  theme_minimal() +
+  ggtitle("Standard Deviation Comparison")
+
+
+copula_summary <- results_df %>%
+  filter(Model == "Copula") %>%
+  summarise(
+    Bias_mean = mean(Bias),
+    Bias_sd   = sd(Bias),
+    
+    RMSE_mean = mean(RMSE),
+    RMSE_sd   = sd(RMSE),
+    
+    IPS_mean  = mean(IPS),
+    IPS_sd    = sd(IPS),
+    
+    DR_mean   = mean(DR),
+    DR_sd     = sd(DR),
+    
+    Coverage_mean = mean(Coverage),
+    Coverage_sd   = sd(Coverage)
+  )
+
+print(copula_summary)
+
+nocopula_summary <- results_df %>%
+  filter(Model == "No Copula") %>%
+  summarise(
+    Bias_mean = mean(Bias),
+    Bias_sd   = sd(Bias),
+    
+    RMSE_mean = mean(RMSE),
+    RMSE_sd   = sd(RMSE),
+    
+    IPS_mean  = mean(IPS),
+    IPS_sd    = sd(IPS),
+    
+    DR_mean   = mean(DR),
+    DR_sd     = sd(DR),
+    
+    Coverage_mean = mean(Coverage),
+    Coverage_sd   = sd(Coverage)
+  )
+
+print(nocopula_summary)
+
+summary_table <- results_df %>%
+  group_by(Model) %>%
+  summarise(
+    Bias_mean = mean(Bias), Bias_sd = sd(Bias),
+    RMSE_mean = mean(RMSE), RMSE_sd = sd(RMSE),
+    IPS_mean  = mean(IPS),  IPS_sd  = sd(IPS),
+    DR_mean   = mean(DR),   DR_sd   = sd(DR),
+    Coverage_mean = mean(Coverage),
+    Coverage_sd   = sd(Coverage)
+  )
+
+print(summary_table)
+
+format_summary <- function(df){
+  df %>%
+    group_by(Model) %>%
+    summarise(
+      Bias = sprintf("%.3f (%.3f)", mean(Bias), sd(Bias)),
+      RMSE = sprintf("%.3f (%.3f)", mean(RMSE), sd(RMSE)),
+      IPS  = sprintf("%.3f (%.3f)", mean(IPS), sd(IPS)),
+      DR   = sprintf("%.3f (%.3f)", mean(DR), sd(DR)),
+      Coverage = sprintf("%.3f (%.3f)", mean(Coverage), sd(Coverage))
+    )
+}
+
+formatted_table <- format_summary(results_df)
+print(formatted_table)
+
+five_num_summary <- results_df %>%
+  group_by(Model) %>%
+  summarise(
+    # Bias
+    Bias_min = min(Bias),
+    Bias_Q1  = quantile(Bias, 0.25),
+    Bias_med = median(Bias),
+    Bias_Q3  = quantile(Bias, 0.75),
+    Bias_max = max(Bias),
+    Bias_IQR = IQR(Bias),
+    
+    # RMSE
+    RMSE_min = min(RMSE),
+    RMSE_Q1  = quantile(RMSE, 0.25),
+    RMSE_med = median(RMSE),
+    RMSE_Q3  = quantile(RMSE, 0.75),
+    RMSE_max = max(RMSE),
+    RMSE_IQR = IQR(RMSE),
+    
+    # IPS
+    IPS_min = min(IPS),
+    IPS_Q1  = quantile(IPS, 0.25),
+    IPS_med = median(IPS),
+    IPS_Q3  = quantile(IPS, 0.75),
+    IPS_max = max(IPS),
+    IPS_IQR = IQR(IPS),
+    
+    # DR
+    DR_min = min(DR),
+    DR_Q1  = quantile(DR, 0.25),
+    DR_med = median(DR),
+    DR_Q3  = quantile(DR, 0.75),
+    DR_max = max(DR),
+    DR_IQR = IQR(DR),
+    
+    # Coverage
+    Cov_min = min(Coverage),
+    Cov_Q1  = quantile(Coverage, 0.25),
+    Cov_med = median(Coverage),
+    Cov_Q3  = quantile(Coverage, 0.75),
+    Cov_max = max(Coverage),
+    Cov_IQR = IQR(Coverage)
+  )
+
+print(five_num_summary)
+
+library(tidyr)
+
+summary_long <- results_df %>%
+  pivot_longer(cols = -Model, names_to = "Metric", values_to = "Value") %>%
+  group_by(Model, Metric) %>%
+  summarise(
+    Min = min(Value),
+    Q1  = quantile(Value, 0.25),
+    Median = median(Value),
+    Q3  = quantile(Value, 0.75),
+    Max = max(Value),
+    Mean = mean(Value),
+    SD   = sd(Value),
+    IQR  = IQR(Value),
+    .groups = "drop"
+  )
+
+print(summary_long)
+
+
+# ==========================================================
+# 0️⃣ Libraries
+# ==========================================================
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(keras)
+library(tensorflow)
+library(umap)
+library(Rtsne)
+library(grf)
+library(tidyr)
+
+# Optional: disable GPU warning
+Sys.setenv(CUDA_VISIBLE_DEVICES = "-1")
+
+set.seed(123)
+
+# ==========================================================
+# 1️⃣ LOAD DATA
+# ==========================================================
+data <- fread("criteo-research-uplift-v2.1.csv.gz")
+
+# Downsample
+data <- data[sample(.N, 50000)]
+
+# ==========================================================
+# 2️⃣ VARIABLES
+# ==========================================================
+Y <- data$conversion
+T <- data$treatment
+
+X <- as.matrix(data[, !c("conversion", "treatment"), with=FALSE])
+
+# Remove near-zero variance
+nzv <- apply(X, 2, var) > 1e-6
+X <- X[, nzv]
+
+n <- nrow(X)
+
+# ==========================================================
+# 3️⃣ FEATURE ENGINEERING
+# ==========================================================
+X_scaled <- scale(X)
+
+umap_fit <- umap(X_scaled)
+
+X_jitter <- X_scaled + matrix(rnorm(length(X_scaled), 0, 1e-6), nrow=n)
+tsne_fit <- Rtsne(X_jitter, dims=2, perplexity=30, verbose=FALSE)
+
+X_full <- cbind(
+  X_scaled,
+  umap_fit$layout,
+  tsne_fit$Y
+)
+
+# ==========================================================
+# 4️⃣ COPULA TRANSFORM
+# ==========================================================
+copula_transform <- function(X){
+  n <- nrow(X)
+  apply(X, 2, function(col) rank(col)/(n+1))
+}
+
+# ==========================================================
+# 5️⃣ PROPENSITY MODEL
+# ==========================================================
+estimate_ps <- function(X, T){
+  df <- data.frame(T=T, X)
+  model <- glm(T ~ ., data=df, family=binomial)
+  ps <- predict(model, type="response")
+  pmin(pmax(ps, 0.01), 0.99)
+}
+
+# ==========================================================
+# 6️⃣ TENSOR BUILDER
+# ==========================================================
+build_tensor_matrix <- function(X, T){
+  
+  X_tensor <- tf$constant(X, dtype=tf$float32)
+  T_tensor <- tf$constant(T, dtype=tf$float32)
+  
+  T_tensor <- tf$reshape(T_tensor, shape = c(-1L, 1L))
+  T_rep <- tf$tile(T_tensor, multiples = c(1L, ncol(X)))
+  
+  interaction <- X_tensor * T_rep
+  
+  tf$concat(list(X_tensor, T_rep, interaction), axis=1L)
+}
+
+# ==========================================================
+# 7️⃣ MODEL
+# ==========================================================
+build_model <- function(input_dim){
+  
+  inputs <- layer_input(shape = input_dim)
+  
+  x <- inputs %>%
+    layer_dense(256, activation="relu") %>%
+    layer_dropout(0.3) %>%
+    layer_dense(128, activation="relu") %>%
+    layer_dense(64, activation="relu")
+  
+  outputs <- layer_dense(x, 1)
+  
+  model <- keras_model(inputs, outputs)
+  
+  model %>% compile(
+    optimizer = optimizer_adam(0.001),
+    loss = "mse"
+  )
+  
+  model
+}
+
+# ==========================================================
+# 8️⃣ PREDICTION
+# ==========================================================
+predict_tensor_fast <- function(X, T, model){
+  X_tensor <- build_tensor_matrix(X, T)
+  as.vector(model %>% predict(X_tensor, verbose=0))
+}
+
+# ==========================================================
+# 9️⃣ CATE ESTIMATION
+# ==========================================================
+estimate_cate <- function(X, model){
+  
+  T0 <- matrix(0, nrow=nrow(X), ncol=1)
+  T1 <- matrix(1, nrow=nrow(X), ncol=1)
+  
+  y0 <- predict_tensor_fast(X, T0, model)
+  y1 <- predict_tensor_fast(X, T1, model)
+  
+  y1 - y0
+}
+
+# ==========================================================
+# 🔟 IPS & DR
+# ==========================================================
+compute_ips <- function(Y, T, ps, cate_hat){
+  pi_hat <- ifelse(cate_hat > 0, 1, 0)
+  mean((T == pi_hat) * Y / (T * ps + (1 - T) * (1 - ps)))
+}
+
+compute_dr <- function(Y, T, ps, cate_hat, mu0, mu1){
+  
+  pi_hat <- ifelse(cate_hat > 0, 1, 0)
+  
+  mean(
+    (mu1 - mu0) * pi_hat +
+      (T == pi_hat) * (Y - (T * mu1 + (1 - T) * mu0)) /
+      (T * ps + (1 - T) * (1 - ps))
+  )
+}
+
+compute_bias_rmse <- function(Y, T, ps, cate_hat){
+  
+  # IPW pseudo true effect
+  tau_ipw <- (T * Y / ps) - ((1 - T) * Y / (1 - ps))
+  
+  bias <- mean(cate_hat - tau_ipw)
+  rmse <- sqrt(mean((cate_hat - tau_ipw)^2))
+  
+  c(Bias = bias, RMSE = rmse)
+}
+
+# ==========================================================
+# 1️⃣1️⃣ EXPERIMENT
+# ==========================================================
+run_experiment <- function(seed){
+  
+  set.seed(seed)
+  
+  idx <- sample(1:n, 0.8*n)
+  
+  X_train <- X_full[idx,]
+  X_test  <- X_full[-idx,]
+  
+  T_train <- matrix(T[idx], ncol=1)
+  T_test  <- T[-idx]
+  
+  Y_train <- Y[idx]
+  Y_test  <- Y[-idx]
+  
+  # Propensity
+  ps_test <- estimate_ps(X_test, T_test)
+  
+  # Copula
+  X_train_cop <- copula_transform(X_train)
+  X_test_cop  <- copula_transform(X_test)
+  
+  # Tensor
+  X_tensor <- build_tensor_matrix(X_train, T_train)
+  X_tensor_cop <- build_tensor_matrix(X_train_cop, T_train)
+  
+  # Models
+  m1 <- build_model(ncol(X_tensor))
+  m2 <- build_model(ncol(X_tensor_cop))
+  
+  m1 %>% fit(X_tensor, Y_train, epochs=5, batch_size=128, verbose=0)
+  m2 %>% fit(X_tensor_cop, Y_train, epochs=5, batch_size=128, verbose=0)
+  
+  # CATE
+  cate_raw <- estimate_cate(X_test, m1)
+  cate_cop <- estimate_cate(X_test_cop, m2)
+  
+  # Potential outcomes
+  mu0_raw <- predict_tensor_fast(X_test, matrix(0, nrow(X_test),1), m1)
+  mu1_raw <- predict_tensor_fast(X_test, matrix(1, nrow(X_test),1), m1)
+  
+  mu0_cop <- predict_tensor_fast(X_test_cop, matrix(0, nrow(X_test),1), m2)
+  mu1_cop <- predict_tensor_fast(X_test_cop, matrix(1, nrow(X_test),1), m2)
+  
+  # IPS / DR
+  ips_raw <- compute_ips(Y_test, T_test, ps_test, cate_raw)
+  ips_cop <- compute_ips(Y_test, T_test, ps_test, cate_cop)
+  
+  dr_raw <- compute_dr(Y_test, T_test, ps_test, cate_raw, mu0_raw, mu1_raw)
+  dr_cop <- compute_dr(Y_test, T_test, ps_test, cate_cop, mu0_cop, mu1_cop)
+  
+  # 🔥 Bias + RMSE
+  metrics_raw <- compute_bias_rmse(Y_test, T_test, ps_test, cate_raw)
+  metrics_cop <- compute_bias_rmse(Y_test, T_test, ps_test, cate_cop)
+  
+  rbind(
+    data.frame(
+      Model="No Copula",
+      IPS=ips_raw,
+      DR=dr_raw,
+      Bias=metrics_raw["Bias"],
+      RMSE=metrics_raw["RMSE"]
+    ),
+    data.frame(
+      Model="Copula",
+      IPS=ips_cop,
+      DR=dr_cop,
+      Bias=metrics_cop["Bias"],
+      RMSE=metrics_cop["RMSE"]
+    )
+  )
+}
+
+
+# ==========================================================
+# 1️⃣2️⃣ MONTE CARLO
+# ==========================================================
+results <- lapply(1:100, run_experiment)
+results_df <- do.call(rbind, results)
+
+# ==========================================================
+# 1️⃣3️⃣ SUMMARY (Five-number + Mean + SD + IQR)
+# ==========================================================
+summary_full <- results_df %>%
+  pivot_longer(cols = -Model, names_to = "Metric", values_to = "Value") %>%
+  group_by(Model, Metric) %>%
+  summarise(
+    Min = min(Value),
+    Q1  = quantile(Value, 0.25),
+    Median = median(Value),
+    Q3  = quantile(Value, 0.75),
+    Max = max(Value),
+    Mean = mean(Value),
+    SD   = sd(Value),
+    IQR  = IQR(Value),
+    .groups = "drop"
+  )
+
+print(summary_full)
+
+
+# ==========================================================
+# 📊 PLOTS
+# ==========================================================
+
+
+# RMSE
+ggplot(results_df, aes(x=Model, y=RMSE, fill=Model)) +
+  geom_boxplot() +
+  theme_minimal() +
+  ggtitle("RMSE Comparison")
+
+# Bias
+ggplot(results_df, aes(x=Model, y=Bias, fill=Model)) +
+  geom_boxplot() +
+  theme_minimal() +
+  ggtitle("Bias Comparison")
+
+# IPS
+ggplot(results_df, aes(x=Model, y=IPS, fill=Model)) +
+  geom_boxplot() +
+  theme_minimal() +
+  ggtitle("IPS Policy Value Comparison")
+
+# DR
+ggplot(results_df, aes(x=Model, y=DR, fill=Model)) +
+  geom_boxplot() +
+  theme_minimal() +
+  ggtitle("DR Policy Value Comparison")
+
+# SD comparison
+sd_df <- summary_results %>%
+  dplyr::select(Model, RMSE_sd, IPS_sd, DR_sd) %>%
+  reshape2::melt(id.vars="Model")
+
+ggplot(sd_df, aes(x=Model, y=value, fill=variable)) +
+  geom_bar(stat="identity", position="dodge") +
+  theme_minimal() +
+  ggtitle("Estimator Stability (SD)")
+

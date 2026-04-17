@@ -405,7 +405,7 @@ library(grf)
 set.seed(123)
 
 # =========================================================
-# 2️⃣ LOAD / SIMULATE DATA (CRITEO SUBSAMPLE)
+# 2️⃣ LOAD DATA
 # =========================================================
 uplift_path <- "criteo-research-uplift-v2.1.csv.gz"
 criteo <- fread(uplift_path)
@@ -441,7 +441,7 @@ T_mat <- as.matrix(criteo[, .(treatment1, treatment2, treatment3, treatment4)])
 Y <- as.numeric(criteo$outcome)
 
 # =========================================================
-# 5️⃣ TRAIN / TEST SPLIT
+# 5️⃣ SPLIT
 # =========================================================
 train_idx <- sample(1:nrow(X), 0.8*nrow(X))
 
@@ -449,12 +449,8 @@ X_train <- X[train_idx,]; X_test <- X[-train_idx,]
 T_train <- T_mat[train_idx,]; T_test <- T_mat[-train_idx,]
 Y_train <- Y[train_idx]; Y_test <- Y[-train_idx]
 
-# fake oracle (paper placeholder)
 tau_true <- rep(1.5, nrow(X_test))
 
-# =========================================================
-# 6️⃣ VALIDATION SPLIT
-# =========================================================
 val_idx <- sample(1:nrow(X_train), 0.2*nrow(X_train))
 
 X_val <- X_train[val_idx,]
@@ -466,22 +462,26 @@ T_train2 <- T_train[-val_idx,]
 Y_train2 <- Y_train[-val_idx]
 
 # =========================================================
-# 7️⃣ TENSORS
+# 6️⃣ TENSORS
 # =========================================================
 to_tf <- function(x) tf$cast(x, tf$float32)
 
 p <- ncol(X)
-K <- 4L
+K <- as.integer(4)
+
+hidden_units <- as.integer(64)
+batch_size <- as.integer(64)
+
 lambda_grid <- c(0, 0.01, 0.05, 0.1, 0.2)
 
 X_train_tf <- to_tf(X_train2)
 T_train_tf <- to_tf(T_train2)
-Y_train_tf <- tf$reshape(to_tf(Y_train2), shape=c(-1L,1L))
+Y_train_tf <- tf$reshape(to_tf(Y_train2), shape = c(-1L,1L))
 
 train_input <- tf$concat(list(X_train_tf, T_train_tf), axis=1L)
 
 # =========================================================
-# 8️⃣ EMPIRICAL COPULA
+# 7️⃣ EMPIRICAL COPULA
 # =========================================================
 empirical_cdf_tf <- function(x){
   n <- tf$cast(tf$shape(x)[1], tf$float32)
@@ -490,16 +490,16 @@ empirical_cdf_tf <- function(x){
 }
 
 # =========================================================
-# 9️⃣ CCDN MODEL
+# 8️⃣ CCDN MODEL
 # =========================================================
 build_model <- function(){
 
   keras_model_custom(name="ccdn", function(self){
 
-    self$d1 <- layer_dense(units=64L, activation="relu")
-    self$d2 <- layer_dense(units=64L, activation="relu")
-    self$latent <- layer_dense(units=64L, activation="relu")
-    self$out <- layer_dense(units=1L)
+    self$d1 <- layer_dense(units = hidden_units, activation = "relu")
+    self$d2 <- layer_dense(units = hidden_units, activation = "relu")
+    self$latent <- layer_dense(units = hidden_units, activation = "relu")
+    self$out <- layer_dense(units = 1L)
 
     function(inputs, mask=NULL){
 
@@ -510,24 +510,26 @@ build_model <- function(){
       phi_latent <- k_concatenate(list(phi, t)) %>% self$latent()
       y_hat <- self$out(phi_latent)
 
-      list(y_hat=y_hat,
-           phi_latent=phi_latent,
-           t_input=t)
+      list(
+        y_hat = y_hat,
+        phi_latent = phi_latent,
+        t_input = t
+      )
     }
   })
 }
 
 # =========================================================
-# 🔟 TRAIN CCDN
+# 9️⃣ TRAIN FUNCTION
 # =========================================================
 train_ccdn <- function(lambda){
 
   model <- build_model()
-  opt <- optimizer_adam(0.001)
+  opt <- optimizer_adam(learning_rate = 0.001)
 
   ds <- tf$data$Dataset$from_tensor_slices(
-    dict(x=train_input, y=Y_train_tf)
-  )$batch(64)
+    dict(x = train_input, y = Y_train_tf)
+  )$batch(batch_size)
 
   for(epoch in 1:8){
 
@@ -564,7 +566,7 @@ train_ccdn <- function(lambda){
 }
 
 # =========================================================
-# 1️⃣1️⃣ PREDICTION (16 COMBOS)
+# 🔟 PREDICTION (16 COMBOS)
 # =========================================================
 predict_tau <- function(model, X_data){
 
@@ -581,11 +583,12 @@ predict_tau <- function(model, X_data){
   })
 
   colnames(preds) <- apply(combos,1,paste,collapse="")
+
   preds[, "1111"] - preds[, "0000"]
 }
 
 # =========================================================
-# 1️⃣2️⃣ LAMBDA TUNING
+# 1️⃣1️⃣ LAMBDA GRID SEARCH (FIXED)
 # =========================================================
 results_lambda <- data.frame()
 
@@ -593,35 +596,37 @@ for(lam in lambda_grid){
 
   cat("lambda =", lam, "\n")
 
-  model <- train_ccdn(lam)
+  model_tmp <- train_ccdn(lam)
 
-  tau_val <- predict_tau(model, X_val)
+  tau_val <- predict_tau(model_tmp, X_val)
 
   rmse <- sqrt(mean((tau_val - tau_true[1:length(tau_val)])^2))
 
-  results_lambda <- rbind(results_lambda,
-                          data.frame(lambda=lam, RMSE=rmse))
+  results_lambda <- rbind(
+    results_lambda,
+    data.frame(lambda = lam, RMSE = rmse)
+  )
 }
 
 print(results_lambda)
 
 best_lambda <- results_lambda$lambda[which.min(results_lambda$RMSE)]
-cat("\nOptimal lambda:", best_lambda, "\n")
+cat("\nOptimal lambda =", best_lambda, "\n")
 
 # =========================================================
-# 1️⃣3️⃣ FINAL CCDN
+# 1️⃣2️⃣ FINAL CCDN
 # =========================================================
 ccdn_model <- train_ccdn(best_lambda)
 tau_ccdn <- predict_tau(ccdn_model, X_test)
 
 # =========================================================
-# 1️⃣4️⃣ CAUSAL FOREST
+# 1️⃣3️⃣ CAUSAL FOREST
 # =========================================================
 cf <- causal_forest(X_train, Y_train, T_train[,1])
 tau_cf <- predict(cf, X_test)$predictions
 
 # =========================================================
-# 1️⃣5️⃣ TARNet
+# 1️⃣4️⃣ TARNet
 # =========================================================
 input <- layer_input(shape=p)
 
@@ -649,7 +654,7 @@ preds <- tarnet %>% predict(X_test)
 tau_tarnet <- preds[[2]] - preds[[1]]
 
 # =========================================================
-# 1️⃣6️⃣ EVALUATION
+# 1️⃣5️⃣ EVALUATION
 # =========================================================
 eval_model <- function(est, name){
   data.frame(
@@ -665,12 +670,11 @@ results <- rbind(
   eval_model(tau_tarnet, "TARNet")
 )
 
-print(round(results, 4))
+print(results)
 
 # =========================================================
-# 1️⃣7️⃣ FIGURES
+# 1️⃣6️⃣ FIGURE
 # =========================================================
-
 df <- data.frame(
   tau = c(tau_ccdn, tau_cf, tau_tarnet),
   Model = rep(c("CCDN","CausalForest","TARNet"),
@@ -679,7 +683,7 @@ df <- data.frame(
 
 ggplot(df, aes(x=tau, fill=Model)) +
   geom_density(alpha=0.4) +
-  theme_minimal() +
+  theme_minimal(base_size=14) +
   labs(title="Benchmark Comparison (4 Treatments)")
 
 ggplot(results_lambda, aes(x = lambda, y = RMSE)) +

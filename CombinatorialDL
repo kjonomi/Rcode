@@ -1091,21 +1091,6 @@ colnames(pred_matrix) <- apply(combos, 1, paste, collapse = "")
 
 avg_effects <- colMeans(pred_matrix)
 
-df_heat <- data.frame(
-  Combo = names(avg_effects),
-  Effect = as.numeric(avg_effects)
-)
-
-ggplot(df_heat, aes(x = Combo, y = 1, fill = Effect)) +
-  geom_tile() +
-  theme_minimal(base_size = 14) +
-  scale_fill_gradient(low = "white", high = "blue") +
-  labs(
-    title = "CCDN: Average Outcome Across Treatment Combinations",
-    x = "Treatment Combination",
-    y = ""
-  ) +
-  theme(axis.text.y = element_blank())
 
 df_loss <- data.frame(
   Epoch = 1:length(loss_history),

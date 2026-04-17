@@ -283,7 +283,7 @@ results <- bind_rows(
 )
 
 
-print(round(results, 4))
+print(results)
 
 ggplot(results_lambda, aes(x = lambda, y = RMSE)) +
   geom_line(linewidth = 1.2) +

@@ -1,4 +1,5 @@
 ## Real Data Analysis
+## Treatments + outcome (3 treatments)
 
 # ==========================
 # 1️⃣ Libraries
@@ -261,6 +262,8 @@ ggplot(df, aes(x=tau)) +
   theme_minimal() +
   labs(title="CCDN with Empirical Copula Regularization")
 
+## Real Data Analysis
+## Treatments + outcome (4 treatments)
 
 # ==========================
 # 1️⃣ Libraries
@@ -532,6 +535,7 @@ ggplot(df, aes(x=tau)) +
 #############################
 ## Simulated Data
 ############################
+## Treatments + outcome (3 treatments)
 
 
 library(tensorflow)
@@ -810,6 +814,7 @@ ggplot(df, aes(x=tau, fill=Model)) +
   labs(title="Benchmark Comparison (3 Treatments + Optimal λ)")
 
 
+## Treatments + outcome (4 treatments)
 
 library(tensorflow)
 library(keras)

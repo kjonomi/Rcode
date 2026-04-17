@@ -1,4 +1,5 @@
 ## Real Data Analysis
+
 # ==========================
 # 1️⃣ Libraries
 # ==========================
@@ -21,13 +22,13 @@ if(!file.exists(uplift_path)) stop("Criteo file not found")
 criteo <- fread(uplift_path)
 
 # ==========================
-# 3️⃣ Subsample FIRST (IMPORTANT FIX)
+# 3️⃣ Subsample FIRST
 # ==========================
 n <- min(2000, nrow(criteo))
 criteo <- criteo[sample(.N, n)]
 
 # ==========================
-# 4️⃣ Create 3 treatments + outcome
+# 4️⃣ Treatments + outcome (3 treatments)
 # ==========================
 criteo$treatment1 <- rbinom(n, 1, 0.5)
 criteo$treatment2 <- rbinom(n, 1, 0.5)
@@ -61,7 +62,6 @@ X_train <- X[train_idx,]; X_test <- X[-train_idx,]
 T_train <- T_mat[train_idx,]; T_test <- T_mat[-train_idx,]
 Y_train <- Y[train_idx]; Y_test <- Y[-train_idx]
 
-# fake oracle (for evaluation stability)
 tau_true <- rep(1.5, nrow(X_test))
 
 # ==========================
@@ -84,6 +84,7 @@ to_tf <- function(x) tf$cast(x, tf$float32)
 
 p <- ncol(X)
 K <- 3L
+
 lambda_grid <- c(0, 0.01, 0.05, 0.1, 0.2)
 
 X_train_tf <- to_tf(X_train2)
@@ -102,7 +103,7 @@ empirical_cdf_tf <- function(x){
 }
 
 # ==========================
-# 🔟 Model (FIXED units bug)
+# 🔟 Model (FIXED)
 # ==========================
 build_model <- function(){
 
@@ -132,7 +133,7 @@ build_model <- function(){
 }
 
 # ==========================
-# 1️⃣1️⃣ Training function
+# 1️⃣1️⃣ Training function (FIXED batch bug)
 # ==========================
 train_ccdn <- function(lambda){
 
@@ -141,7 +142,7 @@ train_ccdn <- function(lambda){
 
   ds <- tf$data$Dataset$from_tensor_slices(
     dict(x=train_input, y=Y_train_tf)
-  )$batch(64)
+  )$batch(as.integer(64))   # ✅ FIX HERE
 
   for(epoch in 1:8){
 
@@ -202,6 +203,7 @@ predict_tau <- function(model, X_data){
   })
 
   colnames(preds) <- apply(combos,1,paste,collapse="")
+
   preds[, "111"] - preds[, "000"]
 }
 
@@ -236,7 +238,7 @@ final_model <- train_ccdn(best_lambda)
 tau_ccdn <- predict_tau(final_model, X_test)
 
 # ==========================
-# 1️⃣5️⃣ Evaluation (simple)
+# 1️⃣5️⃣ Evaluation
 # ==========================
 eval <- function(est){
   c(
@@ -245,7 +247,7 @@ eval <- function(est){
   )
 }
 
-cat("\nCCDN Performance:\n")
+cat("\nCCDN Results:\n")
 print(round(eval(tau_ccdn), 4))
 
 # ==========================
@@ -257,7 +259,9 @@ ggplot(df, aes(x=tau)) +
   geom_density(fill="steelblue", alpha=0.4) +
   geom_vline(xintercept=1.5, linetype="dashed") +
   theme_minimal() +
-  labs(title="CCDN (Empirical Copula Regularization) - Final Model")
+  labs(title="CCDN with Empirical Copula Regularization")
+
+
 # ==========================
 # 1️⃣ Libraries
 # ==========================
@@ -272,7 +276,7 @@ library(tidyr)
 set.seed(123)
 
 # ==========================
-# 2️⃣ Load Criteo dataset
+# 2️⃣ Load data
 # ==========================
 uplift_path <- "criteo-research-uplift-v2.1.csv.gz"
 if(!file.exists(uplift_path)) stop("Criteo file not found")
@@ -280,20 +284,19 @@ if(!file.exists(uplift_path)) stop("Criteo file not found")
 criteo <- fread(uplift_path)
 
 # ==========================
-# 3️⃣ Subsample FIRST (IMPORTANT)
+# 3️⃣ Subsample
 # ==========================
 n <- min(2000, nrow(criteo))
 criteo <- criteo[sample(.N, n)]
 
 # ==========================
-# 4️⃣ Create 4 treatments + outcome
+# 4️⃣ Create 4 treatments
 # ==========================
 criteo$treatment1 <- rbinom(n, 1, 0.5)
 criteo$treatment2 <- rbinom(n, 1, 0.5)
 criteo$treatment3 <- rbinom(n, 1, 0.5)
 criteo$treatment4 <- rbinom(n, 1, 0.5)
-
-criteo$outcome <- rbinom(n, 1, 0.1)
+criteo$outcome    <- rbinom(n, 1, 0.1)
 
 # ==========================
 # 5️⃣ Feature processing
@@ -311,13 +314,8 @@ for(j in seq_along(num_cols)){
 
 X <- scale(as.matrix(X_dt))
 
-T_mat <- as.matrix(criteo[, .(
-  treatment1,
-  treatment2,
-  treatment3,
-  treatment4
-)])
-
+# IMPORTANT: 4 treatments
+T_mat <- as.matrix(criteo[, .(treatment1, treatment2, treatment3, treatment4)])
 Y <- as.numeric(criteo$outcome)
 
 # ==========================
@@ -329,7 +327,6 @@ X_train <- X[train_idx,]; X_test <- X[-train_idx,]
 T_train <- T_mat[train_idx,]; T_test <- T_mat[-train_idx,]
 Y_train <- Y[train_idx]; Y_test <- Y[-train_idx]
 
-# fake oracle (for evaluation)
 tau_true <- rep(1.5, nrow(X_test))
 
 # ==========================
@@ -346,12 +343,12 @@ T_train2 <- T_train[-val_idx,]
 Y_train2 <- Y_train[-val_idx]
 
 # ==========================
-# 8️⃣ Tensor setup
+# 8️⃣ Tensor conversion
 # ==========================
 to_tf <- function(x) tf$cast(x, tf$float32)
 
 p <- ncol(X)
-K <- 4L
+K <- 4L   # 🔥 IMPORTANT CHANGE
 
 lambda_grid <- c(0, 0.01, 0.05, 0.1, 0.2)
 
@@ -371,21 +368,21 @@ empirical_cdf_tf <- function(x){
 }
 
 # ==========================
-# 🔟 Model (K=4 safe)
+# 🔟 Model (UPDATED FOR K=4)
 # ==========================
 build_model <- function(){
 
   keras_model_custom(name="ccdn", function(self){
 
-    self$d1 <- layer_dense(units = 64L, activation = "relu")
-    self$d2 <- layer_dense(units = 64L, activation = "relu")
-    self$latent <- layer_dense(units = 64L, activation = "relu")
-    self$out <- layer_dense(units = 1L)
+    self$d1 <- layer_dense(units=64L, activation="relu")
+    self$d2 <- layer_dense(units=64L, activation="relu")
+    self$latent <- layer_dense(units=64L, activation="relu")
+    self$out <- layer_dense(units=1L)
 
     function(inputs, mask=NULL){
 
       x <- inputs[, 1:p]
-      t <- inputs[, (p+1):(p+K)]
+      t <- inputs[, (p+1):(p+K)]   # 🔥 NOW 4 treatments
 
       phi <- x %>% self$d1() %>% self$d2()
       phi_latent <- k_concatenate(list(phi, t)) %>% self$latent()
@@ -401,7 +398,7 @@ build_model <- function(){
 }
 
 # ==========================
-# 1️⃣1️⃣ Training
+# 1️⃣1️⃣ Training function
 # ==========================
 train_ccdn <- function(lambda){
 
@@ -410,7 +407,7 @@ train_ccdn <- function(lambda){
 
   ds <- tf$data$Dataset$from_tensor_slices(
     dict(x=train_input, y=Y_train_tf)
-  )$batch(64)
+  )$batch(as.integer(64))
 
   for(epoch in 1:8){
 
@@ -451,7 +448,7 @@ train_ccdn <- function(lambda){
 }
 
 # ==========================
-# 1️⃣2️⃣ Prediction (16 combos)
+# 1️⃣2️⃣ Prediction (16 combos now!)
 # ==========================
 predict_tau <- function(model, X_data){
 
@@ -515,7 +512,7 @@ eval <- function(est){
   )
 }
 
-cat("\nCCDN Results:\n")
+cat("\nFINAL CCDN RESULTS (4 treatments)\n")
 print(round(eval(tau_ccdn), 4))
 
 # ==========================
@@ -528,6 +525,7 @@ ggplot(df, aes(x=tau)) +
   geom_vline(xintercept=1.5, linetype="dashed") +
   theme_minimal() +
   labs(title="CCDN with Empirical Copula (4 Treatments)")
+
 
 
 

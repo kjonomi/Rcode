@@ -769,21 +769,6 @@ ggplot(df_heat, aes(x = Combo, y = 1, fill = Effect)) +
   theme(axis.text.y = element_blank()) +
   theme(axis.text.x = element_text(angle = 45, hjust = 1))
 
-df_complexity <- data.frame(
-  Combo = names(avg_effects),
-  Effect = as.numeric(avg_effects),
-  NumTreatments = rowSums(combos)
-)
-
-ggplot(df_complexity, aes(x = NumTreatments, y = Effect)) +
-  geom_point(size = 3) +
-  geom_smooth(method = "loess") +
-  theme_minimal(base_size = 14) +
-  labs(
-    title = "Treatment Intensity vs Outcome (4 Treatments)",
-    x = "Number of Active Treatments",
-    y = "Predicted Outcome"
-  )
 
 #############################
 ## Simulated Data

@@ -24,12 +24,21 @@ criteo <- fread(uplift_path)
 # ==========================
 # 3️⃣ Create 3 treatments + outcome
 # ==========================
+
 n <- min(2000, nrow(criteo))
+
+idx <- sample(1:nrow(criteo), n)
+
+criteo <- criteo[idx]
+
+# now safe: criteo has exactly n rows
 
 criteo$treatment1 <- rbinom(n, 1, 0.5)
 criteo$treatment2 <- rbinom(n, 1, 0.5)
 criteo$treatment3 <- rbinom(n, 1, 0.5)
-criteo$outcome    <- rbinom(n, 1, 0.1)
+criteo$treatment4 <- rbinom(n, 1, 0.5)
+
+criteo$outcome <- rbinom(n, 1, 0.1)
 
 # ==========================
 # 4️⃣ Feature processing

@@ -1,47 +1,41 @@
 ## Real Data Analysis
 # ==========================
-# 1️⃣ Load libraries
+# 1️⃣ Libraries
 # ==========================
 library(data.table)
 library(tensorflow)
 library(keras)
-library(grf)
 library(dplyr)
-library(ggplot2)
 library(purrr)
+library(ggplot2)
+library(tidyr)
 
 set.seed(123)
 
 # ==========================
-# 2️⃣ Load Criteo Uplift dataset
+# 2️⃣ Load data
 # ==========================
 uplift_path <- "criteo-research-uplift-v2.1.csv.gz"
 if(!file.exists(uplift_path)) stop("Criteo file not found")
 
-cat("Loading dataset...\n")
 criteo <- fread(uplift_path)
 
 # ==========================
-# 3️⃣ Create 3 treatments + outcome
+# 3️⃣ Subsample FIRST (IMPORTANT FIX)
 # ==========================
-
 n <- min(2000, nrow(criteo))
+criteo <- criteo[sample(.N, n)]
 
-idx <- sample(1:nrow(criteo), n)
-
-criteo <- criteo[idx]
-
-# now safe: criteo has exactly n rows
-
+# ==========================
+# 4️⃣ Create 3 treatments + outcome
+# ==========================
 criteo$treatment1 <- rbinom(n, 1, 0.5)
 criteo$treatment2 <- rbinom(n, 1, 0.5)
 criteo$treatment3 <- rbinom(n, 1, 0.5)
-criteo$treatment4 <- rbinom(n, 1, 0.5)
-
-criteo$outcome <- rbinom(n, 1, 0.1)
+criteo$outcome    <- rbinom(n, 1, 0.1)
 
 # ==========================
-# 4️⃣ Feature processing
+# 5️⃣ Feature processing
 # ==========================
 num_cols <- names(criteo)[grepl("^f", names(criteo))]
 num_cols <- num_cols[1:min(5, length(num_cols))]
@@ -58,11 +52,8 @@ X <- scale(as.matrix(X_dt))
 T_mat <- as.matrix(criteo[, .(treatment1, treatment2, treatment3)])
 Y <- as.numeric(criteo$outcome)
 
-idx <- sample(1:nrow(X), n)
-X <- X[idx,]; T_mat <- T_mat[idx,]; Y <- Y[idx]
-
 # ==========================
-# 5️⃣ Train / Test split
+# 6️⃣ Train/test split
 # ==========================
 train_idx <- sample(1:nrow(X), 0.8*nrow(X))
 
@@ -70,11 +61,11 @@ X_train <- X[train_idx,]; X_test <- X[-train_idx,]
 T_train <- T_mat[train_idx,]; T_test <- T_mat[-train_idx,]
 Y_train <- Y[train_idx]; Y_test <- Y[-train_idx]
 
-# fake oracle (for evaluation stability in paper)
+# fake oracle (for evaluation stability)
 tau_true <- rep(1.5, nrow(X_test))
 
 # ==========================
-# 6️⃣ Validation split
+# 7️⃣ Validation split
 # ==========================
 val_idx <- sample(1:nrow(X_train), 0.2*nrow(X_train))
 
@@ -87,7 +78,7 @@ T_train2 <- T_train[-val_idx,]
 Y_train2 <- Y_train[-val_idx]
 
 # ==========================
-# 7️⃣ Tensor conversion
+# 8️⃣ Tensor conversion
 # ==========================
 to_tf <- function(x) tf$cast(x, tf$float32)
 
@@ -97,14 +88,12 @@ lambda_grid <- c(0, 0.01, 0.05, 0.1, 0.2)
 
 X_train_tf <- to_tf(X_train2)
 T_train_tf <- to_tf(T_train2)
-Y_train_tf <- tf$reshape(to_tf(Y_train2), shape=c(-1L,1L))
-
-X_val_tf <- to_tf(X_val)
+Y_train_tf <- tf$reshape(to_tf(Y_train2), shape = c(-1L,1L))
 
 train_input <- tf$concat(list(X_train_tf, T_train_tf), axis=1L)
 
 # ==========================
-# 8️⃣ Empirical Copula
+# 9️⃣ Empirical Copula
 # ==========================
 empirical_cdf_tf <- function(x){
   n <- tf$cast(tf$shape(x)[1], tf$float32)
@@ -113,16 +102,16 @@ empirical_cdf_tf <- function(x){
 }
 
 # ==========================
-# 9️⃣ Model
+# 🔟 Model (FIXED units bug)
 # ==========================
 build_model <- function(){
 
   keras_model_custom(name="ccdn", function(self){
 
-    self$d1 <- layer_dense(64L, activation="relu")
-    self$d2 <- layer_dense(64L, activation="relu")
-    self$latent <- layer_dense(64L, activation="relu")
-    self$out <- layer_dense(1L)
+    self$d1 <- layer_dense(units = 64L, activation = "relu")
+    self$d2 <- layer_dense(units = 64L, activation = "relu")
+    self$latent <- layer_dense(units = 64L, activation = "relu")
+    self$out <- layer_dense(units = 1L)
 
     function(inputs, mask=NULL){
 
@@ -143,7 +132,7 @@ build_model <- function(){
 }
 
 # ==========================
-# 🔟 Training function
+# 1️⃣1️⃣ Training function
 # ==========================
 train_ccdn <- function(lambda){
 
@@ -193,7 +182,7 @@ train_ccdn <- function(lambda){
 }
 
 # ==========================
-# 1️⃣1️⃣ Prediction
+# 1️⃣2️⃣ Prediction
 # ==========================
 predict_tau <- function(model, X_data){
 
@@ -217,7 +206,7 @@ predict_tau <- function(model, X_data){
 }
 
 # ==========================
-# 1️⃣2️⃣ Lambda tuning
+# 1️⃣3️⃣ Lambda tuning
 # ==========================
 results_lambda <- data.frame()
 
@@ -241,49 +230,13 @@ best_lambda <- results_lambda$lambda[which.min(results_lambda$RMSE)]
 cat("\nBest lambda:", best_lambda, "\n")
 
 # ==========================
-# 1️⃣3️⃣ Final CCDN
+# 1️⃣4️⃣ Final model
 # ==========================
 final_model <- train_ccdn(best_lambda)
 tau_ccdn <- predict_tau(final_model, X_test)
 
 # ==========================
-# 1️⃣4️⃣ Baselines
-# ==========================
-
-# Causal Forest (binary proxy)
-T_bin <- T_mat[,1]
-
-cf <- causal_forest(X_train, Y_train, T_bin[train_idx])
-tau_cf <- predict(cf, X_test)$predictions
-
-# TARNet
-input <- layer_input(shape=p)
-
-shared <- input %>%
-  layer_dense(64L, activation="relu") %>%
-  layer_dense(64L, activation="relu")
-
-y0 <- shared %>% layer_dense(1L)
-y1 <- shared %>% layer_dense(1L)
-
-tarnet <- keras_model(input, list(y0, y1))
-tarnet %>% compile(optimizer="adam", loss="mse")
-
-t_ind <- T_train[,1]
-
-tarnet %>% fit(
-  X_train,
-  list(Y_train*(1-t_ind), Y_train*t_ind),
-  epochs=10,
-  batch_size=64,
-  verbose=0
-)
-
-preds <- tarnet %>% predict(X_test)
-tau_tarnet <- preds[[2]] - preds[[1]]
-
-# ==========================
-# 1️⃣5️⃣ Evaluation
+# 1️⃣5️⃣ Evaluation (simple)
 # ==========================
 eval <- function(est){
   c(
@@ -292,39 +245,29 @@ eval <- function(est){
   )
 }
 
-results <- rbind(
-  CCDN = eval(tau_ccdn),
-  CausalForest = eval(tau_cf),
-  TARNet = eval(tau_tarnet)
-)
-
-print(round(results,4))
+cat("\nCCDN Performance:\n")
+print(round(eval(tau_ccdn), 4))
 
 # ==========================
 # 1️⃣6️⃣ Plot
 # ==========================
-df <- data.frame(
-  tau = c(tau_ccdn, tau_cf, tau_tarnet),
-  Model = rep(c("CCDN","CausalForest","TARNet"),
-              each=length(tau_ccdn))
-)
+df <- data.frame(tau = tau_ccdn)
 
-ggplot(df, aes(x=tau, fill=Model)) +
-  geom_density(alpha=0.4) +
+ggplot(df, aes(x=tau)) +
+  geom_density(fill="steelblue", alpha=0.4) +
   geom_vline(xintercept=1.5, linetype="dashed") +
   theme_minimal() +
-  labs(title="Criteo Benchmark: CCDN vs Baselines")
-
+  labs(title="CCDN (Empirical Copula Regularization) - Final Model")
 # ==========================
 # 1️⃣ Libraries
 # ==========================
 library(data.table)
 library(tensorflow)
 library(keras)
-library(grf)
 library(dplyr)
-library(ggplot2)
 library(purrr)
+library(ggplot2)
+library(tidyr)
 
 set.seed(123)
 
@@ -337,10 +280,14 @@ if(!file.exists(uplift_path)) stop("Criteo file not found")
 criteo <- fread(uplift_path)
 
 # ==========================
-# 3️⃣ SETTINGS (4 treatments)
+# 3️⃣ Subsample FIRST (IMPORTANT)
 # ==========================
 n <- min(2000, nrow(criteo))
+criteo <- criteo[sample(.N, n)]
 
+# ==========================
+# 4️⃣ Create 4 treatments + outcome
+# ==========================
 criteo$treatment1 <- rbinom(n, 1, 0.5)
 criteo$treatment2 <- rbinom(n, 1, 0.5)
 criteo$treatment3 <- rbinom(n, 1, 0.5)
@@ -349,7 +296,7 @@ criteo$treatment4 <- rbinom(n, 1, 0.5)
 criteo$outcome <- rbinom(n, 1, 0.1)
 
 # ==========================
-# 4️⃣ Feature processing
+# 5️⃣ Feature processing
 # ==========================
 num_cols <- names(criteo)[grepl("^f", names(criteo))]
 num_cols <- num_cols[1:min(5, length(num_cols))]
@@ -363,14 +310,18 @@ for(j in seq_along(num_cols)){
 }
 
 X <- scale(as.matrix(X_dt))
-T_mat <- as.matrix(criteo[, .(treatment1, treatment2, treatment3, treatment4)])
+
+T_mat <- as.matrix(criteo[, .(
+  treatment1,
+  treatment2,
+  treatment3,
+  treatment4
+)])
+
 Y <- as.numeric(criteo$outcome)
 
-idx <- sample(1:nrow(X), n)
-X <- X[idx,]; T_mat <- T_mat[idx,]; Y <- Y[idx]
-
 # ==========================
-# 5️⃣ Train/test split
+# 6️⃣ Train/test split
 # ==========================
 train_idx <- sample(1:nrow(X), 0.8*nrow(X))
 
@@ -378,10 +329,11 @@ X_train <- X[train_idx,]; X_test <- X[-train_idx,]
 T_train <- T_mat[train_idx,]; T_test <- T_mat[-train_idx,]
 Y_train <- Y[train_idx]; Y_test <- Y[-train_idx]
 
-tau_true <- rep(1.2, nrow(X_test))
+# fake oracle (for evaluation)
+tau_true <- rep(1.5, nrow(X_test))
 
 # ==========================
-# 6️⃣ Validation split
+# 7️⃣ Validation split
 # ==========================
 val_idx <- sample(1:nrow(X_train), 0.2*nrow(X_train))
 
@@ -394,12 +346,12 @@ T_train2 <- T_train[-val_idx,]
 Y_train2 <- Y_train[-val_idx]
 
 # ==========================
-# 7️⃣ Tensor setup
+# 8️⃣ Tensor setup
 # ==========================
 to_tf <- function(x) tf$cast(x, tf$float32)
 
-K <- 4L
 p <- ncol(X)
+K <- 4L
 
 lambda_grid <- c(0, 0.01, 0.05, 0.1, 0.2)
 
@@ -407,12 +359,10 @@ X_train_tf <- to_tf(X_train2)
 T_train_tf <- to_tf(T_train2)
 Y_train_tf <- tf$reshape(to_tf(Y_train2), shape=c(-1L,1L))
 
-X_val_tf <- to_tf(X_val)
-
 train_input <- tf$concat(list(X_train_tf, T_train_tf), axis=1L)
 
 # ==========================
-# 8️⃣ Copula transform
+# 9️⃣ Empirical Copula
 # ==========================
 empirical_cdf_tf <- function(x){
   n <- tf$cast(tf$shape(x)[1], tf$float32)
@@ -421,16 +371,16 @@ empirical_cdf_tf <- function(x){
 }
 
 # ==========================
-# 9️⃣ CCDN model
+# 🔟 Model (K=4 safe)
 # ==========================
 build_model <- function(){
 
   keras_model_custom(name="ccdn", function(self){
 
-    self$d1 <- layer_dense(64L, activation="relu")
-    self$d2 <- layer_dense(64L, activation="relu")
-    self$latent <- layer_dense(64L, activation="relu")
-    self$out <- layer_dense(1L)
+    self$d1 <- layer_dense(units = 64L, activation = "relu")
+    self$d2 <- layer_dense(units = 64L, activation = "relu")
+    self$latent <- layer_dense(units = 64L, activation = "relu")
+    self$out <- layer_dense(units = 1L)
 
     function(inputs, mask=NULL){
 
@@ -441,15 +391,17 @@ build_model <- function(){
       phi_latent <- k_concatenate(list(phi, t)) %>% self$latent()
       y_hat <- self$out(phi_latent)
 
-      list(y_hat=y_hat,
-           phi_latent=phi_latent,
-           t_input=t)
+      list(
+        y_hat = y_hat,
+        phi_latent = phi_latent,
+        t_input = t
+      )
     }
   })
 }
 
 # ==========================
-# 🔟 Training
+# 1️⃣1️⃣ Training
 # ==========================
 train_ccdn <- function(lambda){
 
@@ -499,7 +451,7 @@ train_ccdn <- function(lambda){
 }
 
 # ==========================
-# 1️⃣1️⃣ Prediction (16 combos)
+# 1️⃣2️⃣ Prediction (16 combos)
 # ==========================
 predict_tau <- function(model, X_data){
 
@@ -524,7 +476,7 @@ predict_tau <- function(model, X_data){
 }
 
 # ==========================
-# 1️⃣2️⃣ Lambda tuning
+# 1️⃣3️⃣ Lambda tuning
 # ==========================
 results_lambda <- data.frame()
 
@@ -548,44 +500,10 @@ best_lambda <- results_lambda$lambda[which.min(results_lambda$RMSE)]
 cat("\nBest lambda:", best_lambda, "\n")
 
 # ==========================
-# 1️⃣3️⃣ Final model
+# 1️⃣4️⃣ Final model
 # ==========================
 final_model <- train_ccdn(best_lambda)
 tau_ccdn <- predict_tau(final_model, X_test)
-
-# ==========================
-# 1️⃣4️⃣ Baselines
-# ==========================
-T_bin <- T_mat[,1]
-
-cf <- causal_forest(X_train, Y_train, T_bin[train_idx])
-tau_cf <- predict(cf, X_test)$predictions
-
-# TARNet
-input <- layer_input(shape=p)
-
-shared <- input %>%
-  layer_dense(64L, activation="relu") %>%
-  layer_dense(64L, activation="relu")
-
-y0 <- shared %>% layer_dense(1L)
-y1 <- shared %>% layer_dense(1L)
-
-tarnet <- keras_model(input, list(y0, y1))
-tarnet %>% compile(optimizer="adam", loss="mse")
-
-t_ind <- T_train[,1]
-
-tarnet %>% fit(
-  X_train,
-  list(Y_train*(1-t_ind), Y_train*t_ind),
-  epochs=10,
-  batch_size=64,
-  verbose=0
-)
-
-preds <- tarnet %>% predict(X_test)
-tau_tarnet <- preds[[2]] - preds[[1]]
 
 # ==========================
 # 1️⃣5️⃣ Evaluation
@@ -597,28 +515,20 @@ eval <- function(est){
   )
 }
 
-results <- rbind(
-  CCDN = eval(tau_ccdn),
-  CausalForest = eval(tau_cf),
-  TARNet = eval(tau_tarnet)
-)
-
-print(round(results,4))
+cat("\nCCDN Results:\n")
+print(round(eval(tau_ccdn), 4))
 
 # ==========================
 # 1️⃣6️⃣ Plot
 # ==========================
-df <- data.frame(
-  tau = c(tau_ccdn, tau_cf, tau_tarnet),
-  Model = rep(c("CCDN","CausalForest","TARNet"),
-              each=length(tau_ccdn))
-)
+df <- data.frame(tau = tau_ccdn)
 
-ggplot(df, aes(x=tau, fill=Model)) +
-  geom_density(alpha=0.4) +
-  geom_vline(xintercept=1.2, linetype="dashed") +
+ggplot(df, aes(x=tau)) +
+  geom_density(fill="steelblue", alpha=0.4) +
+  geom_vline(xintercept=1.5, linetype="dashed") +
   theme_minimal() +
-  labs(title="4-Treatment CCDN Benchmark Comparison")
+  labs(title="CCDN with Empirical Copula (4 Treatments)")
+
 
 
 #############################

@@ -21,7 +21,7 @@ set.seed(123)
 uplift_path <- "criteo-research-uplift-v2.1.csv.gz"
 criteo <- fread(uplift_path)
 
-n <- min(2000, nrow(criteo))
+n <- min(10000, nrow(criteo))
 criteo <- criteo[sample(.N, n)]
 
 # ==========================
@@ -410,7 +410,7 @@ set.seed(123)
 uplift_path <- "criteo-research-uplift-v2.1.csv.gz"
 criteo <- fread(uplift_path)
 
-n <- min(2000, nrow(criteo))
+n <- min(10000, nrow(criteo))
 criteo <- criteo[sample(.N, n)]
 
 # =========================================================

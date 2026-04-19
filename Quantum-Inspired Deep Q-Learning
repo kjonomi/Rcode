@@ -16,7 +16,7 @@ set.seed(123)
 ############################################################
 # 1️⃣ SIMULATION SETUP (LARGER n OPTION)
 ############################################################
-n <- 300          # ↑ increased sample size (Reviewer 3 #6)
+n <- 200          # ↑ increased sample size (Reviewer 3 #6)
 p <- 6
 T_steps <- 10
 

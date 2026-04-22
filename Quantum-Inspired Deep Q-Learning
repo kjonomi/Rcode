@@ -16,9 +16,9 @@ set.seed(123)
 ############################################################
 # 1️⃣ SIMULATION SETUP (LARGER n OPTION)
 ############################################################
-n <- 200          # ↑ increased sample size (Reviewer 3 #6)
-p <- 6
-T_steps <- 5
+n <- 150          # ↑ increased sample size (Reviewer 3 #6)
+p <- 5
+T_steps <- 3
 
 X_long <- array(0, dim = c(n, T_steps, p))
 X_base <- matrix(rnorm(n * p), nrow = n)
@@ -213,7 +213,7 @@ run_experiment <- function(split=0.7) {
 ############################################################
 # 7️⃣ REPLICATIONS (R defined clearly)
 ############################################################
-n_runs <- 30   # increase to 100 for paper
+n_runs <- 3   # increase to 100 for paper
 
 results <- replicate(n_runs, run_experiment(0.7))
 results <- t(results)

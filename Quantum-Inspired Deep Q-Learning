@@ -19,7 +19,7 @@ set.seed(123)
 # 1️⃣ LOAD REAL FINANCIAL DATA
 ############################################################
 symbols <- c("SPY", "QQQ")
-getSymbols(symbols, from="2015-01-01", to="2024-12-31")
+getSymbols(symbols, from="2023-01-01", to="2025-12-31")
 
 # Compute returns
 spy_ret <- dailyReturn(Cl(SPY))

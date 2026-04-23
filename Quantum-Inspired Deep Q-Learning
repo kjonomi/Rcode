@@ -266,7 +266,7 @@ ggplot(df, aes(Method, Reward, fill=Method)) +
 ############################################################
 # 1️⃣2️⃣ LEARNING CURVE (Entropy Effect)
 ############################################################
-out_entropy <- train_dqn(X_long[1:200,,], Y_matrix[1:200,], method="entropy")
+out_entropy <- train_dqn(X_long[1:150,,], Y_matrix[1:150,], method="entropy")
 curve_df <- data.frame(Episode=1:length(out_entropy$rewards),
                        Reward=out_entropy$rewards)
 

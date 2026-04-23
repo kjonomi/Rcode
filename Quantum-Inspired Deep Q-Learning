@@ -1,4 +1,227 @@
 # April 19 2026
+
+############################################################
+# 0️⃣ ENV + LIBRARIES
+############################################################
+Sys.setenv(CUDA_VISIBLE_DEVICES = "")
+Sys.setenv(TF_CPP_MIN_LOG_LEVEL = "2")
+
+library(keras)
+library(tensorflow)
+library(tidyverse)
+library(R6)
+library(quantmod)
+library(TTR)
+
+set.seed(123)
+
+############################################################
+# 1️⃣ LOAD REAL FINANCIAL DATA
+############################################################
+symbols <- c("SPY", "QQQ")
+getSymbols(symbols, from="2015-01-01", to="2024-12-31")
+
+# Compute returns
+spy_ret <- dailyReturn(Cl(SPY))
+qqq_ret <- dailyReturn(Cl(QQQ))
+
+data <- na.omit(merge(spy_ret, qqq_ret))
+colnames(data) <- c("SPY","QQQ")
+
+############################################################
+# 2️⃣ FEATURE ENGINEERING (STATE)
+############################################################
+# Technical indicators
+feat <- data.frame(
+  SPY = data$SPY,
+  QQQ = data$QQQ,
+  SMA10 = SMA(data$SPY, 10),
+  SMA20 = SMA(data$SPY, 20),
+  RSI = RSI(data$SPY, 14),
+  VOL = runSD(data$SPY, 10)
+)
+
+feat <- na.omit(feat)
+
+############################################################
+# 3️⃣ CREATE SEQUENCE DATA (LSTM INPUT)
+############################################################
+T_steps <- 5
+n <- nrow(feat) - T_steps
+
+X_long <- array(0, dim=c(n, T_steps, ncol(feat)))
+Y_matrix <- matrix(0, nrow=n, ncol=3)
+
+for(i in 1:n){
+  X_long[i,,] <- as.matrix(feat[i:(i+T_steps-1), ])
+  
+  # Next-day return = reward
+  next_ret_spy <- feat$SPY[i+T_steps]
+  next_ret_qqq <- feat$QQQ[i+T_steps]
+  
+  Y_matrix[i,] <- c(
+    0,                 # cash
+    next_ret_spy,
+    next_ret_qqq
+  )
+}
+
+############################################################
+# 4️⃣ REPLAY BUFFER
+############################################################
+ReplayBuffer <- R6Class(
+  "ReplayBuffer",
+  public = list(
+    capacity = NULL,
+    buffer = NULL,
+    position = 1,
+    initialize = function(capacity) {
+      self$capacity <- capacity
+      self$buffer <- vector("list", capacity)
+    },
+    push = function(state, action, reward) {
+      self$buffer[[self$position]] <- list(state=state, action=action, reward=reward)
+      self$position <- ifelse(self$position == self$capacity, 1, self$position + 1)
+    },
+    sample_indices = function(batch_size, weights=NULL) {
+      filled <- which(!sapply(self$buffer, is.null))
+      if(length(filled) < batch_size) return(NULL)
+      if(is.null(weights)) return(sample(filled, batch_size))
+      w <- weights[filled]
+      return(sample(filled, batch_size, prob=w/sum(w)))
+    }
+  )
+)
+
+############################################################
+# 5️⃣ MODEL
+############################################################
+build_model <- function(input_shape) {
+  model <- keras_model_sequential() %>%
+    layer_conv_1d(filters=32, kernel_size=2, activation="relu",
+                  input_shape=input_shape) %>%
+    layer_lstm(32) %>%
+    layer_dense(64, activation="relu") %>%
+    layer_dense(3)
+
+  model %>% compile(
+    optimizer = optimizer_adam(0.001),
+    loss = "mse"
+  )
+  model
+}
+
+############################################################
+# 6️⃣ TRAIN DQN
+############################################################
+train_dqn <- function(X, Y, episodes=30, batch_size=32, method="entropy") {
+
+  input_dims <- dim(X)[2:3]
+  model <- build_model(input_dims)
+  buffer <- ReplayBuffer$new(2000)
+
+  epsilon <- 1.0
+  rewards_hist <- c()
+
+  for(ep in 1:episodes){
+
+    ep_rewards <- c()
+
+    for(i in 1:dim(X)[1]){
+
+      state <- X[i,,]
+
+      # epsilon-greedy
+      if(runif(1) < epsilon){
+        action <- sample(0:2,1)
+      } else {
+        q_vals <- predict(model, array(state, dim=c(1,input_dims)), verbose=0)
+        action <- which.max(q_vals) - 1
+      }
+
+      reward <- Y[i, action+1]
+      ep_rewards <- c(ep_rewards, reward)
+
+      buffer$push(state, action, reward)
+    }
+
+    rewards_hist <- c(rewards_hist, mean(ep_rewards))
+
+    # training
+    filled_idx <- which(!sapply(buffer$buffer, is.null))
+    if(length(filled_idx) < batch_size) next
+
+    all_s <- array(0, dim=c(length(filled_idx), input_dims))
+    for(k in seq_along(filled_idx)){
+      all_s[k,,] <- buffer$buffer[[filled_idx[k]]]$state
+    }
+
+    q_all <- predict(model, all_s, verbose=0)
+
+    # entropy-based sampling
+    prob <- t(apply(q_all,1,function(x) exp(x)/sum(exp(x))))
+    entropy <- -rowSums(prob*log(prob+1e-8))
+    weights <- entropy
+
+    idx <- buffer$sample_indices(batch_size, weights)
+    samples <- buffer$buffer[idx]
+
+    batch_s <- array(0, dim=c(batch_size, input_dims))
+    batch_y <- matrix(0, nrow=batch_size, ncol=3)
+
+    for(j in 1:batch_size){
+      batch_s[j,,] <- samples[[j]]$state
+      q <- predict(model, array(samples[[j]]$state, dim=c(1,input_dims)), verbose=0)
+      q[1, samples[[j]]$action+1] <- samples[[j]]$reward
+      batch_y[j,] <- q
+    }
+
+    model %>% fit(batch_s, batch_y, epochs=1, verbose=0)
+
+    epsilon <- max(0.1, epsilon*0.95)
+  }
+
+  list(model=model, rewards=rewards_hist)
+}
+
+############################################################
+# 7️⃣ TRAIN / TEST SPLIT
+############################################################
+split <- floor(0.7 * n)
+X_train <- X_long[1:split,,]
+Y_train <- Y_matrix[1:split,]
+X_test  <- X_long[(split+1):n,,]
+Y_test  <- Y_matrix[(split+1):n,]
+
+############################################################
+# 8️⃣ TRAIN MODEL
+############################################################
+out <- train_dqn(X_train, Y_train)
+
+############################################################
+# 9️⃣ EVALUATION
+############################################################
+evaluate <- function(model, X, Y){
+  q <- predict(model, X, verbose=0)
+  a <- apply(q,1,which.max)
+  mean(sapply(1:nrow(Y), function(i) Y[i, a[i]]))
+}
+
+perf <- evaluate(out$model, X_test, Y_test)
+print(paste("Test Reward:", round(perf,6)))
+
+############################################################
+# 🔟 LEARNING CURVE
+############################################################
+df <- data.frame(Episode=1:length(out$rewards),
+                 Reward=out$rewards)
+
+ggplot(df, aes(Episode, Reward)) +
+  geom_line(size=1) +
+  theme_minimal() +
+  labs(title="DQN Portfolio Learning Curve")
+
+
 ############################################################
 # 0️⃣ ENV + LIBRARIES
 ############################################################

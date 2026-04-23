@@ -1,4 +1,4 @@
-# April 19 2026
+# April 23 2026
 
 ############################################################
 # 0️⃣ ENV + LIBRARIES
@@ -16,54 +16,59 @@ library(TTR)
 set.seed(123)
 
 ############################################################
-# 1️⃣ LOAD REAL FINANCIAL DATA
+# 1️⃣ LOAD DIVERSIFIED FINANCIAL DATA
 ############################################################
-symbols <- c("SPY", "QQQ")
-getSymbols(symbols, from="2023-01-01", to="2025-12-31")
+symbols <- c("SPY","QQQ","TLT","GLD")
+
+getSymbols(symbols,
+           src = "yahoo",
+           from = "2020-01-01",
+           to   = Sys.Date(),
+           auto.assign = TRUE)
 
 # Compute returns
-spy_ret <- dailyReturn(Cl(SPY))
-qqq_ret <- dailyReturn(Cl(QQQ))
-
-data <- na.omit(merge(spy_ret, qqq_ret))
-colnames(data) <- c("SPY","QQQ")
+ret_list <- lapply(symbols, function(sym) dailyReturn(Cl(get(sym))))
+data <- do.call(merge, ret_list)
+colnames(data) <- symbols
+data <- na.omit(data)
 
 ############################################################
-# 2️⃣ FEATURE ENGINEERING (STATE)
+# 2️⃣ FEATURE ENGINEERING
 ############################################################
-# Technical indicators
 feat <- data.frame(
   SPY = data$SPY,
   QQQ = data$QQQ,
-  SMA10 = SMA(data$SPY, 10),
-  SMA20 = SMA(data$SPY, 20),
-  RSI = RSI(data$SPY, 14),
-  VOL = runSD(data$SPY, 10)
+  TLT = data$TLT,
+  GLD = data$GLD,
+  
+  MOM_SPY = ROC(data$SPY, 5),
+  MOM_QQQ = ROC(data$QQQ, 5),
+  
+  VOL_SPY = runSD(data$SPY, 10),
+  
+  CORR_EQ_BOND = runCor(data$SPY, data$TLT, 20)
 )
 
 feat <- na.omit(feat)
 
 ############################################################
-# 3️⃣ CREATE SEQUENCE DATA (LSTM INPUT)
+# 3️⃣ SEQUENCE DATA
 ############################################################
 T_steps <- 5
 n <- nrow(feat) - T_steps
 
 X_long <- array(0, dim=c(n, T_steps, ncol(feat)))
-Y_matrix <- matrix(0, nrow=n, ncol=3)
+Y_matrix <- matrix(0, nrow=n, ncol=5)
 
 for(i in 1:n){
   X_long[i,,] <- as.matrix(feat[i:(i+T_steps-1), ])
-  
-  # Next-day return = reward
-  next_ret_spy <- feat$SPY[i+T_steps]
-  next_ret_qqq <- feat$QQQ[i+T_steps]
-  
-  Y_matrix[i,] <- c(
-    0,                 # cash
-    next_ret_spy,
-    next_ret_qqq
-  )
+
+  r_spy <- feat$SPY[i+T_steps]
+  r_qqq <- feat$QQQ[i+T_steps]
+  r_tlt <- feat$TLT[i+T_steps]
+  r_gld <- feat$GLD[i+T_steps]
+
+  Y_matrix[i,] <- c(0, r_spy, r_qqq, r_tlt, r_gld)
 }
 
 ############################################################
@@ -102,7 +107,7 @@ build_model <- function(input_shape) {
                   input_shape=input_shape) %>%
     layer_lstm(32) %>%
     layer_dense(64, activation="relu") %>%
-    layer_dense(3)
+    layer_dense(5)   # 5 actions
 
   model %>% compile(
     optimizer = optimizer_adam(0.001),
@@ -131,9 +136,8 @@ train_dqn <- function(X, Y, episodes=30, batch_size=32, method="entropy") {
 
       state <- X[i,,]
 
-      # epsilon-greedy
       if(runif(1) < epsilon){
-        action <- sample(0:2,1)
+        action <- sample(0:4,1)
       } else {
         q_vals <- predict(model, array(state, dim=c(1,input_dims)), verbose=0)
         action <- which.max(q_vals) - 1
@@ -147,7 +151,7 @@ train_dqn <- function(X, Y, episodes=30, batch_size=32, method="entropy") {
 
     rewards_hist <- c(rewards_hist, mean(ep_rewards))
 
-    # training
+    # Training
     filled_idx <- which(!sapply(buffer$buffer, is.null))
     if(length(filled_idx) < batch_size) next
 
@@ -167,7 +171,7 @@ train_dqn <- function(X, Y, episodes=30, batch_size=32, method="entropy") {
     samples <- buffer$buffer[idx]
 
     batch_s <- array(0, dim=c(batch_size, input_dims))
-    batch_y <- matrix(0, nrow=batch_size, ncol=3)
+    batch_y <- matrix(0, nrow=batch_size, ncol=5)
 
     for(j in 1:batch_size){
       batch_s[j,,] <- samples[[j]]$state
@@ -188,8 +192,10 @@ train_dqn <- function(X, Y, episodes=30, batch_size=32, method="entropy") {
 # 7️⃣ TRAIN / TEST SPLIT
 ############################################################
 split <- floor(0.7 * n)
+
 X_train <- X_long[1:split,,]
 Y_train <- Y_matrix[1:split,]
+
 X_test  <- X_long[(split+1):n,,]
 Y_test  <- Y_matrix[(split+1):n,]
 
@@ -220,6 +226,7 @@ ggplot(df, aes(Episode, Reward)) +
   geom_line(size=1) +
   theme_minimal() +
   labs(title="DQN Portfolio Learning Curve")
+
 
 
 ############################################################

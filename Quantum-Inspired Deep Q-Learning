@@ -26,8 +26,8 @@ dgs10 <- fread("DGS10.csv")
 dtb3  <- fread("DTB3.csv")
 
 # clean
-dgs10 <- dgs10[, .(DATE, DGS10 = as.numeric(DGS10))]
-dtb3  <- dtb3[, .(DATE, DTB3  = as.numeric(DTB3))]
+dgs10 <- dgs10[, .(observation_date, DGS10 = as.numeric(DGS10))]
+dtb3  <- dtb3[, .(observation_date, DTB3  = as.numeric(DTB3))]
 
 # merge
 data <- merge(dgs10, dtb3, by="DATE")

@@ -16,59 +16,54 @@ library(TTR)
 set.seed(123)
 
 ############################################################
-# 1️⃣ LOAD DIVERSIFIED FINANCIAL DATA
+# 1️⃣ LOAD FRED MACRO DATA
 ############################################################
-symbols <- c("SPY","QQQ","TLT","GLD")
+getSymbols(c("DGS10","DTB3"), src="FRED")
 
-getSymbols(symbols,
-           src = "yahoo",
-           from = "2020-01-01",
-           to   = Sys.Date(),
-           auto.assign = TRUE)
-
-# Compute returns
-ret_list <- lapply(symbols, function(sym) dailyReturn(Cl(get(sym))))
-data <- do.call(merge, ret_list)
-colnames(data) <- symbols
+data <- merge(DGS10, DTB3)
+colnames(data) <- c("DGS10","DTB3")
 data <- na.omit(data)
 
 ############################################################
 # 2️⃣ FEATURE ENGINEERING
 ############################################################
 feat <- data.frame(
-  SPY = data$SPY,
-  QQQ = data$QQQ,
-  TLT = data$TLT,
-  GLD = data$GLD,
-  
-  MOM_SPY = ROC(data$SPY, 5),
-  MOM_QQQ = ROC(data$QQQ, 5),
-  
-  VOL_SPY = runSD(data$SPY, 10),
-  
-  CORR_EQ_BOND = runCor(data$SPY, data$TLT, 20)
+  dgs10 = data$DGS10,
+  dtb3  = data$DTB3,
+
+  # yield changes (returns proxy)
+  dgs10_ret = c(NA, diff(data$DGS10)),
+  dtb3_ret  = c(NA, diff(data$DTB3)),
+
+  # term spread
+  spread = data$DGS10 - data$DTB3,
+
+  # volatility
+  vol_dgs10 = runSD(data$DGS10, 10)
 )
 
 feat <- na.omit(feat)
 
 ############################################################
-# 3️⃣ SEQUENCE DATA
+# 3️⃣ SEQUENCE DATA (RATE TRADING ACTIONS)
 ############################################################
 T_steps <- 5
 n <- nrow(feat) - T_steps
 
 X_long <- array(0, dim=c(n, T_steps, ncol(feat)))
-Y_matrix <- matrix(0, nrow=n, ncol=5)
+Y_matrix <- matrix(0, nrow=n, ncol=3)
 
 for(i in 1:n){
+
   X_long[i,,] <- as.matrix(feat[i:(i+T_steps-1), ])
 
-  r_spy <- feat$SPY[i+T_steps]
-  r_qqq <- feat$QQQ[i+T_steps]
-  r_tlt <- feat$TLT[i+T_steps]
-  r_gld <- feat$GLD[i+T_steps]
+  dy <- feat$dgs10_ret[i+T_steps]
 
-  Y_matrix[i,] <- c(0, r_spy, r_qqq, r_tlt, r_gld)
+  Y_matrix[i,] <- c(
+    0,     # cash
+    dy,    # long rates (yield up)
+    -dy    # short rates (yield down)
+  )
 }
 
 ############################################################
@@ -107,7 +102,7 @@ build_model <- function(input_shape) {
                   input_shape=input_shape) %>%
     layer_lstm(32) %>%
     layer_dense(64, activation="relu") %>%
-    layer_dense(5)   # 5 actions
+    layer_dense(3)   # 3 actions
 
   model %>% compile(
     optimizer = optimizer_adam(0.001),
@@ -119,7 +114,7 @@ build_model <- function(input_shape) {
 ############################################################
 # 6️⃣ TRAIN DQN
 ############################################################
-train_dqn <- function(X, Y, episodes=30, batch_size=32, method="entropy") {
+train_dqn <- function(X, Y, episodes=30, batch_size=32) {
 
   input_dims <- dim(X)[2:3]
   model <- build_model(input_dims)
@@ -137,7 +132,7 @@ train_dqn <- function(X, Y, episodes=30, batch_size=32, method="entropy") {
       state <- X[i,,]
 
       if(runif(1) < epsilon){
-        action <- sample(0:4,1)
+        action <- sample(0:2,1)
       } else {
         q_vals <- predict(model, array(state, dim=c(1,input_dims)), verbose=0)
         action <- which.max(q_vals) - 1
@@ -171,7 +166,7 @@ train_dqn <- function(X, Y, episodes=30, batch_size=32, method="entropy") {
     samples <- buffer$buffer[idx]
 
     batch_s <- array(0, dim=c(batch_size, input_dims))
-    batch_y <- matrix(0, nrow=batch_size, ncol=5)
+    batch_y <- matrix(0, nrow=batch_size, ncol=3)
 
     for(j in 1:batch_size){
       batch_s[j,,] <- samples[[j]]$state
@@ -225,8 +220,7 @@ df <- data.frame(Episode=1:length(out$rewards),
 ggplot(df, aes(Episode, Reward)) +
   geom_line(size=1) +
   theme_minimal() +
-  labs(title="DQN Portfolio Learning Curve")
-
+  labs(title="DQN Interest Rate Trading Learning Curve")
 
 
 ############################################################

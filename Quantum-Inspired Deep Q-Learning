@@ -30,8 +30,8 @@ dgs10 <- dgs10[, .(observation_date, DGS10 = as.numeric(DGS10))]
 dtb3  <- dtb3[, .(observation_date, DTB3  = as.numeric(DTB3))]
 
 # merge
-data <- merge(dgs10, dtb3, by="(observation_date")
-data$DATE <- as.Date(data$(observation_date)
+data <- merge(dgs10, dtb3, by="observation_date")
+data$DATE <- as.Date(data$observation_date)
 
 data <- na.omit(data)
 

@@ -1,7 +1,7 @@
 # April 23 2026
 
 ############################################################
-# 0️⃣ ENV + LIBRARIES
+# 0️⃣ SETUP
 ############################################################
 Sys.setenv(CUDA_VISIBLE_DEVICES = "")
 Sys.setenv(TF_CPP_MIN_LOG_LEVEL = "2")
@@ -19,22 +19,15 @@ set.seed(123)
 ############################################################
 # 1️⃣ LOAD FRED MACRO DATA
 ############################################################
-# https://fred.stlouisfed.org/series/DGS10
-# https://fred.stlouisfed.org/series/DTB3
-# 2021-04-22 to 2026-04-22
 dgs10 <- fread("DGS10.csv")
 dtb3  <- fread("DTB3.csv")
 
-# clean
 dgs10 <- dgs10[, .(observation_date, DGS10 = as.numeric(DGS10))]
 dtb3  <- dtb3[, .(observation_date, DTB3  = as.numeric(DTB3))]
 
-# merge
 data <- merge(dgs10, dtb3, by="observation_date")
 data$DATE <- as.Date(data$observation_date)
-
 data <- na.omit(data)
-
 
 ############################################################
 # 2️⃣ FEATURE ENGINEERING
@@ -42,22 +35,16 @@ data <- na.omit(data)
 feat <- data.frame(
   dgs10 = data$DGS10,
   dtb3  = data$DTB3,
-
-  # yield changes (returns proxy)
   dgs10_ret = c(NA, diff(data$DGS10)),
   dtb3_ret  = c(NA, diff(data$DTB3)),
-
-  # term spread
   spread = data$DGS10 - data$DTB3,
-
-  # volatility
   vol_dgs10 = runSD(data$DGS10, 10)
 )
 
 feat <- na.omit(feat)
 
 ############################################################
-# 3️⃣ SEQUENCE DATA (RATE TRADING ACTIONS)
+# 3️⃣ SEQUENCE DATA
 ############################################################
 T_steps <- 5
 n <- nrow(feat) - T_steps
@@ -66,15 +53,14 @@ X_long <- array(0, dim=c(n, T_steps, ncol(feat)))
 Y_matrix <- matrix(0, nrow=n, ncol=3)
 
 for(i in 1:n){
-
   X_long[i,,] <- as.matrix(feat[i:(i+T_steps-1), ])
 
   dy <- feat$dgs10_ret[i+T_steps]
 
   Y_matrix[i,] <- c(
-    0,     # cash
-    dy,    # long rates (yield up)
-    -dy    # short rates (yield down)
+    0,
+    dy,
+    -dy
   )
 }
 
@@ -87,20 +73,29 @@ ReplayBuffer <- R6Class(
     capacity = NULL,
     buffer = NULL,
     position = 1,
-    initialize = function(capacity) {
+
+    initialize = function(capacity){
       self$capacity <- capacity
       self$buffer <- vector("list", capacity)
     },
-    push = function(state, action, reward) {
-      self$buffer[[self$position]] <- list(state=state, action=action, reward=reward)
+
+    push = function(state, action, reward){
+      self$buffer[[self$position]] <- list(
+        state=state, action=action, reward=reward
+      )
       self$position <- ifelse(self$position == self$capacity, 1, self$position + 1)
     },
-    sample_indices = function(batch_size, weights=NULL) {
+
+    sample_indices = function(batch_size, weights=NULL){
       filled <- which(!sapply(self$buffer, is.null))
       if(length(filled) < batch_size) return(NULL)
-      if(is.null(weights)) return(sample(filled, batch_size))
-      w <- weights[filled]
-      return(sample(filled, batch_size, prob=w/sum(w)))
+
+      if(is.null(weights)){
+        return(sample(filled, batch_size))
+      } else {
+        w <- weights[filled]
+        return(sample(filled, batch_size, prob=w/sum(w)))
+      }
     }
   )
 )
@@ -108,13 +103,13 @@ ReplayBuffer <- R6Class(
 ############################################################
 # 5️⃣ MODEL
 ############################################################
-build_model <- function(input_shape) {
+build_model <- function(input_shape){
   model <- keras_model_sequential() %>%
     layer_conv_1d(filters=32, kernel_size=2, activation="relu",
                   input_shape=input_shape) %>%
     layer_lstm(32) %>%
     layer_dense(64, activation="relu") %>%
-    layer_dense(3)   # 3 actions
+    layer_dense(3)
 
   model %>% compile(
     optimizer = optimizer_adam(0.001),
@@ -124,9 +119,14 @@ build_model <- function(input_shape) {
 }
 
 ############################################################
-# 6️⃣ TRAIN DQN
+# 6️⃣ TRAIN DQN (3 METHODS)
 ############################################################
-train_dqn <- function(X, Y, episodes=30, batch_size=32) {
+train_dqn <- function(X, Y,
+                      episodes=30,
+                      batch_size=32,
+                      method="uniform",
+                      alpha_entropy=0.5,
+                      beta_per=0.6) {
 
   input_dims <- dim(X)[2:3]
   model <- build_model(input_dims)
@@ -139,6 +139,7 @@ train_dqn <- function(X, Y, episodes=30, batch_size=32) {
 
     ep_rewards <- c()
 
+    # collect experience
     for(i in 1:dim(X)[1]){
 
       state <- X[i,,]
@@ -158,7 +159,6 @@ train_dqn <- function(X, Y, episodes=30, batch_size=32) {
 
     rewards_hist <- c(rewards_hist, mean(ep_rewards))
 
-    # Training
     filled_idx <- which(!sapply(buffer$buffer, is.null))
     if(length(filled_idx) < batch_size) next
 
@@ -169,10 +169,29 @@ train_dqn <- function(X, Y, episodes=30, batch_size=32) {
 
     q_all <- predict(model, all_s, verbose=0)
 
-    # entropy-based sampling
-    prob <- t(apply(q_all,1,function(x) exp(x)/sum(exp(x))))
-    entropy <- -rowSums(prob*log(prob+1e-8))
-    weights <- entropy
+    weights <- rep(1, length(filled_idx))
+
+    ########################################################
+    # ENTROPY SAMPLING
+    ########################################################
+    if(method == "entropy"){
+      prob <- t(apply(q_all,1,function(x) exp(x)/sum(exp(x))))
+      entropy <- -rowSums(prob * log(prob + 1e-8))
+      qvar <- apply(q_all,1,var)
+      weights <- alpha_entropy * entropy + (1-alpha_entropy)*qvar
+    }
+
+    ########################################################
+    # PER SAMPLING
+    ########################################################
+    if(method == "per"){
+      rewards <- sapply(filled_idx, function(i) buffer$buffer[[i]]$reward)
+      actions <- sapply(filled_idx, function(i) buffer$buffer[[i]]$action)
+
+      pred <- q_all[cbind(1:nrow(q_all), actions+1)]
+      td <- abs(rewards - pred)
+      weights <- (td + 1e-5)^beta_per
+    }
 
     idx <- buffer$sample_indices(batch_size, weights)
     samples <- buffer$buffer[idx]
@@ -182,21 +201,34 @@ train_dqn <- function(X, Y, episodes=30, batch_size=32) {
 
     for(j in 1:batch_size){
       batch_s[j,,] <- samples[[j]]$state
-      q <- predict(model, array(samples[[j]]$state, dim=c(1,input_dims)), verbose=0)
+
+      q <- predict(model,
+                   array(samples[[j]]$state, dim=c(1,input_dims)),
+                   verbose=0)
+
       q[1, samples[[j]]$action+1] <- samples[[j]]$reward
       batch_y[j,] <- q
     }
 
     model %>% fit(batch_s, batch_y, epochs=1, verbose=0)
 
-    epsilon <- max(0.1, epsilon*0.95)
+    epsilon <- max(0.1, epsilon * 0.95)
   }
 
   list(model=model, rewards=rewards_hist)
 }
 
 ############################################################
-# 7️⃣ TRAIN / TEST SPLIT
+# 7️⃣ EVALUATION
+############################################################
+evaluate_model <- function(model, X, Y){
+  q <- predict(model, X, verbose=0)
+  a <- apply(q,1,which.max)
+  mean(Y[cbind(1:nrow(Y), a)])
+}
+
+############################################################
+# 8️⃣ TRAIN / TEST SPLIT
 ############################################################
 split <- floor(0.7 * n)
 
@@ -207,32 +239,53 @@ X_test  <- X_long[(split+1):n,,]
 Y_test  <- Y_matrix[(split+1):n,]
 
 ############################################################
-# 8️⃣ TRAIN MODEL
+# 9️⃣ TRAIN 3 MODELS
 ############################################################
-out <- train_dqn(X_train, Y_train)
+model_uniform <- train_dqn(X_train, Y_train, method="uniform")
+model_entropy <- train_dqn(X_train, Y_train, method="entropy", alpha_entropy=0.5)
+model_per     <- train_dqn(X_train, Y_train, method="per", beta_per=0.6)
 
 ############################################################
-# 9️⃣ EVALUATION
+# 🔟 TEST PERFORMANCE
 ############################################################
-evaluate <- function(model, X, Y){
-  q <- predict(model, X, verbose=0)
-  a <- apply(q,1,which.max)
-  mean(sapply(1:nrow(Y), function(i) Y[i, a[i]]))
-}
+perf_uniform <- evaluate_model(model_uniform$model, X_test, Y_test)
+perf_entropy <- evaluate_model(model_entropy$model, X_test, Y_test)
+perf_per     <- evaluate_model(model_per$model, X_test, Y_test)
 
-perf <- evaluate(out$model, X_test, Y_test)
-print(paste("Test Reward:", round(perf,6)))
+results <- data.frame(
+  Model = c("Uniform", "Entropy", "PER"),
+  TestReward = c(perf_uniform, perf_entropy, perf_per)
+)
+
+print(results)
 
 ############################################################
-# 🔟 LEARNING CURVE
+# 📊 BAR PLOT
 ############################################################
-df <- data.frame(Episode=1:length(out$rewards),
-                 Reward=out$rewards)
+ggplot(results, aes(Model, TestReward, fill=Model)) +
+  geom_bar(stat="identity") +
+  theme_minimal() +
+  labs(title="DQN Model Comparison (FRED Rates Trading)",
+       y="Average Test Reward")
 
-ggplot(df, aes(Episode, Reward)) +
+############################################################
+# 📈 LEARNING CURVES
+############################################################
+df <- data.frame(
+  Episode = 1:length(model_uniform$rewards),
+  Uniform = model_uniform$rewards,
+  Entropy = model_entropy$rewards,
+  PER = model_per$rewards
+)
+
+df_long <- df %>%
+  pivot_longer(-Episode, names_to="Model", values_to="Reward")
+
+ggplot(df_long, aes(Episode, Reward, color=Model)) +
   geom_line(size=1) +
   theme_minimal() +
-  labs(title="DQN Interest Rate Trading Learning Curve")
+  labs(title="Learning Curves Comparison")
+
 
 
 ############################################################

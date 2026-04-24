@@ -286,7 +286,23 @@ ggplot(df_long, aes(Episode, Reward, color=Model)) +
   theme_minimal() +
   labs(title="Learning Curves Comparison")
 
+############################################################
+# 📊 SUMMARY TABLE
+############################################################
+library(dplyr)
 
+summary_table <- df_long %>%
+  group_by(Model) %>%
+  summarise(
+    Mean_Reward   = mean(Reward, na.rm = TRUE),
+    SD_Reward     = sd(Reward, na.rm = TRUE),
+    Final_Reward  = last(Reward),
+    Early_Reward  = mean(Reward[Episode <= 10], na.rm = TRUE),
+    Late_Reward   = mean(Reward[Episode > max(Episode) - 10], na.rm = TRUE),
+    Improvement   = Late_Reward - Early_Reward
+  )
+
+print(summary_table)
 
 ############################################################
 # 0️⃣ ENV + LIBRARIES

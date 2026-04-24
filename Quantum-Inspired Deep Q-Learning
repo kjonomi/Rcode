@@ -19,6 +19,10 @@ set.seed(123)
 ############################################################
 # 1️⃣ LOAD FRED MACRO DATA
 ############################################################
+ # https://fred.stlouisfed.org/series/DGS10
+ # https://fred.stlouisfed.org/series/DTB3
+ # 2021-04-22 to 2026-04-22
+
 dgs10 <- fread("DGS10.csv")
 dtb3  <- fread("DTB3.csv")
 

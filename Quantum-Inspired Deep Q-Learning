@@ -605,6 +605,23 @@ ggplot(df, aes(Method, Reward, fill=Method)) +
   labs(title="Sampling Method Comparison (70:30)",
        y="Reward")
 
+library(dplyr)
+
+summary_70 <- df %>%
+  group_by(Method) %>%
+  summarise(
+    Mean   = mean(Reward),
+    SD     = sd(Reward),
+    Median = median(Reward),
+    Min    = min(Reward),
+    Max    = max(Reward),
+    Q1     = quantile(Reward, 0.25),
+    Q3     = quantile(Reward, 0.75),
+    .groups = "drop"
+  )
+
+print(summary_70)
+
 df80 <- as.data.frame(results_80) %>%
   pivot_longer(cols=everything(),
                names_to="Method",
@@ -616,6 +633,21 @@ ggplot(df80, aes(Method, Reward, fill=Method)) +
   theme_minimal(base_size=14) +
   labs(title="Sampling Method Comparison (80:20)",
        y="Reward")
+
+summary_80 <- df80 %>%
+  group_by(Method) %>%
+  summarise(
+    Mean   = mean(Reward),
+    SD     = sd(Reward),
+    Median = median(Reward),
+    Min    = min(Reward),
+    Max    = max(Reward),
+    Q1     = quantile(Reward, 0.25),
+    Q3     = quantile(Reward, 0.75),
+    .groups = "drop"
+  )
+
+print(summary_80)
 
 ############################################################
 # 1️⃣2️⃣ LEARNING CURVE (Entropy Effect)

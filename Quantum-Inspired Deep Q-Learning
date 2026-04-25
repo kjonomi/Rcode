@@ -539,16 +539,32 @@ colnames(results_80) <- c("uniform","entropy","per")
 # 9️⃣ STATISTICAL TESTS
 ############################################################
 t_entropy <- t.test(results[, "entropy"], results[, "uniform"], paired=TRUE)
+t_entropy_per <- t.test(results[, "entropy"], results[, "per"], paired=TRUE)
+t_per <- t.test(results[, "per"], results[, "uniform"], paired=TRUE)
 w_entropy <- wilcox.test(results[, "entropy"], results[, "uniform"], paired=TRUE)
+w_entropy_per <- wilcox.test(results[, "entropy"], results[, "per"], paired=TRUE)
+w_per <- wilcox.test(results[, "per"], results[, "uniform"], paired=TRUE)
 
 print(t_entropy)
+print(t_entropy_per)
+print(t_per)
 print(w_entropy)
+print(w_entropy_per)
+print(w_per)
 
 t_entropy_80 <- t.test(results_80[, "entropy"], results[, "uniform"], paired=TRUE)
+t_entropy_per_80 <- t.test(results_80[, "entropy"], results[, "per"], paired=TRUE)
+t_per_80 <- t.test(results_80[, "per"], results[, "uniform"], paired=TRUE)
 w_entropy_80 <- wilcox.test(results_80[, "entropy"], results_80[, "uniform"], paired=TRUE)
+w_entropy_per_80 <- wilcox.test(results_80[, "entropy"], results_80[, "per"], paired=TRUE)
+w_per_80 <- wilcox.test(results_80[, "per"], results_80[, "uniform"], paired=TRUE)
 
 print(t_entropy_80)
+print(t_entropy_per_80)
+print(t_per_80)
 print(w_entropy_80)
+print(w_entropy_per_80)
+print(w_per_80)
 
 ############################################################
 # 🔟 BOOTSTRAP CI
@@ -560,9 +576,19 @@ bootstrap_ci <- function(x, B=1000) {
 
 ci_entropy <- bootstrap_ci(results[, "entropy"])
 ci_uniform <- bootstrap_ci(results[, "uniform"])
+ci_per <- bootstrap_ci(results[, "per"])
 
 print(ci_entropy)
 print(ci_uniform)
+print(ci_per)
+
+ci_entropy_80 <- bootstrap_ci(results_80[, "entropy"])
+ci_uniform_80 <- bootstrap_ci(results_80[, "uniform"])
+ci_per_80 <- bootstrap_ci(results_80[, "per"])
+
+print(ci_entropy_80)
+print(ci_uniform_80)
+print(ci_per_80)
 
 ############################################################
 # 1️⃣1️⃣ PLOTS (IMPROVED)
@@ -576,20 +602,70 @@ ggplot(df, aes(Method, Reward, fill=Method)) +
   geom_boxplot(alpha=0.7) +
   stat_summary(fun=mean, geom="point", size=3) +
   theme_minimal(base_size=14) +
-  labs(title="Sampling Method Comparison",
+  labs(title="Sampling Method Comparison (70:30)",
+       y="Reward")
+
+df80 <- as.data.frame(results_80) %>%
+  pivot_longer(cols=everything(),
+               names_to="Method",
+               values_to="Reward")
+
+ggplot(df80, aes(Method, Reward, fill=Method)) +
+  geom_boxplot(alpha=0.7) +
+  stat_summary(fun=mean, geom="point", size=3) +
+  theme_minimal(base_size=14) +
+  labs(title="Sampling Method Comparison (80:20)",
        y="Reward")
 
 ############################################################
 # 1️⃣2️⃣ LEARNING CURVE (Entropy Effect)
 ############################################################
-out_entropy <- train_dqn(X_long[1:150,,], Y_matrix[1:150,], method="entropy")
-curve_df <- data.frame(Episode=1:length(out_entropy$rewards),
-                       Reward=out_entropy$rewards)
 
-ggplot(curve_df, aes(Episode, Reward)) +
-  geom_line(size=1) +
+out_entropy <- train_dqn(X_long[1:150,,], Y_matrix[1:150,], method="entropy")
+out_per     <- train_dqn(X_long[1:150,,], Y_matrix[1:150,], method="per")
+out_uniform <- train_dqn(X_long[1:150,,], Y_matrix[1:150,], method="uniform")
+
+curve_df <- bind_rows(
+  data.frame(Episode = 1:length(out_entropy$rewards),
+             Reward  = out_entropy$rewards,
+             Method  = "Entropy"),
+
+  data.frame(Episode = 1:length(out_per$rewards),
+             Reward  = out_per$rewards,
+             Method  = "PER"),
+
+  data.frame(Episode = 1:length(out_uniform$rewards),
+             Reward  = out_uniform$rewards,
+             Method  = "Uniform")
+)
+
+min_len <- min(
+  length(out_entropy$rewards),
+  length(out_per$rewards),
+  length(out_uniform$rewards)
+)
+
+curve_df <- bind_rows(
+  data.frame(Episode = 1:min_len,
+             Reward  = out_entropy$rewards[1:min_len],
+             Method  = "Entropy"),
+
+  data.frame(Episode = 1:min_len,
+             Reward  = out_per$rewards[1:min_len],
+             Method  = "PER"),
+
+  data.frame(Episode = 1:min_len,
+             Reward  = out_uniform$rewards[1:min_len],
+             Method  = "Uniform")
+)
+
+ggplot(curve_df, aes(Episode, Reward, color=Method)) +
+  geom_line(alpha=0.5) +
+  geom_smooth(se=FALSE, span=0.2) +
   theme_minimal(base_size=14) +
-  labs(title="Learning Curve (Entropy Sampling)")
+  labs(title="Learning Curves Comparison (Smoothed)")
+
+
 
 # March 4 2026
 

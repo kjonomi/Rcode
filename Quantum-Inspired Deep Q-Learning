@@ -671,25 +671,6 @@ curve_df <- bind_rows(
              Method  = "Uniform")
 )
 
-min_len <- min(
-  length(out_entropy$rewards),
-  length(out_per$rewards),
-  length(out_uniform$rewards)
-)
-
-curve_df <- bind_rows(
-  data.frame(Episode = 1:min_len,
-             Reward  = out_entropy$rewards[1:min_len],
-             Method  = "Entropy"),
-
-  data.frame(Episode = 1:min_len,
-             Reward  = out_per$rewards[1:min_len],
-             Method  = "PER"),
-
-  data.frame(Episode = 1:min_len,
-             Reward  = out_uniform$rewards[1:min_len],
-             Method  = "Uniform")
-)
 
 ggplot(curve_df, aes(Episode, Reward, color=Method)) +
   geom_line(alpha=0.5) +
@@ -697,7 +678,26 @@ ggplot(curve_df, aes(Episode, Reward, color=Method)) +
   theme_minimal(base_size=14) +
   labs(title="Learning Curves Comparison (Smoothed)")
 
+library(dplyr)
 
+curve_summary <- curve_df %>%
+  group_by(Method) %>%
+  summarise(
+    Mean_Reward      = mean(Reward),
+    SD_Reward        = sd(Reward),
+    Final_Reward     = last(Reward),
+    Max_Reward       = max(Reward),
+    AUC_Reward       = sum(Reward),   # area under curve (discrete)
+    Early_Reward     = mean(Reward[1:round(0.2 * n())]),
+    Late_Reward      = mean(Reward[(round(0.8 * n())):n()]),
+    Improvement      = Late_Reward - Early_Reward,
+    .groups = "drop"
+  )
+
+curve_summary_fmt <- curve_summary %>%
+  mutate(across(where(is.numeric), ~ sprintf("%.6f", .)))
+
+print(curve_summary_fmt, width = Inf)
 
 # March 4 2026
 

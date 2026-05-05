@@ -393,10 +393,37 @@ set.seed(123)
 # -------------------------
 # load and preprocess KOSPI data (same as before)
 # -------------------------
-#kospi1 <- read.csv("KOSPI1.csv", header = FALSE)
-#kospi <- t(kospi1)
 kospi1 <- read.csv("newkospi.csv", header = FALSE)
 kospi <- kospi1
+
+# -------------------------
+# Summary statistics (raw KOSPI)
+# -------------------------
+
+kospi_df <- as.data.frame(kospi)
+
+summary_stats <- data.frame(
+  Mean = apply(kospi_df, 2, mean, na.rm = TRUE),
+  SD   = apply(kospi_df, 2, sd, na.rm = TRUE),
+  Min  = apply(kospi_df, 2, min, na.rm = TRUE),
+  Max  = apply(kospi_df, 2, max, na.rm = TRUE),
+  Median = apply(kospi_df, 2, median, na.rm = TRUE)
+)
+
+# overall summary
+overall_stats <- data.frame(
+  Mean   = mean(as.matrix(kospi_df), na.rm = TRUE),
+  SD     = sd(as.matrix(kospi_df), na.rm = TRUE),
+  Min    = min(as.matrix(kospi_df), na.rm = TRUE),
+  Max    = max(as.matrix(kospi_df), na.rm = TRUE),
+  Median = median(as.matrix(kospi_df), na.rm = TRUE)
+)
+
+print("Column-wise summary statistics:")
+print(head(summary_stats))
+
+print("Overall summary statistics:")
+print(overall_stats)
 
 data_mat <- as.matrix(kospi)
 total_rows <- nrow(data_mat)

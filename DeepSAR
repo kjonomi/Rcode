@@ -1,4 +1,776 @@
 # ============================================================
+# SPATIAL SAR-Q-LEARNING INVENTORY SYSTEM
+# USING REAL M5 WALMART DATA
+# ============================================================
+
+# ============================================================
+# 0) Libraries
+# ============================================================
+
+pkgs <- c(
+  "data.table",
+  "dplyr",
+  "tidyr",
+  "ggplot2",
+  "lubridate",
+  "forecast",
+  "Matrix",
+  "igraph",
+  "reshape2",
+  "kableExtra",
+  "ggrepel"
+)
+
+new_pkgs <- pkgs[!(pkgs %in% installed.packages()[, "Package"])]
+
+if(length(new_pkgs)){
+  install.packages(new_pkgs, repos = "https://cloud.r-project.org")
+}
+
+lapply(pkgs, library, character.only = TRUE)
+
+set.seed(123)
+
+# ============================================================
+# 1) LOAD M5 WALMART DATA
+# ============================================================
+
+# Download from:
+# https://www.kaggle.com/competitions/m5-forecasting-accuracy/data
+# https://github.com/claudiawang-tech/M5-Forecasting---Accuracy
+sales <- fread("sales_train_validation.csv")
+calendar <- fread("calendar.csv")
+
+# ============================================================
+# 2) SELECT TOP STORES
+# ============================================================
+
+sales_only <- grep("^d_", names(sales), value = TRUE)
+
+store_sales <- sales %>%
+  group_by(store_id) %>%
+  summarise(
+    total_sales = sum(across(all_of(sales_only))),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(total_sales))
+
+topN <- 10
+
+selected_stores <- head(store_sales$store_id, topN)
+
+sales_sub <- sales %>%
+  filter(store_id %in% selected_stores)
+
+stores <- selected_stores
+
+print(stores)
+
+# ============================================================
+# 3) CONVERT TO DAILY STORE SALES MATRIX
+# ============================================================
+
+sales_long <- sales_sub %>%
+  pivot_longer(
+    cols = starts_with("d_"),
+    names_to = "Day",
+    values_to = "Sales"
+  )
+
+store_daily <- sales_long %>%
+  group_by(store_id, Day) %>%
+  summarise(
+    DailySales = sum(Sales),
+    .groups = "drop"
+  )
+
+sales_wide <- store_daily %>%
+  pivot_wider(
+    names_from = store_id,
+    values_from = DailySales
+  )
+
+sales_wide[is.na(sales_wide)] <- 0
+
+sales_mat <- as.matrix(
+  sales_wide[, stores, drop = FALSE]
+)
+
+rownames(sales_mat) <- sales_wide$Day
+
+# ============================================================
+# 4) ESTIMATE AR(1) DEMAND PARAMETERS
+# ============================================================
+
+n_regions <- ncol(sales_mat)
+
+demand_phi <- numeric(n_regions)
+demand_base <- numeric(n_regions)
+
+for(i in 1:n_regions){
+
+  ts_i <- ts(sales_mat[, i], frequency = 7)
+
+  fit <- tryCatch(
+    arima(ts_i, order = c(1,0,0)),
+    error = function(e) NULL
+  )
+
+  if(!is.null(fit)){
+
+    demand_phi[i] <- coef(fit)["ar1"]
+
+    demand_base[i] <- mean(ts_i)
+
+  } else {
+
+    demand_phi[i] <- 0.5
+
+    demand_base[i] <- mean(ts_i)
+  }
+}
+
+names(demand_phi) <- stores
+names(demand_base) <- stores
+
+phi_table <- data.frame(
+  Store = stores,
+  AR1_phi = round(demand_phi, 3),
+  BaseDemand = round(demand_base, 2)
+)
+
+print(phi_table)
+
+# ============================================================
+# 5) BUILD SPATIAL STORE NETWORK
+# ============================================================
+
+# Correlation-based adjacency
+
+corr_mat <- cor(sales_mat)
+
+W <- matrix(0, n_regions, n_regions)
+
+k_neigh <- 3
+
+for(i in 1:n_regions){
+
+  nbrs <- order(
+    corr_mat[i, ],
+    decreasing = TRUE
+  )[2:(k_neigh + 1)]
+
+  W[i, nbrs] <- 1
+}
+
+W <- W / rowSums(W)
+
+W[is.na(W)] <- 0
+
+rownames(W) <- stores
+colnames(W) <- stores
+
+print(round(W, 2))
+
+# ============================================================
+# 6) VISUALIZE STORE NETWORK
+# ============================================================
+
+g <- graph_from_adjacency_matrix(
+  W,
+  mode = "directed",
+  weighted = TRUE
+)
+
+plot(
+  g,
+  vertex.size = 30,
+  vertex.label.cex = 0.8,
+  main = "Spatial Store Inventory Network"
+)
+
+# ============================================================
+# 7) SAR-Q-LEARNING INITIALIZATION
+# ============================================================
+
+n_actions <- 3
+
+# 0 = maintain
+# 1 = increase shipment
+# 2 = reduce shipment
+
+n_episodes <- 300
+n_steps <- 30
+
+alpha <- 0.08
+gamma <- 0.95
+
+lambda_spatial <- 0.30
+consensus_tau <- 0.08
+
+epsilon_start <- 0.35
+epsilon_end <- 0.05
+
+Q <- matrix(
+  0,
+  nrow = n_regions,
+  ncol = n_actions
+)
+
+rownames(Q) <- stores
+
+states <- round(1.2 * demand_base)
+
+# ============================================================
+# 8) DEMAND VOLATILITY
+# ============================================================
+
+demand_noise_sd <- apply(
+  sales_mat,
+  2,
+  sd
+)
+
+names(demand_noise_sd) <- stores
+
+# ============================================================
+# 9) REWARD FUNCTION
+# ============================================================
+
+reward_fn <- function(
+  inventory,
+  demand,
+  transport_cost = 0
+){
+
+  sales <- pmin(inventory, demand)
+
+  revenue <- 12 * sales
+
+  holding_cost <- 0.06 * pmax(inventory - demand, 0)
+
+  shortage_cost <- 0.50 * pmax(demand - inventory, 0)
+
+  reward <- revenue -
+    holding_cost -
+    shortage_cost -
+    transport_cost
+
+  return(reward)
+}
+
+# ============================================================
+# 10) TRANSPORT COST FUNCTION
+# ============================================================
+
+transport_cost_fn <- function(
+  region,
+  neighbors,
+  inventory_flow
+){
+
+  flow_cost <- 0
+
+  for(j in neighbors){
+
+    flow_cost <- flow_cost +
+      0.02 * abs(inventory_flow)
+  }
+
+  return(flow_cost)
+}
+
+# ============================================================
+# 11) STATE TRANSITION FUNCTION
+# ============================================================
+
+next_state_fn <- function(
+  s,
+  a_vec,
+  demand_forecast,
+  rho = 0.40
+){
+
+  s <- as.numeric(s)
+
+  n <- length(s)
+
+  neighbor_inventory <- as.numeric(
+    rho * (W %*% matrix(s, ncol = 1))
+  )
+
+  action_effect <- rep(0, n)
+
+  for(i in 1:n){
+
+    action_effect[i] <- switch(
+      as.character(a_vec[i]),
+
+      "0" = 0,
+
+      "1" = round(
+        0.20 * demand_forecast[i]
+      ),
+
+      "2" = -round(
+        0.20 * demand_forecast[i]
+      ),
+
+      0
+    )
+  }
+
+  noise <- rnorm(
+    n,
+    0,
+    pmax(1, 0.10 * demand_forecast)
+  )
+
+  s_next <- s +
+    neighbor_inventory +
+    action_effect -
+    demand_forecast +
+    noise
+
+  s_next <- pmax(round(s_next), 0)
+
+  return(s_next)
+}
+
+# ============================================================
+# 12) SAR-Q-LEARNING TRAINING
+# ============================================================
+
+demand_t <- as.numeric(demand_base)
+
+episode_rewards <- matrix(
+  0,
+  nrow = n_episodes,
+  ncol = n_regions
+)
+
+action_counts <- matrix(
+  0,
+  nrow = n_actions,
+  ncol = n_regions
+)
+
+cum_reward <- rep(0, n_regions)
+
+for(ep in 1:n_episodes){
+
+  s <- states
+
+  eps <- epsilon_start +
+    (epsilon_end - epsilon_start) *
+    (ep / n_episodes)
+
+  alpha_ep <- alpha *
+    (1 / (1 + 0.0005 * ep))
+
+  ep_rewards <- rep(0, n_regions)
+
+  for(t in 1:n_steps){
+
+    # --------------------------------------------------------
+    # DEMAND FORECAST
+    # --------------------------------------------------------
+
+    demand_forecast <- numeric(n_regions)
+
+    for(i in 1:n_regions){
+
+      demand_forecast[i] <-
+        demand_t[i] * demand_phi[i] +
+        (1 - demand_phi[i]) *
+        demand_base[i]
+    }
+
+    # --------------------------------------------------------
+    # ACTION SELECTION
+    # --------------------------------------------------------
+
+    actions <- integer(n_regions)
+
+    for(region in 1:n_regions){
+
+      if(runif(1) < eps){
+
+        a <- sample(0:(n_actions - 1), 1)
+
+      } else {
+
+        a <- which.max(Q[region, ]) - 1
+      }
+
+      actions[region] <- a
+
+      action_counts[a + 1, region] <-
+        action_counts[a + 1, region] + 1
+    }
+
+    # --------------------------------------------------------
+    # STATE TRANSITION
+    # --------------------------------------------------------
+
+    s_next <- next_state_fn(
+      s,
+      actions,
+      demand_forecast
+    )
+
+    realized_demand <- pmax(
+      round(
+        demand_forecast +
+          rnorm(
+            n_regions,
+            0,
+            demand_noise_sd
+          )
+      ),
+      0
+    )
+
+    # --------------------------------------------------------
+    # Q UPDATE
+    # --------------------------------------------------------
+
+    for(region in 1:n_regions){
+
+      nbrs <- which(W[region, ] > 0)
+
+      transport_cost <- transport_cost_fn(
+        region,
+        nbrs,
+        inventory_flow = actions[region]
+      )
+
+      r <- reward_fn(
+        inventory = s_next[region],
+        demand = realized_demand[region],
+        transport_cost = transport_cost
+      )
+
+      ep_rewards[region] <-
+        ep_rewards[region] + r
+
+      spatial_term <- lambda_spatial *
+        sum(
+          W[region, ] *
+            Q[, actions[region] + 1]
+        )
+
+      Q[region, actions[region] + 1] <-
+        Q[region, actions[region] + 1] +
+        alpha_ep * (
+          r +
+            gamma * max(Q[region, ]) +
+            spatial_term -
+            Q[region, actions[region] + 1]
+        )
+    }
+
+    # --------------------------------------------------------
+    # CONSENSUS UPDATE
+    # --------------------------------------------------------
+
+    Q_new <- Q
+
+    for(region in 1:n_regions){
+
+      if(sum(W[region, ]) > 0){
+
+        neighbor_Q_mean <- colSums(
+          matrix(
+            W[region, ],
+            nrow = n_regions,
+            ncol = n_actions,
+            byrow = FALSE
+          ) * Q
+        ) / sum(W[region, ])
+
+      } else {
+
+        neighbor_Q_mean <- rep(0, n_actions)
+      }
+
+      Q_new[region, ] <-
+        (1 - consensus_tau) *
+        Q[region, ] +
+        consensus_tau *
+        neighbor_Q_mean
+    }
+
+    Q <- Q_new
+
+    s <- s_next
+
+    demand_t <- realized_demand
+  }
+
+  episode_rewards[ep, ] <- ep_rewards
+
+  cum_reward <- cum_reward + ep_rewards
+
+  if(ep %% 50 == 0){
+
+    cat(
+      sprintf(
+        "Episode %d/%d | Mean reward = %.2f\n",
+        ep,
+        n_episodes,
+        mean(ep_rewards)
+      )
+    )
+  }
+}
+
+# ============================================================
+# 13) FORECAST USING LEARNED POLICY
+# ============================================================
+
+forecast_horizon <- 8
+
+s_current <- states
+
+demand_current <- as.numeric(demand_base)
+
+s_forecast <- matrix(
+  0,
+  nrow = forecast_horizon,
+  ncol = n_regions
+)
+
+actions_forecast <- matrix(
+  0,
+  nrow = forecast_horizon,
+  ncol = n_regions
+)
+
+for(t in 1:forecast_horizon){
+
+  actions_sel <- apply(Q, 1, which.max) - 1
+
+  demand_pred <- numeric(n_regions)
+
+  for(i in 1:n_regions){
+
+    demand_pred[i] <-
+      demand_current[i] * demand_phi[i] +
+      (1 - demand_phi[i]) *
+      demand_base[i]
+  }
+
+  s_next <- next_state_fn(
+    s_current,
+    actions_sel,
+    demand_pred
+  )
+
+  s_forecast[t, ] <- s_next
+
+  actions_forecast[t, ] <- actions_sel
+
+  s_current <- s_next
+
+  demand_current <- demand_pred
+}
+
+# ============================================================
+# 14) RESULTS SUMMARY
+# ============================================================
+
+action_labels <- c(
+  "Maintain",
+  "IncreaseShipment",
+  "ReduceShipment"
+)
+
+policy_table <- data.frame(
+  Store = stores,
+  BestAction = apply(Q, 1, which.max) - 1,
+  ActionMeaning = action_labels[
+    apply(Q, 1, which.max)
+  ]
+)
+
+reward_summary <- data.frame(
+  Store = stores,
+  MeanReward = round(
+    colMeans(episode_rewards),
+    2
+  ),
+  SDReward = round(
+    apply(episode_rewards, 2, sd),
+    2
+  ),
+  CumulativeReward = round(
+    cum_reward,
+    2
+  )
+)
+
+forecast_summary <- data.frame(
+  Store = stores,
+  MeanForecastInventory = round(
+    colMeans(s_forecast),
+    2
+  ),
+  FinalInventory = round(
+    s_forecast[forecast_horizon, ],
+    2
+  )
+)
+
+combined_table <- policy_table %>%
+  left_join(
+    reward_summary,
+    by = "Store"
+  ) %>%
+  left_join(
+    forecast_summary,
+    by = "Store"
+  )
+
+print(combined_table)
+
+combined_table %>%
+  knitr::kable(
+    caption = "Spatial SAR-Q Inventory Results"
+  ) %>%
+  kableExtra::kable_styling()
+
+# ============================================================
+# 15) PLOT: TRAINING REWARDS
+# ============================================================
+
+ep_df <- data.frame(
+  Episode = 1:n_episodes,
+  MeanReward = rowMeans(episode_rewards)
+)
+
+p1 <- ggplot(
+  ep_df,
+  aes(Episode, MeanReward)
+) +
+  geom_line(color = "steelblue") +
+  geom_smooth(se = TRUE) +
+  theme_minimal() +
+  labs(
+    title = "Training Reward Progress",
+    y = "Mean Reward"
+  )
+
+print(p1)
+
+# ============================================================
+# 16) PLOT: FORECAST INVENTORY
+# ============================================================
+
+forecast_df <- as.data.frame(s_forecast)
+
+colnames(forecast_df) <- stores
+
+forecast_df$Week <- 1:nrow(forecast_df)
+
+forecast_long <- pivot_longer(
+  forecast_df,
+  -Week,
+  names_to = "Store",
+  values_to = "Inventory"
+)
+
+p2 <- ggplot(
+  forecast_long,
+  aes(
+    Week,
+    Inventory,
+    color = Store
+  )
+) +
+  geom_line(size = 1) +
+  geom_point() +
+  theme_minimal() +
+  labs(
+    title = "Forecasted Inventory Trajectories"
+  )
+
+print(p2)
+
+# ============================================================
+# 17) PLOT: POLICY PERFORMANCE
+# ============================================================
+
+vis_df <- combined_table
+
+p3 <- ggplot(
+  vis_df,
+  aes(
+    MeanReward,
+    FinalInventory,
+    color = ActionMeaning
+  )
+) +
+  geom_point(size = 4) +
+  geom_text_repel(
+    aes(label = Store)
+  ) +
+  theme_minimal() +
+  labs(
+    title = "Policy Reward vs Inventory"
+  )
+
+print(p3)
+
+# ============================================================
+# 18) PLOT: SPATIAL HEATMAP
+# ============================================================
+
+W_df <- reshape2::melt(W)
+
+colnames(W_df) <- c(
+  "Store1",
+  "Store2",
+  "Weight"
+)
+
+p4 <- ggplot(
+  W_df,
+  aes(
+    Store1,
+    Store2,
+    fill = Weight
+  )
+) +
+  geom_tile() +
+  theme_minimal() +
+  labs(
+    title = "Spatial Store Adjacency Matrix"
+  )
+
+print(p4)
+
+# ============================================================
+# 19) FINAL Q TABLE
+# ============================================================
+
+Q_table <- as.data.frame(Q)
+
+colnames(Q_table) <- c(
+  "Maintain",
+  "IncreaseShipment",
+  "ReduceShipment"
+)
+
+Q_table$Store <- stores
+
+print(Q_table)
+
+# ============================================================
+# END
+# ============================================================
+
+# ============================================================
 # SAR-Q-Learning Supply-Chain using Real Data (UCI Online Retail)
 # ============================================================
 

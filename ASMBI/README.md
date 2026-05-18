@@ -1,4 +1,4 @@
-# Conditional Functional Change-Point Detection Framework (ASMBI)
+# Multivariate Control Charts and Changepoint Detection for Multivariate Functional Data by Nonparametric Conditional Distribution and FPCA (ASMBI)
 
 ## Overview
 

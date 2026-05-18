@@ -4,7 +4,9 @@
 
 This repository implements the methods proposed in the paper:
 
-"Robust Change-Point Detection in Multivariate Functional Data via Conditional Transformation and FPCA"
+"Multivariate Control Charts and Changepoint Detection for
+Multivariate Functional Data by Nonparametric Conditional
+Distribution and FPCA"
 
 The code provides a fully reproducible pipeline for:
 - Multivariate functional data simulation

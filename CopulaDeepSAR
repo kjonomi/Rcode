@@ -1,0 +1,314 @@
+
+# ============================================================
+# FULL M5 WALMART COPULA-SPATIAL SAR-Q INVENTORY RL FRAMEWORK
+# + COPULA vs NO-COPULA + MULTI-HORIZON FORECASTING (FIXED)
+# ============================================================
+
+# ============================================================
+# 0) LIBRARIES
+# ============================================================
+
+pkgs <- c(
+  "data.table","dplyr","tidyr","ggplot2","forecast",
+  "copula","VineCopula","mvtnorm","igraph",
+  "reshape2","ggrepel","kableExtra"
+)
+
+new_pkgs <- pkgs[!(pkgs %in% installed.packages()[, "Package"])]
+if(length(new_pkgs)) install.packages(new_pkgs, repos="https://cloud.r-project.org")
+lapply(pkgs, library, character.only=TRUE)
+set.seed(123)
+
+# ============================================================
+# 1) LOAD M5 DATA
+# ============================================================
+
+sales <- data.table::fread("sales_train_validation.csv")
+sales_only <- grep("^d_", names(sales), value=TRUE)
+
+# ============================================================
+# 2) TOP STORES
+# ============================================================
+
+store_sales <- sales %>%
+  group_by(store_id) %>%
+  summarise(total_sales = sum(across(all_of(sales_only))), .groups="drop") %>%
+  arrange(desc(total_sales))
+
+topN <- 8
+stores <- head(store_sales$store_id, topN)
+sales_sub <- sales %>% filter(store_id %in% stores)
+
+# ============================================================
+# 3) STORE MATRIX
+# ============================================================
+
+sales_long <- sales_sub %>%
+  pivot_longer(cols=starts_with("d_"), names_to="Day", values_to="Sales")
+
+store_daily <- sales_long %>%
+  group_by(store_id, Day) %>%
+  summarise(DailySales=sum(Sales), .groups="drop")
+
+sales_wide <- store_daily %>%
+  pivot_wider(names_from=store_id, values_from=DailySales)
+sales_wide[is.na(sales_wide)] <- 0
+
+sales_mat <- as.matrix(sales_wide[, stores])
+rownames(sales_mat) <- sales_wide$Day
+n_regions <- ncol(sales_mat)
+
+# ============================================================
+# 4) AR(1)
+# ============================================================
+
+demand_phi <- demand_base <- numeric(n_regions)
+
+for(i in 1:n_regions){
+  ts_i <- ts(sales_mat[,i], frequency=7)
+  fit <- tryCatch(arima(ts_i,c(1,0,0)), error=function(e) NULL)
+  demand_phi[i] <- if(!is.null(fit)) coef(fit)["ar1"] else 0.5
+  demand_base[i] <- mean(ts_i)
+}
+
+# ============================================================
+# 5) COPULA
+# ============================================================
+
+U <- pobs(sales_mat)
+fit_gaussian <- fitCopula(normalCopula(dim=n_regions), U, method="ml")
+copula_model <- fit_gaussian@copula
+
+demand_sd <- apply(sales_mat,2,sd)
+
+simulate_copula_demand <- function(copula_model, means, sds, n=1){
+  U_sim <- rCopula(n, copula_model)
+  out <- matrix(0,n,ncol=length(means))
+  for(i in 1:length(means)){
+    out[,i] <- qnorm(U_sim[,i], mean=means[i], sd=sds[i])
+  }
+  pmax(round(out),0)
+}
+
+# ============================================================
+# 6) SPATIAL GRAPH
+# ============================================================
+
+corr_mat <- cor(sales_mat)
+W <- matrix(0,n_regions,n_regions)
+k_neigh <- 3
+
+for(i in 1:n_regions){
+  nbrs <- order(corr_mat[i,], decreasing=TRUE)[2:(k_neigh+1)]
+  W[i,nbrs] <- 1
+}
+W <- W / pmax(rowSums(W),1)
+
+# ============================================================
+# 7) RL SETUP
+# ============================================================
+
+n_actions <- 3
+n_episodes <- 300
+n_steps <- 25
+
+alpha <- 0.08
+gamma <- 0.96
+lambda_spatial <- 0.30
+consensus_tau <- 0.08
+
+epsilon_start <- 0.35
+epsilon_end <- 0.05
+
+Q <- matrix(0,n_regions,n_actions)
+states <- round(1.3*demand_base)
+
+reward_fn <- function(inv,demand,tc=0){
+  sales <- pmin(inv,demand)
+  15*sales - 0.08*pmax(inv-demand,0) - 0.7*pmax(demand-inv,0) - tc
+}
+
+next_state_fn <- function(inv,actions,demand){
+  n <- length(inv)
+  spatial <- as.numeric(0.35*(W%*%inv))
+  act <- rep(0,n)
+  for(i in 1:n){
+    act[i] <- if(actions[i]==1) 0.2*demand[i] else if(actions[i]==2) -0.2*demand[i] else 0
+  }
+  noise <- rnorm(n,0,pmax(1,0.08*demand))
+  pmax(round(inv + spatial + act - demand + noise),0)
+}
+
+transport_cost_fn <- function(flow,distance=1) 0.04*abs(flow)*distance
+
+# ============================================================
+# 8) COPULA SAR-Q TRAINING
+# ============================================================
+
+episode_rewards <- matrix(0,n_episodes,n_regions)
+
+for(ep in 1:n_episodes){
+
+  s <- states
+  eps <- epsilon_start + (epsilon_end-epsilon_start)*(ep/n_episodes)
+  alpha_ep <- alpha/(1+0.0005*ep)
+  ep_r <- rep(0,n_regions)
+  demand_t <- demand_base
+
+  for(t in 1:n_steps){
+
+    demand_forecast <- demand_t*demand_phi + (1-demand_phi)*demand_base
+
+    realized <- as.numeric(
+      simulate_copula_demand(copula_model,demand_forecast,demand_sd,1)
+    )
+
+    actions <- integer(n_regions)
+
+    for(i in 1:n_regions){
+      actions[i] <- if(runif(1)<eps) sample(0:2,1) else which.max(Q[i,])-1
+    }
+
+    s_next <- next_state_fn(s,actions,realized)
+
+    for(i in 1:n_regions){
+      tc <- transport_cost_fn(actions[i], sum(W[i,]>0))
+      r <- reward_fn(s_next[i], realized[i], tc)
+      ep_r[i] <- ep_r[i] + r
+
+      spatial_term <- lambda_spatial * sum(W[i,]*Q[,actions[i]+1])
+
+      Q[i,actions[i]+1] <- Q[i,actions[i]+1] + alpha_ep*
+        (r + gamma*max(Q[i,]) + spatial_term - Q[i,actions[i]+1])
+    }
+
+    s <- s_next
+    demand_t <- realized
+  }
+
+  episode_rewards[ep,] <- ep_r
+}
+
+# ============================================================
+# 9) NO-COPULA MODEL
+# ============================================================
+
+simulate_independent <- function(means,sds,n=1){
+  out <- matrix(0,n,length(means))
+  for(i in 1:length(means)){
+    out[,i] <- rnorm(n,means[i],sds[i])
+  }
+  pmax(round(out),0)
+}
+
+Q0 <- matrix(0,n_regions,n_actions)
+episode_rewards0 <- matrix(0,n_episodes,n_regions)
+
+for(ep in 1:n_episodes){
+  s <- states
+  eps <- epsilon_start + (epsilon_end-epsilon_start)*(ep/n_episodes)
+  alpha_ep <- alpha/(1+0.0005*ep)
+  ep_r <- rep(0,n_regions)
+
+  demand_t <- demand_base
+
+  for(t in 1:n_steps){
+
+    demand_forecast <- demand_t*demand_phi + (1-demand_phi)*demand_base
+
+    realized <- as.numeric(
+      simulate_independent(demand_forecast,demand_sd,1)
+    )
+
+    actions <- integer(n_regions)
+
+    for(i in 1:n_regions){
+      actions[i] <- if(runif(1)<eps) sample(0:2,1) else which.max(Q0[i,])-1
+    }
+
+    s_next <- next_state_fn(s,actions,realized)
+
+    for(i in 1:n_regions){
+      tc <- transport_cost_fn(actions[i], sum(W[i,]>0))
+      r <- reward_fn(s_next[i], realized[i], tc)
+      ep_r[i] <- ep_r[i] + r
+
+      Q0[i,actions[i]+1] <- Q0[i,actions[i]+1] + alpha_ep*
+        (r + gamma*max(Q0[i,]) - Q0[i,actions[i]+1])
+    }
+
+    s <- s_next
+    demand_t <- realized
+  }
+
+  episode_rewards0[ep,] <- ep_r
+}
+
+# ============================================================
+# 10) NONPARAMETRIC TEST
+# ============================================================
+
+
+wilcox.test(rowMeans(episode_rewards), rowMeans(episode_rewards0))
+
+cliff_delta <- function(x, y){
+
+  comp <- outer(x, y, FUN = "-")
+
+  delta <- (sum(comp > 0) - sum(comp < 0)) / (length(x) * length(y))
+
+  return(delta)
+}
+
+cat(
+  "Cliff Delta:",
+  cliff_delta(rowMeans(episode_rewards), rowMeans(episode_rewards0)),
+  "\n"
+)
+# ============================================================
+# 11) MULTI-HORIZON (FIXED)
+# ============================================================
+
+horizons <- c(2,3,4)
+multi_results <- list()
+
+for(H in horizons){
+
+  s_current <- states
+  d_current <- demand_base
+
+  inv <- matrix(0,H,n_regions)
+
+  for(t in 1:H){
+
+    actions <- apply(Q,1,which.max)-1
+
+    d_pred <- d_current*demand_phi + (1-demand_phi)*demand_base
+
+    d_real <- as.numeric(
+      simulate_copula_demand(copula_model,d_pred,demand_sd,1)
+    )
+
+    s_next <- next_state_fn(s_current,actions,d_real)
+
+    inv[t,] <- s_next
+
+    s_current <- s_next
+    d_current <- d_real
+  }
+
+  multi_results[[paste0("H",H)]] <- inv
+}
+
+summary_horizon <- data.frame(
+  Store = stores,
+  H2 = multi_results$H2[2,],
+  H3 = multi_results$H3[3,],
+  H4 = multi_results$H4[4,]
+)
+
+print(summary_horizon)
+
+# ============================================================
+# END
+# ============================================================

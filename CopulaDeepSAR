@@ -1,3 +1,1098 @@
+# ============================================================
+# FULL M5 WALMART COPULA-SPATIAL SAR-Q INVENTORY RL FRAMEWORK
+# ============================================================
+
+# ============================================================
+# 0) LIBRARIES
+# ============================================================
+
+pkgs <- c(
+  "data.table",
+  "dplyr",
+  "tidyr",
+  "ggplot2",
+  "forecast",
+  "copula",
+  "VineCopula",
+  "mvtnorm",
+  "igraph",
+  "reshape2",
+  "ggrepel",
+  "kableExtra"
+)
+
+new_pkgs <- pkgs[!(pkgs %in% installed.packages()[, "Package"])]
+
+if(length(new_pkgs)){
+  install.packages(
+    new_pkgs,
+    repos = "https://cloud.r-project.org"
+  )
+}
+
+lapply(pkgs, library, character.only = TRUE)
+
+set.seed(123)
+
+# ============================================================
+# 1) LOAD M5 WALMART DATA
+# ============================================================
+
+# Download from:
+# https://www.kaggle.com/competitions/m5-forecasting-accuracy/data
+
+sales <- fread(
+  "sales_train_validation.csv"
+)
+
+sales_only <- grep(
+  "^d_",
+  names(sales),
+  value = TRUE
+)
+
+# ============================================================
+# 2) SELECT TOP STORES
+# ============================================================
+
+store_sales <- sales %>%
+  group_by(store_id) %>%
+  summarise(
+    total_sales = sum(across(all_of(sales_only))),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(total_sales))
+
+topN <- 8
+
+stores <- head(store_sales$store_id, topN)
+
+sales_sub <- sales %>%
+  filter(store_id %in% stores)
+
+print(stores)
+
+# ============================================================
+# 3) CREATE STORE SALES MATRIX
+# ============================================================
+
+sales_long <- sales_sub %>%
+  pivot_longer(
+    cols = starts_with("d_"),
+    names_to = "Day",
+    values_to = "Sales"
+  )
+
+store_daily <- sales_long %>%
+  group_by(store_id, Day) %>%
+  summarise(
+    DailySales = sum(Sales),
+    .groups = "drop"
+  )
+
+sales_wide <- store_daily %>%
+  pivot_wider(
+    names_from = store_id,
+    values_from = DailySales
+  )
+
+sales_wide[is.na(sales_wide)] <- 0
+
+sales_mat <- as.matrix(
+  sales_wide[, stores, drop = FALSE]
+)
+
+rownames(sales_mat) <- sales_wide$Day
+
+n_regions <- ncol(sales_mat)
+
+cat("Number of stores:", n_regions, "\n")
+cat("Number of days:", nrow(sales_mat), "\n")
+
+# ============================================================
+# 4) ESTIMATE AR(1) DEMAND MODELS
+# ============================================================
+
+demand_phi <- numeric(n_regions)
+demand_base <- numeric(n_regions)
+
+for(i in 1:n_regions){
+
+  ts_i <- ts(
+    sales_mat[, i],
+    frequency = 7
+  )
+
+  fit <- tryCatch(
+    arima(ts_i, order = c(1,0,0)),
+    error = function(e) NULL
+  )
+
+  if(!is.null(fit)){
+
+    demand_phi[i] <- coef(fit)["ar1"]
+
+    demand_base[i] <- mean(ts_i)
+
+  } else {
+
+    demand_phi[i] <- 0.5
+
+    demand_base[i] <- mean(ts_i)
+  }
+}
+
+names(demand_phi) <- stores
+names(demand_base) <- stores
+
+phi_table <- data.frame(
+  Store = stores,
+  AR1_phi = round(demand_phi, 3),
+  BaseDemand = round(demand_base, 2)
+)
+
+print(phi_table)
+
+# ============================================================
+# 5) COPULA-BASED INVENTORY DEPENDENCE
+# ============================================================
+
+U <- pobs(sales_mat)
+
+gaussian_cop <- normalCopula(
+  dim = n_regions,
+  dispstr = "un"
+)
+
+fit_gaussian <- fitCopula(
+  gaussian_cop,
+  data = U,
+  method = "ml"
+)
+
+copula_model <- fit_gaussian@copula
+
+print(summary(fit_gaussian))
+
+kendall_tau <- cor(
+  sales_mat,
+  method = "kendall"
+)
+
+print(round(kendall_tau, 2))
+
+# ============================================================
+# 6) SPATIAL STORE NETWORK
+# ============================================================
+
+corr_mat <- cor(sales_mat)
+
+W <- matrix(
+  0,
+  n_regions,
+  n_regions
+)
+
+k_neigh <- 3
+
+for(i in 1:n_regions){
+
+  nbrs <- order(
+    corr_mat[i, ],
+    decreasing = TRUE
+  )[2:(k_neigh + 1)]
+
+  W[i, nbrs] <- 1
+}
+
+W <- W / rowSums(W)
+
+W[is.na(W)] <- 0
+
+rownames(W) <- stores
+colnames(W) <- stores
+
+print(round(W, 2))
+
+# ============================================================
+# 7) VISUALIZE SPATIAL NETWORK
+# ============================================================
+
+g <- graph_from_adjacency_matrix(
+  W,
+  mode = "directed",
+  weighted = TRUE
+)
+
+plot(
+  g,
+  vertex.size = 28,
+  vertex.color = "skyblue",
+  vertex.label.cex = 0.8,
+  main = "Spatial Store Inventory Network"
+)
+
+# ============================================================
+# 8) COPULA DEMAND SIMULATION
+# ============================================================
+
+simulate_copula_demand <- function(
+  copula_model,
+  marginal_means,
+  marginal_sds,
+  n = 1
+){
+
+  U_sim <- rCopula(
+    n,
+    copula_model
+  )
+
+  demand_sim <- matrix(
+    0,
+    nrow = n,
+    ncol = length(marginal_means)
+  )
+
+  for(i in 1:length(marginal_means)){
+
+    demand_sim[, i] <- qnorm(
+      U_sim[, i],
+      mean = marginal_means[i],
+      sd = marginal_sds[i]
+    )
+  }
+
+  demand_sim <- pmax(
+    round(demand_sim),
+    0
+  )
+
+  return(demand_sim)
+}
+
+# ============================================================
+# 9) SAR-Q INITIALIZATION
+# ============================================================
+
+n_actions <- 3
+
+# 0 = Maintain
+# 1 = Increase Shipment
+# 2 = Reduce Shipment
+
+n_episodes <- 300
+n_steps <- 25
+
+alpha <- 0.08
+gamma <- 0.96
+
+lambda_spatial <- 0.30
+consensus_tau <- 0.08
+
+epsilon_start <- 0.35
+epsilon_end <- 0.05
+
+Q <- matrix(
+  0,
+  nrow = n_regions,
+  ncol = n_actions
+)
+
+rownames(Q) <- stores
+
+states <- round(
+  1.3 * demand_base
+)
+
+# ============================================================
+# 10) REWARD FUNCTION
+# ============================================================
+
+reward_fn <- function(
+  inventory,
+  demand,
+  transport_cost = 0
+){
+
+  sales <- pmin(
+    inventory,
+    demand
+  )
+
+  revenue <- 15 * sales
+
+  holding_cost <- 0.08 *
+    pmax(inventory - demand, 0)
+
+  shortage_cost <- 0.70 *
+    pmax(demand - inventory, 0)
+
+  reward <- revenue -
+    holding_cost -
+    shortage_cost -
+    transport_cost
+
+  return(reward)
+}
+
+# ============================================================
+# 11) TRANSPORT COST FUNCTION
+# ============================================================
+
+transport_cost_fn <- function(
+  flow,
+  distance = 1
+){
+
+  return(
+    0.04 *
+      abs(flow) *
+      distance
+  )
+}
+
+# ============================================================
+# 12) INVENTORY TRANSITION FUNCTION
+# ============================================================
+
+next_state_fn <- function(
+  inventory,
+  actions,
+  demand,
+  rho = 0.35
+){
+
+  n <- length(inventory)
+
+  spatial_inventory <- as.numeric(
+    rho * (W %*% inventory)
+  )
+
+  action_effect <- rep(0, n)
+
+  for(i in 1:n){
+
+    action_effect[i] <- switch(
+      as.character(actions[i]),
+
+      "0" = 0,
+
+      "1" = round(
+        0.20 * demand[i]
+      ),
+
+      "2" = -round(
+        0.20 * demand[i]
+      ),
+
+      0
+    )
+  }
+
+  noise <- rnorm(
+    n,
+    0,
+    pmax(1, 0.08 * demand)
+  )
+
+  next_inventory <- inventory +
+    spatial_inventory +
+    action_effect -
+    demand +
+    noise
+
+  next_inventory <- pmax(
+    round(next_inventory),
+    0
+  )
+
+  return(next_inventory)
+}
+
+# ============================================================
+# 13) COPULA-SPATIAL SAR-Q TRAINING
+# ============================================================
+
+demand_sd <- apply(
+  sales_mat,
+  2,
+  sd
+)
+
+episode_rewards <- matrix(
+  0,
+  nrow = n_episodes,
+  ncol = n_regions
+)
+
+cum_reward <- rep(0, n_regions)
+
+action_counts <- matrix(
+  0,
+  nrow = n_actions,
+  ncol = n_regions
+)
+
+for(ep in 1:n_episodes){
+
+  s <- states
+
+  eps <- epsilon_start +
+    (epsilon_end - epsilon_start) *
+    (ep / n_episodes)
+
+  alpha_ep <- alpha *
+    (1 / (1 + 0.0005 * ep))
+
+  ep_rewards <- rep(0, n_regions)
+
+  demand_t <- demand_base
+
+  for(t in 1:n_steps){
+
+    # --------------------------------------------------------
+    # DEMAND FORECAST
+    # --------------------------------------------------------
+
+    demand_forecast <- numeric(n_regions)
+
+    for(i in 1:n_regions){
+
+      demand_forecast[i] <-
+        demand_t[i] * demand_phi[i] +
+        (1 - demand_phi[i]) *
+        demand_base[i]
+    }
+
+    # --------------------------------------------------------
+    # COPULA DEPENDENT DEMAND
+    # --------------------------------------------------------
+
+    copula_demand <- simulate_copula_demand(
+      copula_model = copula_model,
+      marginal_means = demand_forecast,
+      marginal_sds = demand_sd,
+      n = 1
+    )
+
+    realized_demand <- as.numeric(
+      copula_demand[1, ]
+    )
+
+    # --------------------------------------------------------
+    # ACTION SELECTION
+    # --------------------------------------------------------
+
+    actions <- integer(n_regions)
+
+    for(region in 1:n_regions){
+
+      if(runif(1) < eps){
+
+        a <- sample(
+          0:(n_actions - 1),
+          1
+        )
+
+      } else {
+
+        a <- which.max(
+          Q[region, ]
+        ) - 1
+      }
+
+      actions[region] <- a
+
+      action_counts[a + 1, region] <-
+        action_counts[a + 1, region] + 1
+    }
+
+    # --------------------------------------------------------
+    # NEXT INVENTORY STATE
+    # --------------------------------------------------------
+
+    s_next <- next_state_fn(
+      inventory = s,
+      actions = actions,
+      demand = realized_demand
+    )
+
+    # --------------------------------------------------------
+    # Q UPDATE
+    # --------------------------------------------------------
+
+    for(region in 1:n_regions){
+
+      neighbors <- which(
+        W[region, ] > 0
+      )
+
+      transport_cost <- transport_cost_fn(
+        flow = actions[region],
+        distance = length(neighbors)
+      )
+
+      r <- reward_fn(
+        inventory = s_next[region],
+        demand = realized_demand[region],
+        transport_cost = transport_cost
+      )
+
+      ep_rewards[region] <-
+        ep_rewards[region] + r
+
+      spatial_term <- lambda_spatial *
+        sum(
+          W[region, ] *
+            Q[, actions[region] + 1]
+        )
+
+      Q[region, actions[region] + 1] <-
+        Q[region, actions[region] + 1] +
+        alpha_ep * (
+          r +
+            gamma * max(Q[region, ]) +
+            spatial_term -
+            Q[region, actions[region] + 1]
+        )
+    }
+
+    # --------------------------------------------------------
+    # CONSENSUS LEARNING
+    # --------------------------------------------------------
+
+    Q_new <- Q
+
+    for(region in 1:n_regions){
+
+      if(sum(W[region, ]) > 0){
+
+        neighbor_Q_mean <- colSums(
+          matrix(
+            W[region, ],
+            nrow = n_regions,
+            ncol = n_actions,
+            byrow = FALSE
+          ) * Q
+        ) / sum(W[region, ])
+
+      } else {
+
+        neighbor_Q_mean <- rep(
+          0,
+          n_actions
+        )
+      }
+
+      Q_new[region, ] <-
+        (1 - consensus_tau) *
+        Q[region, ] +
+        consensus_tau *
+        neighbor_Q_mean
+    }
+
+    Q <- Q_new
+
+    s <- s_next
+
+    demand_t <- realized_demand
+  }
+
+  episode_rewards[ep, ] <- ep_rewards
+
+  cum_reward <- cum_reward + ep_rewards
+
+  if(ep %% 50 == 0){
+
+    cat(
+      sprintf(
+        "Episode %d/%d | Mean Reward = %.2f\n",
+        ep,
+        n_episodes,
+        mean(ep_rewards)
+      )
+    )
+  }
+}
+
+# ============================================================
+# 14) POLICY FORECASTING (2 WEEKS)
+# ============================================================
+
+forecast_horizon <- 2
+
+s_current <- states
+
+forecast_inventory <- matrix(
+  0,
+  nrow = forecast_horizon,
+  ncol = n_regions
+)
+
+forecast_actions <- matrix(
+  0,
+  nrow = forecast_horizon,
+  ncol = n_regions
+)
+
+demand_current <- demand_base
+
+for(t in 1:forecast_horizon){
+
+  actions_sel <- apply(
+    Q,
+    1,
+    which.max
+  ) - 1
+
+  demand_pred <- numeric(n_regions)
+
+  for(i in 1:n_regions){
+
+    demand_pred[i] <-
+      demand_current[i] * demand_phi[i] +
+      (1 - demand_phi[i]) *
+      demand_base[i]
+  }
+
+  copula_future <- simulate_copula_demand(
+    copula_model,
+    demand_pred,
+    demand_sd,
+    n = 1
+  )
+
+  future_demand <- as.numeric(
+    copula_future[1, ]
+  )
+
+  s_next <- next_state_fn(
+    inventory = s_current,
+    actions = actions_sel,
+    demand = future_demand
+  )
+
+  forecast_inventory[t, ] <- s_next
+
+  forecast_actions[t, ] <- actions_sel
+
+  s_current <- s_next
+
+  demand_current <- future_demand
+}
+
+# ============================================================
+# 15) RESULTS SUMMARY
+# ============================================================
+
+action_labels <- c(
+  "Maintain",
+  "IncreaseShipment",
+  "ReduceShipment"
+)
+
+results_table <- data.frame(
+  Store = stores,
+  BestAction = action_labels[
+    apply(Q, 1, which.max)
+  ],
+  MeanReward = round(
+    colMeans(episode_rewards),
+    2
+  ),
+  FinalInventory_2Weeks = round(
+    forecast_inventory[
+      forecast_horizon,
+    ],
+    2
+  )
+)
+
+print(results_table)
+
+results_table %>%
+  knitr::kable(
+    caption = "Copula-Spatial SAR-Q Inventory Results"
+  ) %>%
+  kableExtra::kable_styling()
+
+# ============================================================
+# 16) PLOT: TRAINING REWARDS
+# ============================================================
+
+reward_df <- data.frame(
+  Episode = 1:n_episodes,
+  MeanReward = rowMeans(
+    episode_rewards
+  )
+)
+
+p1 <- ggplot(
+  reward_df,
+  aes(Episode, MeanReward)
+) +
+  geom_line(color = "steelblue") +
+  geom_smooth(se = TRUE) +
+  theme_minimal() +
+  labs(
+    title = "Copula SAR-Q Training Rewards"
+  )
+
+print(p1)
+
+# ============================================================
+# 17) PLOT: FORECAST INVENTORY PATHS
+# ============================================================
+
+forecast_df <- as.data.frame(
+  forecast_inventory
+)
+
+colnames(forecast_df) <- stores
+
+forecast_df$Week <- 1:nrow(forecast_df)
+
+forecast_long <- pivot_longer(
+  forecast_df,
+  -Week,
+  names_to = "Store",
+  values_to = "Inventory"
+)
+
+p2 <- ggplot(
+  forecast_long,
+  aes(
+    Week,
+    Inventory,
+    color = Store
+  )
+) +
+  geom_line(size = 1) +
+  geom_point(size = 2) +
+  theme_minimal() +
+  labs(
+    title = "Forecast Inventory Paths (2 Weeks)",
+    x = "Forecast Week",
+    y = "Inventory Level"
+  )
+
+print(p2)
+
+# ============================================================
+# 18) PLOT: COPULA DEPENDENCE MATRIX
+# ============================================================
+
+tau_df <- reshape2::melt(
+  kendall_tau
+)
+
+colnames(tau_df) <- c(
+  "Store1",
+  "Store2",
+  "Tau"
+)
+
+p3 <- ggplot(
+  tau_df,
+  aes(
+    Store1,
+    Store2,
+    fill = Tau
+  )
+) +
+  geom_tile() +
+  theme_minimal() +
+  labs(
+    title = "Kendall Tau Dependence Matrix"
+  )
+
+print(p3)
+
+# ============================================================
+# 19) PLOT: POLICY PERFORMANCE
+# ============================================================
+
+vis_df <- results_table
+
+p4 <- ggplot(
+  vis_df,
+  aes(
+    MeanReward,
+    FinalInventory_2Weeks,
+    color = BestAction
+  )
+) +
+  geom_point(size = 5) +
+  geom_text_repel(
+    aes(label = Store)
+  ) +
+  theme_minimal() +
+  labs(
+    title = "Reward vs Final Inventory (2 Weeks)"
+  )
+
+print(p4)
+
+# ============================================================
+# 20) PLOT: SPATIAL ADJACENCY HEATMAP
+# ============================================================
+
+W_df <- reshape2::melt(W)
+
+colnames(W_df) <- c(
+  "Store1",
+  "Store2",
+  "Weight"
+)
+
+p5 <- ggplot(
+  W_df,
+  aes(
+    Store1,
+    Store2,
+    fill = Weight
+  )
+) +
+  geom_tile() +
+  theme_minimal() +
+  labs(
+    title = "Spatial Store Adjacency Matrix"
+  )
+
+print(p5)
+
+# ============================================================
+# 21) FINAL Q-TABLE
+# ============================================================
+
+Q_table <- as.data.frame(Q)
+
+colnames(Q_table) <- c(
+  "Maintain",
+  "IncreaseShipment",
+  "ReduceShipment"
+)
+
+Q_table$Store <- stores
+
+print(Q_table)
+
+# ============================================================
+# 22) NO-COPULA BASELINE MODEL
+# ============================================================
+
+simulate_independent_demand <- function(
+  marginal_means,
+  marginal_sds,
+  n = 1
+){
+
+  demand_sim <- matrix(
+    0,
+    nrow = n,
+    ncol = length(marginal_means)
+  )
+
+  for(i in 1:length(marginal_means)){
+
+    demand_sim[, i] <- rnorm(
+      n,
+      mean = marginal_means[i],
+      sd = marginal_sds[i]
+    )
+  }
+
+  demand_sim <- pmax(
+    round(demand_sim),
+    0
+  )
+
+  return(demand_sim)
+}
+
+# ============================================================
+# 23) TRAIN NO-COPULA SAR-Q MODEL
+# ============================================================
+
+Q_nocop <- matrix(
+  0,
+  nrow = n_regions,
+  ncol = n_actions
+)
+
+rownames(Q_nocop) <- stores
+
+episode_rewards_nocop <- matrix(
+  0,
+  nrow = n_episodes,
+  ncol = n_regions
+)
+
+for(ep in 1:n_episodes){
+
+  s <- states
+
+  eps <- epsilon_start +
+    (epsilon_end - epsilon_start) *
+    (ep / n_episodes)
+
+  alpha_ep <- alpha *
+    (1 / (1 + 0.0005 * ep))
+
+  ep_rewards <- rep(0, n_regions)
+
+  demand_t <- demand_base
+
+  for(t in 1:n_steps){
+
+    demand_forecast <- numeric(n_regions)
+
+    for(i in 1:n_regions){
+
+      demand_forecast[i] <-
+        demand_t[i] * demand_phi[i] +
+        (1 - demand_phi[i]) *
+        demand_base[i]
+    }
+
+    independent_demand <- simulate_independent_demand(
+      marginal_means = demand_forecast,
+      marginal_sds = demand_sd,
+      n = 1
+    )
+
+    realized_demand <- as.numeric(
+      independent_demand[1, ]
+    )
+
+    actions <- integer(n_regions)
+
+    for(region in 1:n_regions){
+
+      if(runif(1) < eps){
+
+        a <- sample(
+          0:(n_actions - 1),
+          1
+        )
+
+      } else {
+
+        a <- which.max(
+          Q_nocop[region, ]
+        ) - 1
+      }
+
+      actions[region] <- a
+    }
+
+    s_next <- next_state_fn(
+      inventory = s,
+      actions = actions,
+      demand = realized_demand
+    )
+
+    for(region in 1:n_regions){
+
+      neighbors <- which(
+        W[region, ] > 0
+      )
+
+      transport_cost <- transport_cost_fn(
+        flow = actions[region],
+        distance = length(neighbors)
+      )
+
+      r <- reward_fn(
+        inventory = s_next[region],
+        demand = realized_demand[region],
+        transport_cost = transport_cost
+      )
+
+      ep_rewards[region] <-
+        ep_rewards[region] + r
+
+      spatial_term <- lambda_spatial *
+        sum(
+          W[region, ] *
+            Q_nocop[, actions[region] + 1]
+        )
+
+      Q_nocop[region, actions[region] + 1] <-
+        Q_nocop[region, actions[region] + 1] +
+        alpha_ep * (
+          r +
+            gamma * max(Q_nocop[region, ]) +
+            spatial_term -
+            Q_nocop[region, actions[region] + 1]
+        )
+    }
+
+    s <- s_next
+
+    demand_t <- realized_demand
+  }
+
+  episode_rewards_nocop[ep, ] <- ep_rewards
+}
+
+# ============================================================
+# 24) MODEL COMPARISON
+# ============================================================
+
+comparison_table <- data.frame(
+  Model = c(
+    "Copula SAR-Q",
+    "No-Copula SAR-Q"
+  ),
+  MeanReward = c(
+    round(mean(episode_rewards), 2),
+    round(mean(episode_rewards_nocop), 2)
+  ),
+  RewardSD = c(
+    round(sd(as.vector(episode_rewards)), 2),
+    round(sd(as.vector(episode_rewards_nocop)), 2)
+  )
+)
+
+print(comparison_table)
+
+comparison_table %>%
+  knitr::kable(
+    caption = "Copula vs No-Copula SAR-Q Comparison"
+  ) %>%
+  kableExtra::kable_styling()
+
+# ============================================================
+# 25) VISUALIZE MODEL COMPARISON
+# ============================================================
+
+comparison_df <- rbind(
+  data.frame(
+    Episode = 1:n_episodes,
+    MeanReward = rowMeans(episode_rewards),
+    Model = "Copula"
+  ),
+  data.frame(
+    Episode = 1:n_episodes,
+    MeanReward = rowMeans(episode_rewards_nocop),
+    Model = "NoCopula"
+  )
+)
+
+p6 <- ggplot(
+  comparison_df,
+  aes(Episode, MeanReward, color = Model)
+) +
+  geom_line() +
+  geom_smooth(se = FALSE) +
+  theme_minimal() +
+  labs(
+    title = "Copula vs No-Copula Training Rewards"
+  )
+
+print(p6)
 
 # ============================================================
 # FULL M5 WALMART COPULA-SPATIAL SAR-Q INVENTORY RL FRAMEWORK

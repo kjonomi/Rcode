@@ -1,6 +1,16 @@
-# ================================================================
+###############################################################
+# Copula-Regularized CNN-LSTM Competing Risks Model
+# Complete Simulation Code
+###############################################################
+
+
+# ===============================================================
 # 0. Libraries
-# ================================================================
+# ===============================================================
+
+Sys.setenv(
+    CUDA_VISIBLE_DEVICES="-1"
+)
 
 library(survival)
 library(dplyr)
@@ -13,24 +23,41 @@ library(cmprsk)
 library(ggplot2)
 library(knitr)
 
+
+
 set.seed(123)
 
-# ================================================================
-# 1. Simulation parameters
-# ================================================================
+
+
+# ===============================================================
+# 1. Simulation Parameters
+# ===============================================================
 
 n_sim <- 100
+
 n <- 1000
+
 B_boot <- 50
 
-# Number of predictors
+
 p <- 30
 
-covariates <- paste0("x",1:p)
 
-times_eval <- seq(0,50,by=1)
+covariates <- paste0(
+    "x",
+    1:p
+)
+
+
+times_eval <- seq(
+    0,
+    50,
+    by=1
+)
+
 
 baseline_hazard <- 0.02
+
 
 learning_rate <- 0.001
 
@@ -40,37 +67,53 @@ batch_size <- 32
 
 
 
-# ================================================================
-# TensorFlow utility
-# ================================================================
+# ===============================================================
+# 2. TensorFlow Utility
+# ===============================================================
+
 
 to_uniform_tf <- function(x){
 
-  u <- tf$math$sigmoid(
-        tf$cast(x, tf$float32)
-      )
+    u <- tf$math$sigmoid(
+        tf$cast(
+            x,
+            tf$float32
+        )
+    )
 
-  tf$clip_by_value(
-      u,
-      1e-6,
-      1-1e-6
-  )
+    tf$clip_by_value(
+        u,
+        1e-6,
+        1-1e-6
+    )
 
 }
 
-# ================================================================
-# Synthetic competing-risk data
-# ================================================================
+
+
+# ===============================================================
+# 3. Generate Competing Risk Data
+# ===============================================================
+
 
 generate_data <- function(n){
 
+
     X <- matrix(
-        rnorm(n*p),
+
+        rnorm(
+            n*p
+        ),
+
         nrow=n,
+
         ncol=p
+
     )
 
+
     colnames(X) <- covariates
+
 
     df <- data.frame(
 
@@ -80,166 +123,271 @@ generate_data <- function(n){
 
     )
 
-    ############################################################
-    ## Linear predictors
-    ############################################################
+
+    # Cause 1 hazard
 
     lp1 <-
+
         2*df$x1 -
+
         df$x2 +
+
         1.5*df$x3
 
+
+
+    # Cause 2 hazard
+
     lp2 <-
-       -df$x1 +
+
+        -df$x1 +
+
         2*df$x2 -
+
         df$x4
 
-    ############################################################
-    ## Cause-specific event times
-    ############################################################
+
+
+    # Event times
 
     df$time1 <-
-        -log(runif(n))/
-        (baseline_hazard*exp(lp1))
+
+        -log(runif(n)) /
+
+        (baseline_hazard *
+             exp(lp1))
+
+
 
     df$time2 <-
-        -log(runif(n))/
-        (baseline_hazard*exp(lp2))
 
-    ############################################################
-    ## Independent censoring
-    ############################################################
+        -log(runif(n)) /
+
+        (baseline_hazard *
+             exp(lp2))
+
+
+
+    # Censoring
 
     censor_time <-
-        rexp(n,0.01)
 
-    true_time <-
-        pmin(df$time1,
-             df$time2)
-
-    true_event <-
-        ifelse(
-            df$time1<df$time2,
-            1,
-            2
+        rexp(
+            n,
+            0.01
         )
 
+
+
+    true_time <-
+
+        pmin(
+            df$time1,
+            df$time2
+        )
+
+
+
+    true_event <-
+
+        ifelse(
+
+            df$time1 < df$time2,
+
+            1,
+
+            2
+
+        )
+
+
+
     df$time <-
+
         pmin(
             true_time,
             censor_time
         )
 
+
+
     df$event <-
+
         ifelse(
-            censor_time<true_time,
+
+            censor_time < true_time,
+
             0,
+
             true_event
+
         )
 
-    df
+
+    return(df)
 
 }
 
-# ================================================================
-# Binary Cross-Entropy
-# ================================================================
 
-bce_loss <- function(y_true, y_pred){
+
+
+
+# ===============================================================
+# 4. Binary Cross Entropy
+# ===============================================================
+
+
+bce_loss <- function(
+    y_true,
+    y_pred
+){
+
 
     tf$reduce_mean(
 
-        tf$keras$losses$binary_crossentropy(
-            y_true,
-            y_pred
-        )
+        tf$keras$losses$
+
+            binary_crossentropy(
+
+                y_true,
+
+                y_pred
+
+            )
 
     )
 
 }
 
-# ================================================================
-# Gaussian Copula Loss
-# ================================================================
 
-copula_gaussian_loss <- function(y_true, y_pred){
 
-    ############################################################
-    ## Prediction loss
-    ############################################################
 
-    bce <- bce_loss(y_true, y_pred)
 
-    ############################################################
-    ## Cause-specific outputs only
-    ############################################################
 
-    u <- to_uniform_tf(
+# ===============================================================
+# 5. Gaussian Copula Loss
+# ===============================================================
 
-        y_pred[,2:3]
 
-    )
+copula_gaussian_loss <- function(
+    y_true,
+    y_pred
+){
 
-    rho <- tf$constant(
-        0.50,
-        dtype=tf$float32
-    )
-
-    z <- tf$sqrt(2.0) *
-        tf$math$erfinv(
-            2*u-1
-        )
-
-    z1 <- z[,1]
-    z2 <- z[,2]
-
-    detR <- 1-rho^2
-
-    quad <-
-
-        (z1^2+
-         z2^2-
-         2*rho*z1*z2)/detR
-
-    copula_penalty <-
-
-        -tf$reduce_mean(
-
-            -0.5*quad-
-            0.5*tf$math$log(detR)
-
-        )
-
-    lambda <- tf$constant(
-        0.10,
-        dtype=tf$float32
-    )
-
-    bce + lambda*copula_penalty
-
-}
-
-# ================================================================
-# Clayton Copula Loss
-# ================================================================
-
-copula_clayton_loss <- function(y_true,y_pred){
 
     bce <- bce_loss(
         y_true,
         y_pred
     )
 
+
+
     u <- to_uniform_tf(
 
         y_pred[,2:3]
 
     )
 
-    theta <- tf$constant(
-        1.50,
+
+    rho <- tf$constant(
+        0.5,
         dtype=tf$float32
     )
+
+
+
+    z <-
+
+        tf$sqrt(2.0) *
+
+        tf$math$erfinv(
+
+            2*u-1
+
+        )
+
+
+
+    z1 <- z[,1]
+
+    z2 <- z[,2]
+
+
+
+    detR <- 1-rho^2
+
+
+
+    quad <-
+
+        (z1^2+
+
+             z2^2-
+
+             2*rho*z1*z2)/detR
+
+
+
+    penalty <-
+
+        -tf$reduce_mean(
+
+            -0.5*quad -
+
+                0.5*
+                tf$math$log(detR)
+
+        )
+
+
+
+    lambda <- tf$constant(
+        0.1,
+        dtype=tf$float32
+    )
+
+
+    bce +
+
+        lambda*penalty
+
+}
+
+
+
+
+
+
+# ===============================================================
+# 6. Clayton Copula Loss
+# ===============================================================
+
+
+copula_clayton_loss <- function(
+    y_true,
+    y_pred
+){
+
+
+    bce <- bce_loss(
+        y_true,
+        y_pred
+    )
+
+
+    u <- to_uniform_tf(
+
+        y_pred[,2:3]
+
+    )
+
+
+    theta <- tf$constant(
+        1.5,
+        dtype=tf$float32
+    )
+
+
 
     S <-
 
@@ -250,6 +398,8 @@ copula_clayton_loss <- function(y_true,y_pred){
             axis=1L
 
         )
+
+
 
     log_c <-
 
@@ -277,33 +427,46 @@ copula_clayton_loss <- function(y_true,y_pred){
 
         )
 
-    copula_penalty <-
+
+
+    penalty <-
 
         -tf$reduce_mean(log_c)
 
+
+
     lambda <- tf$constant(
-        0.10,
+        0.1,
         dtype=tf$float32
     )
 
+
     bce +
 
-        lambda*
-
-        copula_penalty
+        lambda*penalty
 
 }
 
-# ================================================================
-# Gumbel Copula Loss
-# ================================================================
 
-copula_gumbel_loss <- function(y_true,y_pred){
+
+
+
+
+# ===============================================================
+# 7. Gumbel Copula Loss
+# ===============================================================
+
+
+copula_gumbel_loss <- function(
+    y_true,
+    y_pred
+){
 
     bce <- bce_loss(
         y_true,
         y_pred
     )
+
 
     u <- to_uniform_tf(
 
@@ -311,18 +474,24 @@ copula_gumbel_loss <- function(y_true,y_pred){
 
     )
 
+
     theta <- tf$constant(
         2.0,
         dtype=tf$float32
     )
 
+
     log_u <-
 
         -tf$math$log(u)
 
+
+
     phi <-
 
         log_u^theta
+
+
 
     S <-
 
@@ -334,9 +503,13 @@ copula_gumbel_loss <- function(y_true,y_pred){
 
         )
 
+
+
     log_C <-
 
         -S^(1/theta)
+
+
 
     log_c <-
 
@@ -348,335 +521,372 @@ copula_gumbel_loss <- function(y_true,y_pred){
 
             S+1e-6
 
-        ) +
-
-        tf$reduce_sum(
-
-            (theta-1)*
-
-            tf$math$log(
-
-                log_u+1e-6
-
-            )
-
-            -
-
-            tf$math$log(
-
-                u+1e-6
-
-            ),
-
-            axis=1L
-
-        ) +
-
-        tf$math$log(
-
-            1+
-
-            (theta-1)*
-
-            S^(-1/theta)
-
         )
 
-    copula_penalty <-
+
+
+    penalty <-
 
         -tf$reduce_mean(log_c)
 
+
+
     lambda <- tf$constant(
-        0.10,
+        0.1,
         dtype=tf$float32
     )
 
+
     bce +
 
-        lambda*
-
-        copula_penalty
+        lambda*penalty
 
 }
 
-# ================================================================
-# 3. CNN-LSTM Model Builder
-# ================================================================
+# ===============================================================
+# 8. CNN-LSTM Model Builder
+# ===============================================================
+
 
 create_model <- function(
     loss_fn,
-    n_features = length(covariates),
-    n_outputs = 3
+    n_features=length(covariates),
+    n_outputs=3
 ){
 
-    ############################################################
-    ## Input Layer
-    ############################################################
 
-    inputs <- layer_input(
+    inputs <-
 
-        shape = c(1, n_features),
+        layer_input(
 
-        name = "Input"
+            shape=c(
+                1,
+                n_features
+            ),
 
-    )
+            name="Input"
 
-    ############################################################
-    ## CNN Feature Extraction
-    ############################################################
+        )
+
+
 
     x <- inputs %>%
 
         layer_conv_1d(
 
-            filters = 32,
+            filters=32,
 
-            kernel_size = 1,
+            kernel_size=1,
 
-            activation = "relu",
+            activation="relu",
 
-            padding = "same",
+            padding="same",
 
-            name = "Conv1"
-
-        ) %>%
-
-        layer_batch_normalization(
-
-            name = "BN1"
+            name="CNN"
 
         ) %>%
+
+        layer_batch_normalization() %>%
 
         layer_dropout(
-
-            rate = 0.20,
-
-            name = "Dropout1"
-
+            rate=0.2
         )
 
-    ############################################################
-    ## LSTM Layer
-    ############################################################
+
 
     x <- x %>%
 
         layer_lstm(
 
-            units = 32,
+            units=32,
 
-            activation = "tanh",
+            dropout=0.1,
 
-            recurrent_dropout = 0.10,
+            recurrent_dropout=0.1,
 
-            name = "LSTM"
+            name="LSTM"
 
         )
 
-    ############################################################
-    ## Dense Layers
-    ############################################################
+
 
     x <- x %>%
 
         layer_dense(
 
-            units = 32,
+            units=32,
 
-            activation = "relu",
-
-            name = "Dense1"
+            activation="relu"
 
         ) %>%
 
         layer_dropout(
 
-            rate = 0.20,
-
-            name = "Dropout2"
+            rate=0.2
 
         )
 
-    ############################################################
-    ## Output Layer
-    ############################################################
 
-    outputs <- x %>%
+
+    outputs <-
+
+        x %>%
 
         layer_dense(
 
-            units = n_outputs,
+            units=n_outputs,
 
-            activation = "sigmoid",
+            activation="sigmoid",
 
-            name = "Output"
+            name="Risk_Output"
 
         )
 
-    ############################################################
-    ## Build Model
-    ############################################################
 
-    model <- keras_model(
 
-        inputs = inputs,
+    model <-
 
-        outputs = outputs
+        keras_model(
 
-    )
+            inputs=inputs,
 
-    ############################################################
-    ## Compile
-    ############################################################
+            outputs=outputs
 
-    model %>% compile(
+        )
 
-        optimizer = optimizer_adam(
 
-            learning_rate = learning_rate
 
-        ),
+    model %>%
 
-        loss = loss_fn,
+        compile(
 
-        metrics = list("accuracy")
+            optimizer=
+                optimizer_adam(
 
-    )
+                    learning_rate=
+                        learning_rate
+
+                ),
+
+            loss=loss_fn,
+
+            metrics=list(
+                "accuracy"
+            )
+
+        )
+
+
 
     return(model)
 
 }
 
-# ================================================================
-# 4. Compute Cause-Specific Cumulative Incidence Functions (CIF)
-# ================================================================
+
+
+
+
+# ===============================================================
+# 9. Compute CIF Function
+# ===============================================================
+
 
 compute_cif_realistic <- function(
+
     model,
+
     df,
+
     times,
+
     model_name,
-    time_step = 1
+
+    time_step=1
+
 ){
 
-    ############################################################
-    ## Prediction
-    ############################################################
 
-    Xd <- array(
+    Xd <-
 
-        as.matrix(df[, covariates]),
+        array(
 
-        dim = c(
-            nrow(df),
-            1,
-            length(covariates)
+            as.matrix(
+
+                df[,covariates,drop=FALSE]
+
+            ),
+
+            dim=c(
+
+                nrow(df),
+
+                1,
+
+                length(covariates)
+
+            )
+
         )
 
-    )
 
-    preds <- predict(
-        model,
-        Xd,
-        verbose = 0
-    )
 
-    ############################################################
-    ## Cause-specific hazards
-    ############################################################
+    preds <-
 
-    h1 <- pmin(
-        pmax(preds[,2],0),
-        1
-    )
+        predict(
 
-    h2 <- pmin(
-        pmax(preds[,3],0),
-        1
-    )
+            model,
 
-    ############################################################
-    ## Storage
-    ############################################################
+            Xd,
 
-    n_subjects <- nrow(df)
+            verbose=0
 
-    n_times <- length(times)
+        )
 
-    cif1 <- matrix(
-        0,
-        n_subjects,
-        n_times
-    )
 
-    cif2 <- matrix(
-        0,
-        n_subjects,
-        n_times
-    )
 
-    surv <- matrix(
-        1,
-        n_subjects,
-        n_times
-    )
+    # Cause-specific hazards
 
-    ############################################################
-    ## Recursive CIF calculation
-    ############################################################
+    h1 <-
+
+        pmin(
+
+            preds[,2]*0.05,
+
+            0.95
+
+        )
+
+
+
+    h2 <-
+
+        pmin(
+
+            preds[,3]*0.05,
+
+            0.95
+
+        )
+
+
+
+    n_subjects <-
+
+        nrow(df)
+
+
+    n_times <-
+
+        length(times)
+
+
+
+    cif1 <-
+
+        matrix(
+
+            0,
+
+            n_subjects,
+
+            n_times
+
+        )
+
+
+
+    cif2 <-
+
+        matrix(
+
+            0,
+
+            n_subjects,
+
+            n_times
+
+        )
+
+
+
+    survival_prob <-
+
+        matrix(
+
+            1,
+
+            n_subjects,
+
+            n_times
+
+        )
+
+
+
 
     for(t in seq_len(n_times)){
 
+
         if(t==1){
 
-            surv_prev <- rep(
-                1,
-                n_subjects
-            )
+            s_prev <-
+
+                rep(
+                    1,
+                    n_subjects
+                )
 
         }else{
 
-            surv_prev <- surv[,t-1]
+            s_prev <-
+
+                survival_prob[,t-1]
 
         }
+
+
 
         cif1[,t] <-
 
             if(t==1){
 
-                surv_prev*h1*time_step
+                s_prev*h1*time_step
 
             }else{
 
                 cif1[,t-1] +
 
-                surv_prev*h1*time_step
+                    s_prev*h1*time_step
 
             }
+
+
 
         cif2[,t] <-
 
             if(t==1){
 
-                surv_prev*h2*time_step
+                s_prev*h2*time_step
 
             }else{
 
                 cif2[,t-1] +
 
-                surv_prev*h2*time_step
+                    s_prev*h2*time_step
 
             }
 
-        surv[,t] <-
+
+
+        survival_prob[,t] <-
 
             pmax(
 
                 1-
 
-                cif1[,t]-
+                    cif1[,t]-
 
-                cif2[,t],
+                    cif2[,t],
 
                 0
 
@@ -684,100 +894,102 @@ compute_cif_realistic <- function(
 
     }
 
-    ############################################################
-    ## Average CIF
-    ############################################################
+
+
 
     data.frame(
 
-        Time = times,
+        Time=times,
 
-        CIF1 = colMeans(cif1),
+        CIF1=colMeans(cif1),
 
-        CIF2 = colMeans(cif2),
+        CIF2=colMeans(cif2),
 
-        Survival = colMeans(surv),
+        Survival=colMeans(survival_prob),
 
-        Model = model_name
+        Model=model_name
 
     )
 
 }
 
-cif_results_list[[sim]] <- rbind(
 
-    compute_cif_realistic(
-        model_gauss,
-        df_test,
-        times_eval,
-        "Gaussian"
-    ),
 
-    compute_cif_realistic(
-        model_clayton,
-        df_test,
-        times_eval,
-        "Clayton"
-    ),
 
-    compute_cif_realistic(
-        model_gumbel,
-        df_test,
-        times_eval,
-        "Gumbel"
-    )
 
-)
+# ===============================================================
+# 10. Bootstrap Cause-specific C-index
+# ===============================================================
 
-# ================================================================
-# 5. Bootstrap Cause-specific C-index
-# ================================================================
 
 cindex_cause_boot_fn <- function(
+
     data,
+
     indices,
+
     model,
-    cause = 1
+
+    cause=1
+
 ){
 
-    ############################################################
-    ## Bootstrap sample
-    ############################################################
 
-    d <- data[indices, ]
+    d <-
 
-    if(sum(d$event==cause) < 2)
+        data[indices,]
+
+
+
+    if(
+
+        sum(d$event==cause)<2
+
+    ){
+
         return(NA)
 
-    ############################################################
-    ## Predictor matrix
-    ############################################################
+    }
 
-    Xd <- array(
 
-        as.matrix(d[,covariates]),
 
-        dim = c(
-            nrow(d),
-            1,
-            length(covariates)
+    Xd <-
+
+        array(
+
+            as.matrix(
+
+                d[,covariates,drop=FALSE]
+
+            ),
+
+            dim=c(
+
+                nrow(d),
+
+                1,
+
+                length(covariates)
+
+            )
+
         )
 
-    )
 
-    ############################################################
-    ## Neural-network prediction
-    ############################################################
 
-    pred <- predict(
-        model,
-        Xd,
-        verbose=0
-    )
+    pred <-
 
-    ############################################################
-    ## Cause-specific risk score
-    ############################################################
+        predict(
+
+            model,
+
+            Xd,
+
+            verbose=0
+
+        )
+
+
 
     if(cause==1){
 
@@ -789,11 +1001,9 @@ cindex_cause_boot_fn <- function(
 
     }
 
-    ############################################################
-    ## Concordance Index
-    ############################################################
 
-    cindex <-
+
+    result <-
 
         rcorr.cens(
 
@@ -804,24 +1014,40 @@ cindex_cause_boot_fn <- function(
                 d$time,
 
                 ifelse(
+
                     d$event==cause,
+
                     1,
+
                     0
+
                 )
 
             )
 
-        )["C Index"]
+        )
 
-    as.numeric(cindex)
+
+
+    as.numeric(
+
+        result["C Index"]
+
+    )
 
 }
 
-# ================================================================
-# Bootstrap Confidence Interval
-# ================================================================
+
+
+
+
+# ===============================================================
+# 11. Bootstrap Confidence Interval
+# ===============================================================
+
 
 ci_safe <- function(b){
+
 
     if(
 
@@ -829,35 +1055,43 @@ ci_safe <- function(b){
 
         ||
 
-        sd(b$t,na.rm=TRUE)==0
+        sd(
+            b$t,
+            na.rm=TRUE
+        )==0
 
     ){
 
-        return(c(NA,NA))
+        return(
+            c(NA,NA)
+        )
 
     }
 
-    out <-
 
-        tryCatch(
 
-            boot.ci(
-                b,
-                type="perc"
-            )$percent[4:5],
+    tryCatch(
 
-            error=function(e)
-                c(NA,NA)
+        boot.ci(
 
-        )
+            b,
 
-    out
+            type="perc"
+
+        )$percent[4:5],
+
+        error=function(e)
+
+            c(NA,NA)
+
+    )
 
 }
 
-# ================================================================
-# Bootstrap all models
-# ================================================================
+# ===============================================================
+# 12. Bootstrap All Models
+# ===============================================================
+
 
 bootstrap_all_models <- function(
 
@@ -865,12 +1099,13 @@ bootstrap_all_models <- function(
 
     df_test,
 
-    B = 50
+    B=50
 
 ){
 
+
     ############################################################
-    ## Cause 1
+    # Cause 1
     ############################################################
 
     boot_c1 <-
@@ -879,13 +1114,16 @@ bootstrap_all_models <- function(
 
             model_list,
 
-            function(m)
+            function(m){
+
 
                 boot(
 
                     data=df_test,
 
-                    statistic=function(d,i)
+
+                    statistic=function(d,i){
+
 
                         cindex_cause_boot_fn(
 
@@ -897,17 +1135,27 @@ bootstrap_all_models <- function(
 
                             cause=1
 
-                        ),
+                        )
+
+
+                    },
+
 
                     R=B
 
                 )
 
+
+            }
+
         )
 
+
+
     ############################################################
-    ## Cause 2
+    # Cause 2
     ############################################################
+
 
     boot_c2 <-
 
@@ -915,13 +1163,16 @@ bootstrap_all_models <- function(
 
             model_list,
 
-            function(m)
+            function(m){
+
 
                 boot(
 
                     data=df_test,
 
-                    statistic=function(d,i)
+
+                    statistic=function(d,i){
+
 
                         cindex_cause_boot_fn(
 
@@ -933,21 +1184,34 @@ bootstrap_all_models <- function(
 
                             cause=2
 
-                        ),
+                        )
+
+
+                    },
+
 
                     R=B
 
                 )
 
+
+            }
+
         )
 
+
+
+
+
     ############################################################
-    ## Summary table
+    # Summary
     ############################################################
+
 
     data.frame(
 
         Model=names(model_list),
+
 
         C_index_Cause1=
 
@@ -967,7 +1231,8 @@ bootstrap_all_models <- function(
 
             ),
 
-        Lower1=
+
+        CI_lower_Cause1=
 
             sapply(
 
@@ -979,7 +1244,8 @@ bootstrap_all_models <- function(
 
             ),
 
-        Upper1=
+
+        CI_upper_Cause1=
 
             sapply(
 
@@ -990,6 +1256,8 @@ bootstrap_all_models <- function(
                     ci_safe(x)[2]
 
             ),
+
+
 
         C_index_Cause2=
 
@@ -1009,7 +1277,8 @@ bootstrap_all_models <- function(
 
             ),
 
-        Lower2=
+
+        CI_lower_Cause2=
 
             sapply(
 
@@ -1021,7 +1290,8 @@ bootstrap_all_models <- function(
 
             ),
 
-        Upper2=
+
+        CI_upper_Cause2=
 
             sapply(
 
@@ -1033,56 +1303,76 @@ bootstrap_all_models <- function(
 
             )
 
+
     )
 
 }
 
-boot_summary <-
 
-    bootstrap_all_models(
 
-        pretrained_all,
 
-        df_test,
 
-        B = B_boot
 
-    )
+# ===============================================================
+# 13. Simulation Loop
+# ===============================================================
 
-boot_summary$Simulation <- sim
-
-cindex_results_list[[sim]] <- boot_summary
-
-# ================================================================
-# 6. Simulation Loop
-# ================================================================
 
 set.seed(123)
 
+
+
 cindex_results_list <- list()
+
 
 cif_results_list <- list()
 
 
+
+
+
 for(sim in 1:n_sim){
 
+
+    ############################################################
+    # Clear TensorFlow graph
+    ############################################################
+
+
+    k_clear_session()
+
+
+
     cat(
+
         "Simulation:",
+
         sim,
+
         "\n"
+
     )
 
 
-    ############################################################
-    ## Generate data
-    ############################################################
-
-    df <- generate_data(n)
 
 
     ############################################################
-    ## Train/Test split
+    # Generate data
     ############################################################
+
+
+    df <-
+
+        generate_data(n)
+
+
+
+
+
+    ############################################################
+    # Train/Test split
+    ############################################################
+
 
     idx_train <-
 
@@ -1090,19 +1380,44 @@ for(sim in 1:n_sim){
 
             seq_len(n),
 
-            size = floor(0.8*n)
+            floor(0.8*n)
 
         )
 
 
-    df_train <- df[idx_train,]
 
-    df_test  <- df[-idx_train,]
+    df_train <-
+
+        df[idx_train,]
+
+
+
+    df_test <-
+
+        df[-idx_train,]
+
+
+
+
+    stopifnot(
+
+        all(
+
+            covariates %in%
+
+                names(df_test)
+
+        )
+
+    )
+
+
 
 
     ############################################################
-    ## CNN-LSTM input arrays
+    # CNN-LSTM input
     ############################################################
+
 
     X_train <-
 
@@ -1110,7 +1425,7 @@ for(sim in 1:n_sim){
 
             as.matrix(
 
-                df_train[,covariates]
+                df_train[,covariates,drop=FALSE]
 
             ),
 
@@ -1127,9 +1442,12 @@ for(sim in 1:n_sim){
         )
 
 
+
+
     ############################################################
-    ## Competing risk labels
+    # Labels
     ############################################################
+
 
     y_train <-
 
@@ -1148,13 +1466,17 @@ for(sim in 1:n_sim){
         )
 
 
+
     storage.mode(y_train) <- "numeric"
 
 
 
+
+
     ############################################################
-    ## Build models
+    # Build models
     ############################################################
+
 
     model_gauss <-
 
@@ -1183,8 +1505,11 @@ for(sim in 1:n_sim){
         )
 
 
+
+
+
     ############################################################
-    ## Train models
+    # Train models
     ############################################################
 
 
@@ -1205,6 +1530,7 @@ for(sim in 1:n_sim){
         )
 
 
+
     model_clayton %>%
 
         fit(
@@ -1220,6 +1546,7 @@ for(sim in 1:n_sim){
             verbose=0
 
         )
+
 
 
     model_gumbel %>%
@@ -1240,31 +1567,39 @@ for(sim in 1:n_sim){
 
 
 
-    ############################################################
-    ## Store models
-    ############################################################
-
-    pretrained_all <- list(
-
-        Gaussian = model_gauss,
-
-        Clayton  = model_clayton,
-
-        Gumbel   = model_gumbel
-
-    )
-
 
 
     ############################################################
-    ## Bootstrap C-index
+    # Store models
     ############################################################
+
+
+    model_list <-
+
+        list(
+
+            Gaussian=model_gauss,
+
+            Clayton=model_clayton,
+
+            Gumbel=model_gumbel
+
+        )
+
+
+
+
+
+    ############################################################
+    # Bootstrap C-index
+    ############################################################
+
 
     cindex_results_list[[sim]] <-
 
         bootstrap_all_models(
 
-            pretrained_all,
+            model_list,
 
             df_test,
 
@@ -1280,9 +1615,12 @@ for(sim in 1:n_sim){
 
 
 
+
+
     ############################################################
-    ## CIF estimation
+    # CIF estimation
     ############################################################
+
 
     cif_results_list[[sim]] <-
 
@@ -1301,6 +1639,7 @@ for(sim in 1:n_sim){
             ),
 
 
+
             compute_cif_realistic(
 
                 model_clayton,
@@ -1312,6 +1651,7 @@ for(sim in 1:n_sim){
                 "Clayton"
 
             ),
+
 
 
             compute_cif_realistic(
@@ -1329,31 +1669,29 @@ for(sim in 1:n_sim){
         )
 
 
-}
-
-# ================================================================
-# 7. Aggregate Simulation Results
-# ================================================================
 
 
-############################################################
-## Combine CIF results
-############################################################
+    cat(
 
-cif_all <-
+        "Completed simulation:",
 
-    do.call(
+        sim,
 
-        rbind,
-
-        cif_results_list
+        "\n\n"
 
     )
 
 
-############################################################
-## Combine C-index results
-############################################################
+}
+
+# ===============================================================
+# 14. Aggregate Simulation Results
+# ===============================================================
+
+
+###############################################################
+# Combine C-index results
+###############################################################
 
 cindex_all <-
 
@@ -1366,147 +1704,35 @@ cindex_all <-
     )
 
 
-head(cif_all)
+
+###############################################################
+# Combine CIF results
+###############################################################
+
+cif_all <-
+
+    do.call(
+
+        rbind,
+
+        cif_results_list
+
+    )
+
+
+
+# Check results
 
 head(cindex_all)
 
-# ================================================================
-# Cause 1 CIF Plot
-# ================================================================
+head(cif_all)
 
-ggplot(
 
-    cif_all,
 
-    aes(
+# ===============================================================
+# 15. Average C-index Summary Table
+# ===============================================================
 
-        x=Time,
-
-        y=CIF1,
-
-        color=Model
-
-    )
-
-) +
-
-geom_line(
-
-    linewidth=1.2
-
-) +
-
-labs(
-
-    title =
-        "Predicted Cumulative Incidence Function: Cause 1",
-
-    x =
-        "Time",
-
-    y =
-        "CIF Cause 1",
-
-    color =
-        "Copula Model"
-
-) +
-
-theme_minimal(
-
-)
-
-# ================================================================
-# Cause 2 CIF Plot
-# ================================================================
-
-ggplot(
-
-    cif_all,
-
-    aes(
-
-        x=Time,
-
-        y=CIF2,
-
-        color=Model
-
-    )
-
-) +
-
-geom_line(
-
-    linewidth=1.2
-
-) +
-
-labs(
-
-    title =
-        "Predicted Cumulative Incidence Function: Cause 2",
-
-    x =
-        "Time",
-
-    y =
-        "CIF Cause 2",
-
-    color =
-        "Copula Model"
-
-) +
-
-theme_minimal()
-
-# ================================================================
-# Survival Probability
-# ================================================================
-
-ggplot(
-
-    cif_all,
-
-    aes(
-
-        x=Time,
-
-        y=Survival,
-
-        color=Model
-
-    )
-
-) +
-
-geom_line(
-
-    linewidth=1.2
-
-) +
-
-labs(
-
-    title =
-        "Estimated Survival Probability",
-
-    x =
-        "Time",
-
-    y =
-        "S(t)",
-
-    color =
-        "Copula Model"
-
-) +
-
-theme_minimal()
-
-# ================================================================
-# Average C-index summary
-# ================================================================
 
 cindex_summary <-
 
@@ -1520,49 +1746,118 @@ cindex_summary <-
 
     summarise(
 
-        Mean_Cause1 = mean(
 
-            C_index_Cause1,
+        Mean_Cause1 =
 
-            na.rm=TRUE
+            mean(
 
-        ),
+                C_index_Cause1,
 
-        SD_Cause1 = sd(
+                na.rm=TRUE
 
-            C_index_Cause1,
-
-            na.rm=TRUE
-
-        ),
+            ),
 
 
-        Mean_Cause2 = mean(
 
-            C_index_Cause2,
+        SD_Cause1 =
 
-            na.rm=TRUE
+            sd(
 
-        ),
+                C_index_Cause1,
 
-        SD_Cause2 = sd(
+                na.rm=TRUE
 
-            C_index_Cause2,
+            ),
 
-            na.rm=TRUE
 
-        ),
+
+        Lower_Cause1 =
+
+            mean(
+
+                CI_lower_Cause1,
+
+                na.rm=TRUE
+
+            ),
+
+
+
+        Upper_Cause1 =
+
+            mean(
+
+                CI_upper_Cause1,
+
+                na.rm=TRUE
+
+            ),
+
+
+
+
+        Mean_Cause2 =
+
+            mean(
+
+                C_index_Cause2,
+
+                na.rm=TRUE
+
+            ),
+
+
+
+        SD_Cause2 =
+
+            sd(
+
+                C_index_Cause2,
+
+                na.rm=TRUE
+
+            ),
+
+
+
+        Lower_Cause2 =
+
+            mean(
+
+                CI_lower_Cause2,
+
+                na.rm=TRUE
+
+            ),
+
+
+
+        Upper_Cause2 =
+
+            mean(
+
+                CI_upper_Cause2,
+
+                na.rm=TRUE
+
+            ),
+
+
 
         .groups="drop"
 
     )
 
 
-cindex_summary
 
-# ================================================================
-# Format table
-# ================================================================
+print(cindex_summary)
+
+
+
+# ===============================================================
+# 16. Publication Style C-index Table
+# ===============================================================
+
 
 cindex_table <-
 
@@ -1570,28 +1865,77 @@ cindex_table <-
 
     mutate(
 
+
         Cause1 =
+
             paste0(
 
-                round(Mean_Cause1,3),
+                round(
+
+                    Mean_Cause1,
+
+                    3
+
+                ),
 
                 " (",
 
-                round(SD_Cause1,3),
+                round(
+
+                    Lower_Cause1,
+
+                    3
+
+                ),
+
+                ", ",
+
+                round(
+
+                    Upper_Cause1,
+
+                    3
+
+                ),
 
                 ")"
 
             ),
 
 
+
+
         Cause2 =
+
             paste0(
 
-                round(Mean_Cause2,3),
+                round(
+
+                    Mean_Cause2,
+
+                    3
+
+                ),
 
                 " (",
 
-                round(SD_Cause2,3),
+                round(
+
+                    Lower_Cause2,
+
+                    3
+
+                ),
+
+                ", ",
+
+                round(
+
+                    Upper_Cause2,
+
+                    3
+
+                ),
 
                 ")"
 
@@ -1610,316 +1954,231 @@ cindex_table <-
     )
 
 
+
 kable(
 
     cindex_table,
 
-    caption =
-        "Simulation Results: Cause-specific C-index"
+    caption=
+
+        "Cause-specific C-index with Bootstrap 95% Confidence Intervals"
 
 )
 
-# ================================================================
-# Save outputs
-# ================================================================
+
+
+
+
+# ===============================================================
+# 17. CIF Plot: Cause 1
+# ===============================================================
+
+
+ggplot(
+
+    cif_all,
+
+    aes(
+
+        x=Time,
+
+        y=CIF1,
+
+        color=Model
+
+    )
+
+)+
+
+
+geom_line(
+
+    linewidth=1.2
+
+)+
+
+
+labs(
+
+    title=
+
+        "Predicted CIF for Cause 1",
+
+
+    x="Time",
+
+
+    y="Cumulative Incidence"
+
+)+
+
+
+theme_minimal()
+
+
+
+
+
+# ===============================================================
+# 18. CIF Plot: Cause 2
+# ===============================================================
+
+
+ggplot(
+
+    cif_all,
+
+    aes(
+
+        x=Time,
+
+        y=CIF2,
+
+        color=Model
+
+    )
+
+)+
+
+
+geom_line(
+
+    linewidth=1.2
+
+)+
+
+
+labs(
+
+    title=
+
+        "Predicted CIF for Cause 2",
+
+
+    x="Time",
+
+
+    y="Cumulative Incidence"
+
+)+
+
+
+theme_minimal()
+
+
+
+
+
+# ===============================================================
+# 19. Survival Probability Plot
+# ===============================================================
+
+
+ggplot(
+
+    cif_all,
+
+    aes(
+
+        x=Time,
+
+        y=Survival,
+
+        color=Model
+
+    )
+
+)+
+
+
+geom_line(
+
+    linewidth=1.2
+
+)+
+
+
+labs(
+
+    title=
+
+        "Predicted Survival Probability",
+
+    x="Time",
+
+    y="S(t)"
+
+)+
+
+
+theme_minimal()
+
+
+
+
+
+# ===============================================================
+# 20. Save Results
+# ===============================================================
+
 
 write.csv(
 
     cindex_all,
 
-    "CNN_LSTM_Copula_Cindex_results.csv",
+    "Copula_CNN_LSTM_Cindex_results.csv",
 
     row.names=FALSE
 
 )
+
+
+
+write.csv(
+
+    cindex_table,
+
+    "Copula_CNN_LSTM_Cindex_summary_table.csv",
+
+    row.names=FALSE
+
+)
+
 
 
 write.csv(
 
     cif_all,
 
-    "CNN_LSTM_Copula_CIF_results.csv",
+    "Copula_CNN_LSTM_CIF_results.csv",
 
     row.names=FALSE
 
 )
 
-copula_gaussian_loss <- function(y_true, y_pred){
-  rho <- tf$constant(0.5, dtype=tf$float32)
-  u <- to_uniform_tf(y_pred)
-  z <- tf$sqrt(2) * tf$math$erfinv(2*u - 1)
-  z1 <- z[,1]; z2 <- z[,2]
-  detR <- 1 - rho^2
-  invR <- 1 / detR
-  quad <- invR * (z1^2 + z2^2 - 2*rho*z1*z2)
-  loss_term <- -0.5*quad - 0.5*tf$math$log(detR)
-  -tf$reduce_mean(loss_term)
-}
-
-copula_clayton_loss <- function(y_true, y_pred){
-  theta <- tf$constant(1.5, dtype=tf$float32)
-  u <- to_uniform_tf(y_pred)
-  S <- tf$reduce_sum(u^(-theta), axis=1L)
-  log_c <- tf$math$log(1+theta) - (theta+1)*tf$reduce_sum(tf$math$log(u), axis=1L) - (2 + 1/theta)*tf$math$log(S - 1 + 1e-6)
-  -tf$reduce_mean(log_c)
-}
-
-copula_gumbel_loss <- function(y_true, y_pred){
-  theta <- tf$constant(2.0, dtype=tf$float32)
-  u <- to_uniform_tf(y_pred)
-  log_u <- -tf$math$log(u)
-  phi <- log_u^theta
-  S <- tf$reduce_sum(phi, axis=1L)
-  log_C <- -S^(1/theta)
-  log_c <- log_C +
-    (1/theta - 1) * tf$math$log(S + 1e-6) +
-    tf$reduce_sum((theta-1)*tf$math$log(log_u + 1e-6) - tf$math$log(u + 1e-6), axis=1L) +
-    tf$math$log(1 + (theta-1)*S^(-1/theta))
-  -tf$reduce_mean(log_c)
-}
-
-# ================================================================
-# 3️⃣ CNN-LSTM model builder
-# ================================================================
-
-create_model <- function(loss_fn,
-                         n_features = length(covariates),
-                         n_outputs = 3){
-
-    inputs <- layer_input(shape = c(1,n_features))
-
-    outputs <- inputs %>%
-        layer_conv_1d(
-            filters = 32,
-            kernel_size = 1,
-            activation = "relu"
-        ) %>%
-        layer_lstm(32) %>%
-        layer_dense(32, activation="relu") %>%
-        layer_dropout(0.20) %>%
-        layer_dense(n_outputs,
-                    activation="sigmoid")
-
-    model <- keras_model(inputs, outputs)
-
-    model %>% compile(
-        optimizer = optimizer_adam(0.001),
-        loss = loss_fn
-    )
-
-    model
-}
 
 
-# ================================================================
-# 4️⃣ Realistic CIF computation function
-# ================================================================
-compute_cif_realistic <- function(model, df, times, time_step=1){
-  Xd <- array(as.matrix(df[,covariates]), dim=c(nrow(df),1,length(covariates)))
-  preds <- model %>% predict(Xd) # discrete hazard per interval
-  
-  n <- nrow(df)
-  n_times <- length(times)
-  
-  # Initialize matrices
-  cif1 <- matrix(0, nrow=n, ncol=n_times)
-  cif2 <- matrix(0, nrow=n, ncol=n_times)
-  surv_prob <- matrix(1, nrow=n, ncol=n_times)
-  
-  for(t in 1:n_times){
-    h1 <- preds[,1] * time_step
-    h2 <- preds[,2] * time_step
-    s_prev <- if(t==1) rep(1,n) else surv_prob[,t-1]
-    
-    cif1[,t] <- if(t==1) h1 else cif1[,t-1] + h1 * s_prev
-    cif2[,t] <- if(t==1) h2 else cif2[,t-1] + h2 * s_prev
-    surv_prob[,t] <- 1 - cif1[,t] - cif2[,t]
-  }
-  
-  data.frame(
-    Time = times,
-    CIF1 = colMeans(cif1),
-    CIF2 = colMeans(cif2),
-    Model = deparse(substitute(model))
-  )
-}
+saveRDS(
 
-# ================================================================
-# 5️⃣ Bootstrap C-index function
-# ================================================================
-cindex_cause_boot_fn <- function(data, indices, model, cause=1){
-  d <- data[indices, ]
-  y_true <- d$event
-  if(sum(y_true==cause)<2) return(NA)
-  
-  Xd <- array(as.matrix(d[,covariates]), dim=c(nrow(d),1,length(covariates)))
-  score <- model %>% predict(Xd)
-  score <- score[,cause]
-  
-  rcorr.cens(score, Surv(d$time, ifelse(y_true==cause,1,0)))["C Index"]
-}
+    list(
 
-ci_safe <- function(b){ 
-  if(all(is.na(b$t))||sd(b$t,na.rm=TRUE)==0) c(NA,NA) else boot.ci(b,type="perc")$percent[4:5] 
-}
+        Cindex=cindex_all,
 
-# ================================================================
-# 6️⃣ Simulation loop with CIF and C-index
-# ================================================================
-set.seed(123)
-cindex_results_list <- list()
-cif_results_list <- list()
+        CIF=cif_all
 
-for(sim in 1:n_sim){
-  cat("Simulation:", sim, "\n")
+    ),
 
-# ================================================================
-# Synthetic data
-# ================================================================
+    "Copula_CNN_LSTM_simulation_results.rds"
 
-X <- matrix(rnorm(n*30), nrow=n)
-
-colnames(X) <- covariates
-
-df <- data.frame(
-    id = 1:n,
-    X
 )
 
-##############################################################
-## Cause-specific linear predictors
-##############################################################
 
-lp1 <- 2*df$x1 -
-       df$x2 +
-       1.5*df$x3
 
-lp2 <- -1*df$x1 +
-        2*df$x2 -
-        df$x4
+cat(
 
-##############################################################
-## Event times
-##############################################################
+    "All simulations completed and results saved.\n"
 
-baseline_hazard <- 0.02
-
-df$time1 <- -log(runif(n)) /
-    (baseline_hazard*exp(lp1))
-
-df$time2 <- -log(runif(n)) /
-    (baseline_hazard*exp(lp2))
-
-##############################################################
-## Independent censoring
-##############################################################
-
-censor_time <- rexp(n, rate=0.01)
-
-true_time <- pmin(df$time1,
-                  df$time2)
-
-true_event <- ifelse(df$time1<df$time2,1,2)
-
-df$time <- pmin(true_time,
-                censor_time)
-
-df$event <- ifelse(
-    censor_time<true_time,
-    0,
-    true_event
 )
-
-  
-  # ---------- Train/test split ----------
-  idx_train <- sample(seq_len(n), floor(0.8*n))
-  df_train <- df[idx_train, ]
-  df_test  <- df[-idx_train, ]
-  
-  X_train <- array(as.matrix(df_train[,covariates]), dim=c(nrow(df_train),1,length(covariates)))
-  y_train_cr <- as.matrix(cbind(1-(df_train$event==1 | df_train$event==2), 
-                                df_train$event==1, df_train$event==2))
-  
-  # ---------- Train models ----------
-  model_gauss <- create_model(copula_gaussian_loss)
-  model_clayton <- create_model(copula_clayton_loss)
-  model_gumbel <- create_model(copula_gumbel_loss)
-  
-  model_gauss %>% fit(X_train, y_train_cr, epochs=5, batch_size=32, verbose=0)
-  model_clayton %>% fit(X_train, y_train_cr, epochs=5, batch_size=32, verbose=0)
-  model_gumbel %>% fit(X_train, y_train_cr, epochs=5, batch_size=32, verbose=0)
-  
-  pretrained_all <- list(
-    Copula_Gaussian=model_gauss,
-    Copula_Clayton=model_clayton,
-    Copula_Gumbel=model_gumbel
-  )
-  
-  # ---------- Bootstrap C-index ----------
-  boot_results_c1 <- lapply(pretrained_all, function(m) 
-    boot(df_test, function(d,i) cindex_cause_boot_fn(d,i,m,1), R=B_boot)
-  )
-  boot_results_c2 <- lapply(pretrained_all, function(m) 
-    boot(df_test, function(d,i) cindex_cause_boot_fn(d,i,m,2), R=B_boot)
-  )
-  
-  summary_cause_ci <- data.frame(
-    Simulation=sim,
-    Model=names(pretrained_all),
-    C_index_Cause1 = sapply(boot_results_c1, function(b) mean(b$t, na.rm=TRUE)),
-    CI_lower_Cause1 = sapply(boot_results_c1, function(b) ci_safe(b)[1]),
-    CI_upper_Cause1 = sapply(boot_results_c1, function(b) ci_safe(b)[2]),
-    C_index_Cause2 = sapply(boot_results_c2, function(b) mean(b$t, na.rm=TRUE)),
-    CI_lower_Cause2 = sapply(boot_results_c2, function(b) ci_safe(b)[1]),
-    CI_upper_Cause2 = sapply(boot_results_c2, function(b) ci_safe(b)[2])
-  )
-  
-  cindex_results_list[[sim]] <- summary_cause_ci
-  
-  # ---------- Compute CIF ----------
-  cif_results_list[[sim]] <- rbind(
-    compute_cif_realistic(model_gauss, df_test, times_eval),
-    compute_cif_realistic(model_clayton, df_test, times_eval),
-    compute_cif_realistic(model_gumbel, df_test, times_eval)
-  )
-}
-
-# ================================================================
-# 7️⃣ Aggregate CIFs and C-index results
-# ================================================================
-cif_all <- do.call(rbind, cif_results_list)
-cindex_all <- do.call(rbind, cindex_results_list)
-
-# ---------- Plot CIF ----------
-ggplot(cif_all, aes(x=Time, y=CIF1, color=Model)) +
-  geom_line(size=1) +
-  labs(title="Predicted Cause 1 CIF", y="CIF", x="Time") +
-  theme_minimal()
-
-ggplot(cif_all, aes(x=Time, y=CIF2, color=Model)) +
-  geom_line(size=1) +
-  labs(title="Predicted Cause 2 CIF", y="CIF", x="Time") +
-  theme_minimal()
-
-# ---------- Summarize C-index ----------
-cindex_long <- cindex_all %>%
-  pivot_longer(cols = c(C_index_Cause1, C_index_Cause2),
-               names_to = "Cause", values_to = "C_index") %>%
-  mutate(Cause = ifelse(Cause=="C_index_Cause1","Cause 1","Cause 2"))
-
-cindex_summary_table <- cindex_long %>%
-  group_by(Model, Cause) %>%
-  summarise(
-    Mean_C_index = mean(C_index, na.rm=TRUE),
-    CI_lower = mean(ifelse(Cause=="Cause 1", CI_lower_Cause1, CI_lower_Cause2), na.rm=TRUE),
-    CI_upper = mean(ifelse(Cause=="Cause 1", CI_upper_Cause1, CI_upper_Cause2), na.rm=TRUE),
-    .groups="drop"
-  ) %>%
-  arrange(Model, Cause)
-
-# ---------- Show C-index summary table ----------
-kable(cindex_summary_table, digits=3, caption="Cause-specific C-index with 95% Bootstrap CI")
-
 
 # ======================================================================
 # Full PBC Competing-Risk Analysis Using Entire Dataset

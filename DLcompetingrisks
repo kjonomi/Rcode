@@ -1853,11 +1853,9 @@ cindex_summary <-
 print(cindex_summary)
 
 
-
 # ===============================================================
 # 16. Publication Style C-index Table
 # ===============================================================
-
 
 cindex_table <-
 
@@ -1865,106 +1863,70 @@ cindex_table <-
 
     mutate(
 
+        Cause1 = paste0(
 
-        Cause1 =
+            sprintf("%.3f", Mean_Cause1),
 
-            paste0(
+            " (",
 
-                round(
+            sprintf("%.3f", Lower_Cause1),
 
-                    Mean_Cause1,
+            ", ",
 
-                    3
+            sprintf("%.3f", Upper_Cause1),
 
-                ),
+            ")"
 
-                " (",
+        ),
 
-                round(
+        Cause2 = paste0(
 
-                    Lower_Cause1,
+            sprintf("%.3f", Mean_Cause2),
 
-                    3
+            " (",
 
-                ),
+            sprintf("%.3f", Lower_Cause2),
 
-                ", ",
+            ", ",
 
-                round(
+            sprintf("%.3f", Upper_Cause2),
 
-                    Upper_Cause1,
+            ")"
 
-                    3
-
-                ),
-
-                ")"
-
-            ),
-
-
-
-
-        Cause2 =
-
-            paste0(
-
-                round(
-
-                    Mean_Cause2,
-
-                    3
-
-                ),
-
-                " (",
-
-                round(
-
-                    Lower_Cause2,
-
-                    3
-
-                ),
-
-                ", ",
-
-                round(
-
-                    Upper_Cause2,
-
-                    3
-
-                ),
-
-                ")"
-
-            )
-
-    ) %>%
-
-    select(
-
-        Model,
-
-        Cause1,
-
-        Cause2
+        )
 
     )
 
 
+# Keep only desired columns using base R
+cindex_table <-
 
-kable(
+    cindex_table[ ,
+
+        c(
+
+            "Model",
+
+            "Cause1",
+
+            "Cause2"
+
+        )
+
+    ]
+
+
+# Display table
+
+knitr::kable(
 
     cindex_table,
 
-    caption=
+    caption = "Cause-specific C-index with 95% Bootstrap Confidence Intervals",
 
-        "Cause-specific C-index with Bootstrap 95% Confidence Intervals"
+    align = "lcc"
 
 )
-
 
 
 

@@ -90,25 +90,25 @@ to_uniform_tf <- function(x){
 }
 
 
+# ===============================================================
+# 3. Generate High Correlated Nonlinear Weibull Competing Risk Data
+# ===============================================================
 
-# ===============================================================
-# 3. Generate Competing Risk Data
-# ===============================================================
+
+library(MASS)
 
 
 generate_data <- function(n){
 
 
+    ###############################################################
+    # Covariates
+    ###############################################################
+
     X <- matrix(
-
-        rnorm(
-            n*p
-        ),
-
+        rnorm(n*p),
         nrow=n,
-
         ncol=p
-
     )
 
 
@@ -116,65 +116,144 @@ generate_data <- function(n){
 
 
     df <- data.frame(
-
         id=1:n,
-
         X
-
     )
 
 
-    # Cause 1 hazard
 
-    lp1 <-
-
-        2*df$x1 -
-
-        df$x2 +
-
-        1.5*df$x3
+    ###############################################################
+    # Nonlinear risk functions
+    ###############################################################
 
 
+    # Cause 1 nonlinear predictor
 
-    # Cause 2 hazard
+    eta1 <-
 
-    lp2 <-
+        1.5*df$x1 -
 
-        -df$x1 +
+        1.2*df$x2 +
 
-        2*df$x2 -
+        0.8*df$x3^2 +
 
-        df$x4
+        1.5*sin(df$x4) +
+
+        0.7*df$x5*df$x6
 
 
 
-    # Event times
+    # Cause 2 nonlinear predictor
+
+
+    eta2 <-
+
+        -1.2*df$x1 +
+
+        1.8*df$x2 +
+
+        0.6*df$x4^2 -
+
+        1.2*cos(df$x3) +
+
+        0.8*df$x6*df$x7
+
+
+
+    ###############################################################
+    # Weibull baseline parameters
+    ###############################################################
+
+    shape1 <- 1.8
+
+    shape2 <- 2.5
+
+
+    scale1 <- 0.04
+
+    scale2 <- 0.03
+
+
+
+    ###############################################################
+    # Covariate-dependent Weibull hazards
+    ###############################################################
+
+    lambda1 <-
+
+        scale1 *
+        exp(eta1)
+
+
+    lambda2 <-
+
+        scale2 *
+        exp(eta2)
+
+
+
+    ###############################################################
+    # Gaussian copula dependence
+    ###############################################################
+
+    rho <- 0.85
+
+
+    Sigma <- matrix(
+        c(
+            1, rho,
+            rho, 1
+        ),
+        nrow=2
+    )
+
+
+    Z <-
+
+        mvrnorm(
+            n,
+            mu=c(0,0),
+            Sigma=Sigma
+        )
+
+
+
+    # Convert Gaussian copula to uniforms
+
+    U1 <- pnorm(Z[,1])
+
+    U2 <- pnorm(Z[,2])
+
+
+
+    ###############################################################
+    # Correlated Weibull event times
+    ###############################################################
+
 
     df$time1 <-
 
-        -log(runif(n)) /
-
-        (baseline_hazard *
-             exp(lp1))
+        (-log(U1)/lambda1)^(1/shape1)
 
 
 
     df$time2 <-
 
-        -log(runif(n)) /
-
-        (baseline_hazard *
-             exp(lp2))
+        (-log(U2)/lambda2)^(1/shape2)
 
 
 
+
+    ###############################################################
     # Censoring
+    ###############################################################
+
 
     censor_time <-
 
         rexp(
             n,
-            0.01
+            rate=0.01
         )
 
 
@@ -187,17 +266,12 @@ generate_data <- function(n){
         )
 
 
-
     true_event <-
 
         ifelse(
-
             df$time1 < df$time2,
-
             1,
-
             2
-
         )
 
 
@@ -214,21 +288,24 @@ generate_data <- function(n){
     df$event <-
 
         ifelse(
-
             censor_time < true_time,
-
             0,
-
             true_event
-
         )
+
+
+
+    ###############################################################
+    # Remove latent variables
+    ###############################################################
+
+    df$time1 <- NULL
+    df$time2 <- NULL
 
 
     return(df)
 
 }
-
-
 
 
 

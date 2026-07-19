@@ -37,7 +37,7 @@ n_sim <- 100
 
 n <- 1000
 
-B_boot <- 50
+B_boot <- 100
 
 
 p <- 300
@@ -90,187 +90,167 @@ to_uniform_tf <- function(x){
 }
 
 
-
 # ===============================================================
-# 3. Generate Competing Risk Data
+# 3. Generate High-Correlation Competing Risk Data
 # ===============================================================
-
 
 generate_data <- function(n){
 
+    ############################################################
+    # AR(1) covariance matrix
+    ############################################################
 
-    X <- matrix(
+    rho <- 0.90
 
-        rnorm(
-            n*p
-        ),
+    Sigma <- outer(
 
-        nrow=n,
+        1:p,
 
-        ncol=p
+        1:p,
+
+        function(i,j) rho^abs(i-j)
 
     )
 
+    ############################################################
+    # Multivariate normal predictors
+    ############################################################
+
+    X <- MASS::mvrnorm(
+
+        n = n,
+
+        mu = rep(0,p),
+
+        Sigma = Sigma
+
+    )
 
     colnames(X) <- covariates
 
-
     df <- data.frame(
 
-        id=1:n,
+        id = 1:n,
 
         X
 
     )
 
-
-    # Cause 1 hazard
+    ############################################################
+    # Nonlinear predictors
+    ############################################################
 
     lp1 <-
 
-        2*df$x1 -
+        1.5*sin(df$x1) +
 
-        df$x2 +
+        0.8*(df$x2)^2 -
 
-        1.5*df$x3
+        1.2*log(abs(df$x3)+1) +
 
+        0.6*df$x4*df$x5 +
 
+        0.5*df$x6*df$x7 -
 
-    # Cause 2 hazard
+        0.8*cos(df$x8)
 
     lp2 <-
 
-        -df$x1 +
+        -1.2*cos(df$x1) +
 
-        2*df$x2 -
+        0.5*(df$x2)^3 -
 
-        df$x4
+        0.8*sqrt(abs(df$x3)+1) +
 
+        0.7*df$x4*df$x5 -
 
+        0.6*df$x6*df$x7 +
 
-############################################################
-# Nonlinear predictors
-############################################################
+        log(abs(df$x9)+1)
 
-lp1 <-
+    ############################################################
+    # Weibull parameters
+    ############################################################
 
-    1.5*sin(df$x1) +
+    shape1 <- 1.5
 
-    0.8*(df$x2)^2 -
+    shape2 <- 2.0
 
-    1.2*log(abs(df$x3)+1) +
+    lambda1 <- 0.01
 
-    0.6*df$x4*df$x5
+    lambda2 <- 0.015
 
+    ############################################################
+    # Weibull event times
+    ############################################################
 
-lp2 <-
+    u1 <- runif(n)
 
-    -1.2*cos(df$x1) +
+    u2 <- runif(n)
 
-    0.5*(df$x2)^3 -
+    df$time1 <-
 
-    0.8*sqrt(abs(df$x3)+1) +
+        (-log(u1) /
 
-    0.7*df$x4*df$x5
+            (lambda1*exp(lp1)))^(1/shape1)
 
-############################################################
-# Weibull parameters
-############################################################
+    df$time2 <-
 
-shape1 <- 1.5
+        (-log(u2) /
 
-shape2 <- 2.0
+            (lambda2*exp(lp2)))^(1/shape2)
 
-lambda1 <- 0.01
+    ############################################################
+    # Independent censoring
+    ############################################################
 
-lambda2 <- 0.015
+    censor_time <- rexp(
 
-############################################################
-# Uniform variables
-############################################################
+        n,
 
-u1 <- runif(n)
+        rate = 0.01
 
-u2 <- runif(n)
+    )
 
-############################################################
-# Nonlinear Weibull event times
-############################################################
+    true_time <- pmin(
 
-df$time1 <-
+        df$time1,
 
-    (-log(u1) /
+        df$time2
 
-        (lambda1*exp(lp1)))^(1/shape1)
+    )
 
+    true_event <- ifelse(
 
-df$time2 <-
+        df$time1 < df$time2,
 
-    (-log(u2) /
+        1,
 
-        (lambda2*exp(lp2)))^(1/shape2)
+        2
 
+    )
 
-    # Censoring
+    df$time <- pmin(
 
-    censor_time <-
+        true_time,
 
-        rexp(
-            n,
-            0.01
-        )
+        censor_time
 
+    )
 
+    df$event <- ifelse(
 
-    true_time <-
+        censor_time < true_time,
 
-        pmin(
-            df$time1,
-            df$time2
-        )
+        0,
 
+        true_event
 
-
-    true_event <-
-
-        ifelse(
-
-            df$time1 < df$time2,
-
-            1,
-
-            2
-
-        )
-
-
-
-    df$time <-
-
-        pmin(
-            true_time,
-            censor_time
-        )
-
-
-
-    df$event <-
-
-        ifelse(
-
-            censor_time < true_time,
-
-            0,
-
-            true_event
-
-        )
-
+    )
 
     return(df)
 
 }
-
 
 
 

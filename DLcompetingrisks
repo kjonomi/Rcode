@@ -35,12 +35,12 @@ set.seed(123)
 
 n_sim <- 100
 
-n <- 1000
+n <- 3000
 
-B_boot <- 100
+B_boot <- 50
 
 
-p <- 300
+p <- 30
 
 
 covariates <- paste0(
@@ -61,7 +61,7 @@ baseline_hazard <- 0.02
 
 learning_rate <- 0.001
 
-epochs <- 5
+epochs <- 50
 
 batch_size <- 32
 
@@ -90,167 +90,144 @@ to_uniform_tf <- function(x){
 }
 
 
+
 # ===============================================================
-# 3. Generate High-Correlation Competing Risk Data
+# 3. Generate Competing Risk Data
 # ===============================================================
+
 
 generate_data <- function(n){
 
-    ############################################################
-    # AR(1) covariance matrix
-    ############################################################
 
-    rho <- 0.90
+    X <- matrix(
 
-    Sigma <- outer(
+        rnorm(
+            n*p
+        ),
 
-        1:p,
+        nrow=n,
 
-        1:p,
-
-        function(i,j) rho^abs(i-j)
+        ncol=p
 
     )
 
-    ############################################################
-    # Multivariate normal predictors
-    ############################################################
-
-    X <- MASS::mvrnorm(
-
-        n = n,
-
-        mu = rep(0,p),
-
-        Sigma = Sigma
-
-    )
 
     colnames(X) <- covariates
 
+
     df <- data.frame(
 
-        id = 1:n,
+        id=1:n,
 
         X
 
     )
 
-    ############################################################
-    # Nonlinear predictors
-    ############################################################
+
+    # Cause 1 hazard
 
     lp1 <-
 
-        1.5*sin(df$x1) +
+        2*df$x1 -
 
-        0.8*(df$x2)^2 -
+        df$x2 +
 
-        1.2*log(abs(df$x3)+1) +
+        1.5*df$x3
 
-        0.6*df$x4*df$x5 +
 
-        0.5*df$x6*df$x7 -
 
-        0.8*cos(df$x8)
+    # Cause 2 hazard
 
     lp2 <-
 
-        -1.2*cos(df$x1) +
+        -df$x1 +
 
-        0.5*(df$x2)^3 -
+        2*df$x2 -
 
-        0.8*sqrt(abs(df$x3)+1) +
+        df$x4
 
-        0.7*df$x4*df$x5 -
 
-        0.6*df$x6*df$x7 +
 
-        log(abs(df$x9)+1)
-
-    ############################################################
-    # Weibull parameters
-    ############################################################
-
-    shape1 <- 1.5
-
-    shape2 <- 2.0
-
-    lambda1 <- 0.01
-
-    lambda2 <- 0.015
-
-    ############################################################
-    # Weibull event times
-    ############################################################
-
-    u1 <- runif(n)
-
-    u2 <- runif(n)
+    # Event times
 
     df$time1 <-
 
-        (-log(u1) /
+        -log(runif(n)) /
 
-            (lambda1*exp(lp1)))^(1/shape1)
+        (baseline_hazard *
+             exp(lp1))
+
+
 
     df$time2 <-
 
-        (-log(u2) /
+        -log(runif(n)) /
 
-            (lambda2*exp(lp2)))^(1/shape2)
+        (baseline_hazard *
+             exp(lp2))
 
-    ############################################################
-    # Independent censoring
-    ############################################################
 
-    censor_time <- rexp(
 
-        n,
+    # Censoring
 
-        rate = 0.01
+    censor_time <-
 
-    )
+        rexp(
+            n,
+            0.01
+        )
 
-    true_time <- pmin(
 
-        df$time1,
 
-        df$time2
+    true_time <-
 
-    )
+        pmin(
+            df$time1,
+            df$time2
+        )
 
-    true_event <- ifelse(
 
-        df$time1 < df$time2,
 
-        1,
+    true_event <-
 
-        2
+        ifelse(
 
-    )
+            df$time1 < df$time2,
 
-    df$time <- pmin(
+            1,
 
-        true_time,
+            2
 
-        censor_time
+        )
 
-    )
 
-    df$event <- ifelse(
 
-        censor_time < true_time,
+    df$time <-
 
-        0,
+        pmin(
+            true_time,
+            censor_time
+        )
 
-        true_event
 
-    )
+
+    df$event <-
+
+        ifelse(
+
+            censor_time < true_time,
+
+            0,
+
+            true_event
+
+        )
+
 
     return(df)
 
 }
+
 
 
 
@@ -1876,9 +1853,11 @@ cindex_summary <-
 print(cindex_summary)
 
 
+
 # ===============================================================
 # 16. Publication Style C-index Table
 # ===============================================================
+
 
 cindex_table <-
 
@@ -1886,70 +1865,106 @@ cindex_table <-
 
     mutate(
 
-        Cause1 = paste0(
 
-            sprintf("%.3f", Mean_Cause1),
+        Cause1 =
 
-            " (",
+            paste0(
 
-            sprintf("%.3f", Lower_Cause1),
+                round(
 
-            ", ",
+                    Mean_Cause1,
 
-            sprintf("%.3f", Upper_Cause1),
+                    3
 
-            ")"
+                ),
 
-        ),
+                " (",
 
-        Cause2 = paste0(
+                round(
 
-            sprintf("%.3f", Mean_Cause2),
+                    Lower_Cause1,
 
-            " (",
+                    3
 
-            sprintf("%.3f", Lower_Cause2),
+                ),
 
-            ", ",
+                ", ",
 
-            sprintf("%.3f", Upper_Cause2),
+                round(
 
-            ")"
+                    Upper_Cause1,
 
-        )
+                    3
+
+                ),
+
+                ")"
+
+            ),
+
+
+
+
+        Cause2 =
+
+            paste0(
+
+                round(
+
+                    Mean_Cause2,
+
+                    3
+
+                ),
+
+                " (",
+
+                round(
+
+                    Lower_Cause2,
+
+                    3
+
+                ),
+
+                ", ",
+
+                round(
+
+                    Upper_Cause2,
+
+                    3
+
+                ),
+
+                ")"
+
+            )
+
+    ) %>%
+
+    select(
+
+        Model,
+
+        Cause1,
+
+        Cause2
 
     )
 
 
-# Keep only desired columns using base R
-cindex_table <-
 
-    cindex_table[ ,
-
-        c(
-
-            "Model",
-
-            "Cause1",
-
-            "Cause2"
-
-        )
-
-    ]
-
-
-# Display table
-
-knitr::kable(
+kable(
 
     cindex_table,
 
-    caption = "Cause-specific C-index with 95% Bootstrap Confidence Intervals",
+    caption=
 
-    align = "lcc"
+        "Cause-specific C-index with Bootstrap 95% Confidence Intervals"
 
 )
+
 
 
 

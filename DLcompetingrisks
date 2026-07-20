@@ -40,7 +40,7 @@ n <- 1000
 B_boot <- 50
 
 
-p <- 300
+p <- 30
 
 
 covariates <- paste0(
@@ -91,221 +91,249 @@ to_uniform_tf <- function(x){
 
 
 # ===============================================================
-# 3. Generate High Correlated Nonlinear Weibull Competing Risk Data
+# 3. Generate High-Correlation Competing Risk Data
 # ===============================================================
-
-
-library(MASS)
-
 
 generate_data <- function(n){
 
+    ############################################################
+    # AR(1) covariance matrix
+    ############################################################
 
-    ###############################################################
-    # Covariates
-    ###############################################################
+    rho <- 0.90
 
-    X <- matrix(
-        rnorm(n*p),
-        nrow=n,
-        ncol=p
+    Sigma <- outer(
+
+        1:p,
+
+        1:p,
+
+        function(i,j) rho^abs(i-j)
+
     )
 
+    ############################################################
+    # Multivariate normal predictors
+    ############################################################
+
+    X <- MASS::mvrnorm(
+
+        n = n,
+
+        mu = rep(0,p),
+
+        Sigma = Sigma
+
+    )
 
     colnames(X) <- covariates
 
-
     df <- data.frame(
-        id=1:n,
+
+        id = 1:n,
+
         X
+
     )
 
+    ############################################################
+    # Nonlinear predictors
+    ############################################################
+
+############################################################
+# Cause 1 Linear Predictor (30 variables)
+############################################################
+
+lp1 <-
+
+    1.5*sin(df$x1) +
+
+    0.8*(df$x2)^2 -
+
+    1.2*log(abs(df$x3)+1) +
+
+    0.6*df$x4*df$x5 +
+
+    0.7*cos(df$x6) -
+
+    0.5*(df$x7)^2 +
+
+    0.8*df$x8*df$x9 +
+
+    0.4*exp(df$x10/3) -
+
+    0.6*sqrt(abs(df$x11)+1) +
+
+    0.5*df$x12 +
+
+    0.8*sin(df$x13*df$x14) -
+
+    0.7*log(abs(df$x15)+1) +
+
+    0.5*(df$x16)^2 -
+
+    0.6*df$x17*df$x18 +
+
+    0.7*cos(df$x19) +
+
+    0.5*df$x20 -
+
+    0.8*exp(-abs(df$x21)) +
+
+    0.6*df$x22*df$x23 -
+
+    0.5*(df$x24)^2 +
+
+    0.7*sin(df$x25) +
+
+    0.4*df$x26 +
+
+    0.6*log(abs(df$x27)+1) -
+
+    0.5*df$x28*df$x29 +
+
+    0.8*df$x30
 
 
-    ###############################################################
-    # Nonlinear risk functions
-    ###############################################################
+############################################################
+# Cause 2 Linear Predictor (30 variables)
+############################################################
+
+lp2 <-
+
+    3*sin(df$x1) +
+
+    2*(df$x2)^2 -
+
+    2*log(abs(df$x3)+1) +
+
+    1.5*df$x4*df$x5 +
+
+    1.2*cos(df$x6) -
+
+    1.0*(df$x7)^2 +
+
+    1.1*df$x8*df$x9 +
+
+    0.8*exp(df$x10/3) -
+
+    1.0*sqrt(abs(df$x11)+1) +
+
+    0.9*df$x12 +
+
+    1.2*sin(df$x13*df$x14) -
+
+    1.1*log(abs(df$x15)+1) +
+
+    0.8*(df$x16)^2 -
+
+    0.9*df$x17*df$x18 +
+
+    1.0*cos(df$x19) +
+
+    0.7*df$x20 -
+
+    1.1*exp(-abs(df$x21)) +
+
+    0.9*df$x22*df$x23 -
+
+    0.8*(df$x24)^2 +
+
+    1.0*sin(df$x25) +
+
+    0.7*df$x26 +
+
+    0.9*log(abs(df$x27)+1) -
+
+    0.8*df$x28*df$x29 +
+
+    1.2*df$x30
 
 
-    # Cause 1 nonlinear predictor
+    ############################################################
+    # Weibull parameters
+    ############################################################
 
-    eta1 <-
+    shape1 <- 2.5
 
-        1.5*df$x1 -
+    shape2 <- 3.0
 
-        1.2*df$x2 +
+    lambda1 <- 0.01
 
-        0.8*df$x3^2 +
+    lambda2 <- 0.015
 
-        1.5*sin(df$x4) +
+    ############################################################
+    # Weibull event times
+    ############################################################
 
-        0.7*df$x5*df$x6
+    u1 <- runif(n)
 
-
-
-    # Cause 2 nonlinear predictor
-
-
-    eta2 <-
-
-        -1.2*df$x1 +
-
-        1.8*df$x2 +
-
-        0.6*df$x4^2 -
-
-        1.2*cos(df$x3) +
-
-        0.8*df$x6*df$x7
-
-
-
-    ###############################################################
-    # Weibull baseline parameters
-    ###############################################################
-
-    shape1 <- 1.8
-
-    shape2 <- 2.5
-
-
-    scale1 <- 3.0
-
-    scale2 <- 4.0
-
-
-
-    ###############################################################
-    # Covariate-dependent Weibull hazards
-    ###############################################################
-
-    lambda1 <-
-
-        scale1 *
-        exp(eta1)
-
-
-    lambda2 <-
-
-        scale2 *
-        exp(eta2)
-
-
-
-    ###############################################################
-    # Gaussian copula dependence
-    ###############################################################
-
-    rho <- 0.95
-
-
-    Sigma <- matrix(
-        c(
-            1, rho,
-            rho, 1
-        ),
-        nrow=2
-    )
-
-
-    Z <-
-
-        mvrnorm(
-            n,
-            mu=c(0,0),
-            Sigma=Sigma
-        )
-
-
-
-    # Convert Gaussian copula to uniforms
-
-    U1 <- pnorm(Z[,1])
-
-    U2 <- pnorm(Z[,2])
-
-
-
-    ###############################################################
-    # Correlated Weibull event times
-    ###############################################################
-
+    u2 <- runif(n)
 
     df$time1 <-
 
-        (-log(U1)/lambda1)^(1/shape1)
+        (-log(u1) /
 
-
+            (lambda1*exp(lp1)))^(1/shape1)
 
     df$time2 <-
 
-        (-log(U2)/lambda2)^(1/shape2)
+        (-log(u2) /
 
+            (lambda2*exp(lp2)))^(1/shape2)
 
+    ############################################################
+    # Independent censoring
+    ############################################################
 
+    censor_time <- rexp(
 
-    ###############################################################
-    # Censoring
-    ###############################################################
+        n,
 
+        rate = 0.01
 
-    censor_time <-
+    )
 
-        rexp(
-            n,
-            rate=0.01
-        )
+    true_time <- pmin(
 
+        df$time1,
 
+        df$time2
 
-    true_time <-
+    )
 
-        pmin(
-            df$time1,
-            df$time2
-        )
+    true_event <- ifelse(
 
+        df$time1 < df$time2,
 
-    true_event <-
+        1,
 
-        ifelse(
-            df$time1 < df$time2,
-            1,
-            2
-        )
+        2
 
+    )
 
+    df$time <- pmin(
 
-    df$time <-
+        true_time,
 
-        pmin(
-            true_time,
-            censor_time
-        )
+        censor_time
 
+    )
 
+    df$event <- ifelse(
 
-    df$event <-
+        censor_time < true_time,
 
-        ifelse(
-            censor_time < true_time,
-            0,
-            true_event
-        )
+        0,
 
+        true_event
 
-
-    ###############################################################
-    # Remove latent variables
-    ###############################################################
-
-    df$time1 <- NULL
-    df$time2 <- NULL
-
+    )
 
     return(df)
 
 }
+
 
 
 
@@ -1929,37 +1957,98 @@ cindex_summary <-
 
 print(cindex_summary)
 
+
+
 # ===============================================================
 # 16. Publication Style C-index Table
 # ===============================================================
+
 
 cindex_table <-
 
     cindex_summary %>%
 
-    dplyr::mutate(
+    mutate(
 
-        Cause1 = paste0(
-            sprintf("%.3f", Mean_Cause1),
-            " (",
-            sprintf("%.3f", Lower_Cause1),
-            ", ",
-            sprintf("%.3f", Upper_Cause1),
-            ")"
-        ),
 
-        Cause2 = paste0(
-            sprintf("%.3f", Mean_Cause2),
-            " (",
-            sprintf("%.3f", Lower_Cause2),
-            ", ",
-            sprintf("%.3f", Upper_Cause2),
-            ")"
-        )
+        Cause1 =
+
+            paste0(
+
+                round(
+
+                    Mean_Cause1,
+
+                    3
+
+                ),
+
+                " (",
+
+                round(
+
+                    Lower_Cause1,
+
+                    3
+
+                ),
+
+                ", ",
+
+                round(
+
+                    Upper_Cause1,
+
+                    3
+
+                ),
+
+                ")"
+
+            ),
+
+
+
+
+        Cause2 =
+
+            paste0(
+
+                round(
+
+                    Mean_Cause2,
+
+                    3
+
+                ),
+
+                " (",
+
+                round(
+
+                    Lower_Cause2,
+
+                    3
+
+                ),
+
+                ", ",
+
+                round(
+
+                    Upper_Cause2,
+
+                    3
+
+                ),
+
+                ")"
+
+            )
 
     ) %>%
 
-    dplyr::select(
+    select(
 
         Model,
 
@@ -1970,23 +2059,14 @@ cindex_table <-
     )
 
 
-# ===============================================================
-# Print publication table
-# ===============================================================
 
-knitr::kable(
+kable(
 
     cindex_table,
 
-    align = "lcc",
+    caption=
 
-    col.names = c(
-        "Copula Model",
-        "Cause 1 C-index (95% CI)",
-        "Cause 2 C-index (95% CI)"
-    ),
-
-    caption = "Bootstrap C-index Comparison for Competing Risks"
+        "Cause-specific C-index with Bootstrap 95% Confidence Intervals"
 
 )
 
@@ -2204,6 +2284,7 @@ cat(
     "All simulations completed and results saved.\n"
 
 )
+
 
 # ======================================================================
 # Full PBC Competing-Risk Analysis Using Entire Dataset

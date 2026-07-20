@@ -1957,98 +1957,80 @@ cindex_summary <-
 
 print(cindex_summary)
 
+###############################################################
+# Average C-index Summary
+###############################################################
 
+cindex_summary <-
 
-# ===============================================================
-# 16. Publication Style C-index Table
-# ===============================================================
+    cindex_all %>%
 
+    dplyr::group_by(Model) %>%
+
+    dplyr::summarise(
+
+        Mean_Cause1 =
+            mean(C_index_Cause1, na.rm=TRUE),
+
+        SD_Cause1 =
+            sd(C_index_Cause1, na.rm=TRUE),
+
+        Lower_Cause1 =
+            mean(CI_lower_Cause1, na.rm=TRUE),
+
+        Upper_Cause1 =
+            mean(CI_upper_Cause1, na.rm=TRUE),
+
+        Mean_Cause2 =
+            mean(C_index_Cause2, na.rm=TRUE),
+
+        SD_Cause2 =
+            sd(C_index_Cause2, na.rm=TRUE),
+
+        Lower_Cause2 =
+            mean(CI_lower_Cause2, na.rm=TRUE),
+
+        Upper_Cause2 =
+            mean(CI_upper_Cause2, na.rm=TRUE),
+
+        .groups="drop"
+
+    )
+
+print(cindex_summary)
+
+###############################################################
+# Publication Table
+###############################################################
 
 cindex_table <-
 
     cindex_summary %>%
 
-    mutate(
+    dplyr::mutate(
+
+        Cause1 = sprintf(
+            "%.3f (%.3f, %.3f)",
+            Mean_Cause1,
+            Lower_Cause1,
+            Upper_Cause1
+        ),
+
+        Cause2 = sprintf(
+            "%.3f (%.3f, %.3f)",
+            Mean_Cause2,
+            Lower_Cause2,
+            Upper_Cause2
+        )
+
+    )
 
 
-        Cause1 =
+cindex_table <-
 
-            paste0(
+    dplyr::select(
 
-                round(
-
-                    Mean_Cause1,
-
-                    3
-
-                ),
-
-                " (",
-
-                round(
-
-                    Lower_Cause1,
-
-                    3
-
-                ),
-
-                ", ",
-
-                round(
-
-                    Upper_Cause1,
-
-                    3
-
-                ),
-
-                ")"
-
-            ),
-
-
-
-
-        Cause2 =
-
-            paste0(
-
-                round(
-
-                    Mean_Cause2,
-
-                    3
-
-                ),
-
-                " (",
-
-                round(
-
-                    Lower_Cause2,
-
-                    3
-
-                ),
-
-                ", ",
-
-                round(
-
-                    Upper_Cause2,
-
-                    3
-
-                ),
-
-                ")"
-
-            )
-
-    ) %>%
-
-    select(
+        cindex_table,
 
         Model,
 
@@ -2059,18 +2041,17 @@ cindex_table <-
     )
 
 
-
-kable(
+knitr::kable(
 
     cindex_table,
 
-    caption=
+    digits = 3,
 
-        "Cause-specific C-index with Bootstrap 95% Confidence Intervals"
+    align="lcc",
+
+    caption="Cause-specific C-index (95% Bootstrap CI)"
 
 )
-
-
 
 
 
@@ -2220,7 +2201,146 @@ theme_minimal()
 
 
 
+###############################################################
+# CIF Summary Table
+###############################################################
 
+library(dplyr)
+
+cif_summary <-
+
+    cif_all %>%
+
+    dplyr::group_by(Model) %>%
+
+    dplyr::summarise(
+
+        Mean_CIF1 =
+            mean(CIF1, na.rm = TRUE),
+
+        SD_CIF1 =
+            sd(CIF1, na.rm = TRUE),
+
+        Max_CIF1 =
+            max(CIF1, na.rm = TRUE),
+
+        Mean_CIF2 =
+            mean(CIF2, na.rm = TRUE),
+
+        SD_CIF2 =
+            sd(CIF2, na.rm = TRUE),
+
+        Max_CIF2 =
+            max(CIF2, na.rm = TRUE),
+
+        Mean_Survival =
+            mean(Survival, na.rm = TRUE),
+
+        SD_Survival =
+            sd(Survival, na.rm = TRUE),
+
+        Min_Survival =
+            min(Survival, na.rm = TRUE),
+
+        .groups = "drop"
+
+    )
+
+print(cif_summary)
+
+knitr::kable(
+
+    cif_summary,
+
+    digits = 3,
+
+    caption = "Summary of Predicted Cumulative Incidence Functions and Survival"
+
+)
+
+cif_table <-
+
+    cif_summary %>%
+
+    dplyr::mutate(
+
+        Cause1 = sprintf(
+            "%.3f ± %.3f (Max %.3f)",
+            Mean_CIF1,
+            SD_CIF1,
+            Max_CIF1
+        ),
+
+        Cause2 = sprintf(
+            "%.3f ± %.3f (Max %.3f)",
+            Mean_CIF2,
+            SD_CIF2,
+            Max_CIF2
+        ),
+
+        Survival = sprintf(
+            "%.3f ± %.3f (Min %.3f)",
+            Mean_Survival,
+            SD_Survival,
+            Min_Survival
+        )
+
+    )
+
+cif_table <-
+
+    cif_table[ ,
+
+        c(
+            "Model",
+            "Cause1",
+            "Cause2",
+            "Survival"
+        )
+
+    ]
+
+knitr::kable(
+
+    cif_table,
+
+    align = "lccc",
+
+    caption = "Predicted CIF and Survival Summary"
+
+)
+
+time_points <- c(10,20,30,40,50)
+
+cif_time_summary <-
+
+    cif_all %>%
+
+    dplyr::filter(Time %in% time_points) %>%
+
+    dplyr::group_by(Model, Time) %>%
+
+    dplyr::summarise(
+
+        CIF1 = mean(CIF1, na.rm = TRUE),
+
+        CIF2 = mean(CIF2, na.rm = TRUE),
+
+        Survival = mean(Survival, na.rm = TRUE),
+
+        .groups = "drop"
+
+    )
+
+knitr::kable(
+
+    cif_time_summary,
+
+    digits = 3,
+
+    caption = "Predicted CIFs and Survival at Selected Time Points"
+
+)
 
 # ===============================================================
 # 20. Save Results

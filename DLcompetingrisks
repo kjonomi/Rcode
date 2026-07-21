@@ -2923,7 +2923,7 @@ row.names=FALSE
 )
 
 
-install.packages("riskRegression")
+#install.packages("riskRegression")
 
 ###############################################################
 # Part 13.1

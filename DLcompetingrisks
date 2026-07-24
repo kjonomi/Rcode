@@ -58,7 +58,7 @@ set.seed(1234)
 
 
 
-n <- 1000
+n <- 3000
 
 
 p <- 30
@@ -79,7 +79,7 @@ batch_size <- 64
 
 
 
-lambda_copula <- 0.20
+lambda_copula <- 0.30
 
 
 
@@ -250,13 +250,13 @@ eta2 <-
 ###############################################################
 
 
-shape1 <- 1.8
+shape1 <- 2.8
 
 scale1 <- 0.03
 
 
 
-shape2 <- 0.8
+shape2 <- 1.8
 
 scale2 <- 0.05
 
@@ -463,7 +463,7 @@ gaussian_copula_penalty <- function(
 
 
 
-    rho <- 0.5
+    rho <- 0.8
 
 
 
@@ -2099,72 +2099,48 @@ write.csv(
 # 22. Publication Format Table
 ###############################################################
 
-
 publication_table <-
 
-    summary_results %>%
+summary_results %>%
 
-    mutate(
+dplyr::mutate(
 
-        Cindex =
+    Cindex =
+        sprintf(
+            "%.3f (%.3f)",
+            Mean_Cindex,
+            SD_Cindex
+        ),
 
-            sprintf(
+    AUC =
+        sprintf(
+            "%.3f (%.3f)",
+            Mean_AUC,
+            SD_AUC
+        ),
 
-                "%.3f (%.3f)",
+    IBS =
+        sprintf(
+            "%.3f (%.3f)",
+            Mean_IBS,
+            SD_IBS
+        )
 
-                Mean_Cindex,
+) %>%
 
-                SD_Cindex
+dplyr::select(
 
-            ),
+    Model,
 
+    Cause,
 
+    Cindex,
 
-        AUC =
+    AUC,
 
-            sprintf(
+    IBS
 
-                "%.3f (%.3f)",
-
-                Mean_AUC,
-
-                SD_AUC
-
-            ),
-
-
-
-        IBS =
-
-            sprintf(
-
-                "%.3f (%.3f)",
-
-                Mean_IBS,
-
-                SD_IBS
-
-            )
-
-    ) %>%
-
-    select(
-
-        Model,
-
-        Cause,
-
-        Cindex,
-
-        AUC,
-
-        IBS
-
-    )
-
-
-
-
+)
 
 cat("\nPublication Table\n")
 
@@ -2226,66 +2202,78 @@ library(tidyr)
 
 
 
+###############################################################
+# Part 8
+# Figures from 100 Simulation Results
+###############################################################
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+theme_set(theme_bw())
 
 ###############################################################
 # Figure 1
-# Mean C-index Comparison
+# Mean C-index
 ###############################################################
-
 
 cindex_summary <-
 
 simulation_results %>%
 
-group_by(Model) %>%
+group_by(
+    Model,
+    Cause
+) %>%
 
 summarise(
 
-    Mean_C1 =
+    Mean_Cindex =
         mean(
-            Cindex_Cause1,
+            Cindex,
             na.rm=TRUE
         ),
 
-    Mean_C2 =
-        mean(
-            Cindex_Cause2,
+    SD_Cindex =
+        sd(
+            Cindex,
             na.rm=TRUE
-        )
+        ),
+
+    .groups="drop"
 
 )
 
+cindex_summary$Cause <-
 
+factor(
 
-cindex_long <-
+    cindex_summary$Cause,
 
-cindex_summary %>%
+    levels=c(1,2),
 
-pivot_longer(
-
-    cols=c(
-        Mean_C1,
-        Mean_C2
-    ),
-
-    names_to="Cause",
-
-    values_to="Cindex"
+    labels=c(
+        "Cause 1",
+        "Cause 2"
+    )
 
 )
-
-
 
 p1 <-
 
 ggplot(
 
-    cindex_long,
+    cindex_summary,
 
     aes(
-        Model,
-        Cindex,
+
+        x=Model,
+
+        y=Mean_Cindex,
+
         fill=Cause
+
     )
 
 )+
@@ -2294,12 +2282,312 @@ geom_col(
     position="dodge"
 )+
 
-theme_bw()+
+geom_errorbar(
+
+    aes(
+
+        ymin=Mean_Cindex-SD_Cindex,
+
+        ymax=Mean_Cindex+SD_Cindex
+
+    ),
+
+    width=.20,
+
+    position=position_dodge(.9)
+
+)+
 
 labs(
 
-title=
-"100 Simulation Mean C-index",
+    title="Mean C-index Across 100 Simulations",
+
+    x="Model",
+
+    y="Mean C-index"
+
+)+
+
+theme(
+
+axis.text.x=
+
+element_text(
+angle=45,
+hjust=1)
+
+)
+
+print(p1)
+
+ggsave(
+"Figure1_Mean_Cindex.png",
+p1,
+width=8,
+height=5,
+dpi=300
+)
+
+###############################################################
+# Figure 2
+# Mean AUC
+###############################################################
+
+auc_summary <-
+
+simulation_results %>%
+
+group_by(
+    Model,
+    Cause
+) %>%
+
+summarise(
+
+    Mean_AUC=
+        mean(AUC),
+
+    SD_AUC=
+        sd(AUC),
+
+    .groups="drop"
+
+)
+
+auc_summary$Cause <-
+
+factor(
+
+auc_summary$Cause,
+
+levels=c(1,2),
+
+labels=c(
+"Cause 1",
+"Cause 2"
+)
+
+)
+
+p2<-
+
+ggplot(
+
+auc_summary,
+
+aes(
+
+Model,
+
+Mean_AUC,
+
+fill=Cause
+
+)
+
+)+
+
+geom_col(
+position="dodge"
+)+
+
+geom_errorbar(
+
+aes(
+
+ymin=Mean_AUC-SD_AUC,
+
+ymax=Mean_AUC+SD_AUC
+
+),
+
+position=position_dodge(.9),
+
+width=.20
+
+)+
+
+labs(
+
+title="Mean Time-dependent AUC",
+
+x="Model",
+
+y="Mean AUC"
+
+)+
+
+theme(
+
+axis.text.x=
+
+element_text(
+
+angle=45,
+
+hjust=1
+
+)
+
+)
+
+print(p2)
+
+ggsave(
+"Figure2_Mean_AUC.png",
+p2,
+width=8,
+height=5,
+dpi=300
+)
+
+###############################################################
+# Figure 3
+# Mean IBS
+###############################################################
+
+ibs_summary <-
+
+simulation_results %>%
+
+group_by(
+Model,
+Cause
+)%>%
+
+summarise(
+
+Mean_IBS=
+mean(IBS),
+
+SD_IBS=
+sd(IBS),
+
+.groups="drop"
+
+)
+
+ibs_summary$Cause<-
+
+factor(
+
+ibs_summary$Cause,
+
+levels=c(1,2),
+
+labels=c(
+"Cause 1",
+"Cause 2"
+)
+
+)
+
+p3<-
+
+ggplot(
+
+ibs_summary,
+
+aes(
+
+Model,
+
+Mean_IBS,
+
+fill=Cause
+
+)
+
+)+
+
+geom_col(
+position="dodge"
+)+
+
+geom_errorbar(
+
+aes(
+
+ymin=Mean_IBS-SD_IBS,
+
+ymax=Mean_IBS+SD_IBS
+
+),
+
+position=position_dodge(.9),
+
+width=.20
+
+)+
+
+labs(
+
+title="Mean Integrated Brier Score",
+
+x="Model",
+
+y="Mean IBS"
+
+)+
+
+theme(
+
+axis.text.x=
+
+element_text(
+
+angle=45,
+
+hjust=1
+
+)
+
+)
+
+print(p3)
+
+ggsave(
+"Figure3_Mean_IBS.png",
+p3,
+width=8,
+height=5,
+dpi=300
+)
+
+###############################################################
+# Figure 4
+# Cause 1 C-index Distribution
+###############################################################
+
+p4<-
+
+simulation_results%>%
+
+filter(Cause==1)%>%
+
+ggplot(
+
+aes(
+
+Model,
+
+Cindex,
+
+fill=Model
+
+)
+
+)+
+
+geom_boxplot(
+
+alpha=.8
+
+)+
+
+labs(
+
+title="Cause 1 C-index Distribution",
 
 x="Model",
 
@@ -2310,91 +2598,102 @@ y="C-index"
 theme(
 
 axis.text.x=
+
 element_text(
+
 angle=45,
+
 hjust=1
-)
 
 )
 
+)
 
-
-print(p1)
-
-
+print(p4)
 
 ggsave(
-
-"Figure1_Mean_Cindex.png",
-
-p1,
-
-width=9,
-
-height=5
-
+"Figure4_Cause1_Boxplot.png",
+p4,
+width=8,
+height=5,
+dpi=300
 )
-
-
-
-
-
 
 ###############################################################
-# Figure 2
-# Mean AUC Comparison
+# Figure 5
+# Cause 2 C-index Distribution
 ###############################################################
 
+p5<-
 
-auc_summary <-
+simulation_results%>%
 
-simulation_results %>%
-
-group_by(Model)%>%
-
-summarise(
-
-Mean_AUC1 =
-mean(
-AUC_Cause1,
-na.rm=TRUE
-),
-
-Mean_AUC2 =
-mean(
-AUC_Cause2,
-na.rm=TRUE
-)
-
-)
-
-
-
-
-auc_long <-
-
-auc_summary %>%
-
-pivot_longer(
-
-cols=c(
-Mean_AUC1,
-Mean_AUC2
-),
-
-names_to="Cause",
-
-values_to="AUC"
-
-)
-
-
-
-p2 <-
+filter(Cause==2)%>%
 
 ggplot(
 
-auc_long,
+aes(
+
+Model,
+
+Cindex,
+
+fill=Model
+
+)
+
+)+
+
+geom_boxplot(
+
+alpha=.8
+
+)+
+
+labs(
+
+title="Cause 2 C-index Distribution",
+
+x="Model",
+
+y="C-index"
+
+)+
+
+theme(
+
+axis.text.x=
+
+element_text(
+
+angle=45,
+
+hjust=1
+
+)
+
+)
+
+print(p5)
+
+ggsave(
+"Figure5_Cause2_Boxplot.png",
+p5,
+width=8,
+height=5,
+dpi=300
+)
+
+###############################################################
+# Figure 6
+# AUC Distribution
+###############################################################
+
+p6<-
+
+simulation_results%>%
+
+ggplot(
 
 aes(
 
@@ -2402,121 +2701,64 @@ Model,
 
 AUC,
 
-fill=Cause
+fill=factor(Cause)
 
 )
 
 )+
 
+geom_boxplot(
 
-geom_col(
-position="dodge"
+position=position_dodge(.75)
+
 )+
-
-
-theme_bw()+
-
 
 labs(
 
-title=
-"100 Simulation Mean Time-dependent AUC",
+title="AUC Distribution Across 100 Simulations",
 
 x="Model",
 
-y="AUC"
+y="AUC",
+
+fill="Cause"
 
 )+
-
 
 theme(
 
 axis.text.x=
+
 element_text(
+
 angle=45,
+
 hjust=1
-)
 
 )
 
+)
 
-
-print(p2)
-
-
+print(p6)
 
 ggsave(
-
-"Figure2_Mean_AUC.png",
-
-p2,
-
+"Figure6_AUC_Boxplot.png",
+p6,
 width=9,
-
-height=5
-
+height=5,
+dpi=300
 )
-
-
-
-
-
-
 
 ###############################################################
-# Figure 3
-# Mean IBS Comparison
+# Figure 7
+# IBS Distribution
 ###############################################################
 
+p7<-
 
-ibs_summary <-
-
-simulation_results %>%
-
-group_by(Model)%>%
-
-summarise(
-
-Mean_IBS1 =
-mean(
-IBS_Cause1,
-na.rm=TRUE
-),
-
-Mean_IBS2 =
-mean(
-IBS_Cause2,
-na.rm=TRUE
-)
-
-)
-
-
-
-ibs_long <-
-
-ibs_summary %>%
-
-pivot_longer(
-
-cols=c(
-Mean_IBS1,
-Mean_IBS2
-),
-
-names_to="Cause",
-
-values_to="IBS"
-
-)
-
-
-
-p3 <-
+simulation_results%>%
 
 ggplot(
-
-ibs_long,
 
 aes(
 
@@ -2524,479 +2766,176 @@ Model,
 
 IBS,
 
-fill=Cause
+fill=factor(Cause)
 
 )
 
 )+
 
+geom_boxplot(
 
-geom_col(
-position="dodge"
+position=position_dodge(.75)
+
 )+
-
-
-theme_bw()+
-
 
 labs(
 
-title=
-"100 Simulation Mean Brier Score",
+title="IBS Distribution Across 100 Simulations",
 
 x="Model",
 
-y="IBS"
+y="IBS",
+
+fill="Cause"
 
 )+
-
 
 theme(
 
 axis.text.x=
+
 element_text(
+
 angle=45,
+
 hjust=1
-)
-
-)
-
-
-
-print(p3)
-
-
-
-ggsave(
-
-"Figure3_Mean_IBS.png",
-
-p3,
-
-width=9,
-
-height=5
-
-)
-
-
-
-
-
-
-
-###############################################################
-# Figure 4
-# Distribution of C-index across 100 simulations
-###############################################################
-
-
-p4 <-
-
-simulation_results %>%
-
-ggplot(
-
-aes(
-
-Model,
-
-Cindex_Cause1
-
-)
-
-)+
-
-
-geom_boxplot()+
-
-
-theme_bw()+
-
-
-labs(
-
-title=
-"Distribution of Cause 1 C-index Across 100 Simulations",
-
-x="Model",
-
-y="C-index"
-
-)+
-
-
-theme(
-
-axis.text.x=
-element_text(
-angle=45,
-hjust=1
-)
-
-)
-
-
-
-print(p4)
-
-
-
-ggsave(
-
-"Figure4_Cindex_Boxplot.png",
-
-p4,
-
-width=9,
-
-height=5
-
-)
-
-
-
-
-
-
-
-###############################################################
-# Figure 5
-# Cause 2 C-index Boxplot
-###############################################################
-
-
-p5 <-
-
-simulation_results %>%
-
-ggplot(
-
-aes(
-
-Model,
-
-Cindex_Cause2
-
-)
-
-)+
-
-
-geom_boxplot()+
-
-
-theme_bw()+
-
-
-labs(
-
-title=
-"Distribution of Cause 2 C-index Across 100 Simulations",
-
-x="Model",
-
-y="C-index"
-
-)
-
-
-
-print(p5)
-
-
-
-ggsave(
-
-"Figure5_Cause2_Boxplot.png",
-
-p5,
-
-width=9,
-
-height=5
-
-)
-
-
-
-
-
-
-###############################################################
-# Figure 6
-# Event Distribution
-###############################################################
-
-
-event_df <-
-
-data.frame(
-
-Event=
-
-factor(
-
-c(
-"Cause 1",
-"Cause 2",
-"Censor"
-)
-
-),
-
-Count=
-
-c(
-
-mean(event_count_cause1),
-
-mean(event_count_cause2),
-
-mean(event_count_censor)
 
 )
 
 )
-
-
-
-p6 <-
-
-ggplot(
-
-event_df,
-
-aes(
-
-Event,
-
-Count
-
-)
-
-)+
-
-geom_col()+
-
-theme_bw()+
-
-labs(
-
-title=
-"Average Event Distribution",
-
-x="Event Type",
-
-y="Number of Subjects"
-
-)
-
-
-
-print(p6)
-
-
-
-ggsave(
-
-"Figure6_Event_Distribution.png",
-
-p6,
-
-width=7,
-
-height=5
-
-)
-
-
-
-
-
-
-###############################################################
-# Figure 7
-# RSF Variable Importance
-###############################################################
-
-
-importance_df <-
-
-data.frame(
-
-Variable=
-names(rsf_model$importance),
-
-Importance=
-as.numeric(
-rsf_model$importance
-)
-
-)
-
-
-
-importance_df <-
-
-importance_df %>%
-
-arrange(
-desc(Importance)
-)
-
-
-
-p7 <-
-
-importance_df %>%
-
-ggplot(
-
-aes(
-
-x=reorder(
-Variable,
-Importance
-),
-
-y=Importance
-
-)
-
-)+
-
-
-geom_col()+
-
-
-coord_flip()+
-
-
-theme_bw()+
-
-
-labs(
-
-title=
-"Random Survival Forest Variable Importance",
-
-x="Variable",
-
-y="Importance"
-
-)
-
-
 
 print(p7)
 
-
-
 ggsave(
-
-"Figure7_RSF_Variable_Importance.png",
-
+"Figure7_IBS_Boxplot.png",
 p7,
-
-width=8,
-
-height=7
-
+width=9,
+height=5,
+dpi=300
 )
-
-
-
-
-
 
 ###############################################################
 # Figure 8
-# Training Loss
+# Mean Performance Heatmap
 ###############################################################
 
+heatmap_df<-
 
-loss_df <-
+simulation_results%>%
 
-data.frame(
+group_by(
+Model,
+Cause
+)%>%
 
-Epoch=
+summarise(
 
-seq_along(
-history_gaussian$metrics$loss
+Cindex=mean(Cindex),
+
+AUC=mean(AUC),
+
+IBS=mean(IBS),
+
+.groups="drop"
+
+)%>%
+
+pivot_longer(
+
+cols=c(
+
+Cindex,
+
+AUC,
+
+IBS
+
 ),
 
+names_to="Metric",
 
-Loss=
+values_to="Value"
 
-as.numeric(
-history_gaussian$metrics$loss
+)
+
+heatmap_df$Cause<-
+
+factor(
+
+heatmap_df$Cause,
+
+labels=c(
+
+"Cause 1",
+
+"Cause 2"
+
 )
 
 )
 
-
-
-p8 <-
+p8<-
 
 ggplot(
 
-loss_df,
+heatmap_df,
 
 aes(
 
-Epoch,
+Metric,
 
-Loss
+Model,
+
+fill=Value
 
 )
 
 )+
 
-geom_line(
+geom_tile()+
 
-linewidth=1
+facet_wrap(
+
+~Cause
 
 )+
 
+geom_text(
 
-theme_bw()+
+aes(
 
+label=round(Value,3)
+
+),
+
+size=4
+
+)+
 
 labs(
 
-title=
-"Gaussian Copula CNN-LSTM Training Loss",
-
-x="Epoch",
-
-y="Loss"
+title="Average Performance Across 100 Simulations"
 
 )
-
-
 
 print(p8)
 
-
-
 ggsave(
-
-"Figure8_Training_Loss.png",
-
+"Figure8_Performance_Heatmap.png",
 p8,
-
-width=8,
-
-height=5
-
+width=10,
+height=6,
+dpi=300
 )
 
+###############################################################
+# End
+###############################################################
+
+cat("All figures completed.\n")
 
 
-###############################################################
-# END FIGURES
-###############################################################
+
 
 ########################
 ### Real Data Analysis

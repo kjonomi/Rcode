@@ -82,7 +82,7 @@ batch_size <- 64
 
 
 
-lambda_copula <- 0.20
+lambda_copula <- 0.10
 
 
 
@@ -2179,6 +2179,11 @@ write.csv(
 # Final Figures for 100 Simulations
 ###############################################################
 
+###############################################################
+# Part 5
+# Publication Figures (100 Simulations)
+###############################################################
+
 library(dplyr)
 library(tidyr)
 library(ggplot2)
@@ -2186,25 +2191,62 @@ library(ggplot2)
 theme_set(theme_bw())
 
 ###############################################################
+# Convert simulation results to one data frame
+###############################################################
+
+if (is.list(simulation_results)) {
+
+    simulation_df <-
+
+        dplyr::bind_rows(simulation_results)
+
+} else {
+
+    simulation_df <-
+
+        simulation_results
+
+}
+
+###############################################################
+# Check
+###############################################################
+
+cat("\nSimulation object class:\n")
+
+print(class(simulation_df))
+
+cat("\nDimension:\n")
+
+print(dim(simulation_df))
+
+cat("\nVariables:\n")
+
+print(names(simulation_df))
+
+head(simulation_df)
+
+###############################################################
 # Figure 1
 ###############################################################
 
 cindex_summary <-
 
-simulation_results %>%
+simulation_df %>%
 
 dplyr::group_by(
+
     Model,
+
     Cause
+
 ) %>%
 
 dplyr::summarise(
 
-    Mean =
-        mean(Cindex),
+    Mean=mean(Cindex),
 
-    SD =
-        sd(Cindex),
+    SD=sd(Cindex),
 
     .groups="drop"
 
@@ -2219,7 +2261,9 @@ ggplot(
     aes(
 
         x=Model,
+
         y=Mean,
+
         fill=factor(Cause)
 
     )
@@ -2227,40 +2271,51 @@ ggplot(
 )+
 
 geom_col(
-position="dodge"
+
+    position="dodge"
+
 )+
 
 geom_errorbar(
 
-aes(
+    aes(
 
-ymin=Mean-SD,
-ymax=Mean+SD
+        ymin=Mean-SD,
 
-),
+        ymax=Mean+SD
 
-position=position_dodge(.9),
+    ),
 
-width=.25
+    position=position_dodge(0.9),
+
+    width=.25
 
 )+
 
+theme_bw()+
+
 labs(
 
-title="Mean C-index (100 Simulations)",
+    title="Mean C-index (100 Simulations)",
 
-fill="Cause",
+    x="Model",
 
-y="Mean C-index"
+    y="Mean C-index",
+
+    fill="Cause"
 
 )+
 
 theme(
 
 axis.text.x=
+
 element_text(
+
 angle=45,
+
 hjust=1
+
 )
 
 )
@@ -2268,10 +2323,15 @@ hjust=1
 print(p1)
 
 ggsave(
+
 "Figure1_Mean_Cindex.png",
+
 p1,
+
 width=8,
+
 height=5
+
 )
 
 ###############################################################
@@ -2280,22 +2340,23 @@ height=5
 
 auc_summary <-
 
-simulation_results %>%
+simulation_df %>%
 
-dplyr::group_by(
-    Model,
-    Cause
-) %>%
+group_by(
 
-dplyr::summarise(
+Model,
 
-    Mean=
-        mean(AUC),
+Cause
 
-    SD=
-        sd(AUC),
+)%>%
 
-    .groups="drop"
+summarise(
+
+Mean=mean(AUC),
+
+SD=sd(AUC),
+
+.groups="drop"
 
 )
 
@@ -2318,7 +2379,9 @@ fill=factor(Cause)
 )+
 
 geom_col(
+
 position="dodge"
+
 )+
 
 geom_errorbar(
@@ -2326,6 +2389,7 @@ geom_errorbar(
 aes(
 
 ymin=Mean-SD,
+
 ymax=Mean+SD
 
 ),
@@ -2349,9 +2413,13 @@ y="Mean AUC"
 theme(
 
 axis.text.x=
+
 element_text(
+
 angle=45,
+
 hjust=1
+
 )
 
 )
@@ -2359,12 +2427,16 @@ hjust=1
 print(p2)
 
 ggsave(
-"Figure2_Mean_AUC.png",
-p2,
-width=8,
-height=5
-)
 
+"Figure2_Mean_AUC.png",
+
+p2,
+
+width=8,
+
+height=5
+
+)
 
 ###############################################################
 # Figure 3
@@ -2372,20 +2444,21 @@ height=5
 
 ibs_summary <-
 
-simulation_results %>%
+simulation_df %>%
 
-dplyr::group_by(
-    Model,
-    Cause
-) %>%
+group_by(
 
-dplyr::summarise(
+Model,
 
-Mean=
-mean(IBS),
+Cause
 
-SD=
-sd(IBS),
+)%>%
+
+summarise(
+
+Mean=mean(IBS),
+
+SD=sd(IBS),
 
 .groups="drop"
 
@@ -2410,7 +2483,9 @@ fill=factor(Cause)
 )+
 
 geom_col(
+
 position="dodge"
+
 )+
 
 geom_errorbar(
@@ -2418,6 +2493,7 @@ geom_errorbar(
 aes(
 
 ymin=Mean-SD,
+
 ymax=Mean+SD
 
 ),
@@ -2441,9 +2517,13 @@ y="Mean IBS"
 theme(
 
 axis.text.x=
+
 element_text(
+
 angle=45,
+
 hjust=1
+
 )
 
 )
@@ -2451,10 +2531,15 @@ hjust=1
 print(p3)
 
 ggsave(
+
 "Figure3_Mean_IBS.png",
+
 p3,
+
 width=8,
+
 height=5
+
 )
 
 ###############################################################
@@ -2463,7 +2548,7 @@ height=5
 
 p4 <-
 
-simulation_results %>%
+simulation_df %>%
 
 filter(Cause==1) %>%
 
@@ -2481,7 +2566,11 @@ fill=Model
 
 )+
 
-geom_boxplot()+
+geom_boxplot(
+
+alpha=.8
+
+)+
 
 labs(
 
@@ -2496,9 +2585,13 @@ theme(
 legend.position="none",
 
 axis.text.x=
+
 element_text(
+
 angle=45,
+
 hjust=1
+
 )
 
 )
@@ -2506,10 +2599,15 @@ hjust=1
 print(p4)
 
 ggsave(
+
 "Figure4_Cause1_Boxplot.png",
+
 p4,
+
 width=8,
+
 height=5
+
 )
 
 ###############################################################
@@ -2518,7 +2616,7 @@ height=5
 
 p5 <-
 
-simulation_results %>%
+simulation_df %>%
 
 filter(Cause==2) %>%
 
@@ -2536,7 +2634,11 @@ fill=Model
 
 )+
 
-geom_boxplot()+
+geom_boxplot(
+
+alpha=.8
+
+)+
 
 labs(
 
@@ -2551,9 +2653,13 @@ theme(
 legend.position="none",
 
 axis.text.x=
+
 element_text(
+
 angle=45,
+
 hjust=1
+
 )
 
 )
@@ -2561,235 +2667,17 @@ hjust=1
 print(p5)
 
 ggsave(
+
 "Figure5_Cause2_Boxplot.png",
+
 p5,
+
 width=8,
-height=5
-)
-
-###############################################################
-# Figure 6
-###############################################################
-
-p6 <-
-
-simulation_results %>%
-
-ggplot(
-
-aes(
-
-Model,
-
-AUC,
-
-fill=factor(Cause)
-
-)
-
-)+
-
-geom_boxplot()+
-
-labs(
-
-title="Distribution of Time-dependent AUC",
-
-fill="Cause"
-
-)+
-
-theme(
-
-axis.text.x=
-element_text(
-angle=45,
-hjust=1
-)
-
-)
-
-print(p6)
-
-ggsave(
-"Figure6_AUC_Boxplot.png",
-p6,
-width=8,
-height=5
-)
-
-###############################################################
-# Figure 7
-###############################################################
-
-p7 <-
-
-simulation_results %>%
-
-ggplot(
-
-aes(
-
-Model,
-
-IBS,
-
-fill=factor(Cause)
-
-)
-
-)+
-
-geom_boxplot()+
-
-labs(
-
-title="Distribution of Integrated Brier Score",
-
-fill="Cause"
-
-)+
-
-theme(
-
-axis.text.x=
-element_text(
-angle=45,
-hjust=1
-)
-
-)
-
-print(p7)
-ggsave(
-"Figure7_IBS_Boxplot.png",
-p7,
-width=8,
-height=5
-)
-
-
-###############################################################
-# Figure 8
-###############################################################
-
-heatmap_df <-
-
-simulation_results %>%
-
-group_by(
-
-Model,
-
-Cause
-
-)%>%
-
-summarise(
-
-Cindex=
-mean(Cindex),
-
-AUC=
-mean(AUC),
-
-IBS=
-mean(IBS),
-
-.groups="drop"
-
-)%>%
-
-pivot_longer(
-
-cols=c(
-
-Cindex,
-AUC,
-IBS
-
-),
-
-names_to="Metric",
-
-values_to="Value"
-
-)
-
-p8 <-
-
-ggplot(
-
-heatmap_df,
-
-aes(
-
-Metric,
-
-Model,
-
-fill=Value
-
-)
-
-)+
-
-geom_tile(
-
-color="white"
-
-)+
-
-facet_wrap(
-
-~Cause,
-
-labeller=label_both
-
-)+
-
-geom_text(
-
-aes(
-
-label=sprintf(
-"%.3f",
-Value
-)
-
-),
-
-size=4
-
-)+
-
-scale_fill_gradient(
-
-low="white",
-
-high="steelblue"
-
-)+
-
-labs(
-
-title="Mean Performance Across 100 Simulations"
-
-)
-
-print(p8)
-
-ggsave(
-
-"Figure8_Performance_Heatmap.png",
-
-p8,
-
-width=9,
 
 height=5
 
 )
+
 
 
 

@@ -13,8 +13,9 @@
 # 1. Libraries
 ###############################################################
 
+library(keras)
 library(keras3)
-library(tensorflow)
+
 
 library(MASS)
 
@@ -54,7 +55,9 @@ tf$keras$backend$clear_session()
 ###############################################################
 
 
-set.seed(1234)
+set.seed(12345)
+
+tf$random$set_seed(12345L)
 
 
 

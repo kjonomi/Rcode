@@ -67,7 +67,7 @@ n <- 3000
 p <- 30
 
 
-n_sim <- 3
+n_sim <- 10
 
 
 
@@ -82,7 +82,7 @@ batch_size <- 64
 
 
 
-lambda_copula <- 0.10
+lambda_copula <- 0.05
 
 
 

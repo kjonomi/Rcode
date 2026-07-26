@@ -82,7 +82,7 @@ batch_size <- 64
 
 
 
-lambda_copula <- 0.15
+lambda_copula <- 0.3
 
 
 

@@ -71,7 +71,7 @@ n_sim <- 100
 
 
 
-train_fraction <- 0.80
+train_fraction <- 0.70
 
 
 
@@ -82,7 +82,7 @@ batch_size <- 64
 
 
 
-lambda_copula <- 0.10
+lambda_copula <- 0.2
 
 
 
@@ -104,7 +104,7 @@ generate_data <- function(
 ###############################################################
 
 
-rho <- 0.80
+rho <- 0.60
 
 
 

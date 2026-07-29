@@ -1885,20 +1885,20 @@ gumbel_c2 <-
 # 37. Random Survival Forest
 ###############################################################
 
-
 rsf_data <-
 
     rotterdam_data %>%
 
-    select(
+    dplyr::select(
 
         rtime,
 
         event,
 
-        all_of(features)
+        dplyr::all_of(features)
 
     )
+
 
 
 
@@ -3157,13 +3157,7 @@ final_cindex_results %>%
 
 mutate(
 
-
-    ###########################################################
-    # Extract numerical C-index from CNN character strings
-    ###########################################################
-
     Cause1_numeric =
-
         as.numeric(
             sub(
                 " .*",
@@ -3173,9 +3167,7 @@ mutate(
         ),
 
 
-
     Cause2_numeric =
-
         as.numeric(
             sub(
                 " .*",
@@ -3185,11 +3177,6 @@ mutate(
         ),
 
 
-
-    ###########################################################
-    # Format C-index with CI
-    ###########################################################
-
     Cause1_Cindex_Display =
 
         sprintf(
@@ -3198,7 +3185,6 @@ mutate(
             Cause1_Lower,
             Cause1_Upper
         ),
-
 
 
     Cause2_Cindex_Display =
@@ -3212,8 +3198,7 @@ mutate(
 
 ) %>%
 
-
-select(
+dplyr::select(
 
     Model,
 
@@ -3230,8 +3215,8 @@ select(
 )
 
 
-
 print(final_cindex_table)
+
 
 
 
@@ -4290,28 +4275,38 @@ calibration_results <-
 print(calibration_results)
 
 calibration_table <-
-    
-    calibration_results %>%
-    
-    mutate(
-        
-        AUC_1000 = sprintf("%.3f", AUC_1000),
-        AUC_2000 = sprintf("%.3f", AUC_2000),
-        AUC_3000 = sprintf("%.3f", AUC_3000),
-        IBS       = sprintf("%.3f", IBS)
-        
-    ) %>%
-    
-    select(
-        Model,
-        AUC_1000,
-        AUC_2000,
-        AUC_3000,
-        IBS
-    )
+
+calibration_results %>%
+
+mutate(
+
+    AUC_1000 = sprintf("%.3f", AUC_1000),
+
+    AUC_2000 = sprintf("%.3f", AUC_2000),
+
+    AUC_3000 = sprintf("%.3f", AUC_3000),
+
+    IBS = sprintf("%.3f", IBS)
+
+) %>%
+
+dplyr::select(
+
+    Model,
+
+    AUC_1000,
+
+    AUC_2000,
+
+    AUC_3000,
+
+    IBS
+
+)
 
 
 print(calibration_table)
+
 
 
 ########################

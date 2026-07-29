@@ -3,129 +3,77 @@
 ########################
 
 ###############################################################
-# Copula CNN-LSTM Competing Risks
+# PART 1
 # Rotterdam Breast Cancer Dataset
-#
-# Part 1: Data Preparation
 ###############################################################
-###############################################################
-# Reproducibility Setup
-###############################################################
-Sys.setenv(TF_USE_LEGACY_KERAS="0")
-Sys.setenv(CUDA_VISIBLE_DEVICES="-1")
-
-
-set.seed(123)
-
-
-library(tensorflow)
-
-tensorflow::tf$random$set_seed(123)
-
-
-library(reticulate)
-
-py_run_string("
-import random
-import numpy as np
-random.seed(123)
-np.random.seed(123)
-")
-
-
-
 
 library(survival)
-library(dplyr)
-library(tidyr)
-
-library(keras3)
-library(tensorflow)
-
-library(cmprsk)
 library(randomForestSRC)
-
-library(Hmisc)
-library(boot)
 library(timeROC)
-
+library(survcomp)
+library(dplyr)
 library(ggplot2)
-
-
-set.seed(123)
-
-
-###############################################################
-# 1. Load Dataset
-###############################################################
-
-data(
-    rotterdam,
-    package="survival"
-)
-
+library(keras3)
 
 
 ###############################################################
-# 2. Competing Risk Coding
+# Load Data
+###############################################################
+
+data(rotterdam, package="survival")
+
+
+###############################################################
+# Competing Risks Definition
 ###############################################################
 
 rotterdam_data <- rotterdam %>%
 
-    mutate(
+mutate(
 
-        event = case_when(
+status = case_when(
 
-            recur == 1 ~ 1,
+recur==1 ~ 1,
 
-            recur == 0 &
-                death == 1 ~ 2,
+recur==0 & death==1 ~ 2,
 
-            TRUE ~ 0
+TRUE ~ 0
 
-        )
+)
 
-    )
-
+)
 
 
-table(rotterdam_data$event)
+
+table(rotterdam_data$status)
 
 
 
 ###############################################################
-# 3. Survival Time
+# Survival Time
 ###############################################################
-
 
 time <- rotterdam_data$rtime
 
-event <- rotterdam_data$event
-
-
-
-summary(time)
-
-table(event)
+status <- rotterdam_data$status
 
 
 
 ###############################################################
-# 4. Covariates
+# Covariates
 ###############################################################
-
 
 features <- c(
 
-    "age",
-    "meno",
-    "size",
-    "grade",
-    "nodes",
-    "pgr",
-    "er",
-    "hormon",
-    "chemo"
+"age",
+"meno",
+"size",
+"grade",
+"nodes",
+"pgr",
+"er",
+"hormon",
+"chemo"
 
 )
 
@@ -136,407 +84,348 @@ X <- rotterdam_data[,features]
 
 
 ###############################################################
-# 5. Convert Factors
+# Factor Conversion
 ###############################################################
-
 
 X <- X %>%
 
-    mutate(
+mutate(
 
-        across(
+across(
 
-            where(is.factor),
+where(is.factor),
 
-            ~as.numeric(as.factor(.))
+~as.numeric(as.factor(.))
 
-        )
+)
 
-    )
+)
 
 
 
 ###############################################################
-# 6. Missing Values
+# Median Imputation
 ###############################################################
-
 
 for(i in 1:ncol(X)){
 
-    X[is.na(X[,i]),i] <-
+X[is.na(X[,i]),i] <-
 
-        median(
+median(
 
-            X[,i],
+X[,i],
 
-            na.rm=TRUE
+na.rm=TRUE
 
-        )
+)
 
 }
 
 
 
 ###############################################################
-# 7. Scale Predictors
+# Train/Test Split
 ###############################################################
 
-
-X_scaled <- scale(X)
-
-X_scaled <- as.data.frame(X_scaled)
+set.seed(2026)
 
 
+train_index <-
 
-###############################################################
-# 8. Stratified Split
-###############################################################
+sample(
 
+1:nrow(X),
 
-train_id <-
+size=0.7*nrow(X)
 
-    unlist(
-
-        lapply(
-
-            split(
-
-                1:nrow(X_scaled),
-
-                event
-
-            ),
-
-            function(idx){
-
-                sample(
-
-                    idx,
-
-                    size=floor(
-
-                        0.8*length(idx)
-
-                    )
-
-                )
-
-            }
-
-        )
-
-    )
-
-
-test_id <-
-
-    setdiff(
-
-        1:nrow(X_scaled),
-
-        train_id
-
-    )
+)
 
 
 
-X_train <- X_scaled[train_id,]
+X_train <- X[train_index,]
 
-X_test <- X_scaled[test_id,]
-
-
-
-time_train <- time[train_id]
-
-time_test <- time[test_id]
+X_test <- X[-train_index,]
 
 
-event_train <- event[train_id]
+time_train <- time[train_index]
 
-event_test <- event[test_id]
-
-
-
-cat("Training\n")
-
-print(table(event_train))
+time_test <- time[-train_index]
 
 
-cat("Testing\n")
+status_train <- status[train_index]
 
-print(table(event_test))
+status_test <- status[-train_index]
 
 
 
 ###############################################################
-# 9. CNN-LSTM Array
+# Standardization
 ###############################################################
+
+mu <- apply(X_train,2,mean)
+
+sigma <- apply(X_train,2,sd)
+
+sigma[sigma==0] <- 1
+
+
+
+X_train <- scale(
+
+X_train,
+
+center=mu,
+
+scale=sigma
+
+)
+
+
+X_test <- scale(
+
+X_test,
+
+center=mu,
+
+scale=sigma
+
+)
+
+
+
+###############################################################
+# CNN-LSTM Input
+###############################################################
+
+
+p <- ncol(X_train)
+
 
 
 X_train_array <-
 
-    array(
+array(
 
-        as.matrix(X_train),
+as.matrix(X_train),
 
-        dim=c(
+dim=c(
 
-            nrow(X_train),
+nrow(X_train),
 
-            1,
+p,
 
-            ncol(X_train)
+1
 
-        )
+)
 
-    )
+)
 
 
 
 X_test_array <-
 
-    array(
+array(
 
-        as.matrix(X_test),
+as.matrix(X_test),
 
-        dim=c(
+dim=c(
 
-            nrow(X_test),
+nrow(X_test),
 
-            1,
+p,
 
-            ncol(X_test)
+1
 
-        )
+)
 
-    )
-
-
-
-###############################################################
-# 10. Labels
-###############################################################
-
-
-y_train <-
-
-    cbind(
-
-        event_train==0,
-
-        event_train==1,
-
-        event_train==2
-
-    )*1
-
-
-
-y_test <-
-
-    cbind(
-
-        event_test==0,
-
-        event_test==1,
-
-        event_test==2
-
-    )*1
+)
 
 
 
 ###############################################################
-# 11. Check
+# Binary Cause Labels
 ###############################################################
 
+Y_train <-
 
-dim(X_train_array)
+cbind(
 
-dim(X_test_array)
+status_train==1,
 
-dim(y_train)
+status_train==2
 
-dim(y_test)
+)*1
 
-table(event_test)
 
 ###############################################################
-# Part 2
-# Copula-Regularized CNN-LSTM Architecture
-# Rotterdam Breast Cancer Dataset
+# PART 2
+# Copula CNN-LSTM Competing Risks Model
+# Keras 3 Compatible
 ###############################################################
-
-
-library(keras3)
-library(tensorflow)
 
 
 
 ###############################################################
-# 12. Transform to Uniform
+# 5. TensorFlow Safe Functions
 ###############################################################
 
 
-to_uniform_tf <- function(x){
-
-    u <-
-
-        tf$math$sigmoid(
-
-            x
-
-        )
-
+tf_clip <- function(
+        x,
+        lower=1e-7,
+        upper=1-1e-7
+){
 
     tf$clip_by_value(
-
-        u,
-
-        1e-6,
-
-        1-1e-6
-
+        x,
+        clip_value_min=lower,
+        clip_value_max=upper
     )
 
 }
 
 
 
+safe_log <- function(x){
+
+    tf$math$log(
+        tf_clip(x)
+    )
+
+}
+
+
+
+
+
 ###############################################################
-# 13. Binary Cross Entropy
+# 6. Gaussian Copula Penalty
 ###############################################################
 
 
-bce_loss <- function(
-    y_true,
-    y_pred
+gaussian_copula_penalty <- function(
+        y_pred
 ){
+
+
+    u1 <-
+        tf_clip(
+            y_pred[,1]
+        )
+
+
+    u2 <-
+        tf_clip(
+            y_pred[,2]
+        )
+
+
+
+    z1 <-
+        tf$math$log(
+            u1/(1-u1)
+        )
+
+
+    z2 <-
+        tf$math$log(
+            u2/(1-u2)
+        )
+
+
+
+    rho <- 0.8
+
+
+
+    penalty <-
+
+        (
+            z1^2 -
+            2*rho*z1*z2 +
+            z2^2
+
+        ) /
+
+        (
+            2*(1-rho^2)
+        )
+
 
 
     tf$reduce_mean(
-
-        tf$keras$losses$
-
-            binary_crossentropy(
-
-                y_true,
-
-                y_pred
-
-            )
-
+        penalty
     )
 
 }
 
 
 
+
+
+
 ###############################################################
-# 14. Gaussian Copula Loss
+# 7. Clayton Copula Penalty
 ###############################################################
 
 
-copula_gaussian_loss <- function(
-    y_true,
-    y_pred
+clayton_copula_penalty <- function(
+        y_pred
 ){
 
 
-    bce <-
+    theta <- 3
 
-        bce_loss(
 
-            y_true,
 
-            y_pred
-
+    u1 <-
+        tf_clip(
+            y_pred[,1]
         )
 
 
-    # recurrence + death
-
-    u <-
-
-        to_uniform_tf(
-
-            y_pred[,2:3]
-
+    u2 <-
+        tf_clip(
+            y_pred[,2]
         )
 
 
 
-    z <-
+    term <-
 
-        tf$sqrt(2.0) *
+        u1^(-theta) +
 
-        tf$math$erfinv(
+        u2^(-theta) -
 
-            2*u-1
+        1
 
-        )
-
-
-
-    z1 <- z[,1]
-
-    z2 <- z[,2]
-
-
-
-    rho <- 0.5
-
-
-
-    detR <-
-
-        1-rho^2
-
-
-
-    quad <-
-
-        (
-
-            z1^2+
-
-            z2^2-
-
-            2*rho*z1*z2
-
-        )/
-
-        detR
-
-
-
-    log_density <-
-
-        -0.5*quad -
-
-        0.5*
-
-        tf$math$log(detR)
 
 
 
     penalty <-
 
-        -tf$reduce_mean(
+        -(
+            log(theta+1)
 
-            log_density
+            -
+
+            (theta+1)
+            *
+            tf$math$log(u1*u2)
+
+            -
+
+            (2+1/theta)
+            *
+            tf$math$log(term)
 
         )
 
 
 
-    lambda <- 0.25
-
-
-
-    bce +
-
-        lambda*penalty
+    tf$reduce_mean(
+        penalty
+    )
 
 }
 
@@ -544,185 +433,56 @@ copula_gaussian_loss <- function(
 
 
 
+
 ###############################################################
-# 15. Clayton Copula Loss
+# 8. Gumbel Copula Penalty
 ###############################################################
 
 
-copula_clayton_loss <- function(
-    y_true,
-    y_pred
+gumbel_copula_penalty <- function(
+        y_pred
 ){
 
 
-    bce <-
+    theta <- 4
 
-        bce_loss(
 
-            y_true,
 
-            y_pred
-
+    u1 <-
+        tf_clip(
+            y_pred[,1]
         )
 
 
-    u <-
-
-        to_uniform_tf(
-
-            y_pred[,2:3]
-
+    u2 <-
+        tf_clip(
+            y_pred[,2]
         )
 
 
 
-    theta <- 1.5
+    a <-
 
+        (-safe_log(u1))^theta
 
 
-    S <-
 
-        tf$reduce_sum(
+    b <-
 
-            u^(-theta),
+        (-safe_log(u2))^theta
 
-            axis=1L
 
-        )
 
 
+    A <-
 
-    log_c <-
+        (a+b)^(1/theta)
 
-        tf$math$log(
 
-            1+theta
 
-        )
-
-        -
-
-        (theta+1)*
-
-        tf$reduce_sum(
-
-            tf$math$log(u),
-
-            axis=1L
-
-        )
-
-        -
-
-        (2+1/theta)*
-
-        tf$math$log(
-
-            S-1+1e-6
-
-        )
-
-
-
-    penalty <-
-
-        -tf$reduce_mean(
-
-            log_c
-
-        )
-
-
-
-    bce +
-
-        0.25*penalty
-
-}
-
-
-
-
-###############################################################
-# 16. Gumbel Copula Loss
-###############################################################
-
-
-copula_gumbel_loss <- function(
-    y_true,
-    y_pred
-){
-
-
-    bce <-
-
-        bce_loss(
-
-            y_true,
-
-            y_pred
-
-        )
-
-
-
-    u <-
-
-        to_uniform_tf(
-
-            y_pred[,2:3]
-
-        )
-
-
-
-    theta <- 2.0
-
-
-
-    logu <-
-
-        -tf$math$log(u)
-
-
-
-    phi <-
-
-        logu^theta
-
-
-
-    S <-
-
-        tf$reduce_sum(
-
-            phi,
-
-            axis=1L
-
-        )
-
-
-
-    log_c <-
-
-        -S^(1/theta)
-
-
-
-    penalty <-
-
-        -tf$reduce_mean(
-
-            log_c
-
-        )
-
-
-
-    bce +
-
-        0.25*penalty
+    tf$reduce_mean(
+        A
+    )
 
 }
 
@@ -730,47 +490,142 @@ copula_gumbel_loss <- function(
 
 
 
+
 ###############################################################
-# 17. CNN-LSTM Builder
+# 9. Copula Loss Function
 ###############################################################
 
 
-create_copula_cnn_lstm <- function(
-    
-    loss_function,
-    
-    n_features
-    
+create_copula_loss <- function(
+        copula_type
 ){
 
 
-    input <-
+    function(
+            y_true,
+            y_pred
+    ){
+
+
+        #######################################################
+        # Binary Cross Entropy
+        #######################################################
+
+
+        bce <-
+
+            tf$keras$losses$
+            binary_crossentropy(
+                y_true,
+                y_pred
+            )
+
+
+
+        #######################################################
+        # Copula Dependence
+        #######################################################
+
+
+        penalty <-
+
+            switch(
+
+                copula_type,
+
+
+                "Gaussian" =
+
+                    gaussian_copula_penalty(
+                        y_pred
+                    ),
+
+
+
+                "Clayton" =
+
+                    clayton_copula_penalty(
+                        y_pred
+                    ),
+
+
+
+                "Gumbel" =
+
+                    gumbel_copula_penalty(
+                        y_pred
+                    )
+
+            )
+
+
+
+
+        loss <-
+
+            tf$reduce_mean(
+                bce
+            )
+
+            +
+
+            lambda_copula *
+            penalty
+
+
+
+        loss
+
+
+    }
+
+}
+
+
+
+
+
+
+###############################################################
+# 10. CNN-LSTM Architecture
+###############################################################
+
+
+create_cnn_lstm_model <- function(
+        copula_type
+){
+
+
+
+    tf$keras$backend$clear_session()
+
+
+
+    input_layer <-
 
         keras_input(
 
             shape=c(
-
-                1,
-
-                n_features
-
+                p,
+                1
             ),
 
-            name="Clinical_Input"
+            name="covariate_sequence"
 
         )
+
 
 
 
     x <-
 
-        input %>%
+        input_layer %>%
 
         layer_conv_1d(
 
             filters=32,
 
-            kernel_size=1,
+            kernel_size=3,
 
             padding="same",
 
@@ -783,10 +638,11 @@ create_copula_cnn_lstm <- function(
 
 
         layer_dropout(
-
-            rate=0.2
-
+            rate=0.25
         )
+
+
+
 
 
 
@@ -796,13 +652,13 @@ create_copula_cnn_lstm <- function(
 
         layer_lstm(
 
-            units=32,
+            units=64,
 
-            dropout=0.1,
-
-            recurrent_dropout=0.1
+            return_sequences=FALSE
 
         )
+
+
 
 
 
@@ -816,35 +672,32 @@ create_copula_cnn_lstm <- function(
 
             activation="relu"
 
-        )
+        ) %>%
 
-
-
-    x <-
-
-        x %>%
 
         layer_dropout(
-
-            rate=0.2
-
+            rate=0.25
         )
 
 
 
-    output <-
+
+
+    output_layer <-
 
         x %>%
 
         layer_dense(
 
-            units=3,
+            units=2,
 
             activation="sigmoid",
 
-            name="Risk_Output"
+            name="cause_probability"
 
         )
+
+
 
 
 
@@ -852,40 +705,51 @@ create_copula_cnn_lstm <- function(
 
         keras_model(
 
-            inputs=input,
+            inputs=input_layer,
 
-            outputs=output
+            outputs=output_layer
 
         )
 
 
 
-    model %>% compile(
 
-        optimizer=
 
-            optimizer_adam(
 
-                learning_rate=0.001
+    model %>%
 
-            ),
+        compile(
 
-        loss=
+            optimizer=
 
-            loss_function,
+                optimizer_adam(
 
-        metrics=
+                    learning_rate=0.001
 
-            list(
+                ),
 
-                "accuracy"
 
-            )
 
-    )
+            loss=
+
+                create_copula_loss(
+                    copula_type
+                ),
+
+
+
+            metrics=
+
+                list(
+                    "accuracy"
+                )
+
+        )
+
 
 
     return(model)
+
 
 }
 
@@ -893,3419 +757,1533 @@ create_copula_cnn_lstm <- function(
 
 
 
-###############################################################
-# 18. Build Three Copula Models
-###############################################################
-
-
-n_features <-
-
-    length(features)
-
-
-
-model_gaussian <-
-
-    create_copula_cnn_lstm(
-
-        copula_gaussian_loss,
-
-        n_features
-
-    )
-
-
-
-model_clayton <-
-
-    create_copula_cnn_lstm(
-
-        copula_clayton_loss,
-
-        n_features
-
-    )
-
-
-
-model_gumbel <-
-
-    create_copula_cnn_lstm(
-
-        copula_gumbel_loss,
-
-        n_features
-
-    )
-
-
 
 ###############################################################
-# 19. Model Summary
+# 11. Training Function
 ###############################################################
 
 
-summary(model_gaussian)
+train_model <- function(
 
-summary(model_clayton)
-
-summary(model_gumbel)
-
-###############################################################
-# Part 3
-# Training + Prediction + CIF Estimation
-# Rotterdam Breast Cancer Dataset
-###############################################################
-
-
-###############################################################
-# 20. Training Parameters
-###############################################################
-
-
-epochs <- 300
-
-batch_size <- 32
-
-
-
-###############################################################
-# 21. Train Gaussian Copula CNN-LSTM
-###############################################################
-
-
-history_gaussian <-
-
-    model_gaussian %>%
-
-    fit(
+        model,
 
         X_train_array,
 
-        y_train,
+        Y_train,
 
-        epochs=epochs,
+        model_name
 
-        batch_size=batch_size,
+){
 
-        validation_split=0.2,
 
-        verbose=1
 
+    cat(
+        "\nTraining:",
+        model_name,
+        "\n"
     )
 
 
 
-###############################################################
-# 22. Train Clayton Copula CNN-LSTM
-###############################################################
+    early_stop <-
 
+        callback_early_stopping(
 
-history_clayton <-
+            monitor="val_loss",
 
-    model_clayton %>%
+            patience=10,
 
-    fit(
+            restore_best_weights=TRUE
 
-        X_train_array,
-
-        y_train,
-
-        epochs=epochs,
-
-        batch_size=batch_size,
-
-        validation_split=0.2,
-
-        verbose=1
-
-    )
+        )
 
 
 
-###############################################################
-# 23. Train Gumbel Copula CNN-LSTM
-###############################################################
+    reduce_lr <-
 
+        callback_reduce_lr_on_plateau(
 
-history_gumbel <-
+            monitor="val_loss",
 
-    model_gumbel %>%
+            factor=0.5,
 
-    fit(
+            patience=5,
 
-        X_train_array,
+            min_lr=1e-6
 
-        y_train,
-
-        epochs=epochs,
-
-        batch_size=batch_size,
-
-        validation_split=0.2,
-
-        verbose=1
-
-    )
+        )
 
 
 
-###############################################################
-# 24. Prediction Function
-###############################################################
 
 
-predict_risk <- function(model, X_array){
+    history <-
+
+        model %>%
+
+        fit(
+
+            x=X_train_array,
+
+            y=Y_train,
 
 
-    pred <-
+            validation_split=0.20,
 
-        predict(
 
-            model,
+            epochs=epochs,
 
-            X_array,
+
+            batch_size=batch_size,
+
+
+            callbacks=list(
+
+                early_stop,
+
+                reduce_lr
+
+            ),
+
 
             verbose=0
 
         )
 
 
-    pred <-
 
-        as.data.frame(pred)
-
-
-    colnames(pred) <-
-
-        c(
-
-            "Censor",
-
-            "Recurrence",
-
-            "Death"
-
-        )
-
-
-    return(pred)
+    return(history)
 
 }
 
 
 
 
-###############################################################
-# 25. Test Predictions
-###############################################################
-
-
-risk_gaussian <-
-
-    predict_risk(
-
-        model_gaussian,
-
-        X_test_array
-
-    )
-
-
-
-risk_clayton <-
-
-    predict_risk(
-
-        model_clayton,
-
-        X_test_array
-
-    )
-
-
-
-risk_gumbel <-
-
-    predict_risk(
-
-        model_gumbel,
-
-        X_test_array
-
-    )
-
-
 
 ###############################################################
-# 26. Check Prediction Distribution
+# END PART 2
+###############################################################
+
+###############################################################
+# PART 3
+# Rotterdam Breast Cancer
+# Copula CNN-LSTM + RSF Evaluation
 ###############################################################
 
 
-summary(risk_gaussian)
-
-summary(risk_clayton)
-
-summary(risk_gumbel)
-
-
-
-
 ###############################################################
-# 27. Extract Cause-specific Risk
+# 1. Train Three Copula CNN-LSTM Models
 ###############################################################
 
 
-risk_gaussian_recur <-
+cat("\nTraining Gaussian Copula CNN-LSTM\n")
 
-    risk_gaussian$Recurrence
+model_gaussian <-
+create_cnn_lstm_model(
+    "Gaussian"
+)
 
 
 
-risk_gaussian_death <-
+history_gaussian <-
+train_model(
 
-    risk_gaussian$Death
+    model_gaussian,
 
+    X_train_array,
 
-
-risk_clayton_recur <-
-
-    risk_clayton$Recurrence
-
-
-
-risk_clayton_death <-
-
-    risk_clayton$Death
-
-
-
-risk_gumbel_recur <-
-
-    risk_gumbel$Recurrence
-
-
-
-risk_gumbel_death <-
-
-    risk_gumbel$Death
-
-
-
-
-
-###############################################################
-# 28. Observed CIF Estimation
-###############################################################
-
-
-cif_observed <-
-
-    cuminc(
-
-        ftime=time_test,
-
-        fstatus=event_test
-
-    )
-
-
-print(cif_observed)
-
-
-
-
-###############################################################
-# 29. CIF Prediction Function
-###############################################################
-
-
-predict_CIF <- function(
-    
-    risk,
-    
-    times
-    
-){
-
-
-    n <-
-
-        nrow(risk)
-
-
-
-    cif_recur <-
-
-        matrix(
-
-            0,
-
-            nrow=n,
-
-            ncol=length(times)
-
-        )
-
-
-    cif_death <-
-
-        matrix(
-
-            0,
-
-            nrow=n,
-
-            ncol=length(times)
-
-        )
-
-
-    for(i in 1:n){
-
-
-        h1 <-
-
-            risk$Recurrence[i]
-
-
-
-        h2 <-
-
-            risk$Death[i]
-
-
-
-        total <-
-
-            h1+h2+1e-6
-
-
-
-        cif_recur[i,] <-
-
-            (h1/total)*
-
-            (1-exp(-times/mean(time_test)))
-
-
-
-        cif_death[i,] <-
-
-            (h2/total)*
-
-            (1-exp(-times/mean(time_test)))
-
-
-    }
-
-
-
-    data.frame(
-
-        Time=times,
-
-
-        CIF_Recurrence=
-
-            colMeans(cif_recur),
-
-
-        CIF_Death=
-
-            colMeans(cif_death)
-
-    )
-
-}
-
-
-
-
-###############################################################
-# 30. Predicted CIF Curves
-###############################################################
-
-
-times_eval <-
-
-    seq(
-
-        0,
-
-        max(time_test),
-
-        length.out=100
-
-    )
-
-
-
-cif_gaussian <-
-
-    predict_CIF(
-
-        risk_gaussian,
-
-        times_eval
-
-    )
-
-
-cif_gaussian$Model <-
+    Y_train,
 
     "Gaussian"
 
+)
 
 
-cif_clayton <-
 
-    predict_CIF(
-
-        risk_clayton,
-
-        times_eval
-
-    )
+cat("\nTraining Clayton Copula CNN-LSTM\n")
 
 
-cif_clayton$Model <-
+model_clayton <-
+create_cnn_lstm_model(
+    "Clayton"
+)
+
+
+
+history_clayton <-
+train_model(
+
+    model_clayton,
+
+    X_train_array,
+
+    Y_train,
 
     "Clayton"
 
+)
 
 
-cif_gumbel <-
 
-    predict_CIF(
-
-        risk_gumbel,
-
-        times_eval
-
-    )
+cat("\nTraining Gumbel Copula CNN-LSTM\n")
 
 
-cif_gumbel$Model <-
+model_gumbel <-
+create_cnn_lstm_model(
+    "Gumbel"
+)
+
+
+
+history_gumbel <-
+train_model(
+
+    model_gumbel,
+
+    X_train_array,
+
+    Y_train,
 
     "Gumbel"
 
-
-
-
-cif_all <-
-
-    rbind(
-
-        cif_gaussian,
-
-        cif_clayton,
-
-        cif_gumbel
-
-    )
-
-
-
-head(cif_all)
+)
 
 
 
 
 ###############################################################
-# 31. CIF Recurrence Plot
+# 2. Predictions
 ###############################################################
 
 
-ggplot(
+pred_gaussian <-
 
-    cif_all,
+predict(
 
-    aes(
+    model_gaussian,
 
-        x=Time,
+    X_test_array,
 
-        y=CIF_Recurrence,
+    verbose=0
 
-        color=Model
+)
 
-    )
 
-)+
 
-geom_line(
+pred_clayton <-
 
-    linewidth=1.2
+predict(
 
-)+
+    model_clayton,
 
-labs(
+    X_test_array,
 
-    title="Predicted CIF: Breast Cancer Recurrence",
+    verbose=0
 
-    x="Days",
+)
 
-    y="Cumulative Incidence"
 
-)+
 
-theme_minimal()
+pred_gumbel <-
 
+predict(
 
+    model_gumbel,
 
+    X_test_array,
 
-###############################################################
-# 32. CIF Death Plot
-###############################################################
+    verbose=0
 
-
-ggplot(
-
-    cif_all,
-
-    aes(
-
-        x=Time,
-
-        y=CIF_Death,
-
-        color=Model
-
-    )
-
-)+
-
-geom_line(
-
-    linewidth=1.2
-
-)+
-
-labs(
-
-    title="Predicted CIF: Death",
-
-    x="Days",
-
-    y="Cumulative Incidence"
-
-)+
-
-theme_minimal()
-
-
-###############################################################
-# Part 4
-# Model Evaluation
-# Bootstrap C-index
-# Random Survival Forest
-# Time-dependent AUC
-###############################################################
-
-
-library(Hmisc)
-library(boot)
-library(randomForestSRC)
-library(timeROC)
-library(survival)
-
-
-
-###############################################################
-# 33. Cause-specific C-index Function
-###############################################################
-
-
-cause_cindex <- function(
-    
-    time,
-    
-    event,
-    
-    risk,
-    
-    cause
-    
-){
-
-
-    ###########################################################
-    # Check event availability
-    ###########################################################
-
-
-    if(sum(event==cause)<5){
-
-        return(NA)
-
-    }
-
-
-
-    ###########################################################
-    # Binary cause event
-    ###########################################################
-
-
-    status_binary <-
-
-        ifelse(
-
-            event==cause,
-
-            1,
-
-            0
-
-        )
-
-
-
-    ###########################################################
-    # Concordance
-    ###########################################################
-
-
-    result <-
-
-        rcorr.cens(
-
-            risk,
-
-            Surv(
-
-                time,
-
-                status_binary
-
-            )
-
-        )
-
-
-    as.numeric(
-
-        result["C Index"]
-
-    )
-
-}
-
+)
 
 
 
 
 ###############################################################
-# 34. Test Evaluation Dataset
+# 3. Random Survival Forest
 ###############################################################
 
 
-test_eval <-
-
-    data.frame(
-
-        time=time_test,
-
-        event=event_test
-
-    )
-
-
-
-table(test_eval$event)
-
-
-
-
-
-###############################################################
-# 35. Bootstrap Function
-###############################################################
-
-
-bootstrap_cindex <- function(
-    
-    time,
-    
-    event,
-    
-    risk,
-    
-    cause=2,
-    
-    B=500
-    
-){
-
-
-    boot_fun <- function(data,index){
-
-
-        d <-
-
-            data[index,]
-
-
-        value <-
-
-            cause_cindex(
-
-                d$time,
-
-                d$event,
-
-                d$risk,
-
-                cause
-
-            )
-
-
-        return(value)
-
-    }
-
-
-
-    boot_data <-
-
-        data.frame(
-
-            time=time,
-
-            event=event,
-
-            risk=risk
-
-        )
-
-
-
-    result <-
-
-        boot(
-
-            data=boot_data,
-
-            statistic=boot_fun,
-
-            R=B
-
-        )
-
-
-
-    values <-
-
-        result$t[
-
-            !is.na(result$t)
-
-        ]
-
-
-
-    if(length(values)<10){
-
-
-        return(
-
-            c(
-
-                Mean=NA,
-
-                Lower=NA,
-
-                Upper=NA
-
-            )
-
-        )
-
-    }
-
-
-
-    ci <-
-
-        quantile(
-
-            values,
-
-            c(
-
-                0.025,
-
-                0.975
-
-            )
-
-        )
-
-
-    c(
-
-        Mean=mean(values),
-
-        Lower=ci[1],
-
-        Upper=ci[2]
-
-    )
-
-}
-
-
-
-
-
-###############################################################
-# 36. CNN-LSTM Bootstrap Evaluation
-###############################################################
-
-
-B_boot <- 500
-
-
-
-
-gaussian_c1 <-
-
-    bootstrap_cindex(
-
-        time_test,
-
-        event_test,
-
-        risk_gaussian_recur,
-
-        cause=1,
-
-        B=B_boot
-
-    )
-
-
-
-gaussian_c2 <-
-
-    bootstrap_cindex(
-
-        time_test,
-
-        event_test,
-
-        risk_gaussian_death,
-
-        cause=2,
-
-        B=B_boot
-
-    )
-
-
-
-
-clayton_c1 <-
-
-    bootstrap_cindex(
-
-        time_test,
-
-        event_test,
-
-        risk_clayton_recur,
-
-        cause=1,
-
-        B=B_boot
-
-    )
-
-
-
-clayton_c2 <-
-
-    bootstrap_cindex(
-
-        time_test,
-
-        event_test,
-
-        risk_clayton_death,
-
-        cause=2,
-
-        B=B_boot
-
-    )
-
-
-
-
-gumbel_c1 <-
-
-    bootstrap_cindex(
-
-        time_test,
-
-        event_test,
-
-        risk_gumbel_recur,
-
-        cause=1,
-
-        B=B_boot
-
-    )
-
-
-
-gumbel_c2 <-
-
-    bootstrap_cindex(
-
-        time_test,
-
-        event_test,
-
-        risk_gumbel_death,
-
-        cause=2,
-
-        B=B_boot
-
-    )
-
-
-
-
-
-###############################################################
-# 37. Random Survival Forest
-###############################################################
-
-rsf_data <-
-
-    rotterdam_data %>%
-
-    dplyr::select(
-
-        rtime,
-
-        event,
-
-        dplyr::all_of(features)
-
-    )
-
-
-
-
-colnames(rsf_data)[1] <-
-
-    "time"
-
-
-
-rsf_data$event <-
-
-    factor(
-
-        rsf_data$event,
-
-        levels=c(
-
-            0,
-
-            1,
-
-            2
-
-        )
-
-    )
-
-
-
-
-
-set.seed(123)
-
-
-rsf_model <-
-
-    rfsrc(
-
-        Surv(
-
-            time,
-
-            event
-
-        )
-
-        ~
-
-        .,
-
-        data=rsf_data,
-
-        ntree=1000,
-
-        splitrule="logrankCR",
-
-        importance=TRUE
-
-    )
-
-
-
-print(rsf_model)
-
-
-
-
-###############################################################
-# 38. RSF Prediction
-###############################################################
-
-
-rsf_test <-
-
-    rsf_data[test_id,]
-
-
-
-rsf_pred <-
-
-    predict(
-
-        rsf_model,
-
-        newdata=rsf_test
-
-    )
-
-
-
-###############################################################
-# Check RSF structure
-###############################################################
-
-
-names(rsf_pred)
-
-
-dim(rsf_pred$predicted)
-
-
-
-###############################################################
-# RSF Risk
-###############################################################
-
-
-rsf_recur_risk <-
-
-    rsf_pred$predicted[,1]
-
-
-
-rsf_death_risk <-
-
-    rsf_pred$predicted[,2]
-
-
-
-
-
-###############################################################
-# 39. RSF Bootstrap
-###############################################################
-
-
-rsf_c1 <-
-
-    bootstrap_cindex(
-
-        time_test,
-
-        event_test,
-
-        rsf_recur_risk,
-
-        cause=1,
-
-        B=B_boot
-
-    )
-
-
-
-rsf_c2 <-
-
-    bootstrap_cindex(
-
-        time_test,
-
-        event_test,
-
-        rsf_death_risk,
-
-        cause=2,
-
-        B=B_boot
-
-    )
-
-
-
-
-
-###############################################################
-# 40. Final C-index Table
-###############################################################
-
-
-cindex_results <-
+rsf_train <-
 
 data.frame(
 
-Model=c(
+    time=time_train,
 
-"Gaussian CNN-LSTM",
+    status=status_train,
 
-"Clayton CNN-LSTM",
-
-"Gumbel CNN-LSTM",
-
-"Random Survival Forest"
-
-),
-
-
-Cause1_Cindex=c(
-
-gaussian_c1[1],
-
-clayton_c1[1],
-
-gumbel_c1[1],
-
-rsf_c1[1]
-
-),
-
-
-Cause1_Lower=c(
-
-gaussian_c1[2],
-
-clayton_c1[2],
-
-gumbel_c1[2],
-
-rsf_c1[2]
-
-),
-
-
-Cause1_Upper=c(
-
-gaussian_c1[3],
-
-clayton_c1[3],
-
-gumbel_c1[3],
-
-rsf_c1[3]
-
-),
-
-
-Cause2_Cindex=c(
-
-gaussian_c2[1],
-
-clayton_c2[1],
-
-gumbel_c2[1],
-
-rsf_c2[1]
-
-),
-
-
-Cause2_Lower=c(
-
-gaussian_c2[2],
-
-clayton_c2[2],
-
-gumbel_c2[2],
-
-rsf_c2[2]
-
-),
-
-
-Cause2_Upper=c(
-
-gaussian_c2[3],
-
-clayton_c2[3],
-
-gumbel_c2[3],
-
-rsf_c2[3]
+    X[train_index,]
 
 )
 
-)
-
-
-
-print(cindex_results)
-
-
-
-
-###############################################################
-# Part 6
-# Time-dependent AUC (Fixed)
-# Rotterdam Breast Cancer Dataset
-###############################################################
-
-library(timeROC)
-
-
-
-###############################################################
-# 41. Safe timeROC Function
-###############################################################
-
-
-compute_timeROC <- function(
-    
-    time,
-    
-    event,
-    
-    marker,
-    
-    cause=2
-    
-){
-    
-    
-    roc <- tryCatch(
-        
-        {
-            
-            timeROC(
-                
-                T=time,
-                
-                delta=event,
-                
-                marker=marker,
-                
-                cause=cause,
-                
-                weighting="marginal",
-                
-                iid=TRUE,
-                
-                times=c(
-                    1000,
-                    2000,
-                    3000
-                )
-                
-            )
-            
-        },
-        
-        error=function(e){
-            
-            message(
-                "timeROC failed: ",
-                e$message
-            )
-            
-            return(NULL)
-            
-        }
-        
-    )
-    
-    
-    return(roc)
-    
-}
-
-
-
-###############################################################
-# 42. Calculate AUC
-###############################################################
-
-
-auc_gaussian <-
-
-    compute_timeROC(
-        
-        time_test,
-        
-        event_test,
-        
-        risk_gaussian_death,
-        
-        cause=2
-        
-    )
-
-
-
-auc_clayton <-
-
-    compute_timeROC(
-        
-        time_test,
-        
-        event_test,
-        
-        risk_clayton_death,
-        
-        cause=2
-        
-    )
-
-
-
-auc_gumbel <-
-
-    compute_timeROC(
-        
-        time_test,
-        
-        event_test,
-        
-        risk_gumbel_death,
-        
-        cause=2
-        
-    )
-
-
-
-auc_rsf <-
-
-    compute_timeROC(
-        
-        time_test,
-        
-        event_test,
-        
-        rsf_death_risk,
-        
-        cause=2
-        
-    )
-
-
-
-###############################################################
-# 43. Extract AUC Safely
-###############################################################
-
-
-extract_auc <- function(obj){
-    
-    
-    if(is.null(obj)){
-        
-        return(
-            rep(
-                NA,
-                3
-            )
-        )
-        
-    }
-    
-    
-    if(!is.null(obj$AUC)){
-        
-        return(obj$AUC)
-        
-    }
-    
-    
-    if(!is.null(obj$AUC_1)){
-        
-        return(obj$AUC_1)
-        
-    }
-    
-    
-    return(
-        rep(
-            NA,
-            3
-        )
-    )
-    
-}
-
-
-
-auc_gaussian_values <-
-
-    extract_auc(
-        auc_gaussian
-    )
-
-
-auc_clayton_values <-
-
-    extract_auc(
-        auc_clayton
-    )
-
-
-auc_gumbel_values <-
-
-    extract_auc(
-        auc_gumbel
-    )
-
-
-auc_rsf_values <-
-
-    extract_auc(
-        auc_rsf
-    )
-
-
-
-###############################################################
-# 44. AUC Summary Table
-###############################################################
-
-
-auc_results <-
-
-data.frame(
-
-    Model=c(
-        
-        "Gaussian CNN-LSTM",
-        
-        "Clayton CNN-LSTM",
-        
-        "Gumbel CNN-LSTM",
-        
-        "Random Survival Forest"
-        
-    ),
-    
-    
-    AUC_1000=c(
-        
-        auc_gaussian_values[1],
-        
-        auc_clayton_values[1],
-        
-        auc_gumbel_values[1],
-        
-        auc_rsf_values[1]
-        
-    ),
-    
-    
-    AUC_2000=c(
-        
-        auc_gaussian_values[2],
-        
-        auc_clayton_values[2],
-        
-        auc_gumbel_values[2],
-        
-        auc_rsf_values[2]
-        
-    ),
-    
-    
-    AUC_3000=c(
-        
-        auc_gaussian_values[3],
-        
-        auc_clayton_values[3],
-        
-        auc_gumbel_values[3],
-        
-        auc_rsf_values[3]
-        
-    )
-
-)
-
-
-
-print(
-    auc_results
-)
-
-
-
-
-
-###############################################################
-# 45. Combine C-index + AUC
-###############################################################
-
-
-final_performance <-
-
-    merge(
-        
-        cindex_results,
-        
-        auc_results,
-        
-        by="Model",
-        
-        all=TRUE
-        
-    )
-
-
-
-print(
-    final_performance
-)
-
-
-
-###############################################################
-# 46. Publication Table
-###############################################################
-
-
-final_publication <-
-
-    final_performance %>%
-    
-    mutate(
-        
-        Cause1_Cindex =
-            
-            paste0(
-                
-                round(
-                    Cause1_Cindex,
-                    3
-                ),
-                
-                " (",
-                
-                round(
-                    Cause1_Lower,
-                    3
-                ),
-                
-                "-",
-                
-                round(
-                    Cause1_Upper,
-                    3
-                ),
-                
-                ")"
-                
-            ),
-        
-        
-        Cause2_Cindex =
-            
-            paste0(
-                
-                round(
-                    Cause2_Cindex,
-                    3
-                ),
-                
-                " (",
-                
-                round(
-                    Cause2_Lower,
-                    3
-                ),
-                
-                "-",
-                
-                round(
-                    Cause2_Upper,
-                    3
-                ),
-                
-                ")"
-                
-            )
-        
-    )
-
-
-print(final_publication)
-
-
-###############################################################
-# Part 5
-# Random Survival Forest Competing Risks
-###############################################################
-
-library(randomForestSRC)
-library(survival)
-library(boot)
-library(timeROC)
-library(dplyr)
-
-
-
-###############################################################
-# 35. Prepare RSF Dataset
-###############################################################
-
-rsf_data <-
-
-    data.frame(
-        
-        time = time,
-        
-        event = event,
-        
-        X
-        
-    )
-
-
-
-###############################################################
-# Convert event to factor
-###############################################################
-
-rsf_data$event <-
-
-    factor(
-        
-        rsf_data$event,
-        
-        levels=c(
-            0,
-            1,
-            2
-        )
-        
-    )
-
-
-
-###############################################################
-# 36. Fit RSF Competing Risk Model
-###############################################################
-
-set.seed(123)
 
 
 rsf_model <-
 
 rfsrc(
 
-    Surv(
-        time,
-        event
-    )
-    ~ .,
+    Surv(time,status)~
 
-    data = rsf_data,
+        .,
 
-    ntree = 1000,
+    data=rsf_train,
 
-    splitrule = "logrankCR",
+    ntree=500,
 
-    importance = TRUE
+    nodesize=15,
+
+    splitrule="logrankCR",
+
+    importance=TRUE
 
 )
 
 
-print(rsf_model)
 
-
-
-###############################################################
-# 37. RSF Prediction
-###############################################################
-
-rsf_test <-
-
-rsf_data[test_id,]
-
-
-
-rsf_pred <-
+rsf_prediction <-
 
 predict(
 
     rsf_model,
 
-    newdata = rsf_test
+    newdata=X[-train_index,]
 
 )
 
 
 
 ###############################################################
-# 38. Extract Cause-specific Risk
+# 4. Extract RSF CIF
 ###############################################################
 
-# randomForestSRC competing risk output
-# column 1 = cause 1
-# column 2 = cause 2
+
+rsf_cif <-
+
+rsf_prediction$cif
 
 
-rsf_recurrence_risk <-
 
-rsf_pred$predicted[,1]
+last_time <-
+
+dim(rsf_cif)[2]
 
 
-rsf_death_risk <-
 
-rsf_pred$predicted[,2]
+rsf_cause1 <-
+
+rsf_cif[,
+
+last_time,
+
+1]
+
+
+
+rsf_cause2 <-
+
+rsf_cif[,
+
+last_time,
+
+2]
+
+
 
 
 
 ###############################################################
-# 39. RSF Direct C-index
+# 5. Evaluation Functions
 ###############################################################
 
-rsf_cindex <- function(
-    
-    time,
-    event,
-    risk,
-    cause
-    
+
+cause_cindex <-
+
+function(
+
+time,
+
+status,
+
+risk,
+
+cause
+
 ){
-    
-    rcorr.cens(
-        
-        risk,
-        
-        Surv(
-            time,
-            event==cause
-        )
-        
-    )["C Index"]
-    
+
+
+event <-
+
+ifelse(
+
+status==cause,
+
+1,
+
+0
+
+)
+
+
+concordance.index(
+
+x=risk,
+
+surv.time=time,
+
+surv.event=event,
+
+method="noether"
+
+)$c.index
+
+
 }
 
 
 
-rsf_direct_results <-
-
-data.frame(
-
-    Model="Random Survival Forest",
-
-    Cause1_Cindex =
-        
-        rsf_cindex(
-            
-            time_test,
-            event_test,
-            rsf_recurrence_risk,
-            1
-            
-        ),
-
-    Cause2_Cindex =
-        
-        rsf_cindex(
-            
-            time_test,
-            event_test,
-            rsf_death_risk,
-            2
-            
-        )
-
-)
 
 
-print(rsf_direct_results)
+compute_auc <-
 
+function(
 
+risk,
 
-###############################################################
-# 40. Bootstrap C-index Function
-###############################################################
+cause
 
-rsf_boot_function_cause <- function(
-    
-    data,
-    index,
-    cause
-    
 ){
-    
-    d <- data[index,]
-    
-    
-    event_indicator <-
-        
-        ifelse(
-            
-            d$event==cause,
-            1,
-            0
-            
-        )
-    
-    
-    if(sum(event_indicator)==0){
-        
-        return(NA)
-        
-    }
-    
-    
-    concordance(
-        
-        Surv(
-            d$time,
-            event_indicator
-        )
-        ~
-            d$risk
-        
-    )$concordance
-    
-}
 
 
+delta <-
 
-###############################################################
-# 41. Correct Bootstrap Dataset
-###############################################################
+ifelse(
 
-# Cause 1 recurrence
+status_test==cause,
 
-rsf_boot_data_cause1 <-
+1,
 
-data.frame(
-
-    time=time_test,
-
-    event=event_test,
-
-    risk=rsf_recurrence_risk
+0
 
 )
 
 
 
-# Cause 2 death
+times <-
 
-rsf_boot_data_cause2 <-
+quantile(
 
-data.frame(
+time_test,
 
-    time=time_test,
+probs=c(
 
-    event=event_test,
+0.25,
 
-    risk=rsf_death_risk
+0.50,
+
+0.75
+
+)
 
 )
 
 
 
-###############################################################
-# 42. Bootstrap
-###############################################################
-
-set.seed(123)
-
-
-boot_rsf_cause1 <-
-
-boot(
-
-    data = rsf_boot_data_cause1,
-
-    statistic=function(data,index){
-        
-        rsf_boot_function_cause(
-            
-            data,
-            index,
-            cause=1
-            
-        )
-        
-    },
-
-    R=500
-
-)
-
-
-
-set.seed(123)
-
-
-boot_rsf_cause2 <-
-
-boot(
-
-    data = rsf_boot_data_cause2,
-
-    statistic=function(data,index){
-        
-        rsf_boot_function_cause(
-            
-            data,
-            index,
-            cause=2
-            
-        )
-        
-    },
-
-    R=500
-
-)
-
-
-
-###############################################################
-# Remove failed bootstrap samples
-###############################################################
-
-rsf_c1_values <-
-
-boot_rsf_cause1$t[
-    
-    !is.na(
-        boot_rsf_cause1$t
-    )
-    
-]
-
-
-rsf_c2_values <-
-
-boot_rsf_cause2$t[
-    
-    !is.na(
-        boot_rsf_cause2$t
-    )
-    
-]
-
-
-###############################################################
-# 43. RSF Bootstrap Results
-###############################################################
-
-rsf_boot_results <-
-
-data.frame(
-
-    Model="Random Survival Forest",
-
-
-    Cause1_Cindex =
-        mean(rsf_c1_values),
-
-
-    Cause1_Lower =
-        as.numeric(
-            quantile(
-                rsf_c1_values,
-                0.025
-            )
-        ),
-
-
-    Cause1_Upper =
-        as.numeric(
-            quantile(
-                rsf_c1_values,
-                0.975
-            )
-        ),
-
-
-    Cause2_Cindex =
-        mean(rsf_c2_values),
-
-
-    Cause2_Lower =
-        as.numeric(
-            quantile(
-                rsf_c2_values,
-                0.025
-            )
-        ),
-
-
-    Cause2_Upper =
-        as.numeric(
-            quantile(
-                rsf_c2_values,
-                0.975
-            )
-        )
-
-)
-
-
-print(rsf_boot_results)
-
-
-
-###############################################################
-# 44. RSF Time-dependent AUC
-###############################################################
-
-library(timeROC)
-
-
-###############################################################
-# Event coding
-# 0 = censor
-# 1 = recurrence
-# 2 = death
-###############################################################
-
-event_test_auc <-
-
-    as.numeric(event_test)
-
-
-
-###############################################################
-# Compute competing-risk AUC
-###############################################################
-
-rsf_auc <-
+roc <-
 
 timeROC(
 
-    T = time_test,
+T=time_test,
 
-    delta = event_test_auc,
+delta=delta,
 
-    marker = rsf_death_risk,
+marker=risk,
 
-    cause = 2,
+cause=1,
 
-    weighting = "marginal",
+weighting="marginal",
 
-    times = c(
-        1000,
-        2000,
-        3000
-    ),
-
-    iid = TRUE
+times=times
 
 )
 
 
 
-###############################################################
-# Check AUC output
-###############################################################
+mean(roc$AUC)
 
-print(rsf_auc$AUC_2)
-
-
-
-###############################################################
-# Add RSF AUC
-# AUC_2 = Death AUC
-###############################################################
-
-rsf_boot_results$AUC_1000 <-
-
-    as.numeric(
-        rsf_auc$AUC_2[1]
-    )
-
-
-rsf_boot_results$AUC_2000 <-
-
-    as.numeric(
-        rsf_auc$AUC_2[2]
-    )
-
-
-rsf_boot_results$AUC_3000 <-
-
-    as.numeric(
-        rsf_auc$AUC_2[3]
-    )
-
-
-
-print(rsf_boot_results)
-
-
-
-###############################################################
-# 45. Combine CNN-LSTM + RSF Results
-###############################################################
-
-needed_columns <-
-
-c(
-    "Model",
-    "Cause1_Cindex",
-    "Cause1_Lower",
-    "Cause1_Upper",
-    "Cause2_Cindex",
-    "Cause2_Lower",
-    "Cause2_Upper",
-    "AUC_1000",
-    "AUC_2000",
-    "AUC_3000"
-)
-
-
-
-###############################################################
-# Ensure RSF has same columns
-###############################################################
-
-for(col in setdiff(
-    
-    needed_columns,
-    names(rsf_boot_results)
-    
-)){
-    
-    rsf_boot_results[[col]] <- NA
-    
 }
 
 
 
-rsf_boot_results <-
-
-rsf_boot_results[
-    ,
-    needed_columns
-]
 
 
 
-cnn_results <-
+compute_ibs <-
 
-final_publication[
-    
-    final_publication$Model %in%
-        c(
-            "Clayton CNN-LSTM",
-            "Gaussian CNN-LSTM",
-            "Gumbel CNN-LSTM"
-        ),
-    
-    needed_columns
-    
-]
+function(
+
+risk,
+
+cause
+
+){
 
 
+event <-
 
-final_cindex_results <-
+ifelse(
+
+status_test==cause,
+
+1,
+
+0
+
+)
+
+
+mean(
+
+(event-risk)^2
+
+)
+
+
+}
+
+
+
+
+
+###############################################################
+# 6. Risk Prediction List
+###############################################################
+
+
+risk_list <-
+
+list(
+
+
+RSF_Cause1 =
+rsf_cause1,
+
+
+RSF_Cause2 =
+rsf_cause2,
+
+
+
+Gaussian_Cause1 =
+pred_gaussian[,1],
+
+
+Gaussian_Cause2 =
+pred_gaussian[,2],
+
+
+
+Clayton_Cause1 =
+pred_clayton[,1],
+
+
+Clayton_Cause2 =
+pred_clayton[,2],
+
+
+
+Gumbel_Cause1 =
+pred_gumbel[,1],
+
+
+Gumbel_Cause2 =
+pred_gumbel[,2]
+
+)
+
+
+
+
+
+###############################################################
+# 7. Final Performance Table
+###############################################################
+
+
+results <- data.frame()
+
+
+
+for(name in names(risk_list)){
+
+
+cause <-
+
+ifelse(
+
+grepl(
+
+"Cause1",
+
+name
+
+),
+
+1,
+
+2
+
+)
+
+
+
+risk <-
+
+risk_list[[name]]
+
+
+
+results <-
 
 rbind(
 
-    cnn_results,
+results,
 
-    rsf_boot_results
+data.frame(
+
+Model=
+
+gsub(
+
+"_Cause[12]",
+
+"",
+
+name
+
+),
+
+
+Cause=cause,
+
+
+Cindex=
+
+cause_cindex(
+
+time_test,
+
+status_test,
+
+risk,
+
+cause
+
+),
+
+
+AUC=
+
+compute_auc(
+
+risk,
+
+cause
+
+),
+
+
+IBS=
+
+compute_ibs(
+
+risk,
+
+cause
+
+)
+
+
+)
+
+)
+
+}
+
+
+
+print(results)
+
+
+
+write.csv(
+
+results,
+
+"Rotterdam_Copula_CNN_LSTM_Results.csv",
+
+row.names=FALSE
+
+)
+
+###############################################################
+# PART 4
+# Rotterdam Publication Figures
+# Bootstrap Confidence Intervals
+###############################################################
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+
+###############################################################
+# 1. Bootstrap Performance Estimation
+###############################################################
+
+
+set.seed(2026)
+
+
+B <- 200
+
+
+
+bootstrap_results <- list()
+
+
+
+for(b in 1:B){
+
+
+cat("Bootstrap:",b,"\n")
+
+
+
+idx <- sample(
+
+1:length(time_test),
+
+replace=TRUE
 
 )
 
 
 
-print(final_cindex_results)
+boot_time <-
 
+time_test[idx]
+
+
+boot_status <-
+
+status_test[idx]
+
+
+
+
+for(name in names(risk_list)){
+
+
+cause <-
+
+ifelse(
+
+grepl(
+
+"Cause1",
+
+name
+
+),
+
+1,
+
+2
+
+)
+
+
+
+risk <-
+
+risk_list[[name]][idx]
+
+
+
+event <-
+
+ifelse(
+
+boot_status==cause,
+
+1,
+
+0
+
+)
+
+
+
+cindex <-
+
+tryCatch(
+
+
+concordance.index(
+
+x=risk,
+
+surv.time=boot_time,
+
+surv.event=event,
+
+method="noether"
+
+)$c.index,
+
+
+error=function(e) NA
+
+)
+
+
+
+auc <-
+
+tryCatch({
+
+
+roc <-
+
+timeROC(
+
+T=boot_time,
+
+delta=event,
+
+marker=risk,
+
+cause=1,
+
+weighting="marginal",
+
+times=
+
+quantile(
+
+boot_time,
+
+c(.25,.5,.75)
+
+)
+
+)
+
+
+mean(roc$AUC)
+
+
+},
+
+error=function(e) NA
+
+)
+
+
+
+
+ibs <-
+
+mean(
+
+(event-risk)^2
+
+)
+
+
+
+
+bootstrap_results[[length(bootstrap_results)+1]] <-
+
+data.frame(
+
+Bootstrap=b,
+
+Model=
+
+gsub(
+
+"_Cause[12]",
+
+"",
+
+name
+
+),
+
+Cause=cause,
+
+Cindex=cindex,
+
+AUC=auc,
+
+IBS=ibs
+
+)
+
+
+
+}
+
+}
+
+
+
+bootstrap_df <-
+
+bind_rows(
+
+bootstrap_results
+
+)
+
+
+
+write.csv(
+
+bootstrap_df,
+
+"Rotterdam_Bootstrap_Performance.csv",
+
+row.names=FALSE
+
+)
+
+###############################################################
+# Figure 1
+# C-index
+###############################################################
+
+
+cindex_fig <-
+
+bootstrap_df %>%
+
+group_by(
+
+Model,
+
+Cause
+
+)%>%
+
+summarise(
+
+Mean=mean(Cindex,na.rm=TRUE),
+
+Lower=quantile(
+
+Cindex,
+
+0.025,
+
+na.rm=TRUE
+
+),
+
+Upper=quantile(
+
+Cindex,
+
+0.975,
+
+na.rm=TRUE
+
+),
+
+.groups="drop"
+
+)
+
+
+
+p1 <-
+
+ggplot(
+
+cindex_fig,
+
+aes(
+
+Model,
+
+Mean,
+
+fill=factor(Cause)
+
+)
+
+)+
+
+geom_col(
+
+position="dodge"
+
+)+
+
+geom_errorbar(
+
+aes(
+
+ymin=Lower,
+
+ymax=Upper
+
+),
+
+position=position_dodge(.9),
+
+width=.25
+
+)+
+
+labs(
+
+title="Rotterdam Breast Cancer Dataset",
+
+subtitle="Cause-specific C-index (Bootstrap 95% CI)",
+
+x="",
+
+y="C-index",
+
+fill="Cause"
+
+)+
+
+theme_bw()+
+
+theme(
+
+axis.text.x=
+
+element_text(
+
+angle=45,
+
+hjust=1
+
+)
+
+)
+
+
+print(p1)
+
+
+ggsave(
+
+"Rotterdam_Figure1_Cindex.png",
+
+p1,
+
+width=8,
+
+height=5
+
+)
+
+###############################################################
+# Figure 2
+###############################################################
+
+
+auc_fig <-
+
+bootstrap_df %>%
+
+group_by(
+
+Model,
+
+Cause
+
+)%>%
+
+summarise(
+
+Mean=mean(AUC,na.rm=TRUE),
+
+Lower=quantile(
+
+AUC,
+
+0.025,
+
+na.rm=TRUE
+
+),
+
+Upper=quantile(
+
+AUC,
+
+0.975,
+
+na.rm=TRUE
+
+),
+
+.groups="drop"
+
+)
+
+
+
+p2 <-
+
+ggplot(
+
+auc_fig,
+
+aes(
+
+Model,
+
+Mean,
+
+fill=factor(Cause)
+
+)
+
+)+
+
+geom_col(
+
+position="dodge"
+
+)+
+
+
+geom_errorbar(
+
+aes(
+
+ymin=Lower,
+
+ymax=Upper
+
+),
+
+position=position_dodge(.9),
+
+width=.25
+
+)+
+
+
+labs(
+
+title="Time-dependent AUC",
+
+subtitle="Bootstrap 95% CI",
+
+x="",
+
+y="AUC",
+
+fill="Cause"
+
+)+
+
+theme_bw()+
+
+theme(
+
+axis.text.x=
+
+element_text(
+
+angle=45,
+
+hjust=1
+
+)
+
+)
+
+
+print(p2)
+
+
+ggsave(
+
+"Rotterdam_Figure2_AUC.png",
+
+p2,
+
+width=8,
+
+height=5
+
+)
+
+###############################################################
+# Figure 3
+###############################################################
+
+
+ibs_fig <-
+
+bootstrap_df %>%
+
+group_by(
+
+Model,
+
+Cause
+
+)%>%
+
+summarise(
+
+Mean=mean(IBS,na.rm=TRUE),
+
+Lower=quantile(
+
+IBS,
+
+0.025,
+
+na.rm=TRUE
+
+),
+
+Upper=quantile(
+
+IBS,
+
+0.975,
+
+na.rm=TRUE
+
+),
+
+.groups="drop"
+
+)
+
+
+
+p3 <-
+
+ggplot(
+
+ibs_fig,
+
+aes(
+
+Model,
+
+Mean,
+
+fill=factor(Cause)
+
+)
+
+)+
+
+geom_col(
+
+position="dodge"
+
+)+
+
+geom_errorbar(
+
+aes(
+
+ymin=Lower,
+
+ymax=Upper
+
+),
+
+position=position_dodge(.9),
+
+width=.25
+
+)+
+
+labs(
+
+title="Integrated Brier Score",
+
+subtitle="Bootstrap 95% CI",
+
+x="",
+
+y="IBS",
+
+fill="Cause"
+
+)+
+
+theme_bw()+
+
+theme(
+
+axis.text.x=
+
+element_text(
+
+angle=45,
+
+hjust=1
+
+)
+
+)
+
+
+print(p3)
+
+
+ggsave(
+
+"Rotterdam_Figure3_IBS.png",
+
+p3,
+
+width=8,
+
+height=5
+
+)
+
+###############################################################
+# Figure 4
+###############################################################
+
+
+p4 <-
+
+bootstrap_df %>%
+
+filter(
+
+Cause==1
+
+)%>%
+
+ggplot(
+
+aes(
+
+Model,
+
+Cindex
+
+)
+
+)+
+
+
+geom_boxplot()+
+
+
+labs(
+
+title="Cause 1 C-index Distribution",
+
+y="C-index",
+
+x=""
+
+)+
+
+theme_bw()+
+
+theme(
+
+axis.text.x=
+
+element_text(
+
+angle=45,
+
+hjust=1
+
+)
+
+)
+
+
+
+print(p4)
+
+
+
+ggsave(
+
+"Rotterdam_Figure4_Cause1_Boxplot.png",
+
+p4,
+
+width=8,
+
+height=5
+
+)
+
+###############################################################
+# Figure 5
+###############################################################
+
+
+p5 <-
+
+bootstrap_df %>%
+
+filter(
+
+Cause==2
+
+)%>%
+
+ggplot(
+
+aes(
+
+Model,
+
+Cindex
+
+)
+
+)+
+
+
+geom_boxplot()+
+
+
+labs(
+
+title="Cause 2 C-index Distribution",
+
+y="C-index",
+
+x=""
+
+)+
+
+theme_bw()+
+
+theme(
+
+axis.text.x=
+
+element_text(
+
+angle=45,
+
+hjust=1
+
+)
+
+)
+
+
+
+print(p5)
+
+
+
+ggsave(
+
+"Rotterdam_Figure5_Cause2_Boxplot.png",
+
+p5,
+
+width=8,
+
+height=5
+
+)
+
+###############################################################
+# PART 5
+# Rotterdam Final Summary Tables
+###############################################################
+
+library(dplyr)
+library(knitr)
 
 
 ###############################################################
-# 46. Publication-ready table
+# 1. Basic Performance Summary
 ###############################################################
 
-final_cindex_table <-
 
-final_cindex_results %>%
+final_summary <-
+
+results %>%
 
 mutate(
 
-    Cause1_numeric =
-        as.numeric(
-            sub(
-                " .*",
-                "",
-                Cause1_Cindex
-            )
-        ),
+Cindex = sprintf(
+
+"%.3f",
+
+Cindex
+
+),
 
 
-    Cause2_numeric =
-        as.numeric(
-            sub(
-                " .*",
-                "",
-                Cause2_Cindex
-            )
-        ),
+AUC = sprintf(
+
+"%.3f",
+
+AUC
+
+),
 
 
-    Cause1_Cindex_Display =
+IBS = sprintf(
 
-        sprintf(
-            "%.3f (%.3f-%.3f)",
-            Cause1_numeric,
-            Cause1_Lower,
-            Cause1_Upper
-        ),
+"%.3f",
 
+IBS
 
-    Cause2_Cindex_Display =
-
-        sprintf(
-            "%.3f (%.3f-%.3f)",
-            Cause2_numeric,
-            Cause2_Lower,
-            Cause2_Upper
-        )
-
-) %>%
-
-dplyr::select(
-
-    Model,
-
-    Cause1_Cindex_Display,
-
-    Cause2_Cindex_Display,
-
-    AUC_1000,
-
-    AUC_2000,
-
-    AUC_3000
+)
 
 )
 
 
-print(final_cindex_table)
+
+cat("\n====================================\n")
+cat("Rotterdam Performance Summary\n")
+cat("====================================\n")
 
 
-
-
-###############################################################
-# 44. RSF Variable Importance
-###############################################################
-
-
-rsf_vimp <-
-
-
-    sort(
-
-        rsf_model$importance,
-
-        decreasing=TRUE
-
-    )
-
-
-
-print(rsf_vimp)
+print(final_summary)
 
 
 
 ###############################################################
-# 45. Variable Importance Plot
-###############################################################
-
-
-barplot(
-
-    rsf_vimp,
-
-    las=2,
-
-    main="Random Survival Forest Variable Importance",
-
-    ylab="Importance"
-
-)
-
-
-###############################################################
-# End Part 5
-###############################################################
-
-
-###############################################################
-# End Part 6
-###############################################################
-
-###############################################################
-# Part 8
-# Predicted CIF Curves
-# Copula CNN-LSTM + Random Survival Forest
-# Rotterdam Breast Cancer Dataset
-###############################################################
-
-
-library(ggplot2)
-library(dplyr)
-
-
-
-###############################################################
-# 55. CNN-LSTM CIF Prediction Function
-###############################################################
-
-
-predict_CIF_CNN <- function(
-
-    risk,
-
-    time_grid,
-
-    model_name
-
-){
-
-
-    n <- nrow(risk)
-
-
-    #############################################
-    # Cause-specific hazards
-    #############################################
-
-
-    h1 <- risk$Recurrence
-
-    h2 <- risk$Death
-
-
-
-    #############################################
-    # Calibration factor
-    # Converts NN probabilities to hazards
-    #############################################
-
-
-    h1 <- pmin(
-
-        h1 * 0.05,
-
-        0.95
-
-    )
-
-
-    h2 <- pmin(
-
-        h2 * 0.05,
-
-        0.95
-
-    )
-
-
-
-    #############################################
-    # Storage
-    #############################################
-
-
-    cif1 <- matrix(
-
-        0,
-
-        n,
-
-        length(time_grid)
-
-    )
-
-
-    cif2 <- matrix(
-
-        0,
-
-        n,
-
-        length(time_grid)
-
-    )
-
-
-    surv <- matrix(
-
-        1,
-
-        n,
-
-        length(time_grid)
-
-    )
-
-
-
-    #############################################
-    # Recursive CIF
-    #############################################
-
-
-    for(t in seq_along(time_grid)){
-
-
-        if(t==1){
-
-            S_prev <- rep(
-
-                1,
-
-                n
-
-            )
-
-        }else{
-
-
-            S_prev <- surv[,t-1]
-
-
-        }
-
-
-
-        cif1[,t] <-
-
-
-            if(t==1){
-
-
-                S_prev*h1
-
-
-            }else{
-
-
-                cif1[,t-1]+S_prev*h1
-
-
-            }
-
-
-
-        cif2[,t] <-
-
-
-            if(t==1){
-
-
-                S_prev*h2
-
-
-            }else{
-
-
-                cif2[,t-1]+S_prev*h2
-
-
-            }
-
-
-
-        surv[,t] <-
-
-
-            pmax(
-
-                1 -
-
-                    cif1[,t] -
-
-                    cif2[,t],
-
-                0
-
-            )
-
-
-    }
-
-
-
-    data.frame(
-
-        Time=time_grid,
-
-
-        CIF_Recurrence=
-
-            colMeans(cif1),
-
-
-        CIF_Death=
-
-            colMeans(cif2),
-
-
-        Survival=
-
-            colMeans(surv),
-
-
-        Model=model_name
-
-
-    )
-
-}
-
-
-
-###############################################################
-# 56. RSF CIF Prediction Function
-###############################################################
-
-
-predict_CIF_RSF <- function(
-
-    rsf_pred,
-
-    model_name
-
-){
-
-
-    #############################################
-    # RSF already estimates cumulative incidence
-    #############################################
-
-
-    cif <- rsf_pred$cif
-
-
-
-    #############################################
-    # RSF time points
-    #############################################
-
-
-    rsf_time <- rsf_pred$time.interest
-
-
-
-    #############################################
-    # Mean CIF over subjects
-    #############################################
-
-
-    data.frame(
-
-        Time = rsf_time,
-
-
-        CIF_Recurrence =
-
-            colMeans(
-
-                cif[, ,1],
-
-                na.rm=TRUE
-
-            ),
-
-
-        CIF_Death =
-
-            colMeans(
-
-                cif[, ,2],
-
-                na.rm=TRUE
-
-            ),
-
-
-        Survival =
-
-            1 -
-
-            colMeans(
-
-                cif[, ,1],
-
-                na.rm=TRUE
-
-            ) -
-
-            colMeans(
-
-                cif[, ,2],
-
-                na.rm=TRUE
-
-            ),
-
-
-        Model=model_name
-
-    )
-
-
-}
-
-
-
-###############################################################
-# 57. Time Grid
-###############################################################
-
-
-time_grid <-
-
-
-    seq(
-
-        0,
-
-        max(time_test),
-
-        length.out=100
-
-    )
-
-
-
-###############################################################
-# 58. CNN-LSTM CIF
-###############################################################
-
-
-cif_gaussian <-
-
-
-    predict_CIF_CNN(
-
-        risk_gaussian,
-
-        time_grid,
-
-        "Gaussian Copula CNN-LSTM"
-
-    )
-
-
-
-cif_clayton <-
-
-
-    predict_CIF_CNN(
-
-        risk_clayton,
-
-        time_grid,
-
-        "Clayton Copula CNN-LSTM"
-
-    )
-
-
-
-cif_gumbel <-
-
-
-    predict_CIF_CNN(
-
-        risk_gumbel,
-
-        time_grid,
-
-        "Gumbel Copula CNN-LSTM"
-
-    )
-
-
-
-###############################################################
-# 59. RSF CIF
-###############################################################
-
-
-cif_rsf <-
-
-
-    predict_CIF_RSF(
-
-        rsf_pred,
-
-        "Random Survival Forest"
-
-    )
-
-
-
-###############################################################
-# 60. Combine CIF Results
-###############################################################
-
-
-cif_results <-
-
-
-    rbind(
-
-        cif_gaussian,
-
-        cif_clayton,
-
-        cif_gumbel,
-
-        cif_rsf
-
-    )
-
-
-
-summary(cif_results)
-
-
-
-###############################################################
-# 61. CIF Recurrence Plot
-###############################################################
-
-
-ggplot(
-
-    cif_results,
-
-    aes(
-
-        x=Time,
-
-        y=CIF_Recurrence,
-
-        group=Model,
-
-        linetype=Model
-
-    )
-
-)+
-
-geom_line(
-
-    linewidth=1.1
-
-)+
-
-labs(
-
-    title=
-
-        "Predicted Cumulative Incidence Function: Recurrence",
-
-    x="Time (days)",
-
-    y="CIF"
-
-)+
-
-theme_minimal()
-
-
-
-###############################################################
-# 62. CIF Death Plot
-###############################################################
-
-
-ggplot(
-
-    cif_results,
-
-    aes(
-
-        x=Time,
-
-        y=CIF_Death,
-
-        group=Model,
-
-        linetype=Model
-
-    )
-
-)+
-
-geom_line(
-
-    linewidth=1.1
-
-)+
-
-labs(
-
-    title=
-
-        "Predicted Cumulative Incidence Function: Death",
-
-    x="Time (days)",
-
-    y="CIF"
-
-)+
-
-theme_minimal()
-
-
-
-###############################################################
-# 63. Save CIF Results
+# Save Table
 ###############################################################
 
 
 write.csv(
 
-    cif_results,
+final_summary,
 
-    "Rotterdam_Copula_CNN_LSTM_RSF_CIF.csv",
+"Rotterdam_Final_Performance_Table.csv",
 
-    row.names=FALSE
-
-)
-
-
-
-###############################################################
-# End Part 8
-###############################################################
-
-###############################################################
-# Part 9
-# Calibration Analysis
-# Brier Score
-# Integrated Brier Score (IBS)
-#
-# Copula CNN-LSTM vs RSF
-# Rotterdam Breast Cancer Dataset
-###############################################################
-
-
-library(survival)
-library(cmprsk)
-library(dplyr)
-library(ggplot2)
-
-
-
-###############################################################
-# 64. Prediction Risk at Specific Time Points
-###############################################################
-
-
-eval_times <- c(
-
-    1000,
-
-    2000,
-
-    3000
+row.names=FALSE
 
 )
-
-
-
-###############################################################
-# 65. Extract CIF at Evaluation Time
-###############################################################
-
-
-extract_CIF <- function(
-
-    cif_data,
-
-    time_point,
-
-    cause="Death"
-
-){
-
-
-    tmp <- cif_data %>%
-
-        filter(
-
-            Time >= time_point
-
-        ) %>%
-
-        slice(1)
-
-
-
-    if(cause=="Death"){
-
-        return(tmp$CIF_Death)
-
-    }else{
-
-        return(tmp$CIF_Recurrence)
-
-    }
-
-}
-
-
-
-###############################################################
-# 66. Observed CIF using Aalen-Johansen
-###############################################################
-
-
-observed_cif <-
-
-
-    cuminc(
-
-        ftime=time_test,
-
-        fstatus=event_test
-
-    )
-
-
-
-print(observed_cif)
-
-
-
-###############################################################
-# 67. Brier Score Function
-###############################################################
-
-
-brier_score <- function(
-
-    observed,
-
-    predicted
-
-){
-
-
-    mean(
-
-        (
-
-            observed -
-
-            predicted
-
-        )^2,
-
-        na.rm=TRUE
-
-    )
-
-}
-
-
-
-###############################################################
-# 68. Create Binary Event Indicators
-###############################################################
-
-
-# Death by time
-
-
-death_indicator <- function(
-
-    t
-
-){
-
-
-    as.numeric(
-
-        time_test <= t &
-
-        event_test == 2
-
-    )
-
-
-}
-
-
-
-# Recurrence by time
-
-
-recurrence_indicator <- function(
-
-    t
-
-){
-
-
-    as.numeric(
-
-        time_test <= t &
-
-        event_test == 1
-
-    )
-
-
-}
-
-
-
-###############################################################
-# 69. Brier Score Evaluation
-###############################################################
-
-
-compute_brier_table <- function(
-
-    cif_model,
-
-    model_name
-
-){
-
-
-    result <- data.frame()
-
-
-
-    for(t in eval_times){
-
-
-        pred_death <-
-
-
-            extract_CIF(
-
-                cif_model,
-
-                t,
-
-                "Death"
-
-            )
-
-
-
-        pred_recur <-
-
-
-            extract_CIF(
-
-                cif_model,
-
-                t,
-
-                "Recurrence"
-
-            )
-
-
-
-        result <- rbind(
-
-            result,
-
-            data.frame(
-
-                Model=model_name,
-
-
-                Time=t,
-
-
-                Death_Brier=
-
-                    brier_score(
-
-                        death_indicator(t),
-
-                        pred_death
-
-                    ),
-
-
-
-                Recurrence_Brier=
-
-                    brier_score(
-
-                        recurrence_indicator(t),
-
-                        pred_recur
-
-                    )
-
-            )
-
-        )
-
-
-    }
-
-
-
-    result
-
-}
-
-
-
-###############################################################
-# 70. Brier Scores for All Models
-###############################################################
-
-
-brier_gaussian <-
-
-
-    compute_brier_table(
-
-        cif_gaussian,
-
-        "Gaussian Copula CNN-LSTM"
-
-    )
-
-
-brier_clayton <-
-
-
-    compute_brier_table(
-
-        cif_clayton,
-
-        "Clayton Copula CNN-LSTM"
-
-    )
-
-
-brier_gumbel <-
-
-
-    compute_brier_table(
-
-        cif_gumbel,
-
-        "Gumbel Copula CNN-LSTM"
-
-    )
-
-
-brier_rsf <-
-
-
-    compute_brier_table(
-
-        cif_rsf,
-
-        "Random Survival Forest"
-
-    )
-
-
-
-brier_results <-
-
-
-    rbind(
-
-        brier_gaussian,
-
-        brier_clayton,
-
-        brier_gumbel,
-
-        brier_rsf
-
-    )
-
-
-
-print(brier_results)
-
-
-
-###############################################################
-# 71. Integrated Brier Score
-###############################################################
-
-
-IBS <- function(
-
-    brier_table
-
-){
-
-
-    mean(
-
-        brier_table$Death_Brier +
-
-        brier_table$Recurrence_Brier,
-
-        na.rm=TRUE
-
-    )
-
-}
-
-
-
-ibs_results <-
-
-
-    data.frame(
-
-        Model=c(
-
-            "Gaussian Copula CNN-LSTM",
-
-            "Clayton Copula CNN-LSTM",
-
-            "Gumbel Copula CNN-LSTM",
-
-            "Random Survival Forest"
-
-        ),
-
-
-
-        IBS=c(
-
-            IBS(brier_gaussian),
-
-            IBS(brier_clayton),
-
-            IBS(brier_gumbel),
-
-            IBS(brier_rsf)
-
-        )
-
-    )
-
-
-###############################################################
-# Fix Model Names
-###############################################################
-
-ibs_results <- 
-    ibs_results %>%
-    mutate(
-        Model = case_when(
-            
-            Model == "Gaussian Copula CNN-LSTM" ~ 
-                "Gaussian CNN-LSTM",
-            
-            Model == "Clayton Copula CNN-LSTM" ~ 
-                "Clayton CNN-LSTM",
-            
-            Model == "Gumbel Copula CNN-LSTM" ~ 
-                "Gumbel CNN-LSTM",
-            
-            TRUE ~ Model
-            
-        )
-    )
-
-
-###############################################################
-# Recombine AUC + IBS
-###############################################################
-
-calibration_results <-
-    
-    auc_results %>%
-    
-    left_join(
-        
-        ibs_results,
-        
-        by = "Model"
-        
-    )
-
-
-###############################################################
-# Check
-###############################################################
-
-print(calibration_results)
-
-calibration_table <-
-
-calibration_results %>%
-
-mutate(
-
-    AUC_1000 = sprintf("%.3f", AUC_1000),
-
-    AUC_2000 = sprintf("%.3f", AUC_2000),
-
-    AUC_3000 = sprintf("%.3f", AUC_3000),
-
-    IBS = sprintf("%.3f", IBS)
-
-) %>%
-
-dplyr::select(
-
-    Model,
-
-    AUC_1000,
-
-    AUC_2000,
-
-    AUC_3000,
-
-    IBS
-
-)
-
-
-print(calibration_table)
 
 
 

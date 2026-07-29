@@ -2213,78 +2213,190 @@ height=5
 
 ###############################################################
 # PART 5
-# Rotterdam Final Summary Tables
+# Final Rotterdam Summary Table
+# Mean + SD + 95% CI
 ###############################################################
+
 
 library(dplyr)
-library(knitr)
+library(tidyr)
 
 
 ###############################################################
-# 1. Basic Performance Summary
+# 1. Bootstrap Summary with SD and CI
 ###############################################################
 
 
-final_summary <-
+bootstrap_summary <-
 
-results %>%
+bootstrap_df %>%
 
-mutate(
+group_by(
 
-Cindex = sprintf(
+    Model,
 
-"%.3f",
+    Cause
 
-Cindex
+) %>%
+
+summarise(
+
+
+###############################################################
+# C-index
+###############################################################
+
+Cindex_Mean = mean(
+
+    Cindex,
+
+    na.rm=TRUE
 
 ),
 
 
-AUC = sprintf(
+Cindex_SD = sd(
 
-"%.3f",
+    Cindex,
 
-AUC
+    na.rm=TRUE
 
 ),
 
 
-IBS = sprintf(
+Cindex_Lower = quantile(
 
-"%.3f",
+    Cindex,
 
-IBS
+    0.025,
 
-)
+    na.rm=TRUE
 
-)
-
-
-
-cat("\n====================================\n")
-cat("Rotterdam Performance Summary\n")
-cat("====================================\n")
+),
 
 
-print(final_summary)
+Cindex_Upper = quantile(
+
+    Cindex,
+
+    0.975,
+
+    na.rm=TRUE
+
+),
 
 
 
 ###############################################################
-# Save Table
+# AUC
 ###############################################################
+
+
+AUC_Mean = mean(
+
+    AUC,
+
+    na.rm=TRUE
+
+),
+
+
+AUC_SD = sd(
+
+    AUC,
+
+    na.rm=TRUE
+
+),
+
+
+AUC_Lower = quantile(
+
+    AUC,
+
+    0.025,
+
+    na.rm=TRUE
+
+),
+
+
+AUC_Upper = quantile(
+
+    AUC,
+
+    0.975,
+
+    na.rm=TRUE
+
+),
+
+
+
+###############################################################
+# IBS
+###############################################################
+
+
+IBS_Mean = mean(
+
+    IBS,
+
+    na.rm=TRUE
+
+),
+
+
+IBS_SD = sd(
+
+    IBS,
+
+    na.rm=TRUE
+
+),
+
+
+IBS_Lower = quantile(
+
+    IBS,
+
+    0.025,
+
+    na.rm=TRUE
+
+),
+
+
+IBS_Upper = quantile(
+
+    IBS,
+
+    0.975,
+
+    na.rm=TRUE
+
+),
+
+
+.groups="drop"
+
+)
+
+
+
+print(bootstrap_summary)
+
 
 
 write.csv(
 
-final_summary,
+bootstrap_summary,
 
-"Rotterdam_Final_Performance_Table.csv",
+"Rotterdam_Summary_Mean_SD_CI.csv",
 
 row.names=FALSE
 
 )
-
 
 
 ########################

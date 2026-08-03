@@ -1,3 +1,7187 @@
+# 08/03/2026 R code
+###############################################################
+# FILE 01
+# Setup, M5 Data Processing, Demand Forecasting
+#
+# Copula Spatial SAR-Q Inventory System
+###############################################################
+
+
+###############################################################
+# PART 1
+# Libraries
+###############################################################
+
+library(data.table)
+library(dplyr)
+library(tidyr)
+
+library(ggplot2)
+library(reshape2)
+library(ggrepel)
+library(kableExtra)
+
+library(forecast)
+library(tseries)
+
+library(copula)
+library(VineCopula)
+
+library(mvtnorm)
+
+library(igraph)
+library(geosphere)
+
+library(effsize)
+library(boot)
+
+library(microbenchmark)
+
+
+
+###############################################################
+# 2. Reproducibility
+###############################################################
+
+MASTER_SEED <- 2026
+
+
+RNGkind(
+    kind="Mersenne-Twister",
+    normal.kind="Inversion"
+)
+
+
+set.seed(MASTER_SEED)
+
+
+
+###############################################################
+# 3. Output Folder
+###############################################################
+
+if(!dir.exists("results")){
+    
+    dir.create("results")
+    
+}
+
+
+
+###############################################################
+# 4. Experiment Seeds
+###############################################################
+
+experiment_seeds <- c(
+    11,
+    29,
+    53,
+    71,
+    97,
+    131,
+    167,
+    211,
+    257,
+    307
+)
+
+
+N_RUNS <- length(experiment_seeds)
+
+
+
+###############################################################
+# 5. Environment Information
+###############################################################
+
+cat("\n")
+cat("========================================\n")
+cat("Copula Spatial SAR-Q Inventory System\n")
+cat("========================================\n")
+
+
+cat(
+    "Master Seed:",
+    MASTER_SEED,
+    "\n"
+)
+
+
+cat(
+    "Runs:",
+    N_RUNS,
+    "\n"
+)
+
+
+cat(
+    "R Version:",
+    R.version.string,
+    "\n"
+)
+
+
+cat(
+    "Date:",
+    Sys.Date(),
+    "\n"
+)
+
+
+cat("========================================\n")
+
+
+
+capture.output(
+    
+    sessionInfo(),
+    
+    file="results/SessionInfo.txt"
+    
+)
+
+
+
+
+###############################################################
+# 6. Load M5 Walmart Dataset
+###############################################################
+
+cat("\nLoading M5 dataset...\n")
+
+
+
+sales_file <- "sales_train_validation.csv"
+
+
+
+if(!file.exists(sales_file)){
+    
+    stop(
+        "Cannot find sales_train_validation.csv"
+    )
+    
+}
+
+
+
+sales <- fread(
+    
+    sales_file,
+    
+    data.table=FALSE
+    
+)
+
+
+
+cat(
+    "Rows:",
+    nrow(sales),
+    "\n"
+)
+
+
+
+cat(
+    "Columns:",
+    ncol(sales),
+    "\n"
+)
+
+
+
+
+###############################################################
+# 7. Identify Daily Sales Columns
+###############################################################
+
+daily_columns <- grep(
+    
+    "^d_",
+    
+    names(sales),
+    
+    value=TRUE
+    
+)
+
+
+
+N_DAYS <- length(daily_columns)
+
+
+
+cat(
+    "Daily observations:",
+    N_DAYS,
+    "\n"
+)
+
+
+
+
+###############################################################
+# 8. Missing Data Check
+###############################################################
+
+missing_count <- sum(
+    
+    is.na(sales)
+    
+)
+
+
+cat(
+    "Missing values:",
+    missing_count,
+    "\n"
+)
+
+
+
+###############################################################
+# 9. Store Aggregation
+###############################################################
+
+store_summary <- sales %>%
+    
+    group_by(store_id) %>%
+    
+    summarise(
+        
+        TotalSales =
+            sum(
+                rowSums(
+                    across(
+                        all_of(daily_columns)
+                    )
+                )
+            ),
+        
+        
+        MeanDaily =
+            mean(
+                rowSums(
+                    across(
+                        all_of(daily_columns)
+                    )
+                )
+            ),
+        
+        
+        .groups="drop"
+        
+    ) %>%
+    
+    arrange(
+        desc(TotalSales)
+    )
+
+
+
+###############################################################
+# 10. Select Top Stores
+###############################################################
+
+TOP_STORES <- 8
+
+
+
+selected_stores <- head(
+    
+    store_summary$store_id,
+    
+    TOP_STORES
+    
+)
+
+
+
+cat("\nSelected Stores:\n")
+
+print(selected_stores)
+
+
+
+
+###############################################################
+# 11. Convert to Store-Day Matrix
+###############################################################
+
+
+sales_selected <- sales %>%
+    
+    filter(
+        
+        store_id %in%
+            
+            selected_stores
+        
+    )
+
+
+
+sales_long <- sales_selected %>%
+    
+    pivot_longer(
+        
+        cols=all_of(daily_columns),
+        
+        names_to="Day",
+        
+        values_to="Sales"
+        
+    )
+
+
+
+daily_sales <- sales_long %>%
+    
+    group_by(
+        
+        store_id,
+        
+        Day
+        
+    ) %>%
+    
+    summarise(
+        
+        Sales=sum(Sales),
+        
+        .groups="drop"
+        
+    )
+
+
+
+sales_wide <- daily_sales %>%
+    
+    pivot_wider(
+        
+        names_from=store_id,
+        
+        values_from=Sales
+        
+    )
+
+
+
+sales_wide[is.na(sales_wide)] <- 0
+
+
+
+
+###############################################################
+# 12. Demand Matrix
+###############################################################
+
+sales_matrix <- as.matrix(
+    
+    sales_wide[,selected_stores,drop=FALSE]
+    
+)
+
+
+
+rownames(sales_matrix) <- sales_wide$Day
+
+
+
+N_STORES <- ncol(sales_matrix)
+
+N_OBS <- nrow(sales_matrix)
+
+
+
+cat(
+    "\nNumber of Stores:",
+    N_STORES,
+    "\n"
+)
+
+
+cat(
+    "Number of Days:",
+    N_OBS,
+    "\n"
+)
+
+
+
+###############################################################
+# 13. Summary Statistics
+###############################################################
+
+summary_table <- data.frame(
+    
+    Store=selected_stores,
+    
+    
+    Mean=
+        round(
+            colMeans(sales_matrix),
+            2
+        ),
+    
+    
+    SD=
+        round(
+            apply(
+                sales_matrix,
+                2,
+                sd
+            ),
+            2
+        ),
+    
+    
+    Median=
+        apply(
+            sales_matrix,
+            2,
+            median
+        ),
+    
+    
+    Maximum=
+        apply(
+            sales_matrix,
+            2,
+            max
+        )
+    
+)
+
+
+
+print(summary_table)
+
+
+
+write.csv(
+    
+    summary_table,
+    
+    "results/StoreSummary.csv",
+    
+    row.names=FALSE
+    
+)
+
+###############################################################
+# 14. Forecasting Engine
+###############################################################
+
+
+forecast_horizon <- 28
+
+
+train_length <- N_OBS - forecast_horizon
+
+
+
+forecast_accuracy <- data.frame()
+
+
+forecast_models <- list()
+
+
+
+demand_base <- numeric(N_STORES)
+
+demand_sd <- numeric(N_STORES)
+
+
+
+
+###############################################################
+# Accuracy Function
+###############################################################
+
+forecast_metrics <- function(obs,pred){
+
+    
+    obs <- as.numeric(obs)
+    
+    pred <- as.numeric(pred)
+    
+    
+    data.frame(
+        
+        RMSE =
+            sqrt(
+                mean(
+                    (obs-pred)^2
+                )
+            ),
+        
+        
+        MAE =
+            mean(
+                abs(obs-pred)
+            ),
+        
+        
+        MAPE =
+            mean(
+                abs(obs-pred) /
+                    pmax(obs,1)
+            )*100,
+        
+        
+        WAPE =
+            sum(abs(obs-pred)) /
+            pmax(sum(obs),1)
+        
+    )
+    
+}
+
+
+
+
+###############################################################
+# 15. Forecast Each Store
+###############################################################
+
+
+for(i in seq_len(N_STORES)){
+    
+    
+    cat(
+        "\nForecasting:",
+        selected_stores[i],
+        "\n"
+    )
+    
+    
+    
+    ###########################################################
+    # Time Series Object
+    ###########################################################
+    
+    y <- ts(
+        
+        sales_matrix[,i],
+        
+        frequency=7
+        
+    )
+    
+    
+    
+    ###########################################################
+    # Train / Test Split
+    ###########################################################
+    
+    train <- ts(
+        
+        y[1:train_length],
+        
+        frequency=7
+        
+    )
+    
+    
+    
+    test <- ts(
+        
+        y[(train_length+1):length(y)],
+        
+        frequency=7
+        
+    )
+    
+    
+    
+    
+    ###########################################################
+    # Models
+    ###########################################################
+    
+    fit_arima <- auto.arima(
+        
+        train
+        
+    )
+    
+    
+    fit_ets <- ets(
+        
+        train
+        
+    )
+    
+    
+    fit_tbats <- tbats(
+        
+        train
+        
+    )
+    
+    
+    
+    ###########################################################
+    # Theta
+    #
+    # IMPORTANT:
+    # thetaf() directly computes required horizon
+    ###########################################################
+    
+    fit_theta <- thetaf(
+        
+        train,
+        
+        h=forecast_horizon
+        
+    )
+    
+    
+    
+    
+    ###########################################################
+    # Forecasts
+    ###########################################################
+    
+    
+    pred_arima <- forecast(
+        
+        fit_arima,
+        
+        h=forecast_horizon
+        
+    )$mean
+    
+    
+    
+    pred_ets <- forecast(
+        
+        fit_ets,
+        
+        h=forecast_horizon
+        
+    )$mean
+    
+    
+    
+    pred_tbats <- forecast(
+        
+        fit_tbats,
+        
+        h=forecast_horizon
+        
+    )$mean
+    
+    
+    
+    pred_theta <- fit_theta$mean
+    
+    
+    
+    
+    ###########################################################
+    # Evaluation
+    ###########################################################
+    
+    
+    results <- rbind(
+        
+        
+        cbind(
+            
+            Model="ARIMA",
+            
+            forecast_metrics(
+                test,
+                pred_arima
+            )
+            
+        ),
+        
+        
+        cbind(
+            
+            Model="ETS",
+            
+            forecast_metrics(
+                test,
+                pred_ets
+            )
+            
+        ),
+        
+        
+        cbind(
+            
+            Model="TBATS",
+            
+            forecast_metrics(
+                test,
+                pred_tbats
+            )
+            
+        ),
+        
+        
+        cbind(
+            
+            Model="Theta",
+            
+            forecast_metrics(
+                test,
+                pred_theta
+            )
+            
+        )
+        
+        
+    )
+    
+    
+    
+    
+    results$Store <- selected_stores[i]
+    
+    
+    
+    
+    forecast_accuracy <- rbind(
+        
+        forecast_accuracy,
+        
+        results
+        
+    )
+    
+    
+    
+    
+    ###########################################################
+    # Save Models
+    ###########################################################
+    
+    
+    forecast_models[[selected_stores[i]]] <- list(
+        
+        ARIMA=fit_arima,
+        
+        ETS=fit_ets,
+        
+        TBATS=fit_tbats,
+        
+        Theta=fit_theta
+        
+    )
+    
+    
+    
+    
+    ###########################################################
+    # Demand Parameters for RL Environment
+    ###########################################################
+    
+    
+    demand_base[i] <- mean(
+        
+        train
+        
+    )
+    
+    
+    
+    demand_sd[i] <- sd(
+        
+        train
+        
+    )
+    
+    
+}
+
+
+
+###############################################################
+# 16. Forecast Summary
+###############################################################
+
+
+forecast_accuracy <- forecast_accuracy %>%
+    
+    select(
+        
+        Store,
+        
+        Model,
+        
+        RMSE,
+        
+        MAE,
+        
+        MAPE,
+        
+        WAPE
+        
+    )
+
+
+
+print(forecast_accuracy)
+
+
+
+write.csv(
+    
+    forecast_accuracy,
+    
+    "results/ForecastComparison.csv",
+    
+    row.names=FALSE
+    
+)
+
+
+
+###############################################################
+# 17. Best Forecast Model Per Store
+###############################################################
+
+
+best_forecast <- forecast_accuracy %>%
+    
+    group_by(Store) %>%
+    
+    arrange(RMSE) %>%
+    
+    slice(1) %>%
+    
+    ungroup()
+
+
+
+print(best_forecast)
+
+
+
+write.csv(
+    
+    best_forecast,
+    
+    "results/BestForecastModel.csv",
+    
+    row.names=FALSE
+    
+)
+
+
+
+
+###############################################################
+# END FILE 01
+###############################################################
+
+###############################################################
+# FILE 02
+# Copula Dependence Modeling and Spatial Network Construction
+#
+# Copula Spatial SAR-Q Inventory System
+###############################################################
+
+
+###############################################################
+# 1. Libraries
+###############################################################
+
+library(copula)
+library(VineCopula)
+
+library(dplyr)
+library(ggplot2)
+
+library(igraph)
+library(geosphere)
+
+
+
+
+###############################################################
+# 2. Header
+###############################################################
+
+cat("\n")
+cat("=====================================\n")
+cat("Copula Dependence Modeling\n")
+cat("=====================================\n")
+
+
+
+
+###############################################################
+# 3. Pseudo Observations
+###############################################################
+
+U <- pobs(
+    
+    sales_matrix
+    
+)
+
+
+
+DIM <- ncol(U)
+
+
+
+cat(
+    "Copula Dimension:",
+    DIM,
+    "\n"
+)
+
+
+
+
+###############################################################
+# 4. Candidate Copula Models
+###############################################################
+
+
+candidate_copulas <- list(
+    
+    
+    Gaussian =
+        normalCopula(
+            dim=DIM,
+            dispstr="un"
+        ),
+    
+    
+    StudentT =
+        tCopula(
+            dim=DIM,
+            dispstr="un",
+            df.fixed=FALSE
+        ),
+    
+    
+    Clayton =
+        claytonCopula(
+            dim=DIM
+        ),
+    
+    
+    Gumbel =
+        gumbelCopula(
+            dim=DIM
+        )
+    
+)
+
+
+
+
+###############################################################
+# 5. Fit Parametric Copulas
+###############################################################
+
+
+copula_results <- list()
+
+
+copula_comparison <- data.frame()
+
+
+
+for(name in names(candidate_copulas)){
+    
+    
+    cat(
+        "\nFitting:",
+        name,
+        "\n"
+    )
+    
+    
+    
+    fit <- tryCatch(
+        
+        
+        fitCopula(
+            
+            candidate_copulas[[name]],
+            
+            data=U,
+            
+            method="ml"
+            
+        ),
+        
+        
+        error=function(e){
+            
+            cat(
+                "Failed:",
+                name,
+                "\n"
+            )
+            
+            NULL
+            
+        }
+        
+    )
+    
+    
+    
+    if(!is.null(fit)){
+        
+        
+        ll <- as.numeric(
+            
+            logLik(fit)
+            
+        )
+        
+        
+        
+        k <- length(
+            
+            coef(fit)
+            
+        )
+        
+        
+        
+        n <- nrow(U)
+        
+        
+        copula_comparison <- rbind(
+            
+            copula_comparison,
+            
+            data.frame(
+                
+                Model=name,
+                
+                LogLik=ll,
+                
+                AIC=-2*ll+2*k,
+                
+                BIC=-2*ll+log(n)*k
+                
+            )
+            
+        )
+        
+        
+        
+        copula_results[[name]] <- fit
+        
+    }
+    
+}
+
+
+
+
+###############################################################
+# 6. Vine Copula
+###############################################################
+
+
+cat(
+    "\nFitting Vine Copula...\n"
+)
+
+
+
+vine_fit <- tryCatch(
+    
+    
+    RVineStructureSelect(
+        
+        U,
+        
+        familyset=c(
+            
+            1, # Gaussian
+            
+            2, # t
+            
+            3, # Clayton
+            
+            4  # Gumbel
+            
+        ),
+        
+        selectioncrit="AIC"
+        
+    ),
+    
+    
+    error=function(e){
+        
+        NULL
+        
+    }
+    
+)
+
+
+
+
+if(!is.null(vine_fit)){
+    
+    
+    vine_logLik <- vine_fit$logLik
+    
+    
+    vine_k <- sum(
+        
+        vine_fit$family != 0
+        
+    )
+    
+    
+    
+    copula_comparison <- rbind(
+        
+        
+        copula_comparison,
+        
+        
+        data.frame(
+            
+            Model="Vine",
+            
+            LogLik=vine_logLik,
+            
+            AIC=-2*vine_logLik+2*vine_k,
+            
+            BIC=-2*vine_logLik+
+                log(nrow(U))*vine_k
+            
+        )
+        
+        
+    )
+    
+    
+}
+
+
+
+
+###############################################################
+# 7. Copula Ranking
+###############################################################
+
+
+copula_comparison <- copula_comparison %>%
+    
+    arrange(AIC)
+
+
+
+print(copula_comparison)
+
+
+
+write.csv(
+    
+    copula_comparison,
+    
+    "results/CopulaComparison.csv",
+    
+    row.names=FALSE
+    
+)
+
+
+
+
+###############################################################
+# 8. Select Best Copula
+###############################################################
+
+
+best_copula_name <- copula_comparison$Model[1]
+
+
+
+cat(
+    "\nBest Copula:",
+    best_copula_name,
+    "\n"
+)
+
+
+
+if(best_copula_name=="Vine"){
+    
+    
+    best_copula <- vine_fit
+    
+    
+}else{
+    
+    
+    best_copula <-
+        
+        copula_results[[best_copula_name]]@copula
+    
+    
+}
+
+
+
+
+###############################################################
+# 9. Copula Simulation Function
+###############################################################
+#
+# Important:
+# rCopula() works for parametric copula objects.
+# Vine uses RVineSim()
+#
+###############################################################
+
+
+simulate_copula_uniform <- function(
+        
+        copula_model,
+        
+        n=1
+        
+){
+    
+    
+    if(
+        inherits(
+            copula_model,
+            "RVineMatrix"
+        )
+    ){
+        
+        
+        U <- RVineSim(
+            
+            n,
+            
+            copula_model
+            
+        )
+        
+        
+    }else{
+        
+        
+        U <- rCopula(
+            
+            n,
+            
+            copula_model
+            
+        )
+        
+        
+    }
+    
+    
+    as.numeric(U)
+    
+}
+
+
+###############################################################
+# 10. Copula-Based Demand Generator
+###############################################################
+
+
+simulate_copula_demand <- function(
+        
+        copula_model,
+        
+        mu,
+        
+        sigma
+        
+){
+    
+    
+    n_store <- length(mu)
+    
+    
+    
+    ###########################################################
+    # Generate dependent uniforms
+    ###########################################################
+    
+    
+    U_sim <- simulate_copula_uniform(
+        
+        copula_model,
+        
+        n=1
+        
+    )
+    
+    
+    
+    U_sim <- matrix(
+        
+        U_sim,
+        
+        nrow=1
+        
+    )
+    
+    
+    
+    ###########################################################
+    # Convert uniforms to Gaussian shocks
+    ###########################################################
+    
+    
+    Z <- qnorm(
+        
+        pmin(
+            
+            pmax(
+                
+                U_sim,
+                
+                1e-8
+                
+            ),
+            
+            1-1e-8
+            
+        )
+        
+    )
+    
+    
+    
+    Z <- as.numeric(Z)
+    
+    
+    
+    
+    ###########################################################
+    # Demand Generation
+    ###########################################################
+    
+    
+    demand <- 
+        
+        
+        mu +
+        
+        sigma * Z
+    
+    
+    
+    demand <- pmax(
+        
+        round(demand),
+        
+        0
+        
+    )
+    
+    
+    
+    return(
+        
+        demand
+        
+    )
+    
+}
+
+
+
+
+###############################################################
+# 11. Kendall Dependence Matrix
+###############################################################
+
+
+kendall_tau <- cor(
+    
+    sales_matrix,
+    
+    method="kendall"
+    
+)
+
+
+
+write.csv(
+    
+    kendall_tau,
+    
+    "results/KendallTau.csv"
+    
+)
+
+
+
+
+###############################################################
+# 12. Spatial Network Construction
+###############################################################
+
+
+cat("\n")
+cat("=====================================\n")
+cat("Spatial Network Construction\n")
+cat("=====================================\n")
+
+
+
+
+###############################################################
+# Store Coordinates
+#
+# Replace with actual Walmart coordinates
+###############################################################
+
+
+store_locations <- data.frame(
+    
+    
+    Store=selected_stores,
+    
+    
+    Latitude=c(
+        
+        34.05,
+        36.16,
+        41.88,
+        29.76,
+        33.45,
+        39.95,
+        32.78,
+        47.60
+        
+    ),
+    
+    
+    Longitude=c(
+        
+        -118.25,
+        -115.15,
+        -87.63,
+        -95.36,
+        -112.07,
+        -75.17,
+        -96.80,
+        -122.33
+        
+    )
+    
+)
+
+
+
+
+###############################################################
+# 13. Geographic Distance Matrix
+###############################################################
+
+
+coordinates <- store_locations %>%
+    
+    select(
+        
+        Longitude,
+        
+        Latitude
+        
+    ) %>%
+    
+    as.matrix()
+
+
+
+geo_distance <- distm(
+    
+    coordinates,
+    
+    fun=distHaversine
+    
+)
+
+
+
+geo_similarity <- exp(
+    
+    -geo_distance /
+        
+        mean(geo_distance)
+    
+)
+
+
+
+diag(geo_similarity) <- 0
+
+
+
+
+###############################################################
+# 14. Demand Correlation Network
+###############################################################
+
+
+corr_matrix <- cor(
+    
+    sales_matrix
+    
+)
+
+
+
+diag(corr_matrix) <- 0
+
+
+
+
+###############################################################
+# 15. Copula Dependence Network
+###############################################################
+
+
+copula_matrix <- abs(
+    
+    kendall_tau
+    
+)
+
+
+
+diag(copula_matrix) <- 0
+
+
+
+
+###############################################################
+# 16. Hybrid Spatial-Copula Weight
+###############################################################
+
+
+alpha_geo <- 0.4
+
+alpha_corr <- 0.3
+
+alpha_copula <- 0.3
+
+
+
+hybrid_matrix <-
+    
+    alpha_geo * geo_similarity +
+    
+    alpha_corr * abs(corr_matrix) +
+    
+    alpha_copula * copula_matrix
+
+
+
+
+###############################################################
+# 17. kNN Network Builder
+###############################################################
+
+
+build_knn_network <- function(
+        
+        similarity,
+        
+        k=3
+        
+){
+    
+    
+    n <- nrow(similarity)
+    
+    
+    W <- matrix(
+        
+        0,
+        
+        n,
+        
+        n
+        
+    )
+    
+    
+    
+    for(i in seq_len(n)){
+        
+        
+        neighbors <- order(
+            
+            similarity[i,],
+            
+            decreasing=TRUE
+            
+        )[1:k]
+        
+        
+        
+        W[i,neighbors] <-
+            
+            similarity[i,neighbors]
+        
+        
+    }
+    
+    
+    
+    
+    row_sum <- rowSums(W)
+    
+    
+    W <- sweep(
+        
+        W,
+        
+        1,
+        
+        row_sum,
+        
+        "/"
+        
+    )
+    
+    
+    W[is.na(W)] <- 0
+    
+    
+    return(W)
+    
+}
+
+
+
+
+###############################################################
+# 18. Generate Networks
+###############################################################
+
+
+W_geo <- build_knn_network(
+    
+    geo_similarity
+    
+)
+
+
+
+W_corr <- build_knn_network(
+    
+    abs(corr_matrix)
+    
+)
+
+
+
+W_copula <- build_knn_network(
+    
+    copula_matrix
+    
+)
+
+
+
+W_hybrid <- build_knn_network(
+    
+    hybrid_matrix
+    
+)
+
+
+
+
+###############################################################
+# 19. Select SAR Network
+###############################################################
+
+
+selected_network <- "Hybrid"
+
+
+
+W <- switch(
+    
+    selected_network,
+    
+    
+    Geographic=W_geo,
+    
+    Correlation=W_corr,
+    
+    Copula=W_copula,
+    
+    Hybrid=W_hybrid
+    
+    
+)
+
+
+
+rownames(W) <- selected_stores
+
+colnames(W) <- selected_stores
+
+
+
+
+###############################################################
+# 20. Network Summary
+###############################################################
+
+
+network_summary <- data.frame(
+    
+    
+    Network=c(
+        
+        "Geographic",
+        
+        "Correlation",
+        
+        "Copula",
+        
+        "Hybrid"
+        
+    ),
+    
+    
+    Density=c(
+        
+        mean(W_geo>0),
+        
+        mean(W_corr>0),
+        
+        mean(W_copula>0),
+        
+        mean(W_hybrid>0)
+        
+    )
+    
+)
+
+
+
+print(network_summary)
+
+
+
+write.csv(
+    
+    network_summary,
+    
+    "results/NetworkSummary.csv",
+    
+    row.names=FALSE
+    
+)
+
+
+
+
+###############################################################
+# 21. Network Visualization
+###############################################################
+
+
+g <- graph_from_adjacency_matrix(
+    
+    W,
+    
+    mode="directed",
+    
+    weighted=TRUE
+    
+)
+
+
+
+plot(
+    
+    g,
+    
+    vertex.size=25,
+    
+    vertex.label.cex=.8,
+    
+    main=paste(
+        
+        selected_network,
+        
+        "Spatial Network"
+        
+    )
+    
+)
+
+
+
+
+###############################################################
+# END FILE 02
+###############################################################
+
+###############################################################
+# FILE 03
+# Inventory Environment and Reward Model
+#
+# Copula Spatial SAR-Q Inventory System
+###############################################################
+
+
+###############################################################
+# 1. Libraries
+###############################################################
+
+library(dplyr)
+
+
+
+
+###############################################################
+# 2. Inventory Parameters
+###############################################################
+
+
+MAX_CAPACITY <- 500
+
+MIN_INVENTORY <- 0
+
+LEAD_TIME <- 2
+
+SERVICE_LEVEL <- 0.95
+
+Z_VALUE <- qnorm(
+    SERVICE_LEVEL
+)
+
+
+
+
+###############################################################
+# 3. Safety Stock
+###############################################################
+
+
+safety_stock <- round(
+    
+    Z_VALUE *
+        
+        demand_sd
+    
+)
+
+
+
+
+###############################################################
+# 4. Reorder Point
+###############################################################
+
+
+lead_time_demand <-
+    
+    demand_base *
+    
+    LEAD_TIME
+
+
+
+reorder_point <- round(
+    
+    lead_time_demand +
+        
+        safety_stock
+    
+)
+
+
+
+
+###############################################################
+# 5. Action Space
+###############################################################
+
+
+actions <- c(
+    
+    0,
+    
+    0.25,
+    
+    0.50,
+    
+    0.75,
+    
+    1.00,
+    
+    1.50,
+    
+    2.00
+    
+)
+
+
+
+N_ACTIONS <- length(actions)
+
+
+
+
+###############################################################
+# 6. Initial Inventory
+###############################################################
+
+
+initial_inventory <- function(){
+    
+    
+    inv <- round(
+        
+        demand_base *
+            
+            LEAD_TIME +
+            
+            safety_stock
+        
+    )
+    
+    
+    
+    inv <- pmin(
+        
+        inv,
+        
+        MAX_CAPACITY
+        
+    )
+    
+    
+    return(inv)
+    
+}
+
+
+
+
+###############################################################
+# 7. Feature Construction
+###############################################################
+
+
+create_state <- function(
+        
+        inventory,
+        
+        forecast=demand_base
+        
+){
+    
+    
+    inventory <- as.numeric(
+        
+        inventory
+        
+    )
+    
+    
+    
+    ###########################################################
+    # Spatial inventory spillover
+    ###########################################################
+    
+    
+    neighbor_inventory <-
+        
+        as.numeric(
+            
+            W %*%
+                
+                inventory
+            
+        )
+    
+    
+    
+    
+    ###########################################################
+    # Recent demand
+    ###########################################################
+    
+    
+    recent_demand <- sapply(
+        
+        seq_len(N_STORES),
+        
+        function(i){
+            
+            mean(
+                
+                tail(
+                    
+                    sales_matrix[,i],
+                    
+                    7
+                    
+                )
+                
+            )
+            
+        }
+        
+    )
+    
+    
+    
+    ###########################################################
+    # Demand trend
+    ###########################################################
+    
+    
+    demand_trend <- sapply(
+        
+        seq_len(N_STORES),
+        
+        function(i){
+            
+            
+            y <- tail(
+                
+                sales_matrix[,i],
+                
+                30
+                
+            )
+            
+            
+            coef(
+                
+                lm(
+                    
+                    y ~ seq_along(y)
+                    
+                )
+                
+            )[2]
+            
+            
+        }
+        
+    )
+    
+    
+    
+    
+    ###########################################################
+    # State Vector
+    ###########################################################
+    
+    
+    state <- c(
+        
+        inventory,
+        
+        forecast,
+        
+        demand_sd,
+        
+        safety_stock,
+        
+        reorder_point,
+        
+        neighbor_inventory,
+        
+        recent_demand,
+        
+        demand_trend,
+        
+        rep(0,N_STORES),   # Promotion
+        
+        rep(0,N_STORES),   # Holiday
+        
+        rep(0,N_STORES),   # Stockout
+        
+        inventory/MAX_CAPACITY
+        
+    )
+    
+    
+    
+    matrix(
+        
+        state,
+        
+        nrow=1
+        
+    )
+    
+}
+
+
+
+
+
+###############################################################
+# 8. State Dimension
+###############################################################
+
+
+N_FEATURES <- ncol(
+    
+    create_state(
+        
+        initial_inventory()
+        
+    )
+    
+)
+
+
+
+cat(
+    "State dimension:",
+    N_FEATURES,
+    "\n"
+)
+
+
+
+
+###############################################################
+# 9. Demand Generator
+###############################################################
+
+
+generate_demand <- function(
+        
+        copula_model=best_copula
+        
+){
+    
+    
+    simulate_copula_demand(
+        
+        copula_model,
+        
+        demand_base,
+        
+        demand_sd
+        
+    )
+    
+}
+
+
+
+
+###############################################################
+# 10. Reward Parameters
+###############################################################
+
+
+reward_parameters <- list(
+    
+    Revenue=15,
+    
+    HoldingCost=0.10,
+    
+    ShortageCost=1.0,
+    
+    TransferCost=0.05
+    
+)
+
+
+
+
+###############################################################
+# 11. Reward Function
+###############################################################
+
+
+compute_reward <- function(
+        
+        demand,
+        
+        inventory,
+        
+        shipment,
+        
+        transfer=0
+        
+){
+    
+    
+    available <- inventory + shipment
+    
+    
+    sales <- pmin(
+        
+        available,
+        
+        demand
+        
+    )
+    
+    
+    
+    ending_inventory <- pmax(
+        
+        available-demand,
+        
+        0
+        
+    )
+    
+    
+    
+    shortage <- pmax(
+        
+        demand-available,
+        
+        0
+        
+    )
+    
+    
+    
+    reward <-
+        
+        reward_parameters$Revenue *
+        
+        sales -
+        
+        reward_parameters$HoldingCost *
+        
+        ending_inventory -
+        
+        reward_parameters$ShortageCost *
+        
+        shortage -
+        
+        reward_parameters$TransferCost *
+        
+        transfer
+    
+    
+    
+    list(
+        
+        reward=reward,
+        
+        sales=sales,
+        
+        ending_inventory=ending_inventory,
+        
+        shortage=shortage
+        
+    )
+    
+}
+
+
+
+
+###############################################################
+# 12. Pipeline Initialization
+###############################################################
+
+
+initialize_pipeline <- function(){
+    
+    
+    matrix(
+        
+        0,
+        
+        nrow=N_STORES,
+        
+        ncol=LEAD_TIME
+        
+    )
+    
+}
+
+
+
+
+###############################################################
+# 13. Inventory Transition
+###############################################################
+
+
+inventory_step <- function(
+        
+        inventory,
+        
+        pipeline,
+        
+        shipment,
+        
+        demand
+        
+){
+    
+    
+    arriving <- pipeline[,1]
+    
+    
+    inventory <- inventory + arriving
+    
+    
+    
+    if(LEAD_TIME > 1){
+        
+        pipeline <-
+            
+            cbind(
+                
+                pipeline[,-1,drop=FALSE],
+                
+                rep(0,N_STORES)
+                
+            )
+        
+    }
+    
+    
+    
+    pipeline[,LEAD_TIME] <- shipment
+    
+    
+    
+    inventory <- pmin(
+        
+        inventory,
+        
+        MAX_CAPACITY
+        
+    )
+    
+    
+    
+    sales <- pmin(
+        
+        inventory,
+        
+        demand
+        
+    )
+    
+    
+    
+    lost_sales <- pmax(
+        
+        demand-sales,
+        
+        0
+        
+    )
+    
+    
+    
+    inventory <- inventory-sales
+    
+    
+    
+    list(
+        
+        inventory=inventory,
+        
+        pipeline=pipeline,
+        
+        sales=sales,
+        
+        lost_sales=lost_sales
+        
+    )
+    
+}
+
+
+
+
+###############################################################
+# 14. Environment Initialization
+###############################################################
+
+
+initialize_environment <- function(){
+    
+    
+    list(
+        
+        inventory=initial_inventory(),
+        
+        pipeline=initialize_pipeline(),
+        
+        time=1,
+        
+        total_reward=0
+        
+    )
+    
+}
+
+
+
+
+###############################################################
+# 15. Environment Step
+###############################################################
+
+
+environment_step <- function(
+        
+        env,
+        
+        action_vector,
+        
+        copula_model=best_copula
+        
+){
+    
+    
+    shipment <- round(
+        
+        env$inventory *
+            
+            action_vector
+        
+    )
+    
+    
+    
+    demand <- generate_demand(
+        
+        copula_model
+        
+    )
+    
+    
+    
+    transition <- inventory_step(
+        
+        env$inventory,
+        
+        env$pipeline,
+        
+        shipment,
+        
+        demand
+        
+    )
+    
+    
+    
+    reward_output <- compute_reward(
+        
+        demand,
+        
+        env$inventory,
+        
+        shipment
+        
+    )
+    
+    
+    
+    next_env <- list(
+        
+        inventory=transition$inventory,
+        
+        pipeline=transition$pipeline,
+        
+        time=env$time+1,
+        
+        total_reward=
+            
+            env$total_reward +
+            
+            sum(
+                reward_output$reward
+            )
+        
+    )
+    
+    
+    
+    list(
+        
+        state=create_state(
+            
+            next_env$inventory
+            
+        ),
+        
+        reward=sum(
+            
+            reward_output$reward
+            
+        ),
+        
+        environment=next_env,
+        
+        demand=demand,
+        
+        sales=transition$sales,
+        
+        lost_sales=transition$lost_sales
+        
+    )
+    
+}
+
+
+
+
+
+###############################################################
+# 16. Environment Test
+###############################################################
+
+
+cat("\nTesting Inventory Environment\n")
+
+
+
+test_env <- initialize_environment()
+
+
+
+test_result <- environment_step(
+    
+    test_env,
+    
+    rep(
+        actions[3],
+        N_STORES
+    )
+    
+)
+
+
+
+print(test_result$reward)
+
+print(test_result$demand)
+
+print(test_result$sales)
+
+
+
+
+###############################################################
+# END FILE 03
+###############################################################
+
+###############################################################
+# FILE 04
+# Reinforcement Learning Agents
+#
+# Q-Learning / SAR-Q / LASAR-Q / Double SAR-Q
+#
+# Copula Spatial SAR-Q Inventory Optimization
+###############################################################
+
+
+###############################################################
+# 1. Libraries
+###############################################################
+
+library(dplyr)
+
+
+
+###############################################################
+# 2. Action Space
+###############################################################
+
+actions <- c(
+    
+    0,
+    0.25,
+    0.50,
+    0.75,
+    1.00,
+    1.50,
+    2.00
+    
+)
+
+
+N_ACTIONS <- length(actions)
+
+
+
+
+###############################################################
+# 3. State Scaling
+###############################################################
+
+scale_state <- function(state){
+    
+    
+    state <- as.numeric(state)
+    
+    
+    state[is.na(state)] <- 0
+    
+    
+    
+    if(length(state) != N_FEATURES){
+        
+        
+        stop(
+            paste(
+                "State length mismatch:",
+                length(state),
+                "Expected:",
+                N_FEATURES
+            )
+        )
+        
+    }
+    
+    
+    
+    sd_value <- sd(state)
+    
+    
+    if(
+        is.na(sd_value) ||
+        sd_value==0
+    ){
+        
+        return(
+            rep(
+                0,
+                length(state)
+            )
+        )
+        
+    }
+    
+    
+    (state-mean(state)) /
+        
+        (sd_value+1e-8)
+    
+}
+
+
+
+
+###############################################################
+# 4. Agent Initialization
+###############################################################
+
+initialize_agent <- function(
+        
+        algorithm="LASARQ"
+        
+){
+    
+    
+    list(
+        
+        Algorithm=algorithm,
+        
+        
+        weights=
+            
+            matrix(
+                
+                0,
+                
+                nrow=N_FEATURES,
+                
+                ncol=N_ACTIONS
+                
+            )
+        
+    )
+    
+}
+
+
+
+
+###############################################################
+# 5. Q Value Calculation
+###############################################################
+
+calculate_q_values <- function(
+        
+        agent,
+        
+        state
+        
+){
+    
+    
+    state <- as.numeric(state)
+    
+    
+    as.numeric(
+        
+        t(state) %*%
+            
+            agent$weights
+        
+    )
+    
+}
+
+
+
+
+###############################################################
+# 6. Action Selection
+###############################################################
+
+select_action <- function(
+        
+        agent,
+        
+        state,
+        
+        epsilon=0.1
+        
+){
+    
+    
+    q_values <- calculate_q_values(
+        
+        agent,
+        
+        state
+        
+    )
+    
+    
+    
+    if(runif(1)<epsilon){
+        
+        
+        sample(
+            
+            seq_len(N_ACTIONS),
+            
+            1
+            
+        )
+        
+        
+    }else{
+        
+        
+        which.max(q_values)
+        
+        
+    }
+    
+}
+
+
+
+
+
+###############################################################
+# 7. Q-Learning Update
+###############################################################
+
+update_qlearning <- function(
+        
+        agent,
+        
+        state,
+        
+        action,
+        
+        reward,
+        
+        next_state,
+        
+        alpha,
+        
+        gamma
+        
+){
+    
+    
+    q_current <-
+        
+        sum(
+            
+            state *
+                
+                agent$weights[,action]
+            
+        )
+    
+    
+    
+    q_next <- max(
+        
+        calculate_q_values(
+            
+            agent,
+            
+            next_state
+            
+        )
+        
+    )
+    
+    
+    
+    td_error <-
+        
+        reward +
+        
+        gamma*q_next -
+        
+        q_current
+    
+    
+    
+    agent$weights[,action] <-
+        
+        agent$weights[,action] +
+        
+        alpha *
+        
+        td_error *
+        
+        state
+    
+    
+    agent
+    
+}
+
+
+
+
+
+###############################################################
+# 8. SAR-Q Update
+###############################################################
+
+update_sarq <- function(
+        
+        agent,
+        
+        state,
+        
+        action,
+        
+        reward,
+        
+        next_state,
+        
+        alpha,
+        
+        gamma
+        
+){
+    
+    
+    next_q <- calculate_q_values(
+        
+        agent,
+        
+        next_state
+        
+    )
+    
+    
+    
+    next_action <- which.max(
+        
+        next_q
+        
+    )
+    
+    
+    
+    td_error <-
+        
+        reward +
+        
+        gamma *
+        
+        next_q[next_action] -
+        
+        sum(
+            
+            state *
+                
+                agent$weights[,action]
+            
+        )
+    
+    
+    
+    agent$weights[,action] <-
+        
+        agent$weights[,action] +
+        
+        alpha *
+        
+        td_error *
+        
+        state
+    
+    
+    
+    agent
+    
+}
+
+
+
+
+
+###############################################################
+# 9. LASAR-Q Update
+###############################################################
+
+update_lasarq <- function(
+        
+        agent,
+        
+        state,
+        
+        action,
+        
+        reward,
+        
+        next_state,
+        
+        alpha,
+        
+        gamma
+        
+){
+    
+    
+    q_current <-
+        
+        sum(
+            
+            state *
+                
+                agent$weights[,action]
+            
+        )
+    
+    
+    
+    next_q <- calculate_q_values(
+        
+        agent,
+        
+        next_state
+        
+    )
+    
+    
+    
+    next_action <- which.max(
+        
+        next_q
+        
+    )
+    
+    
+    
+    td_error <-
+        
+        reward +
+        
+        gamma *
+        
+        next_q[next_action] -
+        
+        q_current
+    
+    
+    
+    agent$weights[,action] <-
+        
+        agent$weights[,action] +
+        
+        alpha *
+        
+        td_error *
+        
+        state
+    
+    
+    
+    agent
+    
+}
+
+
+
+
+
+###############################################################
+# 10. Double SAR-Q Update
+###############################################################
+
+update_double_sarq <- function(
+        
+        agent,
+        
+        state,
+        
+        action,
+        
+        reward,
+        
+        next_state,
+        
+        alpha,
+        
+        gamma
+        
+){
+    
+    
+    if(is.null(agent$weights2)){
+        
+        
+        agent$weights2 <- agent$weights
+        
+    }
+    
+    
+    
+    if(runif(1)<0.5){
+        
+        
+        next_action <- which.max(
+            
+            calculate_q_values(
+                
+                agent,
+                
+                next_state
+                
+            )
+            
+        )
+        
+        
+        
+        target <-
+            
+            reward +
+            
+            gamma *
+            
+            sum(
+                
+                next_state *
+                    
+                    agent$weights2[,next_action]
+                
+            )
+        
+        
+        current <-
+            
+            sum(
+                
+                state *
+                    
+                    agent$weights[,action]
+                
+            )
+        
+        
+        td_error <- target-current
+        
+        
+        
+        agent$weights[,action] <-
+            
+            agent$weights[,action] +
+            
+            alpha *
+            
+            td_error *
+            
+            state
+        
+        
+    }else{
+        
+        
+        next_action <- which.max(
+            
+            calculate_q_values(
+                
+                list(
+                    
+                    weights=agent$weights2
+                    
+                ),
+                
+                next_state
+                
+            )
+            
+        )
+        
+        
+        target <-
+            
+            reward +
+            
+            gamma *
+            
+            sum(
+                
+                next_state *
+                    
+                    agent$weights[,next_action]
+                
+            )
+        
+        
+        current <-
+            
+            sum(
+                
+                state *
+                    
+                    agent$weights2[,action]
+                
+            )
+        
+        
+        td_error <- target-current
+        
+        
+        
+        agent$weights2[,action] <-
+            
+            agent$weights2[,action] +
+            
+            alpha *
+            
+            td_error *
+            
+            state
+        
+    }
+    
+    
+    
+    agent
+    
+}
+
+
+
+
+###############################################################
+# 11. Update Dispatcher
+###############################################################
+
+update_agent <- function(
+        
+        agent,
+        
+        algorithm,
+        
+        state,
+        
+        action,
+        
+        reward,
+        
+        next_state,
+        
+        alpha=0.01,
+        
+        gamma=0.95
+        
+){
+    
+    
+    switch(
+        
+        algorithm,
+        
+        
+        QLearning =
+            update_qlearning(
+                agent,
+                state,
+                action,
+                reward,
+                next_state,
+                alpha,
+                gamma
+            ),
+        
+        
+        SARQ =
+            update_sarq(
+                agent,
+                state,
+                action,
+                reward,
+                next_state,
+                alpha,
+                gamma
+            ),
+        
+        
+        LASARQ =
+            update_lasarq(
+                agent,
+                state,
+                action,
+                reward,
+                next_state,
+                alpha,
+                gamma
+            ),
+        
+        
+        DoubleSARQ =
+            update_double_sarq(
+                agent,
+                state,
+                action,
+                reward,
+                next_state,
+                alpha,
+                gamma
+            )
+        
+    )
+    
+}
+
+
+
+
+###############################################################
+# 12. Training Engine
+###############################################################
+
+train_linear_agent <- function(
+        
+        algorithm="LASARQ",
+        
+        episodes=300,
+        
+        alpha=0.01,
+        
+        gamma=0.95,
+        
+        epsilon=0.3
+        
+){
+    
+    
+    agent <- initialize_agent(
+        
+        algorithm
+        
+    )
+    
+    
+    
+    reward_history <- numeric(
+        
+        episodes
+        
+    )
+    
+    
+    
+    for(ep in seq_len(episodes)){
+        
+        
+        env <- initialize_environment()
+        
+        
+        total_reward <- 0
+        
+        
+        
+        for(step in 1:50){
+            
+            
+            state <- scale_state(
+                
+                create_state(
+                    
+                    env$inventory
+                    
+                )
+                
+            )
+            
+            
+            
+            action <- select_action(
+                
+                agent,
+                
+                state,
+                
+                epsilon
+                
+            )
+            
+            
+            
+            result <- environment_step(
+                
+                env,
+                
+                rep(
+                    
+                    actions[action],
+                    
+                    N_STORES
+                    
+                )
+                
+            )
+            
+            
+            
+            next_state <- scale_state(
+                
+                result$state
+                
+            )
+            
+            
+            
+            agent <- update_agent(
+                
+                agent,
+                
+                algorithm,
+                
+                state,
+                
+                action,
+                
+                result$reward,
+                
+                next_state,
+                
+                alpha,
+                gamma
+                
+            )
+            
+            
+            
+            env <- result$environment
+            
+            
+            total_reward <- total_reward +
+                
+                result$reward
+            
+            
+        }
+        
+        
+        
+        reward_history[ep] <- total_reward
+        
+        
+        epsilon <- max(
+            
+            0.01,
+            
+            epsilon*0.995
+            
+        )
+        
+    }
+    
+    
+    
+    list(
+        
+        agent=agent,
+        
+        RewardHistory=reward_history,
+        
+        MeanReward=mean(reward_history)
+        
+    )
+    
+}
+
+
+
+
+###############################################################
+# END FILE 04
+###############################################################
+
+###############################################################
+# FILE 05
+# RL Benchmark Experiments
+#
+# Q-Learning / SAR-Q / LASAR-Q / Double SAR-Q
+#
+# Copula Spatial SAR-Q Inventory Optimization
+###############################################################
+
+
+###############################################################
+# 1. RL Models
+###############################################################
+
+RL_algorithms <- c(
+    
+    "QLearning",
+    "SARQ",
+    "LASARQ",
+    "DoubleSARQ"
+    
+)
+
+
+
+###############################################################
+# 2. Benchmark Settings
+###############################################################
+
+N_EPISODES <- 300
+
+
+N_REPLICATIONS <- 30
+
+
+
+###############################################################
+# 3. Benchmark Storage
+###############################################################
+
+benchmark_results <- data.frame()
+
+
+
+###############################################################
+# 4. Run Benchmark
+###############################################################
+
+set.seed(123)
+
+
+
+for(rep_id in 1:N_REPLICATIONS){
+    
+    
+    cat(
+        "Replication:",
+        rep_id,
+        "\n"
+    )
+    
+    
+    
+    for(rl_method in RL_algorithms){
+        
+        
+        cat(
+            "  Algorithm:",
+            rl_method,
+            "\n"
+        )
+        
+        
+        
+        result <- train_linear_agent(
+            
+            algorithm = rl_method,
+            
+            episodes = N_EPISODES,
+            
+            alpha = 0.01,
+            
+            gamma = 0.95,
+            
+            epsilon = 0.30
+            
+        )
+        
+        
+        
+        
+        benchmark_results <-
+            
+            rbind(
+                
+                benchmark_results,
+                
+                data.frame(
+                    
+                    Replication = rep_id,
+                    
+                    Model = "Spatial_SARQ",
+                    
+                    Copula = "Gaussian",
+                    
+                    RL = rl_method,
+                    
+                    MeanReward =
+                        result$MeanReward,
+                    
+                    SDReward =
+                        sd(result$RewardHistory)
+                    
+                )
+                
+            )
+        
+        
+    }
+    
+    
+}
+
+
+
+###############################################################
+# 5. Check Output
+###############################################################
+
+cat("\n")
+cat("============================\n")
+cat("Benchmark Completed\n")
+cat("============================\n")
+
+
+print(
+    head(benchmark_results)
+)
+
+
+print(
+    dim(benchmark_results)
+)
+
+###############################################################
+# File 06
+# Final Evaluation and Performance Analysis
+#
+# Copula Spatial SAR-Q Inventory System
+#
+# Evaluation:
+# - Mean Reward
+# - Reward Variability
+# - Confidence Interval
+# - Model Ranking
+# - Visualization
+###############################################################
+
+
+###############################################################
+# 1. Libraries
+###############################################################
+
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+
+
+
+###############################################################
+# 2. Confidence Interval Function
+###############################################################
+
+mean_ci <- function(x){
+
+    n <- length(x)
+
+    m <- mean(x)
+
+    se <- sd(x)/sqrt(n)
+
+    lower <- 
+        m - qt(0.975,n-1)*se
+
+
+    upper <-
+        m + qt(0.975,n-1)*se
+
+
+    data.frame(
+
+        Mean=m,
+
+        Lower=lower,
+
+        Upper=upper
+
+    )
+
+}
+
+
+
+###############################################################
+# 3. Final Benchmark Summary
+###############################################################
+
+
+cat("\n")
+cat("=====================================\n")
+cat("Final Benchmark Evaluation\n")
+cat("=====================================\n")
+
+
+
+final_summary <-
+
+benchmark_results %>%
+
+group_by(
+
+    Model,
+
+    Copula,
+
+    RL
+
+)%>%
+
+summarise(
+
+
+    Episodes=n(),
+
+
+    MeanReward=
+
+        mean(MeanReward),
+
+
+    SDReward=
+
+        sd(MeanReward),
+
+
+    .groups="drop"
+
+
+)%>%
+
+arrange(
+
+    desc(MeanReward)
+
+)
+
+
+
+print(final_summary)
+
+
+
+write.csv(
+
+    final_summary,
+
+    "Final_Model_Ranking.csv",
+
+    row.names=FALSE
+
+)
+
+
+
+###############################################################
+# 4. Confidence Intervals
+###############################################################
+
+
+ci_results <-
+
+
+benchmark_results %>%
+
+
+group_by(Model)%>%
+
+
+summarise(
+
+    CI=
+
+        list(
+
+            mean_ci(MeanReward)
+
+        ),
+
+    .groups="drop"
+
+)
+
+
+
+ci_table <-
+
+
+do.call(
+
+    rbind,
+
+    lapply(
+
+        seq_len(nrow(ci_results)),
+
+        function(i){
+
+            cbind(
+
+                Model=ci_results$Model[i],
+
+                ci_results$CI[[i]]
+
+            )
+
+        }
+
+    )
+
+)
+
+
+
+print(ci_table)
+
+
+
+write.csv(
+
+    ci_table,
+
+    "Reward_Confidence_Intervals.csv",
+
+    row.names=FALSE
+
+)
+
+
+
+###############################################################
+# 5. Reward Distribution Plot
+###############################################################
+
+
+p1 <-
+
+
+ggplot(
+
+benchmark_results,
+
+aes(
+
+    x=Model,
+
+    y=MeanReward
+
+)
+
+)+
+
+
+geom_boxplot()+
+
+
+theme_bw()+
+
+
+theme(
+
+    axis.text.x=
+
+        element_text(
+
+            angle=45,
+
+            hjust=1
+
+        )
+
+)+
+
+
+labs(
+
+    title="Reward Distribution Across Models",
+
+    x="Model",
+
+    y="Reward"
+
+)
+
+
+
+ggsave(
+
+    "Reward_Boxplot.png",
+
+    p1,
+
+    width=12,
+
+    height=6
+
+)
+
+
+
+###############################################################
+# 6. Learning Curve Evaluation
+###############################################################
+
+
+cat("\nTraining Best Agent\n")
+
+
+
+best_model <-
+
+final_summary$Model[1]
+
+
+
+best_copula <-
+
+strsplit(
+
+    best_model,
+
+    "_"
+
+)[[1]][1]
+
+
+
+best_algorithm <-
+
+strsplit(
+
+    best_model,
+
+    "_"
+
+)[[1]][2]
+
+
+
+cat(
+
+    "Best Copula:",
+
+    best_copula,
+
+    "\n"
+
+)
+
+
+cat(
+
+    "Best RL:",
+
+    best_algorithm,
+
+    "\n"
+
+)
+
+
+
+###############################################################
+# Train Best Model Again
+###############################################################
+
+
+best_training <-
+
+
+train_linear_agent(
+
+    algorithm=best_algorithm,
+
+    episodes=1000
+
+)
+
+
+
+learning_curve <-
+
+
+data.frame(
+
+    Episode=
+
+        seq_along(
+
+            best_training$RewardHistory
+
+        ),
+
+
+    Reward=
+
+        best_training$RewardHistory
+
+)
+
+
+
+write.csv(
+
+    learning_curve,
+
+    "LearningCurve.csv",
+
+    row.names=FALSE
+
+)
+
+
+
+###############################################################
+# Learning Curve Plot
+###############################################################
+
+
+p2 <-
+
+
+ggplot(
+
+learning_curve,
+
+aes(
+
+    Episode,
+
+    Reward
+
+)
+
+)+
+
+
+geom_line()+
+
+
+theme_bw()+
+
+
+labs(
+
+    title=paste(
+
+        "Learning Curve:",
+
+        best_model
+
+    ),
+
+    x="Episode",
+
+    y="Reward"
+
+)
+
+
+
+ggsave(
+
+    "LearningCurve.png",
+
+    p2,
+
+    width=8,
+
+    height=5
+
+)
+
+
+
+###############################################################
+# 7. Evaluation of Best Agent
+###############################################################
+
+
+best_agent_result <-
+
+
+evaluate_agent(
+
+    best_training$agent,
+
+    episodes=200
+
+)
+
+
+
+cat("\n")
+cat("============================\n")
+cat("Best Agent Evaluation\n")
+cat("============================\n")
+
+
+print(best_agent_result)
+
+
+
+write.csv(
+
+    data.frame(
+
+        Model=best_model,
+
+        MeanReward=
+
+            best_agent_result$MeanReward,
+
+        SDReward=
+
+            best_agent_result$SDReward
+
+    ),
+
+    "BestAgentEvaluation.csv",
+
+    row.names=FALSE
+
+)
+
+
+
+###############################################################
+# 8. Copula Comparison
+###############################################################
+
+
+copula_summary <-
+
+
+benchmark_results %>%
+
+
+group_by(Copula)%>%
+
+
+summarise(
+
+    MeanReward=
+
+        mean(MeanReward),
+
+    SD=
+
+        sd(MeanReward),
+
+    .groups="drop"
+
+)%>%
+
+
+arrange(
+
+    desc(MeanReward)
+
+)
+
+
+
+print(copula_summary)
+
+
+
+write.csv(
+
+    copula_summary,
+
+    "Copula_Performance.csv",
+
+    row.names=FALSE
+
+)
+
+
+
+###############################################################
+# 9. RL Algorithm Comparison
+###############################################################
+
+
+rl_summary <-
+
+
+benchmark_results %>%
+
+
+group_by(RL)%>%
+
+
+summarise(
+
+    MeanReward=
+
+        mean(MeanReward),
+
+    SD=
+
+        sd(MeanReward),
+
+    .groups="drop"
+
+)%>%
+
+
+arrange(
+
+    desc(MeanReward)
+
+)
+
+
+
+print(rl_summary)
+
+
+
+write.csv(
+
+    rl_summary,
+
+    "RL_Performance.csv",
+
+    row.names=FALSE
+
+)
+
+
+
+###############################################################
+# 10. Final Report
+###############################################################
+
+
+sink(
+
+    "Final_Report.txt"
+
+)
+
+
+cat(
+"Copula Spatial SAR-Q Inventory System\n"
+)
+
+
+cat(
+"====================================\n\n"
+)
+
+
+cat(
+"Best Model:\n"
+)
+
+
+print(
+
+    final_summary[1,]
+
+)
+
+
+cat("\nBest Agent Evaluation:\n")
+
+
+print(best_agent_result)
+
+
+
+sink()
+
+
+
+###############################################################
+# END FILE 06
+###############################################################
+
+###############################################################
+# File 07
+# Statistical Testing and Publication Tables
+#
+# Copula Spatial SAR-Q Inventory System
+#
+# Tests:
+# - Friedman Test
+# - Average Rank
+# - Manual Nemenyi Critical Difference
+# - Cliff's Delta
+# - LaTeX Tables
+###############################################################
+
+
+###############################################################
+# 1. Libraries
+###############################################################
+
+library(dplyr)
+library(effsize)
+
+
+
+###############################################################
+# 2. Friedman Test
+###############################################################
+
+cat("\n")
+cat("====================================\n")
+cat("Friedman Test\n")
+cat("====================================\n")
+
+
+
+friedman_data <-
+
+
+benchmark_results %>%
+
+
+select(
+
+    Seed,
+
+    Model,
+
+    MeanReward
+
+)%>%
+
+
+pivot_wider(
+
+    names_from=Model,
+
+    values_from=MeanReward
+
+)
+
+
+
+friedman_matrix <-
+
+
+as.matrix(
+
+    friedman_data[,-1]
+
+)
+
+
+
+friedman_test <-
+
+
+friedman.test(
+
+    friedman_matrix
+
+)
+
+
+
+print(friedman_test)
+
+
+
+capture.output(
+
+    friedman_test,
+
+    file="Friedman_Test_Result.txt"
+
+)
+
+
+
+###############################################################
+# 3. Average Ranking
+###############################################################
+
+
+rank_matrix <-
+
+
+apply(
+
+    friedman_matrix,
+
+    1,
+
+    function(x)
+
+        rank(
+
+            -x,
+
+            ties.method="average"
+
+        )
+
+)
+
+
+
+average_rank <-
+
+
+data.frame(
+
+    Model=
+
+        colnames(rank_matrix),
+
+    MeanRank=
+
+        rowMeans(
+
+            t(rank_matrix)
+
+        )
+
+)
+
+
+
+average_rank <-
+
+
+average_rank %>%
+
+
+arrange(
+
+    MeanRank
+
+)
+
+
+
+print(average_rank)
+
+
+
+write.csv(
+
+    average_rank,
+
+    "Average_Model_Rank.csv",
+
+    row.names=FALSE
+
+)
+
+
+
+###############################################################
+# 4. Nemenyi Critical Difference
+###############################################################
+
+k <-
+
+ncol(friedman_matrix)
+
+
+
+N <-
+
+nrow(friedman_matrix)
+
+
+
+CD <-
+
+
+qnorm(0.975)*
+
+
+sqrt(
+
+    k*(k+1)/(6*N)
+
+)
+
+
+
+cat(
+
+    "\nCritical Difference =",
+
+    CD,
+
+    "\n"
+
+)
+
+
+
+write.csv(
+
+    data.frame(
+
+        Models=k,
+
+        Experiments=N,
+
+        CriticalDifference=CD
+
+    ),
+
+    "Critical_Difference.csv",
+
+    row.names=FALSE
+
+)
+
+
+
+###############################################################
+# 5. Pairwise Effect Size
+###############################################################
+
+
+ranked_models <-
+
+
+average_rank$Model
+
+
+
+best_model <-
+
+
+ranked_models[1]
+
+
+
+second_model <-
+
+
+ranked_models[2]
+
+
+
+cat(
+
+    "\nComparing:",
+
+    best_model,
+
+    "vs",
+
+    second_model,
+
+    "\n"
+
+)
+
+
+
+x <-
+
+
+benchmark_results %>%
+
+
+filter(
+
+    Model==best_model
+
+)%>%
+
+
+pull(
+
+    MeanReward
+
+)
+
+
+
+y <-
+
+
+benchmark_results %>%
+
+
+filter(
+
+    Model==second_model
+
+)%>%
+
+
+pull(
+
+    MeanReward
+
+)
+
+
+
+cliff_result <-
+
+
+cliff.delta(
+
+    x,
+
+    y
+
+)
+
+
+
+print(cliff_result)
+
+
+
+capture.output(
+
+    cliff_result,
+
+    file="Cliff_Delta_Result.txt"
+
+)
+
+
+
+###############################################################
+# 6. Pairwise All Model Comparison
+###############################################################
+
+
+pairwise_results <- data.frame()
+
+
+
+models <-
+
+
+unique(
+
+    benchmark_results$Model
+
+)
+
+
+
+for(i in 1:(length(models)-1)){
+
+
+    for(j in (i+1):length(models)){
+
+
+        x <-
+
+
+        benchmark_results %>%
+
+        filter(
+
+            Model==models[i]
+
+        )%>%
+
+        pull(
+
+            MeanReward
+
+        )
+
+
+
+        y <-
+
+
+        benchmark_results %>%
+
+        filter(
+
+            Model==models[j]
+
+        )%>%
+
+        pull(
+
+            MeanReward
+
+        )
+
+
+
+        cd <-
+
+
+        cliff.delta(
+
+            x,
+
+            y
+
+        )
+
+
+
+        pairwise_results <-
+
+
+        rbind(
+
+            pairwise_results,
+
+
+            data.frame(
+
+                Model1=models[i],
+
+                Model2=models[j],
+
+                Estimate=cd$estimate,
+
+                Magnitude=cd$magnitude
+
+            )
+
+        )
+
+
+    }
+
+}
+
+
+
+print(pairwise_results)
+
+
+
+write.csv(
+
+    pairwise_results,
+
+    "Pairwise_Effect_Size.csv",
+
+    row.names=FALSE
+
+)
+
+
+
+###############################################################
+# 7. Publication Table
+###############################################################
+
+
+publication_table <-
+
+
+benchmark_results %>%
+
+
+group_by(
+
+    Model
+
+)%>%
+
+
+summarise(
+
+
+    MeanReward=
+
+        round(
+
+            mean(MeanReward),
+
+            2
+
+        ),
+
+
+    SD=
+
+        round(
+
+            sd(MeanReward),
+
+            2
+
+        ),
+
+
+    .groups="drop"
+
+
+)%>%
+
+
+arrange(
+
+    desc(MeanReward)
+
+)
+
+
+
+print(publication_table)
+
+
+
+write.csv(
+
+    publication_table,
+
+    "Publication_Table.csv",
+
+    row.names=FALSE
+
+)
+
+
+
+###############################################################
+# 8. LaTeX Table
+###############################################################
+
+
+latex_lines <- c(
+
+"\\begin{table}[ht]",
+
+"\\centering",
+
+"\\caption{Performance comparison of copula-based reinforcement learning inventory models}",
+
+"\\begin{tabular}{lrr}",
+
+"\\hline",
+
+"Model & Mean Reward & SD \\\\",
+
+"\\hline"
+
+)
+
+
+
+for(i in seq_len(nrow(publication_table))){
+
+
+latex_lines <- c(
+
+latex_lines,
+
+
+paste0(
+
+publication_table$Model[i],
+
+" & ",
+
+publication_table$MeanReward[i],
+
+" & ",
+
+publication_table$SD[i],
+
+" \\\\"
+
+)
+
+
+)
+
+
+}
+
+
+
+latex_lines <- c(
+
+latex_lines,
+
+"\\hline",
+
+"\\end{tabular}",
+
+"\\end{table}"
+
+)
+
+
+
+writeLines(
+
+    latex_lines,
+
+    "Performance_Table_LaTeX.tex"
+
+)
+
+
+
+###############################################################
+# 9. Final Statistical Summary
+###############################################################
+
+
+sink(
+
+"Statistical_Summary.txt"
+
+)
+
+
+cat(
+
+"Copula Spatial SAR-Q Inventory System\n"
+
+)
+
+
+cat(
+
+"====================================\n\n"
+
+)
+
+
+
+cat(
+
+"Friedman Test\n"
+
+)
+
+
+print(friedman_test)
+
+
+
+cat(
+
+"\nAverage Rank\n"
+
+)
+
+
+print(average_rank)
+
+
+
+cat(
+
+"\nBest Model\n"
+
+)
+
+
+print(
+
+    average_rank[1,]
+
+)
+
+
+
+sink()
+
+
+
+###############################################################
+# END FILE 07
+###############################################################
+
+###############################################################
+# File 08
+# Inventory Performance Metrics
+#
+# Copula Spatial SAR-Q Inventory System
+#
+# Metrics:
+# - Fill Rate
+# - Service Level
+# - Stockout Rate
+# - Inventory Turnover
+# - Bullwhip Effect
+# - Operational Dashboard
+###############################################################
+
+
+###############################################################
+# 1. Libraries
+###############################################################
+
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+
+
+
+###############################################################
+# 2. Inventory Simulation Function
+###############################################################
+
+simulate_inventory_policy <- function(
+
+    agent,
+
+    days=365
+
+){
+
+
+    env <-
+
+        initialize_environment()
+
+
+
+    history <- list()
+
+
+
+    for(t in seq_len(days)){
+
+
+        state <-
+
+            scale_state(
+
+                create_state(
+
+                    env$inventory
+
+                )
+
+            )
+
+
+
+        action <-
+
+            select_action(
+
+                agent,
+
+                state,
+
+                epsilon=0
+
+            )
+
+
+
+        result <-
+
+            environment_step(
+
+                env,
+
+                rep(
+
+                    actions[action],
+
+                    N_STORES
+
+                )
+
+            )
+
+
+
+        history[[t]] <-
+
+            data.frame(
+
+
+                Day=t,
+
+
+                Store=
+
+                    selected_stores,
+
+
+                Inventory=
+
+                    env$inventory,
+
+
+                Demand=
+
+                    result$demand,
+
+
+                Sales=
+
+                    result$sales,
+
+
+                LostSales=
+
+                    result$lost_sales,
+
+
+                Reward=
+
+                    result$reward
+
+            )
+
+
+
+        env <-
+
+            result$environment
+
+    }
+
+
+
+    bind_rows(history)
+
+}
+
+
+
+###############################################################
+# 3. Run Best Policy Simulation
+###############################################################
+
+
+cat("\n")
+cat("Running Operational Simulation\n")
+cat("==============================\n")
+
+
+
+best_policy_history <-
+
+
+simulate_inventory_policy(
+
+    best_training$agent,
+
+    days=365
+
+)
+
+
+
+write.csv(
+
+    best_policy_history,
+
+    "BestPolicy_Daily_History.csv",
+
+    row.names=FALSE
+
+)
+
+
+
+###############################################################
+# 4. Fill Rate
+###############################################################
+
+
+fill_rate <-
+
+
+best_policy_history %>%
+
+
+summarise(
+
+    FillRate=
+
+        sum(Sales) /
+
+        sum(Demand)
+
+)
+
+
+
+###############################################################
+# 5. Service Level
+###############################################################
+
+
+service_level <-
+
+
+best_policy_history %>%
+
+
+summarise(
+
+    ServiceLevel=
+
+        mean(
+
+            LostSales==0
+
+        )
+
+)
+
+
+
+###############################################################
+# 6. Stockout Rate
+###############################################################
+
+
+stockout_rate <-
+
+
+best_policy_history %>%
+
+
+summarise(
+
+    StockoutRate=
+
+        mean(
+
+            LostSales>0
+
+        )
+
+)
+
+
+
+###############################################################
+# 7. Average Inventory
+###############################################################
+
+
+average_inventory <-
+
+
+best_policy_history %>%
+
+
+summarise(
+
+    AverageInventory=
+
+        mean(Inventory)
+
+)
+
+
+
+###############################################################
+# 8. Inventory Turnover
+###############################################################
+
+
+inventory_turnover <-
+
+
+best_policy_history %>%
+
+
+summarise(
+
+    Turnover=
+
+        sum(Sales) /
+
+        mean(Inventory)
+
+)
+
+
+
+###############################################################
+# 9. Bullwhip Effect
+###############################################################
+
+#
+# Bullwhip =
+# Variance(Order)/Variance(Demand)
+#
+
+
+order_variance <-
+
+
+best_policy_history %>%
+
+
+group_by(Store)%>%
+
+
+summarise(
+
+    OrderVariance=
+
+        var(
+
+            diff(Inventory)
+
+        ),
+
+    .groups="drop"
+
+)
+
+
+
+demand_variance <-
+
+
+best_policy_history %>%
+
+
+group_by(Store)%>%
+
+
+summarise(
+
+    DemandVariance=
+
+        var(Demand),
+
+    .groups="drop"
+
+)
+
+
+
+bullwhip <-
+
+
+left_join(
+
+    order_variance,
+
+    demand_variance,
+
+    by="Store"
+
+)%>%
+
+
+mutate(
+
+    BullwhipEffect=
+
+        OrderVariance /
+
+        DemandVariance
+
+)
+
+
+
+print(bullwhip)
+
+
+
+write.csv(
+
+    bullwhip,
+
+    "Bullwhip_Effect.csv",
+
+    row.names=FALSE
+
+)
+
+
+
+###############################################################
+# 10. Final KPI Dashboard
+###############################################################
+
+
+inventory_KPI <- data.frame(
+
+    Metric=c(
+
+        "Fill Rate",
+
+        "Service Level",
+
+        "Stockout Rate",
+
+        "Average Inventory",
+
+        "Inventory Turnover"
+
+    ),
+
+
+    Value=c(
+
+        fill_rate$FillRate,
+
+        service_level$ServiceLevel,
+
+        stockout_rate$StockoutRate,
+
+        average_inventory$AverageInventory,
+
+        inventory_turnover$Turnover
+
+    )
+
+)
+
+
+
+print(inventory_KPI)
+
+
+
+write.csv(
+
+    inventory_KPI,
+
+    "Inventory_KPI.csv",
+
+    row.names=FALSE
+
+)
+
+
+
+###############################################################
+# 11. Demand vs Sales Plot
+###############################################################
+
+
+daily_summary <-
+
+
+best_policy_history %>%
+
+
+group_by(Day)%>%
+
+
+summarise(
+
+    Demand=sum(Demand),
+
+    Sales=sum(Sales),
+
+    Inventory=sum(Inventory),
+
+    .groups="drop"
+
+)
+
+
+
+plot_data <-
+
+
+daily_summary %>%
+
+
+pivot_longer(
+
+    cols=c(
+
+        Demand,
+
+        Sales,
+
+        Inventory
+
+    ),
+
+    names_to="Metric",
+
+    values_to="Value"
+
+)
+
+
+
+p1 <-
+
+
+ggplot(
+
+plot_data,
+
+aes(
+
+    Day,
+
+    Value,
+
+    color=Metric
+
+)
+
+)+
+
+
+geom_line()+
+
+
+theme_bw()+
+
+
+labs(
+
+    title="Demand, Sales and Inventory Dynamics",
+
+    x="Day",
+
+    y="Units"
+
+)
+
+
+
+ggsave(
+
+    "Demand_Sales_Inventory.png",
+
+    p1,
+
+    width=10,
+
+    height=5
+
+)
+
+
+
+###############################################################
+# 12. Store-Level Performance
+###############################################################
+
+
+store_performance <-
+
+
+best_policy_history %>%
+
+
+group_by(Store)%>%
+
+
+summarise(
+
+
+FillRate=
+
+    sum(Sales)/sum(Demand),
+
+
+StockoutRate=
+
+    mean(LostSales>0),
+
+
+AverageInventory=
+
+    mean(Inventory),
+
+
+Reward=
+
+    mean(Reward),
+
+
+.groups="drop"
+
+
+)
+
+
+
+print(store_performance)
+
+
+
+write.csv(
+
+    store_performance,
+
+    "Store_Level_Performance.csv",
+
+    row.names=FALSE
+
+)
+
+
+
+###############################################################
+# 13. Save Final Dashboard
+###############################################################
+
+
+sink(
+
+"Operational_Performance_Report.txt"
+
+)
+
+
+
+cat(
+
+"Copula Spatial SAR-Q Inventory System\n"
+
+)
+
+
+cat(
+
+"===================================\n\n"
+
+)
+
+
+
+cat(
+
+"Inventory KPI\n"
+
+)
+
+
+print(inventory_KPI)
+
+
+
+cat(
+
+"\nStore Performance\n"
+
+)
+
+
+print(store_performance)
+
+
+
+sink()
+
+
+
+###############################################################
+# END FILE 08
+###############################################################
+
+###############################################################
+# File 09
+# Ablation Study
+#
+# Copula Spatial SAR-Q Inventory System
+#
+# Components:
+# 1. Q-Learning
+# 2. SAR-Q
+# 3. SAR-Q + Copula
+# 4. SAR-Q + Spatial
+# 5. Full Copula Spatial SAR-Q
+###############################################################
+
+
+###############################################################
+# 1. Libraries
+###############################################################
+
+library(dplyr)
+library(ggplot2)
+
+
+
+###############################################################
+# 2. Ablation Configuration
+###############################################################
+
+
+ablation_models <- data.frame(
+
+    Model=c(
+
+        "QLearning",
+
+        "SARQ",
+
+        "SARQ_NoCopula",
+
+        "SARQ_NoSpatial",
+
+        "Copula_SARQ",
+
+        "Full_Copula_Spatial_SARQ"
+
+    ),
+
+
+    Copula=c(
+
+        FALSE,
+
+        FALSE,
+
+        FALSE,
+
+        TRUE,
+
+        TRUE,
+
+        TRUE
+
+    ),
+
+
+    Spatial=c(
+
+        FALSE,
+
+        TRUE,
+
+        TRUE,
+
+        FALSE,
+
+        TRUE,
+
+        TRUE
+
+    ),
+
+
+    SAR=c(
+
+        FALSE,
+
+        TRUE,
+
+        TRUE,
+
+        TRUE,
+
+        TRUE,
+
+        TRUE
+
+    )
+
+
+)
+
+
+
+print(ablation_models)
+
+
+
+###############################################################
+# 3. Environment Modification
+###############################################################
+
+
+generate_demand_ablation <- function(
+
+    use_copula=TRUE
+
+){
+
+
+    if(use_copula){
+
+
+        return(
+
+            generate_demand()
+
+        )
+
+
+    }else{
+
+
+        independent_demand <-
+
+
+            rnorm(
+
+                N_STORES,
+
+                demand_base,
+
+                demand_sd
+
+            )
+
+
+        return(
+
+            pmax(
+
+                round(independent_demand),
+
+                0
+
+            )
+
+        )
+
+    }
+
+}
+
+
+
+
+###############################################################
+# 4. Spatial State Switch
+###############################################################
+
+
+create_state_ablation <- function(
+
+    inventory,
+
+    use_spatial=TRUE
+
+){
+
+
+    if(use_spatial){
+
+
+        neighbor_inventory <-
+
+
+            as.numeric(
+
+                W %*%
+
+                inventory
+
+            )
+
+
+    }else{
+
+
+        neighbor_inventory <-
+
+            rep(
+
+                0,
+
+                N_STORES
+
+            )
+
+    }
+
+
+
+    state <- data.frame(
+
+
+        Inventory=inventory,
+
+
+        ForecastDemand=demand_base,
+
+
+        DemandSD=demand_sd,
+
+
+        SafetyStock=safety_stock,
+
+
+        ReorderPoint=reorder_point,
+
+
+        NeighborInventory=neighbor_inventory,
+
+
+        CapacityRatio=
+
+            inventory/MAX_CAPACITY
+
+    )
+
+
+
+    as.matrix(state)
+
+}
+
+
+
+
+###############################################################
+# 5. Train Ablation Model
+###############################################################
+
+
+train_ablation_agent <- function(
+
+    model_name,
+
+    episodes=500
+
+){
+
+
+    config <-
+
+
+        ablation_models %>%
+
+
+        filter(
+
+            Model==model_name
+
+        )
+
+
+
+    use_copula <- config$Copula
+
+
+    use_spatial <- config$Spatial
+
+
+
+    agent <-
+
+
+        initialize_agent(
+
+            "SARQ"
+
+        )
+
+
+
+    reward_history <- numeric(episodes)
+
+
+
+    epsilon <- 0.3
+
+
+
+    for(ep in seq_len(episodes)){
+
+
+
+        env <-
+
+
+            initialize_environment()
+
+
+
+        total_reward <- 0
+
+
+
+        for(step in 1:50){
+
+
+
+            state <-
+
+
+                scale_state_ablation <-
+
+
+                scale_state(
+
+
+                    create_state_ablation(
+
+                        env$inventory,
+
+                        use_spatial
+
+                    )[1,]
+
+                )
+
+
+
+            action <-
+
+
+                select_action(
+
+                    agent,
+
+                    state,
+
+                    epsilon
+
+                )
+
+
+
+            if(use_copula){
+
+
+                result <-
+
+
+                    environment_step(
+
+                        env,
+
+                        rep(
+
+                            actions[action],
+
+                            N_STORES
+
+                        )
+
+                    )
+
+
+            }else{
+
+
+                demand <-
+
+
+                    generate_demand_ablation(
+
+                        FALSE
+
+                    )
+
+
+
+                result <-
+
+
+                    environment_step(
+
+                        env,
+
+                        rep(
+
+                            actions[action],
+
+                            N_STORES
+
+                        )
+
+                    )
+
+
+            }
+
+
+
+
+            next_state <-
+
+
+                scale_state(
+
+                    create_state_ablation(
+
+                        result$environment$inventory,
+
+                        use_spatial
+
+                    )[1,]
+
+                )
+
+
+
+            agent <-
+
+
+                update_sarq(
+
+                    agent,
+
+                    state,
+
+                    action,
+
+                    result$reward,
+
+                    next_state,
+
+                    0.01,
+
+                    0.95
+
+                )
+
+
+
+            env <-
+
+
+                result$environment
+
+
+
+            total_reward <-
+
+
+                total_reward +
+
+                result$reward
+
+
+
+        }
+
+
+
+        reward_history[ep] <-
+
+
+            total_reward
+
+
+
+        epsilon <-
+
+
+            max(
+
+                0.01,
+
+                epsilon*0.995
+
+            )
+
+
+    }
+
+
+
+    list(
+
+        agent=agent,
+
+        RewardHistory=reward_history,
+
+        MeanReward=mean(reward_history)
+
+    )
+
+}
+
+
+
+
+###############################################################
+# 6. Run Ablation Experiment
+###############################################################
+
+
+ablation_results <- data.frame()
+
+
+
+set.seed(2026)
+
+
+
+for(i in seq_len(nrow(ablation_models))){
+
+
+    cat(
+
+        "\nRunning:",
+
+        ablation_models$Model[i]
+
+    )
+
+
+
+    result <-
+
+
+        train_ablation_agent(
+
+            ablation_models$Model[i],
+
+            episodes=500
+
+        )
+
+
+
+    evaluation <-
+
+
+        evaluate_agent(
+
+            result$agent,
+
+            episodes=100
+
+        )
+
+
+
+    ablation_results <-
+
+
+        rbind(
+
+            ablation_results,
+
+
+            data.frame(
+
+                Model=
+
+                    ablation_models$Model[i],
+
+
+                TrainingReward=
+
+                    result$MeanReward,
+
+
+                TestReward=
+
+                    evaluation$MeanReward,
+
+
+                SD=
+
+                    evaluation$SDReward
+
+            )
+
+        )
+
+
+}
+
+
+
+print(ablation_results)
+
+
+
+write.csv(
+
+    ablation_results,
+
+    "Ablation_Results.csv",
+
+    row.names=FALSE
+
+)
+
+
+
+###############################################################
+# 7. Improvement Percentage
+###############################################################
+
+
+baseline <-
+
+
+ablation_results %>%
+
+
+filter(
+
+    Model=="QLearning"
+
+)%>%
+
+pull(
+
+    TestReward
+
+)
+
+
+
+ablation_results <-
+
+
+ablation_results %>%
+
+
+mutate(
+
+    Improvement=
+
+        100*(TestReward-baseline)/abs(baseline)
+
+)
+
+
+
+print(ablation_results)
+
+
+
+write.csv(
+
+    ablation_results,
+
+    "Ablation_Improvement.csv",
+
+    row.names=FALSE
+
+)
+
+
+
+###############################################################
+# 8. Ablation Plot
+###############################################################
+
+
+p <-
+
+
+ggplot(
+
+ablation_results,
+
+aes(
+
+    x=reorder(Model,TestReward),
+
+    y=TestReward
+
+)
+
+)+
+
+
+geom_col()+
+
+
+coord_flip()+
+
+
+theme_bw()+
+
+
+labs(
+
+    title="Ablation Study: Contribution of Model Components",
+
+    x="Model",
+
+    y="Mean Reward"
+
+)
+
+
+
+ggsave(
+
+    "Ablation_Study.png",
+
+    p,
+
+    width=9,
+
+    height=6
+
+)
+
+
+
+###############################################################
+# 9. LaTeX Ablation Table
+###############################################################
+
+
+latex <- c(
+
+"\\begin{table}[ht]",
+
+"\\centering",
+
+"\\caption{Ablation study of Copula Spatial SAR-Q inventory optimization}",
+
+"\\begin{tabular}{lrr}",
+
+"\\hline",
+
+"Model & Test Reward & Improvement(\\%)\\\\",
+
+"\\hline"
+
+)
+
+
+
+for(i in seq_len(nrow(ablation_results))){
+
+latex <- c(
+
+latex,
+
+
+paste0(
+
+ablation_results$Model[i],
+
+" & ",
+
+round(ablation_results$TestReward[i],2),
+
+" & ",
+
+round(ablation_results$Improvement[i],2),
+
+" \\\\"
+
+)
+
+)
+
+}
+
+
+
+latex <- c(
+
+latex,
+
+"\\hline",
+
+"\\end{tabular}",
+
+"\\end{table}"
+
+)
+
+
+
+writeLines(
+
+latex,
+
+"Ablation_Table_LaTeX.tex"
+
+)
+
+
+
+###############################################################
+# END FILE 09
+###############################################################
+
+###############################################################
+# File 10
+# Robustness Analysis
+#
+# Copula Spatial SAR-Q Inventory System
+#
+# Scenarios:
+# 1. Normal Demand
+# 2. High Volatility Demand
+# 3. Demand Shock
+# 4. Longer Lead Time
+# 5. Different Service Levels
+# 6. Copula Misspecification
+###############################################################
+
+
+###############################################################
+# 1. Libraries
+###############################################################
+
+library(dplyr)
+library(ggplot2)
+
+
+
+###############################################################
+# 2. Save Original Parameters
+###############################################################
+
+
+original_demand_sd <- demand_sd
+
+original_lead_time <- LEAD_TIME
+
+original_service_level <- SERVICE_LEVEL
+
+
+
+###############################################################
+# 3. Demand Scenario Generator
+###############################################################
+
+
+generate_scenario_demand <- function(
+
+    scenario
+
+){
+
+
+    if(scenario=="Normal"){
+
+
+        sd_factor <- 1
+
+
+    }else if(scenario=="HighVolatility"){
+
+
+        sd_factor <- 2
+
+
+    }else if(scenario=="ExtremeVolatility"){
+
+
+        sd_factor <- 3
+
+
+    }else if(scenario=="DemandShock"){
+
+
+        shock <- runif(
+
+            1,
+
+            1.5,
+
+            2.5
+
+        )
+
+
+        return(
+
+            pmax(
+
+                round(
+
+                    demand_base *
+
+                    shock +
+
+                    rnorm(
+
+                        N_STORES,
+
+                        0,
+
+                        demand_sd
+
+                    )
+
+                ),
+
+                0
+
+            )
+
+        )
+
+
+    }
+
+
+    demand <-
+
+
+        demand_base +
+
+        rnorm(
+
+            N_STORES,
+
+            0,
+
+            demand_sd*sd_factor
+
+        )
+
+
+    pmax(
+
+        round(demand),
+
+        0
+
+    )
+
+
+}
+
+
+
+
+###############################################################
+# 4. Robust Environment Step
+###############################################################
+
+
+environment_step_robust <- function(
+
+    env,
+
+    action_vector,
+
+    scenario="Normal",
+
+    use_copula=TRUE
+
+){
+
+
+
+    shipment <-
+
+
+        round(
+
+            env$inventory *
+
+            action_vector
+
+        )
+
+
+
+    if(use_copula){
+
+
+        demand <-
+
+
+            generate_demand()
+
+
+
+    }else{
+
+
+        demand <-
+
+
+            generate_scenario_demand(
+
+                scenario
+
+            )
+
+    }
+
+
+
+
+    transition <-
+
+
+        inventory_step(
+
+            env$inventory,
+
+            env$pipeline,
+
+            shipment,
+
+            demand
+
+        )
+
+
+
+
+    reward_output <-
+
+
+        compute_reward(
+
+            demand,
+
+            env$inventory,
+
+            shipment
+
+        )
+
+
+
+    next_env <- list(
+
+
+        inventory=
+
+            transition$inventory,
+
+
+        pipeline=
+
+            transition$pipeline,
+
+
+        time=
+
+            env$time+1,
+
+
+        total_reward=
+
+            env$total_reward+
+
+            sum(
+
+                reward_output$reward
+
+            )
+
+    )
+
+
+
+    list(
+
+        reward=
+
+            sum(
+
+                reward_output$reward
+
+            ),
+
+        environment=
+
+            next_env
+
+    )
+
+}
+
+
+
+###############################################################
+# 5. Robustness Evaluation Function
+###############################################################
+
+
+evaluate_scenario <- function(
+
+    agent,
+
+    scenario,
+
+    lead_time=2,
+
+    service_level=.95,
+
+    copula=TRUE,
+
+    episodes=100
+
+){
+
+
+
+    assign(
+
+        "LEAD_TIME",
+
+        lead_time,
+
+        envir=.GlobalEnv
+
+    )
+
+
+
+    assign(
+
+        "SERVICE_LEVEL",
+
+        service_level,
+
+        envir=.GlobalEnv
+
+    )
+
+
+
+    rewards <- numeric(episodes)
+
+
+
+    for(ep in seq_len(episodes)){
+
+
+        env <-
+
+
+            initialize_environment()
+
+
+
+        total <- 0
+
+
+
+        for(step in 1:50){
+
+
+
+            state <-
+
+
+                scale_state(
+
+                    create_state(
+
+                        env$inventory
+
+                    )[1,]
+
+                )
+
+
+
+            action <-
+
+
+                select_action(
+
+                    agent,
+
+                    state,
+
+                    0
+
+                )
+
+
+
+            result <-
+
+
+                environment_step_robust(
+
+                    env,
+
+                    rep(
+
+                        actions[action],
+
+                        N_STORES
+
+                    ),
+
+                    scenario,
+
+                    copula
+
+                )
+
+
+
+            env <-
+
+
+                result$environment
+
+
+
+            total <-
+
+
+                total +
+
+                result$reward
+
+
+        }
+
+
+
+        rewards[ep] <- total
+
+    }
+
+
+
+    data.frame(
+
+        Scenario=scenario,
+
+        LeadTime=lead_time,
+
+        ServiceLevel=service_level,
+
+        Copula=copula,
+
+        MeanReward=mean(rewards),
+
+        SD=sd(rewards)
+
+    )
+
+
+}
+
+
+
+###############################################################
+# 6. Robustness Scenarios
+###############################################################
+
+
+scenarios <- c(
+
+    "Normal",
+
+    "HighVolatility",
+
+    "ExtremeVolatility",
+
+    "DemandShock"
+
+)
+
+
+
+robust_results <- data.frame()
+
+
+
+for(s in scenarios){
+
+
+    cat(
+
+        "\nScenario:",
+
+        s
+
+    )
+
+
+    out <-
+
+
+        evaluate_scenario(
+
+            best_training$agent,
+
+            s,
+
+            lead_time=2,
+
+            service_level=.95,
+
+            copula=FALSE,
+
+            episodes=100
+
+        )
+
+
+
+    robust_results <-
+
+
+        rbind(
+
+            robust_results,
+
+            out
+
+        )
+
+
+}
+
+
+
+###############################################################
+# 7. Lead Time Sensitivity
+###############################################################
+
+
+for(L in c(1,2,3,5)){
+
+
+    out <-
+
+
+        evaluate_scenario(
+
+            best_training$agent,
+
+            "Normal",
+
+            lead_time=L,
+
+            service_level=.95,
+
+            copula=TRUE,
+
+            episodes=100
+
+        )
+
+
+
+    robust_results <-
+
+
+        rbind(
+
+            robust_results,
+
+            out
+
+        )
+
+
+}
+
+
+
+###############################################################
+# 8. Service Level Sensitivity
+###############################################################
+
+
+for(SL in c(.90,.95,.99)){
+
+
+    out <-
+
+
+        evaluate_scenario(
+
+            best_training$agent,
+
+            "Normal",
+
+            lead_time=2,
+
+            service_level=SL,
+
+            copula=TRUE,
+
+            episodes=100
+
+        )
+
+
+    robust_results <-
+
+
+        rbind(
+
+            robust_results,
+
+            out
+
+        )
+
+}
+
+
+
+###############################################################
+# 9. Save Results
+###############################################################
+
+
+print(robust_results)
+
+
+
+write.csv(
+
+    robust_results,
+
+    "Robustness_Analysis.csv",
+
+    row.names=FALSE
+
+)
+
+
+
+###############################################################
+# 10. Robustness Plot
+###############################################################
+
+
+p <-
+
+
+ggplot(
+
+robust_results,
+
+aes(
+
+x=Scenario,
+
+y=MeanReward
+
+)
+
+)+
+
+
+geom_boxplot()+
+
+
+theme_bw()+
+
+
+labs(
+
+title="Robustness Analysis Under Demand Uncertainty",
+
+x="Scenario",
+
+y="Mean Reward"
+
+)
+
+
+
+ggsave(
+
+"Robustness_Boxplot.png",
+
+p,
+
+width=8,
+
+height=5
+
+)
+
+
+
+###############################################################
+# 11. Restore Parameters
+###############################################################
+
+
+assign(
+
+"LEAD_TIME",
+
+original_lead_time,
+
+envir=.GlobalEnv
+
+)
+
+
+assign(
+
+"SERVICE_LEVEL",
+
+original_service_level,
+
+envir=.GlobalEnv
+
+)
+
+
+
+demand_sd <- original_demand_sd
+
+
+
+###############################################################
+# END FILE 10
+###############################################################
+
+
+#Past R code
 # ============================================================
 # FULL M5 WALMART COPULA-SPATIAL SAR-Q INVENTORY RL FRAMEWORK
 # ============================================================

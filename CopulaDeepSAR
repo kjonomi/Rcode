@@ -2548,30 +2548,103 @@ inventory_step <- function(
 }
 
 
-
-
 ###############################################################
 # 14. Environment Initialization
 ###############################################################
 
+initialize_environment <- function(
+    copula = best_copula
+){
 
-initialize_environment <- function(){
-    
-    
-    list(
-        
-        inventory=initial_inventory(),
-        
-        pipeline=initialize_pipeline(),
-        
-        time=1,
-        
-        total_reward=0
-        
-    )
-    
+    env <- list()
+
+    env$inventory <- initial_inventory()
+
+    env$pipeline <- initialize_pipeline()
+
+    env$day <- 1
+
+    env$copula <- copula
+
+    env
+
 }
 
+###############################################################
+# 15. Environment Transition
+###############################################################
+
+environment_step <- function(
+    environment,
+    shipment,
+    copula = environment$copula
+){
+
+    ###########################################################
+    # Generate Demand
+    ###########################################################
+
+    demand <- generate_demand(copula)
+
+    ###########################################################
+    # Inventory Transition
+    ###########################################################
+
+    transition <- inventory_step(
+
+        inventory = environment$inventory,
+
+        pipeline = environment$pipeline,
+
+        shipment = shipment,
+
+        demand = demand
+
+    )
+
+    ###########################################################
+    # Reward
+    ###########################################################
+
+    reward_result <- compute_reward(
+
+        demand = demand,
+
+        inventory = environment$inventory,
+
+        shipment = shipment
+
+    )
+
+    ###########################################################
+    # Update Environment
+    ###########################################################
+
+    environment$inventory <- transition$inventory
+
+    environment$pipeline <- transition$pipeline
+
+    environment$day <- environment$day + 1
+
+    ###########################################################
+    # Return
+    ###########################################################
+
+    list(
+
+        environment = environment,
+
+        demand = demand,
+
+        sales = transition$sales,
+
+        lost_sales = transition$lost_sales,
+
+        reward = sum(reward_result$reward)
+
+    )
+
+}
 
 
 
@@ -3641,7 +3714,7 @@ Copula_models <- c(
 
 N_EPISODES <- 300
 
-N_REPLICATIONS <- 30
+N_REPLICATIONS <- 10
 
 
 
@@ -5150,11 +5223,8 @@ simulate_inventory_policy <- function(
 
 ){
 
-
-    env <- initialize_environment(
-
-        copula = copula_model
-
+   env <- initialize_environment(
+    copula = best_copula
     )
 
 
@@ -5198,16 +5268,15 @@ simulate_inventory_policy <- function(
         )
 
 
+result <- environment_step(
 
-        result <- environment_step(
+    environment = env,
 
-            env,
+    shipment = order_quantity,
 
-            order_quantity,
+    copula = best_copula
 
-            copula = copula_model
-
-        )
+)
 
 
 
@@ -6620,7 +6689,6 @@ envir=.GlobalEnv
 ###############################################################
 # END FILE 10
 ###############################################################
-
 
 
 #Past R code

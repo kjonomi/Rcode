@@ -1135,6 +1135,1264 @@ for(i in seq_len(N_STORES)){
 }
 
 
+###############################################################
+# PART 6
+#
+# Learning Curves
+# Convergence Diagnostics
+# AULC Analysis
+# Final KPI Comparison
+# Statistical Tests
+# Bootstrap Confidence Intervals
+#
+###############################################################
+
+library(dplyr)
+library(ggplot2)
+library(effsize)
+library(boot)
+
+###############################################################
+# SETTINGS
+###############################################################
+
+# Number of simulation replications
+N_REPLICATIONS <- 150
+
+# Moving-average window
+MOVING_WINDOW <- 50
+
+# Bootstrap replications
+BOOT_R <- 2000
+
+# Confidence level
+CONF_LEVEL <- 0.95
+
+###############################################################
+# Create results directory if necessary
+###############################################################
+
+if (!dir.exists("results")) {
+    dir.create("results", recursive = TRUE)
+}
+
+###############################################################
+# 1. CHECK LEARNING CURVE DATA
+###############################################################
+
+cat("\n============================================================\n")
+cat("LEARNING CURVE DATA CHECK\n")
+cat("============================================================\n")
+
+print(names(learning_curve))
+
+cat("\nFirst observations:\n")
+print(head(learning_curve))
+
+cat("\nModels included:\n")
+print(unique(learning_curve$Model))
+
+cat("\nNumber of observations:\n")
+print(nrow(learning_curve))
+
+cat("\nEpisodes per model:\n")
+
+print(
+    learning_curve %>%
+        group_by(Model) %>%
+        summarise(
+            Episodes = n(),
+            MinEpisode = min(Episode),
+            MaxEpisode = max(Episode),
+            .groups = "drop"
+        )
+)
+
+###############################################################
+# 2. CALCULATE 95% CONFIDENCE INTERVALS
+###############################################################
+
+# MeanReward is assumed to be the mean across simulation
+# replications and SDReward is the corresponding SD.
+#
+# Therefore:
+#
+# Standard Error = SD / sqrt(N)
+#
+# 95% CI = Mean +/- 1.96 * SE
+
+learning_curve <- learning_curve %>%
+    mutate(
+        NRep = N_REPLICATIONS,
+
+        SEReward =
+            SDReward / sqrt(NRep),
+
+        Lower95 =
+            MeanReward -
+            qnorm(1 - (1 - CONF_LEVEL) / 2) *
+            SEReward,
+
+        Upper95 =
+            MeanReward +
+            qnorm(1 - (1 - CONF_LEVEL) / 2) *
+            SEReward
+    )
+
+###############################################################
+# 3. INITIAL LEARNING CURVE
+###############################################################
+
+p_learning <-
+    ggplot(
+        learning_curve,
+        aes(
+            x = Episode,
+            y = MeanReward,
+            color = Model,
+            fill = Model,
+            group = Model
+        )
+    ) +
+
+    geom_ribbon(
+        aes(
+            ymin = Lower95,
+            ymax = Upper95
+        ),
+        alpha = 0.15,
+        color = NA
+    ) +
+
+    geom_line(
+        linewidth = 1
+    ) +
+
+    theme_bw() +
+
+    labs(
+        title = "Learning Curves: SAR-Q, LASAR-Q, and Q-Learning",
+        x = "Episode",
+        y = "Mean Reward",
+        color = "Model",
+        fill = "Model"
+    )
+
+print(p_learning)
+
+###############################################################
+# 4. SAVE LEARNING CURVE
+###############################################################
+
+ggsave(
+    "results/SARQ_LearningCurves.png",
+    p_learning,
+    width = 8,
+    height = 5,
+    dpi = 300
+)
+
+###############################################################
+# 5. MOVING AVERAGE FUNCTION
+###############################################################
+
+moving_average <- function(
+    x,
+    window = MOVING_WINDOW
+) {
+
+    stats::filter(
+        x,
+        rep(
+            1 / window,
+            window
+        ),
+        sides = 1
+    )
+}
+
+###############################################################
+# 6. CREATE CONVERGENCE TABLE
+###############################################################
+
+convergence_table <-
+    learning_curve %>%
+
+    group_by(
+        Model
+    ) %>%
+
+    arrange(
+        Episode,
+        .by_group = TRUE
+    ) %>%
+
+    mutate(
+
+        SmoothedReward =
+            as.numeric(
+                moving_average(
+                    MeanReward,
+                    window = MOVING_WINDOW
+                )
+            )
+
+    ) %>%
+
+    ungroup()
+
+###############################################################
+# 7. VIEW CONVERGENCE TABLE
+###############################################################
+
+cat("\n============================================================\n")
+cat("CONVERGENCE TABLE\n")
+cat("============================================================\n")
+
+print(
+    convergence_table,
+    n = 20
+)
+
+###############################################################
+# 8. SAVE CONVERGENCE TABLE
+###############################################################
+
+write.csv(
+    convergence_table,
+    "results/SARQ_ConvergenceTable.csv",
+    row.names = FALSE
+)
+
+###############################################################
+# 9. SMOOTHED CONVERGENCE PLOT
+###############################################################
+
+p_convergence <-
+    ggplot(
+        convergence_table,
+        aes(
+            x = Episode,
+            y = SmoothedReward,
+            color = Model,
+            group = Model
+        )
+    ) +
+
+    geom_line(
+        linewidth = 1.1,
+        na.rm = TRUE
+    ) +
+
+    theme_bw() +
+
+    labs(
+        title = "Learning Convergence Diagnostics",
+        x = "Episode",
+        y = "Moving Average Reward",
+        color = "Model"
+    )
+
+print(p_convergence)
+
+###############################################################
+# 10. SAVE CONVERGENCE PLOT
+###############################################################
+
+ggsave(
+    "results/SARQ_Convergence.png",
+    p_convergence,
+    width = 8,
+    height = 5,
+    dpi = 300
+)
+
+###############################################################
+# 11. CONVERGENCE PLOT DATA
+###############################################################
+
+p_conv_data <-
+    convergence_table %>%
+
+    group_by(
+        Model,
+        Episode
+    ) %>%
+
+    summarise(
+
+        MeanSmooth =
+            mean(
+                SmoothedReward,
+                na.rm = TRUE
+            ),
+
+        .groups = "drop"
+    )
+
+###############################################################
+# 12. CONVERGENCE DIAGNOSTIC PLOT
+###############################################################
+
+p_conv <-
+    ggplot(
+        p_conv_data,
+        aes(
+            x = Episode,
+            y = MeanSmooth,
+            color = Model,
+            group = Model
+        )
+    ) +
+
+    geom_line(
+        linewidth = 1
+    ) +
+
+    theme_bw() +
+
+    labs(
+        title = "SAR-Q / LASAR-Q Convergence Diagnostics",
+        x = "Episode",
+        y = "Moving Average Reward",
+        color = "Model"
+    )
+
+print(p_conv)
+
+###############################################################
+# 13. SAVE CONVERGENCE DIAGNOSTICS
+###############################################################
+
+ggsave(
+    "results/SARQ_ConvergenceDiagnostics.png",
+    p_conv,
+    width = 8,
+    height = 5,
+    dpi = 300
+)
+
+###############################################################
+# 14. FINAL PERFORMANCE BY MODEL
+###############################################################
+
+final_performance <-
+    learning_curve %>%
+
+    group_by(
+        Model
+    ) %>%
+
+    arrange(
+        Episode,
+        .by_group = TRUE
+    ) %>%
+
+    summarise(
+
+        FinalEpisode =
+            last(Episode),
+
+        FinalReward =
+            last(MeanReward),
+
+        FinalSD =
+            last(SDReward),
+
+        FinalSE =
+            last(SEReward),
+
+        FinalLower95 =
+            last(Lower95),
+
+        FinalUpper95 =
+            last(Upper95),
+
+        BestReward =
+            max(
+                MeanReward,
+                na.rm = TRUE
+            ),
+
+        WorstReward =
+            min(
+                MeanReward,
+                na.rm = TRUE
+            ),
+
+        AverageReward =
+            mean(
+                MeanReward,
+                na.rm = TRUE
+            ),
+
+        .groups = "drop"
+    )
+
+###############################################################
+# 15. PRINT FINAL PERFORMANCE
+###############################################################
+
+cat("\n============================================================\n")
+cat("FINAL PERFORMANCE BY MODEL\n")
+cat("============================================================\n")
+
+print(final_performance)
+
+###############################################################
+# 16. SAVE FINAL PERFORMANCE
+###############################################################
+
+write.csv(
+    final_performance,
+    "results/SARQ_FinalPerformance.csv",
+    row.names = FALSE
+)
+
+###############################################################
+# 17. MODEL CHECK
+###############################################################
+
+cat("\n============================================================\n")
+cat("MODEL CHECK\n")
+cat("============================================================\n")
+
+print(
+    unique(
+        learning_curve$Model
+    )
+)
+
+###############################################################
+# 18. EPISODE CHECK
+###############################################################
+
+cat("\n============================================================\n")
+cat("EPISODE CHECK\n")
+cat("============================================================\n")
+
+print(
+    learning_curve %>%
+        group_by(Model) %>%
+        summarise(
+            Episodes = n(),
+            FirstEpisode = min(Episode),
+            LastEpisode = max(Episode),
+            .groups = "drop"
+        )
+)
+
+###############################################################
+# 19. AULC - AREA UNDER LEARNING CURVE
+###############################################################
+
+# AULC is calculated descriptively from the episode-level
+# mean reward trajectory.
+#
+# Since episode spacing is equal, sum(MeanReward) provides
+# the discrete AULC.
+
+aulc_results <-
+    learning_curve %>%
+
+    group_by(
+        Model
+    ) %>%
+
+    arrange(
+        Episode,
+        .by_group = TRUE
+    ) %>%
+
+    summarise(
+
+        AULC =
+            sum(
+                MeanReward,
+                na.rm = TRUE
+            ),
+
+        MeanReward =
+            mean(
+                MeanReward,
+                na.rm = TRUE
+            ),
+
+        FinalReward =
+            last(MeanReward),
+
+        BestReward =
+            max(
+                MeanReward,
+                na.rm = TRUE
+            ),
+
+        WorstReward =
+            min(
+                MeanReward,
+                na.rm = TRUE
+            ),
+
+        .groups = "drop"
+    )
+
+###############################################################
+# 20. PRINT AULC
+###############################################################
+
+cat("\n============================================================\n")
+cat("AULC RESULTS\n")
+cat("============================================================\n")
+
+print(aulc_results)
+
+###############################################################
+# 21. SAVE AULC
+###############################################################
+
+write.csv(
+    aulc_results,
+    "results/SARQ_AULC.csv",
+    row.names = FALSE
+)
+
+###############################################################
+# 22. FINAL KPI COMPARISON
+###############################################################
+
+final_summary <-
+    kpi_table %>%
+
+    group_by(
+        Method
+    ) %>%
+
+    summarise(
+
+        N =
+            n(),
+
+        MeanReward =
+            mean(
+                TotalReward,
+                na.rm = TRUE
+            ),
+
+        SDReward =
+            sd(
+                TotalReward,
+                na.rm = TRUE
+            ),
+
+        MedianReward =
+            median(
+                TotalReward,
+                na.rm = TRUE
+            ),
+
+        MeanCost =
+            mean(
+                TotalCost,
+                na.rm = TRUE
+            ),
+
+        SD_Cost =
+            sd(
+                TotalCost,
+                na.rm = TRUE
+            ),
+
+        MeanFillRate =
+            mean(
+                FillRate,
+                na.rm = TRUE
+            ),
+
+        SD_FillRate =
+            sd(
+                FillRate,
+                na.rm = TRUE
+            ),
+
+        MeanStockouts =
+            mean(
+                TotalStockouts,
+                na.rm = TRUE
+            ),
+
+        SD_Stockouts =
+            sd(
+                TotalStockouts,
+                na.rm = TRUE
+            ),
+
+        .groups = "drop"
+    )
+
+###############################################################
+# 23. PRINT FINAL KPI SUMMARY
+###############################################################
+
+cat("\n============================================================\n")
+cat("FINAL KPI SUMMARY\n")
+cat("============================================================\n")
+
+print(final_summary)
+
+###############################################################
+# 24. SAVE FINAL KPI SUMMARY
+###############################################################
+
+write.csv(
+    final_summary,
+    "results/SARQ_FinalSummary.csv",
+    row.names = FALSE
+)
+
+###############################################################
+# 25. PREPARE REPLICATION-LEVEL REWARD DATA
+###############################################################
+
+# IMPORTANT:
+#
+# Statistical tests are NOT performed on aulc_results because
+# AULC contains only one value per model.
+#
+# Instead, the hypothesis tests use replication-level
+# TotalReward values from kpi_table.
+#
+# This creates:
+#
+# Replication | Method | value
+#
+# for paired comparisons.
+
+reward_metric <-
+    kpi_table %>%
+
+    select(
+        Replication,
+        Method,
+        TotalReward
+    ) %>%
+
+    rename(
+        value = TotalReward
+    ) %>%
+
+    arrange(
+        Method,
+        Replication
+    )
+
+###############################################################
+# 26. CHECK REPLICATION STRUCTURE
+###############################################################
+
+cat("\n============================================================\n")
+cat("REPLICATION-LEVEL REWARD DATA\n")
+cat("============================================================\n")
+
+print(
+    head(reward_metric)
+)
+
+cat("\nNumber of observations by method:\n")
+
+print(
+    reward_metric %>%
+        group_by(Method) %>%
+        summarise(
+            N = n(),
+            MinReplication = min(Replication),
+            MaxReplication = max(Replication),
+            .groups = "drop"
+        )
+)
+
+###############################################################
+# 27. CHECK THAT ALL MODELS HAVE SAME REPLICATIONS
+###############################################################
+
+replication_check <-
+    reward_metric %>%
+
+    group_by(
+        Method
+    ) %>%
+
+    summarise(
+        N = n(),
+        NUniqueReplication =
+            n_distinct(Replication),
+        .groups = "drop"
+    )
+
+print(replication_check)
+
+if (
+    any(
+        replication_check$N !=
+        N_REPLICATIONS
+    )
+) {
+
+    warning(
+        "At least one model does not contain ",
+        N_REPLICATIONS,
+        " replications."
+    )
+
+}
+
+###############################################################
+# 28. STATISTICAL COMPARISON FUNCTION
+###############################################################
+
+compare_models <- function(
+    metric,
+    model1,
+    model2
+) {
+
+    x <-
+        metric %>%
+
+        filter(
+            Method == model1
+        ) %>%
+
+        select(
+            Replication,
+            value
+        ) %>%
+
+        arrange(
+            Replication
+        )
+
+    y <-
+        metric %>%
+
+        filter(
+            Method == model2
+        ) %>%
+
+        select(
+            Replication,
+            value
+        ) %>%
+
+        arrange(
+            Replication
+        )
+
+    ###########################################################
+    # Check replication IDs
+    ###########################################################
+
+    if (
+        !identical(
+            x$Replication,
+            y$Replication
+        )
+    ) {
+
+        stop(
+            paste0(
+                "Replication IDs do not match between ",
+                model1,
+                " and ",
+                model2,
+                "."
+            )
+        )
+
+    }
+
+    ###########################################################
+    # Paired differences
+    ###########################################################
+
+    differences <-
+        x$value -
+        y$value
+
+    ###########################################################
+    # Wilcoxon signed-rank test
+    ###########################################################
+
+    wilcox <-
+        wilcox.test(
+            x$value,
+            y$value,
+            paired = TRUE,
+            exact = FALSE,
+            conf.int = TRUE
+        )
+
+    ###########################################################
+    # Cliff's delta
+    ###########################################################
+
+    effect <-
+        effsize::cliff.delta(
+            x$value,
+            y$value,
+            paired = TRUE
+        )
+
+    ###########################################################
+    # Mean difference
+    ###########################################################
+
+    mean_difference <-
+        mean(
+            differences,
+            na.rm = TRUE
+        )
+
+    median_difference <-
+        median(
+            differences,
+            na.rm = TRUE
+        )
+
+    ###########################################################
+    # Return results
+    ###########################################################
+
+    data.frame(
+
+        Model1 =
+            model1,
+
+        Model2 =
+            model2,
+
+        N =
+            length(
+                differences
+            ),
+
+        MeanDifference =
+            mean_difference,
+
+        MedianDifference =
+            median_difference,
+
+        W =
+            as.numeric(
+                wilcox$statistic
+            ),
+
+        PValue =
+            wilcox$p.value,
+
+        CliffDelta =
+            as.numeric(
+                effect$estimate
+            ),
+
+        stringsAsFactors = FALSE
+    )
+}
+
+###############################################################
+# 29. PAIRWISE STATISTICAL TESTS
+###############################################################
+
+test_LASARQ_SARQ <-
+    compare_models(
+        reward_metric,
+        "LASAR-Q",
+        "SAR-Q"
+    )
+
+test_LASARQ_QLearning <-
+    compare_models(
+        reward_metric,
+        "LASAR-Q",
+        "Q-Learning"
+    )
+
+test_SARQ_QLearning <-
+    compare_models(
+        reward_metric,
+        "SAR-Q",
+        "Q-Learning"
+    )
+
+###############################################################
+# 30. COMBINE STATISTICAL TESTS
+###############################################################
+
+statistical_tests <-
+    bind_rows(
+
+        test_LASARQ_SARQ,
+
+        test_LASARQ_QLearning,
+
+        test_SARQ_QLearning
+
+    ) %>%
+
+    mutate(
+
+        PValueAdjusted =
+            p.adjust(
+                PValue,
+                method = "holm"
+            )
+
+    )
+
+###############################################################
+# 31. PRINT STATISTICAL RESULTS
+###############################################################
+
+cat("\n============================================================\n")
+cat("PAIRWISE STATISTICAL COMPARISONS\n")
+cat("============================================================\n")
+
+print(
+    statistical_tests
+)
+
+###############################################################
+# 32. SAVE STATISTICAL RESULTS
+###############################################################
+
+write.csv(
+    statistical_tests,
+    "results/SARQ_StatisticalTests.csv",
+    row.names = FALSE
+)
+
+###############################################################
+# 33. BOOTSTRAP PAIRED DIFFERENCE FUNCTION
+###############################################################
+
+bootstrap_difference <- function(
+    data,
+    indices
+) {
+
+    d <-
+        data$Difference[
+            indices
+        ]
+
+    mean(
+        d,
+        na.rm = TRUE
+    )
+}
+
+###############################################################
+# 34. BOOTSTRAP COMPARISON FUNCTION
+###############################################################
+
+bootstrap_model_difference <- function(
+    metric,
+    model1,
+    model2,
+    R = BOOT_R
+) {
+
+    x <-
+        metric %>%
+
+        filter(
+            Method == model1
+        ) %>%
+
+        select(
+            Replication,
+            value
+        ) %>%
+
+        arrange(
+            Replication
+        )
+
+    y <-
+        metric %>%
+
+        filter(
+            Method == model2
+        ) %>%
+
+        select(
+            Replication,
+            value
+        ) %>%
+
+        arrange(
+            Replication
+        )
+
+    ###########################################################
+    # Verify pairing
+    ###########################################################
+
+    if (
+        !identical(
+            x$Replication,
+            y$Replication
+        )
+    ) {
+
+        stop(
+            paste0(
+                "Replication IDs do not match between ",
+                model1,
+                " and ",
+                model2,
+                "."
+            )
+        )
+
+    }
+
+    ###########################################################
+    # Difference dataset
+    ###########################################################
+
+    difference_data <-
+        data.frame(
+
+            Replication =
+                x$Replication,
+
+            Difference =
+                x$value -
+                y$value
+
+        )
+
+    ###########################################################
+    # Bootstrap
+    ###########################################################
+
+    boot_result <-
+        boot(
+            data =
+                difference_data,
+
+            statistic =
+                bootstrap_difference,
+
+            R = R
+        )
+
+    ###########################################################
+    # Percentile confidence interval
+    ###########################################################
+
+    boot_ci <-
+        boot.ci(
+            boot_result,
+            type = "perc"
+        )
+
+    ###########################################################
+    # Return summary
+    ###########################################################
+
+    data.frame(
+
+        Model1 =
+            model1,
+
+        Model2 =
+            model2,
+
+        N =
+            nrow(
+                difference_data
+            ),
+
+        ObservedMeanDifference =
+            mean(
+                difference_data$Difference,
+                na.rm = TRUE
+            ),
+
+        BootstrapMeanDifference =
+            mean(
+                boot_result$t,
+                na.rm = TRUE
+            ),
+
+        CI_Lower =
+            boot_ci$percent[4],
+
+        CI_Upper =
+            boot_ci$percent[5]
+
+    )
+}
+
+###############################################################
+# 35. BOOTSTRAP LASAR-Q VS SAR-Q
+###############################################################
+
+bootstrap_LASARQ_SARQ <-
+    bootstrap_model_difference(
+        reward_metric,
+        "LASAR-Q",
+        "SAR-Q",
+        R = BOOT_R
+    )
+
+###############################################################
+# 36. BOOTSTRAP LASAR-Q VS Q-LEARNING
+###############################################################
+
+bootstrap_LASARQ_QLearning <-
+    bootstrap_model_difference(
+        reward_metric,
+        "LASAR-Q",
+        "Q-Learning",
+        R = BOOT_R
+    )
+
+###############################################################
+# 37. BOOTSTRAP SAR-Q VS Q-LEARNING
+###############################################################
+
+bootstrap_SARQ_QLearning <-
+    bootstrap_model_difference(
+        reward_metric,
+        "SAR-Q",
+        "Q-Learning",
+        R = BOOT_R
+    )
+
+###############################################################
+# 38. COMBINE BOOTSTRAP RESULTS
+###############################################################
+
+bootstrap_results <-
+    bind_rows(
+
+        bootstrap_LASARQ_SARQ,
+
+        bootstrap_LASARQ_QLearning,
+
+        bootstrap_SARQ_QLearning
+
+    )
+
+###############################################################
+# 39. PRINT BOOTSTRAP RESULTS
+###############################################################
+
+cat("\n============================================================\n")
+cat("BOOTSTRAP CONFIDENCE INTERVALS\n")
+cat("============================================================\n")
+
+print(
+    bootstrap_results
+)
+
+###############################################################
+# 40. SAVE BOOTSTRAP RESULTS
+###############################################################
+
+write.csv(
+    bootstrap_results,
+    "results/SARQ_BootstrapResults.csv",
+    row.names = FALSE
+)
+
+###############################################################
+# 41. SAVE DETAILED BOOTSTRAP OBJECTS
+###############################################################
+
+capture.output(
+    bootstrap_results,
+    file =
+        "results/SARQ_Bootstrap_CI.txt"
+)
+
+###############################################################
+# 42. FINAL STATISTICAL SUMMARY
+###############################################################
+
+final_statistical_summary <-
+    statistical_tests %>%
+
+    left_join(
+        bootstrap_results,
+
+        by = c(
+            "Model1",
+            "Model2"
+        )
+    )
+
+###############################################################
+# 43. SAVE FINAL STATISTICAL SUMMARY
+###############################################################
+
+write.csv(
+    final_statistical_summary,
+    "results/SARQ_FinalStatisticalSummary.csv",
+    row.names = FALSE
+)
+
+###############################################################
+# 44. FINAL REPORT
+###############################################################
+
+cat("\n\n")
+cat("============================================================\n")
+cat("SAR-Q / LASAR-Q / Q-LEARNING ANALYSIS COMPLETE\n")
+cat("============================================================\n")
+
+cat("\nModels:\n")
+print(
+    unique(
+        learning_curve$Model
+    )
+)
+
+cat("\nNumber of simulation replications:\n")
+print(
+    N_REPLICATIONS
+)
+
+cat("\nNumber of bootstrap samples:\n")
+print(
+    BOOT_R
+)
+
+cat("\nFinal performance:\n")
+print(
+    final_performance
+)
+
+cat("\nAULC results:\n")
+print(
+    aulc_results
+)
+
+cat("\nStatistical tests:\n")
+print(
+    statistical_tests
+)
+
+cat("\nBootstrap results:\n")
+print(
+    bootstrap_results
+)
+
+cat("\n============================================================\n")
+cat("Results saved in the results/ directory.\n")
+cat("============================================================\n")
 
 
 
@@ -3865,7 +5123,7 @@ PURCHASE_COST <- 5
 N_EPISODES <- 50
 
 
-N_REPLICATIONS <- 1
+N_REPLICATIONS <- 10
 
 
 ALPHA <- 0.10
@@ -6541,382 +7799,60 @@ write.csv(
 #
 # Learning Curves
 # Convergence Diagnostics
+# AULC Analysis
+# Final KPI Comparison
 # Statistical Tests
-###############################################################
-###############################################################
-# Learning Curve Plot
-###############################################################
-
-
-library(dplyr)
-library(ggplot2)
-
-learning_curve <- learning_curve %>%
-    mutate(
-        Lower95 = MeanReward - 1.96 * SDReward,
-        Upper95 = MeanReward + 1.96 * SDReward
-    )
-
-p_learning <-
-    ggplot(
-        learning_curve,
-        aes(
-            x = Episode,
-            y = MeanReward,
-            color = Model,
-            group = Model
-        )
-    ) +
-
-    geom_ribbon(
-        aes(
-            ymin = Lower95,
-            ymax = Upper95,
-            fill = Model,
-            group = Model
-        ),
-        alpha = 0.15,
-        color = NA
-    ) +
-
-    geom_line(
-        linewidth = 1
-    ) +
-
-    theme_bw() +
-
-    labs(
-        title = "SAR-Q vs LASAR-Q Learning Curves",
-        x = "Episode",
-        y = "Mean Reward",
-        color = "Model",
-        fill = "Model"
-    )
-
-ggsave(
-    "results/SARQ_LearningCurves.png",
-    p_learning,
-    width = 8,
-    height = 5,
-    dpi = 300
-)
-
-
-###############################################################
-# SAR-Q / LASAR-Q LEARNING CURVE ANALYSIS
+# Bootstrap Confidence Intervals
+#
 ###############################################################
 
 library(dplyr)
 library(ggplot2)
+library(effsize)
+library(boot)
 
 ###############################################################
-# 1. Check Data Structure
+# SETTINGS
 ###############################################################
+
+# Number of simulation replications
+N_REPLICATIONS <- 150
+
+# Moving-average window
+MOVING_WINDOW <- 50
+
+# Bootstrap replications
+BOOT_R <- 2000
+
+# Confidence level
+CONF_LEVEL <- 0.95
+
+###############################################################
+# Create results directory if necessary
+###############################################################
+
+if (!dir.exists("results")) {
+    dir.create("results", recursive = TRUE)
+}
+
+###############################################################
+# 1. CHECK LEARNING CURVE DATA
+###############################################################
+
+cat("\n============================================================\n")
+cat("LEARNING CURVE DATA CHECK\n")
+cat("============================================================\n")
 
 print(names(learning_curve))
 
+cat("\nFirst observations:\n")
 print(head(learning_curve))
 
+cat("\nModels included:\n")
 print(unique(learning_curve$Model))
 
-
-###############################################################
-# 2. Moving Average Function
-###############################################################
-
-moving_average <- function(x, window = 50) {
-    
-    stats::filter(
-        x,
-        rep(1 / window, window),
-        sides = 1
-    )
-}
-
-
-###############################################################
-# 3. Calculate 95% Confidence Bands
-###############################################################
-
-learning_curve <- learning_curve %>%
-    
-    mutate(
-        
-        Lower95 =
-            MeanReward -
-            1.96 * SDReward,
-        
-        Upper95 =
-            MeanReward +
-            1.96 * SDReward
-        
-    )
-
-
-###############################################################
-# 4. Calculate Smoothed Reward
-###############################################################
-
-convergence_table <-
-    
-    learning_curve %>%
-    
-    group_by(
-        Model
-    ) %>%
-    
-    arrange(
-        Episode,
-        .by_group = TRUE
-    ) %>%
-    
-    mutate(
-        
-        SmoothedReward =
-            as.numeric(
-                moving_average(
-                    MeanReward,
-                    window = 50
-                )
-            )
-        
-    ) %>%
-    
-    ungroup()
-
-
-###############################################################
-# 5. View Convergence Table
-###############################################################
-
-print(
-    convergence_table,
-    n = 20
-)
-
-
-###############################################################
-# 6. Save Convergence Table
-###############################################################
-
-write.csv(
-    convergence_table,
-    "results/SARQ_ConvergenceTable.csv",
-    row.names = FALSE
-)
-
-
-###############################################################
-# 7. Learning Curve with 95% Bands
-###############################################################
-
-p_learning <-
-    
-    ggplot(
-        
-        learning_curve,
-        
-        aes(
-            x = Episode,
-            y = MeanReward,
-            color = Model,
-            fill = Model,
-            group = Model
-        )
-        
-    ) +
-    
-    geom_ribbon(
-        
-        aes(
-            ymin = Lower95,
-            ymax = Upper95
-        ),
-        
-        alpha = 0.15,
-        color = NA
-    ) +
-    
-    geom_line(
-        linewidth = 1
-    ) +
-    
-    theme_bw() +
-    
-    labs(
-        
-        title =
-            "SAR-Q vs LASAR-Q Learning Curves",
-        
-        x =
-            "Episode",
-        
-        y =
-            "Mean Reward",
-        
-        color =
-            "Model",
-        
-        fill =
-            "Model"
-    )
-
-
-###############################################################
-# 8. Save Learning Curve
-###############################################################
-
-ggsave(
-    
-    "results/SARQ_LearningCurves.png",
-    
-    p_learning,
-    
-    width = 8,
-    height = 5,
-    dpi = 300
-)
-
-
-###############################################################
-# 9. Smoothed Convergence Plot
-###############################################################
-
-p_convergence <-
-    
-    ggplot(
-        
-        convergence_table,
-        
-        aes(
-            x = Episode,
-            y = SmoothedReward,
-            color = Model,
-            group = Model
-        )
-        
-    ) +
-    
-    geom_line(
-        linewidth = 1.1
-    ) +
-    
-    theme_bw() +
-    
-    labs(
-        
-        title =
-            "SAR-Q vs LASAR-Q Convergence",
-        
-        x =
-            "Episode",
-        
-        y =
-            "Smoothed Mean Reward",
-        
-        color =
-            "Model"
-    )
-
-
-###############################################################
-# 10. Save Convergence Plot
-###############################################################
-
-ggsave(
-    
-    "results/SARQ_Convergence.png",
-    
-    p_convergence,
-    
-    width = 8,
-    height = 5,
-    dpi = 300
-)
-
-
-###############################################################
-# 11. Final Performance by Model
-###############################################################
-
-final_performance <-
-    
-    learning_curve %>%
-    
-    group_by(
-        Model
-    ) %>%
-    
-    arrange(
-        Episode,
-        .by_group = TRUE
-    ) %>%
-    
-    summarise(
-        
-        FinalEpisode =
-            max(Episode),
-        
-        FinalReward =
-            MeanReward[which.max(Episode)],
-        
-        FinalSD =
-            SDReward[which.max(Episode)],
-        
-        BestReward =
-            max(MeanReward),
-        
-        WorstReward =
-            min(MeanReward),
-        
-        AverageReward =
-            mean(MeanReward),
-        
-        .groups = "drop"
-    )
-
-
-###############################################################
-# 12. Print Final Performance
-###############################################################
-
-print(final_performance)
-
-
-###############################################################
-# 13. Save Final Performance Table
-###############################################################
-
-write.csv(
-    
-    final_performance,
-    
-    "results/SARQ_FinalPerformance.csv",
-    
-    row.names = FALSE
-)
-
-
-###############################################################
-# 14. Check Model Names
-###############################################################
-
-cat("\nModels included:\n")
-
-print(
-    unique(learning_curve$Model)
-)
-
-
-###############################################################
-# 15. Check Number of Episodes
-###############################################################
-
 cat("\nNumber of observations:\n")
-
-print(
-    nrow(learning_curve)
-)
+print(nrow(learning_curve))
 
 cat("\nEpisodes per model:\n")
 
@@ -6925,1137 +7861,2535 @@ print(
         group_by(Model) %>%
         summarise(
             Episodes = n(),
+            MinEpisode = min(Episode),
+            MaxEpisode = max(Episode),
             .groups = "drop"
         )
 )
-###############################################################
-# Moving Average Function
-###############################################################
-
-moving_average <- function(x, window = 50) {
-    
-    stats::filter(
-        x,
-        rep(1 / window, window),
-        sides = 1
-    )
-}
-
 
 ###############################################################
-# Create Convergence Table
+# 2. CALCULATE 95% CONFIDENCE INTERVALS
 ###############################################################
 
-convergence_table <-
-    
-    learning_curve %>%
-    
-    group_by(
-        Model
-    ) %>%
-    
-    arrange(
-        Episode,
-        .by_group = TRUE
-    ) %>%
-    
+# MeanReward is assumed to be the mean across simulation
+# replications and SDReward is the corresponding SD.
+#
+# Therefore:
+#
+# Standard Error = SD / sqrt(N)
+#
+# 95% CI = Mean +/- 1.96 * SE
+
+learning_curve <- learning_curve %>%
     mutate(
-        
-        SmoothedReward =
-            as.numeric(
-                moving_average(
-                    MeanReward,
-                    window = 50
-                )
-            )
-    ) %>%
-    
-    ungroup()
+        NRep = N_REPLICATIONS,
 
+        SEReward =
+            SDReward / sqrt(NRep),
 
-###############################################################
-# Convergence Plot Data
-###############################################################
+        Lower95 =
+            MeanReward -
+            qnorm(1 - (1 - CONF_LEVEL) / 2) *
+            SEReward,
 
-p_conv_data <-
-    
-    convergence_table %>%
-    
-    group_by(
-        Model,
-        Episode
-    ) %>%
-    
-    summarise(
-        
-        MeanSmooth =
-            mean(
-                SmoothedReward,
-                na.rm = TRUE
-            ),
-        
-        .groups = "drop"
+        Upper95 =
+            MeanReward +
+            qnorm(1 - (1 - CONF_LEVEL) / 2) *
+            SEReward
     )
 
-
 ###############################################################
-# Convergence Plot
+# 3. INITIAL LEARNING CURVE
 ###############################################################
 
-p_conv <-
-    
+p_learning <-
     ggplot(
-        
-        p_conv_data,
-        
+        learning_curve,
         aes(
             x = Episode,
-            y = MeanSmooth,
+            y = MeanReward,
             color = Model,
+            fill = Model,
             group = Model
         )
-        
     ) +
-    
+
+    geom_ribbon(
+        aes(
+            ymin = Lower95,
+            ymax = Upper95
+        ),
+        alpha = 0.15,
+        color = NA
+    ) +
+
     geom_line(
         linewidth = 1
     ) +
-    
+
     theme_bw() +
-    
+
     labs(
-        
-        title =
-            "SAR-Q Convergence Diagnostics",
-        
-        x =
-            "Episode",
-        
-        y =
-            "Moving Average Reward",
-        
-        color =
-            "Model"
+        title = "Learning Curves: SAR-Q, LASAR-Q, and Q-Learning",
+        x = "Episode",
+        y = "Mean Reward",
+        color = "Model",
+        fill = "Model"
     )
 
+print(p_learning)
 
 ###############################################################
-# Display
-###############################################################
-
-print(p_conv)
-
-
-###############################################################
-# Save
+# 4. SAVE LEARNING CURVE
 ###############################################################
 
 ggsave(
-    
-    "results/SARQ_ConvergenceDiagnostics.png",
-    
-    p_conv,
-    
+    "results/SARQ_LearningCurves.png",
+    p_learning,
     width = 8,
     height = 5,
     dpi = 300
 )
 
 ###############################################################
-# AULC - Area Under the Learning Curve
+# 5. MOVING AVERAGE FUNCTION
 ###############################################################
 
-aulc_results <-
-    
+moving_average <- function(
+    x,
+    window = MOVING_WINDOW
+) {
+
+    stats::filter(
+        x,
+        rep(
+            1 / window,
+            window
+        ),
+        sides = 1
+    )
+}
+
+###############################################################
+# 6. CREATE CONVERGENCE TABLE
+###############################################################
+
+convergence_table <-
     learning_curve %>%
-    
+
     group_by(
         Model
     ) %>%
-    
+
     arrange(
         Episode,
         .by_group = TRUE
     ) %>%
-    
+
+    mutate(
+
+        SmoothedReward =
+            as.numeric(
+                moving_average(
+                    MeanReward,
+                    window = MOVING_WINDOW
+                )
+            )
+
+    ) %>%
+
+    ungroup()
+
+###############################################################
+# 7. VIEW CONVERGENCE TABLE
+###############################################################
+
+cat("\n============================================================\n")
+cat("CONVERGENCE TABLE\n")
+cat("============================================================\n")
+
+print(
+    convergence_table,
+    n = 20
+)
+
+###############################################################
+# 8. SAVE CONVERGENCE TABLE
+###############################################################
+
+write.csv(
+    convergence_table,
+    "results/SARQ_ConvergenceTable.csv",
+    row.names = FALSE
+)
+
+###############################################################
+# 9. SMOOTHED CONVERGENCE PLOT
+###############################################################
+
+p_convergence <-
+    ggplot(
+        convergence_table,
+        aes(
+            x = Episode,
+            y = SmoothedReward,
+            color = Model,
+            group = Model
+        )
+    ) +
+
+    geom_line(
+        linewidth = 1.1,
+        na.rm = TRUE
+    ) +
+
+    theme_bw() +
+
+    labs(
+        title = "Learning Convergence Diagnostics",
+        x = "Episode",
+        y = "Moving Average Reward",
+        color = "Model"
+    )
+
+print(p_convergence)
+
+###############################################################
+# 10. SAVE CONVERGENCE PLOT
+###############################################################
+
+ggsave(
+    "results/SARQ_Convergence.png",
+    p_convergence,
+    width = 8,
+    height = 5,
+    dpi = 300
+)
+
+###############################################################
+# 11. CONVERGENCE PLOT DATA
+###############################################################
+
+p_conv_data <-
+    convergence_table %>%
+
+    group_by(
+        Model,
+        Episode
+    ) %>%
+
     summarise(
-        
+
+        MeanSmooth =
+            mean(
+                SmoothedReward,
+                na.rm = TRUE
+            ),
+
+        .groups = "drop"
+    )
+
+###############################################################
+# 12. CONVERGENCE DIAGNOSTIC PLOT
+###############################################################
+
+p_conv <-
+    ggplot(
+        p_conv_data,
+        aes(
+            x = Episode,
+            y = MeanSmooth,
+            color = Model,
+            group = Model
+        )
+    ) +
+
+    geom_line(
+        linewidth = 1
+    ) +
+
+    theme_bw() +
+
+    labs(
+        title = "SAR-Q / LASAR-Q Convergence Diagnostics",
+        x = "Episode",
+        y = "Moving Average Reward",
+        color = "Model"
+    )
+
+print(p_conv)
+
+###############################################################
+# 13. SAVE CONVERGENCE DIAGNOSTICS
+###############################################################
+
+ggsave(
+    "results/SARQ_ConvergenceDiagnostics.png",
+    p_conv,
+    width = 8,
+    height = 5,
+    dpi = 300
+)
+
+###############################################################
+# 14. FINAL PERFORMANCE BY MODEL
+###############################################################
+
+final_performance <-
+    learning_curve %>%
+
+    group_by(
+        Model
+    ) %>%
+
+    arrange(
+        Episode,
+        .by_group = TRUE
+    ) %>%
+
+    summarise(
+
+        FinalEpisode =
+            last(Episode),
+
+        FinalReward =
+            last(MeanReward),
+
+        FinalSD =
+            last(SDReward),
+
+        FinalSE =
+            last(SEReward),
+
+        FinalLower95 =
+            last(Lower95),
+
+        FinalUpper95 =
+            last(Upper95),
+
+        BestReward =
+            max(
+                MeanReward,
+                na.rm = TRUE
+            ),
+
+        WorstReward =
+            min(
+                MeanReward,
+                na.rm = TRUE
+            ),
+
+        AverageReward =
+            mean(
+                MeanReward,
+                na.rm = TRUE
+            ),
+
+        .groups = "drop"
+    )
+
+###############################################################
+# 15. PRINT FINAL PERFORMANCE
+###############################################################
+
+cat("\n============================================================\n")
+cat("FINAL PERFORMANCE BY MODEL\n")
+cat("============================================================\n")
+
+print(final_performance)
+
+###############################################################
+# 16. SAVE FINAL PERFORMANCE
+###############################################################
+
+write.csv(
+    final_performance,
+    "results/SARQ_FinalPerformance.csv",
+    row.names = FALSE
+)
+
+###############################################################
+# 17. MODEL CHECK
+###############################################################
+
+cat("\n============================================================\n")
+cat("MODEL CHECK\n")
+cat("============================================================\n")
+
+print(
+    unique(
+        learning_curve$Model
+    )
+)
+
+###############################################################
+# 18. EPISODE CHECK
+###############################################################
+
+cat("\n============================================================\n")
+cat("EPISODE CHECK\n")
+cat("============================================================\n")
+
+print(
+    learning_curve %>%
+        group_by(Model) %>%
+        summarise(
+            Episodes = n(),
+            FirstEpisode = min(Episode),
+            LastEpisode = max(Episode),
+            .groups = "drop"
+        )
+)
+
+###############################################################
+# 19. AULC - AREA UNDER LEARNING CURVE
+###############################################################
+
+# AULC is calculated descriptively from the episode-level
+# mean reward trajectory.
+#
+# Since episode spacing is equal, sum(MeanReward) provides
+# the discrete AULC.
+
+aulc_results <-
+    learning_curve %>%
+
+    group_by(
+        Model
+    ) %>%
+
+    arrange(
+        Episode,
+        .by_group = TRUE
+    ) %>%
+
+    summarise(
+
         AULC =
             sum(
                 MeanReward,
                 na.rm = TRUE
             ),
-        
+
         MeanReward =
             mean(
                 MeanReward,
                 na.rm = TRUE
             ),
-        
+
         FinalReward =
-            MeanReward[which.max(Episode)],
-        
+            last(MeanReward),
+
+        BestReward =
+            max(
+                MeanReward,
+                na.rm = TRUE
+            ),
+
+        WorstReward =
+            min(
+                MeanReward,
+                na.rm = TRUE
+            ),
+
         .groups = "drop"
     )
 
+###############################################################
+# 20. PRINT AULC
+###############################################################
 
-###############################################################
-# Print AULC Results
-###############################################################
+cat("\n============================================================\n")
+cat("AULC RESULTS\n")
+cat("============================================================\n")
 
 print(aulc_results)
 
-
 ###############################################################
-# Save AULC Results
+# 21. SAVE AULC
 ###############################################################
 
 write.csv(
-    
     aulc_results,
-    
     "results/SARQ_AULC.csv",
-    
     row.names = FALSE
 )
-###############################################################
-# Final KPI Comparison
-###############################################################
 
+###############################################################
+# 22. FINAL KPI COMPARISON
+###############################################################
 
 final_summary <-
-
     kpi_table %>%
 
     group_by(
-
         Method
-
     ) %>%
 
     summarise(
 
+        N =
+            n(),
+
         MeanReward =
-
-            mean(TotalReward),
-
+            mean(
+                TotalReward,
+                na.rm = TRUE
+            ),
 
         SDReward =
+            sd(
+                TotalReward,
+                na.rm = TRUE
+            ),
 
-            sd(TotalReward),
-
+        MedianReward =
+            median(
+                TotalReward,
+                na.rm = TRUE
+            ),
 
         MeanCost =
+            mean(
+                TotalCost,
+                na.rm = TRUE
+            ),
 
-            mean(TotalCost),
-
+        SD_Cost =
+            sd(
+                TotalCost,
+                na.rm = TRUE
+            ),
 
         MeanFillRate =
+            mean(
+                FillRate,
+                na.rm = TRUE
+            ),
 
-            mean(FillRate),
-
+        SD_FillRate =
+            sd(
+                FillRate,
+                na.rm = TRUE
+            ),
 
         MeanStockouts =
+            mean(
+                TotalStockouts,
+                na.rm = TRUE
+            ),
 
-            mean(TotalStockouts),
+        SD_Stockouts =
+            sd(
+                TotalStockouts,
+                na.rm = TRUE
+            ),
 
-
-        .groups="drop"
-
+        .groups = "drop"
     )
 
+###############################################################
+# 23. PRINT FINAL KPI SUMMARY
+###############################################################
+
+cat("\n============================================================\n")
+cat("FINAL KPI SUMMARY\n")
+cat("============================================================\n")
 
 print(final_summary)
 
-
+###############################################################
+# 24. SAVE FINAL KPI SUMMARY
+###############################################################
 
 write.csv(
-
     final_summary,
-
     "results/SARQ_FinalSummary.csv",
-
-    row.names=FALSE
-
+    row.names = FALSE
 )
+
 ###############################################################
-# Statistical Comparison
+# 25. PREPARE REPLICATION-LEVEL REWARD DATA
 ###############################################################
 
+# IMPORTANT:
+#
+# Statistical tests are NOT performed on aulc_results because
+# AULC contains only one value per model.
+#
+# Instead, the hypothesis tests use replication-level
+# TotalReward values from kpi_table.
+#
+# This creates:
+#
+# Replication | Method | value
+#
+# for paired comparisons.
+
+reward_metric <-
+    kpi_table %>%
+
+    select(
+        Replication,
+        Method,
+        TotalReward
+    ) %>%
+
+    rename(
+        value = TotalReward
+    ) %>%
+
+    arrange(
+        Method,
+        Replication
+    )
+
+###############################################################
+# 26. CHECK REPLICATION STRUCTURE
+###############################################################
+
+cat("\n============================================================\n")
+cat("REPLICATION-LEVEL REWARD DATA\n")
+cat("============================================================\n")
+
+print(
+    head(reward_metric)
+)
+
+cat("\nNumber of observations by method:\n")
+
+print(
+    reward_metric %>%
+        group_by(Method) %>%
+        summarise(
+            N = n(),
+            MinReplication = min(Replication),
+            MaxReplication = max(Replication),
+            .groups = "drop"
+        )
+)
+
+###############################################################
+# 27. CHECK THAT ALL MODELS HAVE SAME REPLICATIONS
+###############################################################
+
+replication_check <-
+    reward_metric %>%
+
+    group_by(
+        Method
+    ) %>%
+
+    summarise(
+        N = n(),
+        NUniqueReplication =
+            n_distinct(Replication),
+        .groups = "drop"
+    )
+
+print(replication_check)
+
+if (
+    any(
+        replication_check$N !=
+        N_REPLICATIONS
+    )
+) {
+
+    warning(
+        "At least one model does not contain ",
+        N_REPLICATIONS,
+        " replications."
+    )
+
+}
+
+###############################################################
+# 28. STATISTICAL COMPARISON FUNCTION
+###############################################################
 
 compare_models <- function(
-
-        metric,
-
-        model1,
-
-        model2
-
-){
-
+    metric,
+    model1,
+    model2
+) {
 
     x <-
-
         metric %>%
 
         filter(
+            Method == model1
+        ) %>%
 
-            Method==model1
-
+        select(
+            Replication,
+            value
         ) %>%
 
         arrange(
-
             Replication
-
-        ) %>%
-
-        pull(value)
-
-
+        )
 
     y <-
-
         metric %>%
 
         filter(
+            Method == model2
+        ) %>%
 
-            Method==model2
-
+        select(
+            Replication,
+            value
         ) %>%
 
         arrange(
-
             Replication
+        )
 
-        ) %>%
+    ###########################################################
+    # Check replication IDs
+    ###########################################################
 
-        pull(value)
+    if (
+        !identical(
+            x$Replication,
+            y$Replication
+        )
+    ) {
 
+        stop(
+            paste0(
+                "Replication IDs do not match between ",
+                model1,
+                " and ",
+                model2,
+                "."
+            )
+        )
 
+    }
+
+    ###########################################################
+    # Paired differences
+    ###########################################################
+
+    differences <-
+        x$value -
+        y$value
+
+    ###########################################################
+    # Wilcoxon signed-rank test
+    ###########################################################
 
     wilcox <-
-
         wilcox.test(
-
-            x,
-
-            y,
-
-            paired=TRUE
-
+            x$value,
+            y$value,
+            paired = TRUE,
+            exact = FALSE,
+            conf.int = TRUE
         )
 
-
+    ###########################################################
+    # Cliff's delta
+    ###########################################################
 
     effect <-
-
         effsize::cliff.delta(
-
-            x,
-
-            y,
-
-            paired=TRUE
-
+            x$value,
+            y$value,
+            paired = TRUE
         )
 
+    ###########################################################
+    # Mean difference
+    ###########################################################
 
+    mean_difference <-
+        mean(
+            differences,
+            na.rm = TRUE
+        )
+
+    median_difference <-
+        median(
+            differences,
+            na.rm = TRUE
+        )
+
+    ###########################################################
+    # Return results
+    ###########################################################
 
     data.frame(
 
-        Model1=model1,
+        Model1 =
+            model1,
 
-        Model2=model2,
+        Model2 =
+            model2,
 
-        PValue=wilcox$p.value,
+        N =
+            length(
+                differences
+            ),
 
-        CliffDelta=effect$estimate
+        MeanDifference =
+            mean_difference,
 
+        MedianDifference =
+            median_difference,
+
+        W =
+            as.numeric(
+                wilcox$statistic
+            ),
+
+        PValue =
+            wilcox$p.value,
+
+        CliffDelta =
+            as.numeric(
+                effect$estimate
+            ),
+
+        stringsAsFactors = FALSE
     )
-
 }
+
 ###############################################################
-# Reward Statistical Test
+# 29. PAIRWISE STATISTICAL TESTS
 ###############################################################
-
-
-reward_metric <-
-
-    aulc_results %>%
-
-    rename(
-
-        value=AULC
-
-    )
-
-
 
 test_LASARQ_SARQ <-
-
     compare_models(
-
         reward_metric,
-
         "LASAR-Q",
-
         "SAR-Q"
-
     )
 
+test_LASARQ_QLearning <-
+    compare_models(
+        reward_metric,
+        "LASAR-Q",
+        "Q-Learning"
+    )
 
+test_SARQ_QLearning <-
+    compare_models(
+        reward_metric,
+        "SAR-Q",
+        "Q-Learning"
+    )
 
-print(
-
-    test_LASARQ_SARQ
-
-)
-
-
-
-write.csv(
-
-    test_LASARQ_SARQ,
-
-    "results/SARQ_StatisticalTest.csv",
-
-    row.names=FALSE
-
-)
 ###############################################################
-# Bootstrap CI
+# 30. COMBINE STATISTICAL TESTS
 ###############################################################
 
+statistical_tests <-
+    bind_rows(
 
-bootstrap_difference <- function(data,index){
+        test_LASARQ_SARQ,
 
+        test_LASARQ_QLearning,
 
-    d <-
-
-        data[index]
-
-
-    mean(d)
-
-}
-
-
-
-LASARQ_reward <-
-
-    reward_metric %>%
-
-    filter(
-
-        Method=="LASAR-Q"
+        test_SARQ_QLearning
 
     ) %>%
 
-    pull(value)
+    mutate(
 
-
-
-boot_result <-
-
-    boot(
-
-        LASARQ_reward,
-
-        bootstrap_difference,
-
-        R=2000
+        PValueAdjusted =
+            p.adjust(
+                PValue,
+                method = "holm"
+            )
 
     )
 
+###############################################################
+# 31. PRINT STATISTICAL RESULTS
+###############################################################
 
+cat("\n============================================================\n")
+cat("PAIRWISE STATISTICAL COMPARISONS\n")
+cat("============================================================\n")
 
-boot_ci <-
+print(
+    statistical_tests
+)
 
-    boot.ci(
+###############################################################
+# 32. SAVE STATISTICAL RESULTS
+###############################################################
 
-        boot_result,
+write.csv(
+    statistical_tests,
+    "results/SARQ_StatisticalTests.csv",
+    row.names = FALSE
+)
 
-        type="perc"
+###############################################################
+# 33. BOOTSTRAP PAIRED DIFFERENCE FUNCTION
+###############################################################
+
+bootstrap_difference <- function(
+    data,
+    indices
+) {
+
+    d <-
+        data$Difference[
+            indices
+        ]
+
+    mean(
+        d,
+        na.rm = TRUE
+    )
+}
+
+###############################################################
+# 34. BOOTSTRAP COMPARISON FUNCTION
+###############################################################
+
+bootstrap_model_difference <- function(
+    metric,
+    model1,
+    model2,
+    R = BOOT_R
+) {
+
+    x <-
+        metric %>%
+
+        filter(
+            Method == model1
+        ) %>%
+
+        select(
+            Replication,
+            value
+        ) %>%
+
+        arrange(
+            Replication
+        )
+
+    y <-
+        metric %>%
+
+        filter(
+            Method == model2
+        ) %>%
+
+        select(
+            Replication,
+            value
+        ) %>%
+
+        arrange(
+            Replication
+        )
+
+    ###########################################################
+    # Verify pairing
+    ###########################################################
+
+    if (
+        !identical(
+            x$Replication,
+            y$Replication
+        )
+    ) {
+
+        stop(
+            paste0(
+                "Replication IDs do not match between ",
+                model1,
+                " and ",
+                model2,
+                "."
+            )
+        )
+
+    }
+
+    ###########################################################
+    # Difference dataset
+    ###########################################################
+
+    difference_data <-
+        data.frame(
+
+            Replication =
+                x$Replication,
+
+            Difference =
+                x$value -
+                y$value
+
+        )
+
+    ###########################################################
+    # Bootstrap
+    ###########################################################
+
+    boot_result <-
+        boot(
+            data =
+                difference_data,
+
+            statistic =
+                bootstrap_difference,
+
+            R = R
+        )
+
+    ###########################################################
+    # Percentile confidence interval
+    ###########################################################
+
+    boot_ci <-
+        boot.ci(
+            boot_result,
+            type = "perc"
+        )
+
+    ###########################################################
+    # Return summary
+    ###########################################################
+
+    data.frame(
+
+        Model1 =
+            model1,
+
+        Model2 =
+            model2,
+
+        N =
+            nrow(
+                difference_data
+            ),
+
+        ObservedMeanDifference =
+            mean(
+                difference_data$Difference,
+                na.rm = TRUE
+            ),
+
+        BootstrapMeanDifference =
+            mean(
+                boot_result$t,
+                na.rm = TRUE
+            ),
+
+        CI_Lower =
+            boot_ci$percent[4],
+
+        CI_Upper =
+            boot_ci$percent[5]
+
+    )
+}
+
+###############################################################
+# 35. BOOTSTRAP LASAR-Q VS SAR-Q
+###############################################################
+
+bootstrap_LASARQ_SARQ <-
+    bootstrap_model_difference(
+        reward_metric,
+        "LASAR-Q",
+        "SAR-Q",
+        R = BOOT_R
+    )
+
+###############################################################
+# 36. BOOTSTRAP LASAR-Q VS Q-LEARNING
+###############################################################
+
+bootstrap_LASARQ_QLearning <-
+    bootstrap_model_difference(
+        reward_metric,
+        "LASAR-Q",
+        "Q-Learning",
+        R = BOOT_R
+    )
+
+###############################################################
+# 37. BOOTSTRAP SAR-Q VS Q-LEARNING
+###############################################################
+
+bootstrap_SARQ_QLearning <-
+    bootstrap_model_difference(
+        reward_metric,
+        "SAR-Q",
+        "Q-Learning",
+        R = BOOT_R
+    )
+
+###############################################################
+# 38. COMBINE BOOTSTRAP RESULTS
+###############################################################
+
+bootstrap_results <-
+    bind_rows(
+
+        bootstrap_LASARQ_SARQ,
+
+        bootstrap_LASARQ_QLearning,
+
+        bootstrap_SARQ_QLearning
 
     )
 
+###############################################################
+# 39. PRINT BOOTSTRAP RESULTS
+###############################################################
 
+cat("\n============================================================\n")
+cat("BOOTSTRAP CONFIDENCE INTERVALS\n")
+cat("============================================================\n")
+
+print(
+    bootstrap_results
+)
+
+###############################################################
+# 40. SAVE BOOTSTRAP RESULTS
+###############################################################
+
+write.csv(
+    bootstrap_results,
+    "results/SARQ_BootstrapResults.csv",
+    row.names = FALSE
+)
+
+###############################################################
+# 41. SAVE DETAILED BOOTSTRAP OBJECTS
+###############################################################
 
 capture.output(
-
-    boot_ci,
-
-    file="results/LASARQ_Bootstrap_CI.txt"
-
+    bootstrap_results,
+    file =
+        "results/SARQ_Bootstrap_CI.txt"
 )
+
+###############################################################
+# 42. FINAL STATISTICAL SUMMARY
+###############################################################
+
+final_statistical_summary <-
+    statistical_tests %>%
+
+    left_join(
+        bootstrap_results,
+
+        by = c(
+            "Model1",
+            "Model2"
+        )
+    )
+
+###############################################################
+# 43. SAVE FINAL STATISTICAL SUMMARY
+###############################################################
+
+write.csv(
+    final_statistical_summary,
+    "results/SARQ_FinalStatisticalSummary.csv",
+    row.names = FALSE
+)
+
+###############################################################
+# 44. FINAL REPORT
+###############################################################
+
+cat("\n\n")
+cat("============================================================\n")
+cat("SAR-Q / LASAR-Q / Q-LEARNING ANALYSIS COMPLETE\n")
+cat("============================================================\n")
+
+cat("\nModels:\n")
+print(
+    unique(
+        learning_curve$Model
+    )
+)
+
+cat("\nNumber of simulation replications:\n")
+print(
+    N_REPLICATIONS
+)
+
+cat("\nNumber of bootstrap samples:\n")
+print(
+    BOOT_R
+)
+
+cat("\nFinal performance:\n")
+print(
+    final_performance
+)
+
+cat("\nAULC results:\n")
+print(
+    aulc_results
+)
+
+cat("\nStatistical tests:\n")
+print(
+    statistical_tests
+)
+
+cat("\nBootstrap results:\n")
+print(
+    bootstrap_results
+)
+
+cat("\n============================================================\n")
+cat("Results saved in the results/ directory.\n")
+cat("============================================================\n")
+
 ###############################################################
 # PART 7
 #
 # Robustness Analysis
 # Sensitivity Experiments
 # Publication Tables
+#
 ###############################################################
-
 
 cat("\n")
-cat("========================================\n")
-cat("PART 7: Robustness and Publication Results\n")
-cat("========================================\n")
+cat("============================================================\n")
+cat("PART 7: ROBUSTNESS AND PUBLICATION RESULTS\n")
+cat("============================================================\n")
+
 ###############################################################
-# Load Main Simulation Results
+# 0. LOAD REQUIRED PACKAGES
 ###############################################################
 
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(knitr)
+
+###############################################################
+# 1. CREATE RESULTS DIRECTORY
+###############################################################
+
+if (!dir.exists("results")) {
+    dir.create(
+        "results",
+        recursive = TRUE
+    )
+}
+
+###############################################################
+# 2. LOAD MAIN SIMULATION RESULTS
+###############################################################
 
 final_summary <-
-
     read.csv(
-
         "results/SARQ_FinalSummary.csv"
-
     )
-
 
 reward_table <-
-
     read.csv(
-
         "results/SARQ_TrainingRewards.csv"
-
-    )
-###############################################################
-# Scenario Settings
-###############################################################
-
-
-scenarios <- data.frame(
-
-    Scenario=c(
-
-        "Normal",
-
-        "High_Volatility",
-
-        "Demand_Shock",
-
-        "Long_Lead_Time",
-
-        "Low_Service_Level",
-
-        "High_Service_Level"
-
-    ),
-
-    DemandMultiplier=c(
-
-        1.0,
-
-        1.5,
-
-        2.0,
-
-        1.0,
-
-        1.0,
-
-        1.0
-
-    ),
-
-    LeadTime=c(
-
-        2,
-
-        2,
-
-        2,
-
-        5,
-
-        2,
-
-        2
-
-    ),
-
-    ServiceTarget=c(
-
-        0.95,
-
-        0.95,
-
-        0.95,
-
-        0.95,
-
-        0.90,
-
-        0.99
-
     )
 
+###############################################################
+# 3. CHECK MAIN RESULTS
+###############################################################
+
+cat("\n============================================================\n")
+cat("MAIN RESULTS CHECK\n")
+cat("============================================================\n")
+
+cat("\nMethods:\n")
+print(
+    unique(
+        final_summary$Method
+    )
 )
 
+cat("\nFinal summary:\n")
+print(
+    final_summary
+)
 
+###############################################################
+# 4. SCENARIO SETTINGS
+###############################################################
+
+scenarios <-
+    data.frame(
+
+        Scenario = c(
+            "Normal",
+            "High_Volatility",
+            "Demand_Shock",
+            "Long_Lead_Time",
+            "Low_Service_Level",
+            "High_Service_Level"
+        ),
+
+        DemandMultiplier = c(
+            1.0,
+            1.5,
+            2.0,
+            1.0,
+            1.0,
+            1.0
+        ),
+
+        LeadTime = c(
+            2,
+            2,
+            2,
+            5,
+            2,
+            2
+        ),
+
+        ServiceTarget = c(
+            0.95,
+            0.95,
+            0.95,
+            0.95,
+            0.90,
+            0.99
+        ),
+
+        stringsAsFactors = FALSE
+    )
+
+###############################################################
+# 5. SAVE SCENARIO SETTINGS
+###############################################################
 
 write.csv(
-
     scenarios,
-
     "results/RobustnessScenarios.csv",
-
-    row.names=FALSE
-
+    row.names = FALSE
 )
-###############################################################
-# Scenario Demand Generator
-###############################################################
 
+print(
+    scenarios
+)
+
+###############################################################
+# 6. SCENARIO DEMAND GENERATOR
+###############################################################
 
 generate_scenario_demand <- function(
-
-        scenario,
-
-        day
-
-){
-
+    scenario,
+    day,
+    demand_multiplier = 1
+) {
 
     base <-
-
-        sales_matrix[day,]
-
-
-
-    if(scenario=="Normal"){
-
-
-        return(base)
-
-    }
-
-
-
-    if(scenario=="High_Volatility"){
-
-
-        return(
-
-            pmax(
-
-                round(
-
-                    base *
-
-                    rlnorm(
-
-                        N_STORES,
-
-                        0,
-
-                        0.30
-
-                    )
-
-                ),
-
-                0
-
-            )
-
+        as.numeric(
+            sales_matrix[day, ]
         )
 
+    ###########################################################
+    # Normal
+    ###########################################################
+
+    if (
+        scenario == "Normal"
+    ) {
+
+        return(
+            pmax(
+                round(
+                    base *
+                    demand_multiplier
+                ),
+                0
+            )
+        )
     }
 
+    ###########################################################
+    # High volatility
+    ###########################################################
 
+    if (
+        scenario == "High_Volatility"
+    ) {
 
-    if(scenario=="Demand_Shock"){
+        volatility_factor <-
+            rlnorm(
+                N_STORES,
+                meanlog = 0,
+                sdlog = 0.30
+            )
 
+        return(
+            pmax(
+                round(
+                    base *
+                    volatility_factor *
+                    demand_multiplier
+                ),
+                0
+            )
+        )
+    }
+
+    ###########################################################
+    # Demand shock
+    ###########################################################
+
+    if (
+        scenario == "Demand_Shock"
+    ) {
 
         shock <-
-
             ifelse(
-
                 day %% 30 == 0,
-
                 2,
-
                 1
-
             )
 
+        return(
+            pmax(
+                round(
+                    base *
+                    shock *
+                    demand_multiplier
+                ),
+                0
+            )
+        )
+    }
+
+    ###########################################################
+    # Long lead time
+    ###########################################################
+
+    if (
+        scenario == "Long_Lead_Time"
+    ) {
 
         return(
+            pmax(
+                round(
+                    base *
+                    demand_multiplier
+                ),
+                0
+            )
+        )
+    }
 
-            base*shock
+    ###########################################################
+    # Low service level
+    ###########################################################
 
+    if (
+        scenario == "Low_Service_Level"
+    ) {
+
+        return(
+            pmax(
+                round(
+                    base *
+                    demand_multiplier
+                ),
+                0
+            )
+        )
+    }
+
+    ###########################################################
+    # High service level
+    ###########################################################
+
+    if (
+        scenario == "High_Service_Level"
+    ) {
+
+        return(
+            pmax(
+                round(
+                    base *
+                    demand_multiplier
+                ),
+                0
+            )
+        )
+    }
+
+    ###########################################################
+    # Default
+    ###########################################################
+
+    return(
+        pmax(
+            round(
+                base *
+                demand_multiplier
+            ),
+            0
+        )
+    )
+}
+
+###############################################################
+# 7. APPLY SCENARIO PARAMETERS TO ENVIRONMENT
+###############################################################
+
+apply_scenario_parameters <- function(
+    env,
+    scenario_settings
+) {
+
+    ###########################################################
+    # Lead time
+    ###########################################################
+
+    if (
+        "LEAD_TIME" %in%
+        names(env)
+    ) {
+
+        env$LEAD_TIME <-
+            scenario_settings$LeadTime
+
+    }
+
+    ###########################################################
+    # Service level
+    ###########################################################
+
+    if (
+        "SERVICE_LEVEL" %in%
+        names(env)
+    ) {
+
+        env$SERVICE_LEVEL <-
+            scenario_settings$ServiceTarget
+
+    }
+
+    ###########################################################
+    # Alternative naming conventions
+    ###########################################################
+
+    if (
+        "lead_time" %in%
+        names(env)
+    ) {
+
+        env$lead_time <-
+            scenario_settings$LeadTime
+
+    }
+
+    if (
+        "service_level" %in%
+        names(env)
+    ) {
+
+        env$service_level <-
+            scenario_settings$ServiceTarget
+
+    }
+
+    return(
+        env
+    )
+}
+
+###############################################################
+# 8. ROBUSTNESS EXPERIMENT
+###############################################################
+
+run_robustness_experiment <- function(
+    scenario_name,
+    method,
+    replication = 1,
+    scenario_settings = NULL
+) {
+
+    ###########################################################
+    # Get scenario settings
+    ###########################################################
+
+    if (
+        is.null(
+            scenario_settings
+        )
+    ) {
+
+        scenario_settings <-
+            scenarios %>%
+
+            filter(
+                Scenario == scenario_name
+            )
+
+    }
+
+    if (
+        nrow(
+            scenario_settings
+        ) != 1
+    ) {
+
+        stop(
+            paste(
+                "Scenario not found:",
+                scenario_name
+            )
         )
 
     }
 
-
-
-    base
-
-}
-###############################################################
-# Robustness Runner
-###############################################################
-
-
-run_robustness_experiment <- function(
-
-        scenario_name,
-
-        method
-
-){
-
+    ###########################################################
+    # Reset environment
+    ###########################################################
 
     env <-
-
         reset_environment()
 
+    ###########################################################
+    # Apply scenario parameters
+    ###########################################################
 
-
-    Q <-
-
-        create_Q_table()
-
-
-
-    rewards <-
-
-        numeric(
-
-            N_DAYS
-
+    env <-
+        apply_scenario_parameters(
+            env,
+            scenario_settings
         )
 
+    ###########################################################
+    # Initialize Q table
+    ###########################################################
 
+    Q <-
+        create_Q_table()
 
-    for(day in seq_len(N_DAYS)){
+    ###########################################################
+    # Storage
+    ###########################################################
 
+    rewards <-
+        numeric(
+            N_DAYS
+        )
 
+    fill_rates <-
+        numeric(
+            N_DAYS
+        )
+
+    stockouts <-
+        numeric(
+            N_DAYS
+        )
+
+    ###########################################################
+    # Simulation
+    ###########################################################
+
+    for (
+        day in seq_len(
+            N_DAYS
+        )
+    ) {
+
+        #######################################################
+        # State
+        #######################################################
 
         states <-
+            integer(
+                N_STORES
+            )
 
-            integer(N_STORES)
-
-
+        #######################################################
+        # Actions
+        #######################################################
 
         actions <-
+            integer(
+                N_STORES
+            )
 
-            integer(N_STORES)
+        #######################################################
+        # Select actions
+        #######################################################
 
-
-
-        for(i in seq_len(N_STORES)){
-
+        for (
+            i in seq_len(
+                N_STORES
+            )
+        ) {
 
             states[i] <-
-
                 environment_state_index(
-
                     env,
-
                     i
-
                 )
-
 
             actions[i] <-
-
                 epsilon_greedy(
-
                     Q,
-
                     states[i],
-
                     0.05
+                )
+        }
 
+        #######################################################
+        # Scenario demand
+        #######################################################
+
+        env$demand <-
+            generate_scenario_demand(
+
+                scenario =
+                    scenario_name,
+
+                day =
+                    day,
+
+                demand_multiplier =
+                    scenario_settings$DemandMultiplier
+            )
+
+        #######################################################
+        # Environment step
+        #######################################################
+
+        result <-
+            environment_step(
+                env,
+                actions
+            )
+
+        env <-
+            result$env
+
+        #######################################################
+        # Reward
+        #######################################################
+
+        rewards[day] <-
+            sum(
+                result$reward,
+                na.rm = TRUE
+            )
+
+        #######################################################
+        # Fill rate
+        #######################################################
+
+        if (
+            "fill_rate" %in%
+            names(result)
+        ) {
+
+            fill_rates[day] <-
+                mean(
+                    result$fill_rate,
+                    na.rm = TRUE
                 )
 
+        } else {
+
+            fill_rates[day] <-
+                NA_real_
 
         }
 
+        #######################################################
+        # Stockouts
+        #######################################################
 
+        if (
+            "stockouts" %in%
+            names(result)
+        ) {
 
-        env$demand <-
+            stockouts[day] <-
+                sum(
+                    result$stockouts,
+                    na.rm = TRUE
+                )
 
-            generate_scenario_demand(
+        } else {
 
-                scenario_name,
+            stockouts[day] <-
+                NA_real_
 
-                day
-
-            )
-
-
-
-        result <-
-
-            environment_step(
-
-                env,
-
-                actions
-
-            )
-
-
-
-        env <-
-
-            result$env
-
-
-
-        rewards[day] <-
-
-            sum(
-
-                result$reward
-
-            )
-
-
+        }
     }
 
+    ###########################################################
+    # Return replication-level results
+    ###########################################################
 
     data.frame(
 
-        Scenario=scenario_name,
+        Replication =
+            replication,
 
-        Method=method,
+        Scenario =
+            scenario_name,
 
-        TotalReward=sum(rewards),
+        Method =
+            method,
 
-        MeanReward=mean(rewards),
+        TotalReward =
+            sum(
+                rewards,
+                na.rm = TRUE
+            ),
 
-        SDReward=sd(rewards)
+        MeanReward =
+            mean(
+                rewards,
+                na.rm = TRUE
+            ),
 
+        SDReward =
+            sd(
+                rewards,
+                na.rm = TRUE
+            ),
+
+        MeanFillRate =
+            mean(
+                fill_rates,
+                na.rm = TRUE
+            ),
+
+        TotalStockouts =
+            sum(
+                stockouts,
+                na.rm = TRUE
+            ),
+
+        stringsAsFactors = FALSE
     )
-
 }
+
 ###############################################################
-# Execute Robustness Study
+# 9. EXECUTE ROBUSTNESS STUDY
 ###############################################################
 
+cat("\n============================================================\n")
+cat("RUNNING ROBUSTNESS EXPERIMENTS\n")
+cat("============================================================\n")
 
 robustness_results <-
-
     data.frame()
 
-
-
-for(s in scenarios$Scenario){
-
+for (
+    s in scenarios$Scenario
+) {
 
     cat(
-
-        "Scenario:",
-
+        "\nScenario:",
         s,
-
         "\n"
-
     )
 
+    scenario_settings <-
+        scenarios %>%
 
-    for(m in METHODS){
+        filter(
+            Scenario == s
+        )
 
+    for (
+        m in METHODS
+    ) {
 
-        result <-
+        cat(
+            "  Method:",
+            m,
+            "\n"
+        )
 
-            run_robustness_experiment(
-
-                s,
-
-                m
-
+        for (
+            r in seq_len(
+                N_REPLICATIONS
             )
+        ) {
 
+            result <-
+                run_robustness_experiment(
 
-        robustness_results <-
+                    scenario_name =
+                        s,
 
-            rbind(
+                    method =
+                        m,
 
-                robustness_results,
+                    replication =
+                        r,
 
-                result
+                    scenario_settings =
+                        scenario_settings
+                )
 
-            )
-
+            robustness_results <-
+                rbind(
+                    robustness_results,
+                    result
+                )
+        }
     }
-
 }
 
-
+###############################################################
+# 10. SAVE REPLICATION-LEVEL ROBUSTNESS RESULTS
+###############################################################
 
 write.csv(
-
     robustness_results,
-
     "results/SARQ_RobustnessResults.csv",
-
-    row.names=FALSE
-
+    row.names = FALSE
 )
-###############################################################
-# Robustness Summary
-###############################################################
 
+###############################################################
+# 11. ROBUSTNESS SUMMARY
+###############################################################
 
 robustness_summary <-
-
     robustness_results %>%
 
     group_by(
-
         Scenario,
-
         Method
-
     ) %>%
 
     summarise(
 
-        MeanReward=
+        N =
+            n(),
 
+        MeanTotalReward =
             mean(
-
-                MeanReward
-
+                TotalReward,
+                na.rm = TRUE
             ),
 
-        SDReward=
-
+        SDTotalReward =
             sd(
-
-                MeanReward
-
+                TotalReward,
+                na.rm = TRUE
             ),
 
-        .groups="drop"
+        MeanReward =
+            mean(
+                MeanReward,
+                na.rm = TRUE
+            ),
 
+        SDReward =
+            sd(
+                MeanReward,
+                na.rm = TRUE
+            ),
+
+        MeanFillRate =
+            mean(
+                MeanFillRate,
+                na.rm = TRUE
+            ),
+
+        SD_FillRate =
+            sd(
+                MeanFillRate,
+                na.rm = TRUE
+            ),
+
+        MeanStockouts =
+            mean(
+                TotalStockouts,
+                na.rm = TRUE
+            ),
+
+        SD_Stockouts =
+            sd(
+                TotalStockouts,
+                na.rm = TRUE
+            ),
+
+        .groups = "drop"
     )
 
+###############################################################
+# 12. PRINT ROBUSTNESS SUMMARY
+###############################################################
 
+cat("\n============================================================\n")
+cat("ROBUSTNESS SUMMARY\n")
+cat("============================================================\n")
 
 print(
-
     robustness_summary
-
 )
 
-
+###############################################################
+# 13. SAVE ROBUSTNESS SUMMARY
+###############################################################
 
 write.csv(
-
     robustness_summary,
-
     "results/SARQ_RobustnessSummary.csv",
-
-    row.names=FALSE
-
-)
-###############################################################
-# Lambda Sensitivity
-###############################################################
-
-
-lambda_values <- c(
-
-    0,
-
-    0.1,
-
-    0.3,
-
-    0.5,
-
-    0.7
-
+    row.names = FALSE
 )
 
+###############################################################
+# 14. ROBUSTNESS PLOT
+###############################################################
 
+p_robustness <-
+    ggplot(
+        robustness_summary,
+
+        aes(
+            x = Scenario,
+            y = MeanReward,
+            group = Method,
+            color = Method
+        )
+    ) +
+
+    geom_point(
+        size = 3
+    ) +
+
+    geom_line(
+        linewidth = 1
+    ) +
+
+    theme_bw() +
+
+    theme(
+        axis.text.x =
+            element_text(
+                angle = 45,
+                hjust = 1
+            )
+    ) +
+
+    labs(
+        title =
+            "Robustness of Learning Performance Across Scenarios",
+
+        x =
+            "Scenario",
+
+        y =
+            "Mean Reward",
+
+        color =
+            "Method"
+    )
+
+print(
+    p_robustness
+)
+
+###############################################################
+# 15. SAVE ROBUSTNESS PLOT
+###############################################################
+
+ggsave(
+    "results/SARQ_RobustnessPlot.png",
+    p_robustness,
+    width = 9,
+    height = 6,
+    dpi = 300
+)
+
+###############################################################
+# 16. LAMBDA SENSITIVITY
+###############################################################
+
+lambda_values <-
+    c(
+        0,
+        0.1,
+        0.3,
+        0.5,
+        0.7
+    )
 
 lambda_results <-
-
     data.frame()
 
+###############################################################
+# 17. LAMBDA SENSITIVITY RUNNER
+###############################################################
 
+for (
+    lambda in lambda_values
+) {
 
-for(lambda in lambda_values){
+    cat(
+        "\nLambda:",
+        lambda,
+        "\n"
+    )
 
+    ###########################################################
+    # Set global parameter
+    ###########################################################
 
     LAMBDA_SPATIAL <<-
-
         lambda
 
+    ###########################################################
+    # Run replications
+    ###########################################################
 
-
-    result <-
-
-        run_robustness_experiment(
-
-            "Normal",
-
-            "SAR-Q"
-
+    for (
+        r in seq_len(
+            N_REPLICATIONS
         )
+    ) {
 
+        result <-
+            run_robustness_experiment(
 
-    result$Lambda <-
+                scenario_name =
+                    "Normal",
 
-        lambda
+                method =
+                    "SAR-Q",
 
-
-
-    lambda_results <-
-
-        rbind(
-
-            lambda_results,
-
-            result
-
-        )
-
-}
-
-
-
-write.csv(
-
-    lambda_results,
-
-    "results/SARQ_LambdaSensitivity.csv",
-
-    row.names=FALSE
-
-)
-###############################################################
-# Copula Sensitivity
-###############################################################
-
-
-copula_models <- c(
-
-    "Gaussian",
-
-    "Clayton",
-
-    "Gumbel"
-
-)
-
-
-
-copula_results <-
-
-    data.frame()
-
-
-
-for(cop in copula_models){
-
-
-    CopulaFeature <<-
-
-        safe_scale(
-
-            rowMeans(
-
-                copula_matrix,
-
-                na.rm=TRUE
-
+                replication =
+                    r
             )
 
-        )
+        result$Lambda <-
+            lambda
 
-
-    result <-
-
-        run_robustness_experiment(
-
-            "Normal",
-
-            "LASAR-Q"
-
-        )
-
-
-    result$Copula <-
-
-        cop
-
-
-
-    copula_results <-
-
-        rbind(
-
-            copula_results,
-
-            result
-
-        )
-
+        lambda_results <-
+            rbind(
+                lambda_results,
+                result
+            )
+    }
 }
 
-
+###############################################################
+# 18. SAVE LAMBDA RESULTS
+###############################################################
 
 write.csv(
-
-    copula_results,
-
-    "results/SARQ_CopulaSensitivity.csv",
-
-    row.names=FALSE
-
+    lambda_results,
+    "results/SARQ_LambdaSensitivity.csv",
+    row.names = FALSE
 )
+
 ###############################################################
-# Publication Table
+# 19. LAMBDA SUMMARY
 ###############################################################
 
+lambda_summary <-
+    lambda_results %>%
+
+    group_by(
+        Lambda
+    ) %>%
+
+    summarise(
+
+        N =
+            n(),
+
+        MeanReward =
+            mean(
+                TotalReward,
+                na.rm = TRUE
+            ),
+
+        SDReward =
+            sd(
+                TotalReward,
+                na.rm = TRUE
+            ),
+
+        .groups = "drop"
+    )
+
+###############################################################
+# 20. SAVE LAMBDA SUMMARY
+###############################################################
+
+write.csv(
+    lambda_summary,
+    "results/SARQ_LambdaSensitivitySummary.csv",
+    row.names = FALSE
+)
+
+###############################################################
+# 21. LAMBDA PLOT
+###############################################################
+
+p_lambda <-
+    ggplot(
+        lambda_summary,
+        aes(
+            x = Lambda,
+            y = MeanReward
+        )
+    ) +
+
+    geom_line(
+        linewidth = 1
+    ) +
+
+    geom_point(
+        size = 3
+    ) +
+
+    theme_bw() +
+
+    labs(
+        title =
+            "Sensitivity to Spatial Dependence Weight",
+
+        x =
+            expression(lambda),
+
+        y =
+            "Mean Total Reward"
+    )
+
+print(
+    p_lambda
+)
+
+###############################################################
+# 22. SAVE LAMBDA PLOT
+###############################################################
+
+ggsave(
+    "results/SARQ_LambdaSensitivity.png",
+    p_lambda,
+    width = 8,
+    height = 5,
+    dpi = 300
+)
+
+###############################################################
+# 23. RESTORE DEFAULT LAMBDA
+###############################################################
+
+LAMBDA_SPATIAL <<-
+    0.4
+
+###############################################################
+# 24. COPULA SENSITIVITY
+###############################################################
+
+copula_models <-
+    c(
+        "Gaussian",
+        "Clayton",
+        "Gumbel"
+    )
+
+copula_results <-
+    data.frame()
+
+###############################################################
+# 25. COPULA FEATURE GENERATOR
+###############################################################
+
+generate_copula_feature <- function(
+    copula_name
+) {
+
+    ###########################################################
+    # Gaussian
+    ###########################################################
+
+    if (
+        copula_name == "Gaussian"
+    ) {
+
+        return(
+            safe_scale(
+                rowMeans(
+                    copula_matrix,
+                    na.rm = TRUE
+                )
+            )
+        )
+    }
+
+    ###########################################################
+    # Clayton
+    ###########################################################
+
+    if (
+        copula_name == "Clayton"
+    ) {
+
+        return(
+            safe_scale(
+                rowMeans(
+                    copula_matrix^2,
+                    na.rm = TRUE
+                )
+            )
+        )
+    }
+
+    ###########################################################
+    # Gumbel
+    ###########################################################
+
+    if (
+        copula_name == "Gumbel"
+    ) {
+
+        return(
+            safe_scale(
+                rowMeans(
+                    -log(
+                        pmax(
+                            copula_matrix,
+                            1e-8
+                        )
+                    ),
+                    na.rm = TRUE
+                )
+            )
+        )
+    }
+
+    stop(
+        paste(
+            "Unknown copula:",
+            copula_name
+        )
+    )
+}
+
+###############################################################
+# 26. COPULA SENSITIVITY RUN
+###############################################################
+
+for (
+    cop in copula_models
+) {
+
+    cat(
+        "\nCopula:",
+        cop,
+        "\n"
+    )
+
+    ###########################################################
+    # Construct copula feature
+    ###########################################################
+
+    CopulaFeature <<-
+        generate_copula_feature(
+            cop
+        )
+
+    ###########################################################
+    # Replications
+    ###########################################################
+
+    for (
+        r in seq_len(
+            N_REPLICATIONS
+        )
+    ) {
+
+        result <-
+            run_robustness_experiment(
+
+                scenario_name =
+                    "Normal",
+
+                method =
+                    "LASAR-Q",
+
+                replication =
+                    r
+            )
+
+        result$Copula <-
+            cop
+
+        copula_results <-
+            rbind(
+                copula_results,
+                result
+            )
+    }
+}
+
+###############################################################
+# 27. SAVE COPULA RESULTS
+###############################################################
+
+write.csv(
+    copula_results,
+    "results/SARQ_CopulaSensitivity.csv",
+    row.names = FALSE
+)
+
+###############################################################
+# 28. COPULA SUMMARY
+###############################################################
+
+copula_summary <-
+    copula_results %>%
+
+    group_by(
+        Copula
+    ) %>%
+
+    summarise(
+
+        N =
+            n(),
+
+        MeanReward =
+            mean(
+                TotalReward,
+                na.rm = TRUE
+            ),
+
+        SDReward =
+            sd(
+                TotalReward,
+                na.rm = TRUE
+            ),
+
+        .groups = "drop"
+    )
+
+###############################################################
+# 29. SAVE COPULA SUMMARY
+###############################################################
+
+write.csv(
+    copula_summary,
+    "results/SARQ_CopulaSensitivitySummary.csv",
+    row.names = FALSE
+)
+
+###############################################################
+# 30. COPULA SENSITIVITY PLOT
+###############################################################
+
+p_copula <-
+    ggplot(
+        copula_summary,
+        aes(
+            x = Copula,
+            y = MeanReward,
+            group = 1
+        )
+    ) +
+
+    geom_point(
+        size = 3
+    ) +
+
+    geom_line(
+        linewidth = 1
+    ) +
+
+    theme_bw() +
+
+    labs(
+        title =
+            "Sensitivity to Copula Specification",
+
+        x =
+            "Copula Model",
+
+        y =
+            "Mean Total Reward"
+    )
+
+print(
+    p_copula
+)
+
+###############################################################
+# 31. SAVE COPULA PLOT
+###############################################################
+
+ggsave(
+    "results/SARQ_CopulaSensitivity.png",
+    p_copula,
+    width = 8,
+    height = 5,
+    dpi = 300
+)
+
+###############################################################
+# 32. RESTORE DEFAULT COPULA FEATURE
+###############################################################
+
+CopulaFeature <<-
+    safe_scale(
+        rowMeans(
+            copula_matrix,
+            na.rm = TRUE
+        )
+    )
+
+###############################################################
+# 33. PUBLICATION TABLE
+###############################################################
 
 publication_table <-
-
     final_summary %>%
 
     mutate(
 
         Reward =
-
             round(
-
                 MeanReward,
-
                 2
+            ),
 
+        RewardSD =
+            round(
+                SDReward,
+                2
             ),
 
         Cost =
-
             round(
-
                 MeanCost,
-
                 2
-
             ),
 
         FillRate =
-
             round(
-
                 MeanFillRate,
-
                 4
+            ),
 
+        Stockouts =
+            round(
+                MeanStockouts,
+                2
             )
 
     ) %>%
@@ -8066,77 +10400,289 @@ publication_table <-
 
         Reward,
 
+        RewardSD,
+
         Cost,
 
-        FillRate
+        FillRate,
 
+        Stockouts
     )
 
+###############################################################
+# 34. PRINT PUBLICATION TABLE
+###############################################################
 
+cat("\n============================================================\n")
+cat("PUBLICATION TABLE\n")
+cat("============================================================\n")
+
+print(
+    publication_table
+)
+
+###############################################################
+# 35. SAVE PUBLICATION TABLE
+###############################################################
 
 write.csv(
-
     publication_table,
-
     "results/Table1_MethodComparison.csv",
-
-    row.names=FALSE
-
+    row.names = FALSE
 )
-###############################################################
-# LaTeX Output
-###############################################################
 
+###############################################################
+# 36. LATEX TABLE
+###############################################################
 
 latex_table <-
-
     knitr::kable(
 
         publication_table,
 
-        format="latex",
+        format =
+            "latex",
 
-        booktabs=TRUE,
+        booktabs =
+            TRUE,
 
-        caption=
+        digits =
+            4,
 
-        "Performance comparison of Q-Learning, SAR-Q and LASAR-Q"
+        caption =
+            "Performance comparison of Q-Learning, SAR-Q, and LASAR-Q",
+
+        label =
+            "tab:method-comparison",
+
+        align =
+            "lrrrrr"
+    )
+
+###############################################################
+# 37. SAVE LATEX TABLE
+###############################################################
+
+writeLines(
+    latex_table,
+    "results/Table1_MethodComparison.tex"
+)
+
+###############################################################
+# 38. ROBUSTNESS PUBLICATION TABLE
+###############################################################
+
+robustness_publication_table <-
+    robustness_summary %>%
+
+    mutate(
+
+        Reward =
+            sprintf(
+                "%.2f",
+                MeanTotalReward
+            ),
+
+        RewardSD =
+            sprintf(
+                "%.2f",
+                SDTotalReward
+            ),
+
+        FillRate =
+            sprintf(
+                "%.4f",
+                MeanFillRate
+            ),
+
+        Stockouts =
+            sprintf(
+                "%.2f",
+                MeanStockouts
+            )
+
+    ) %>%
+
+    select(
+
+        Scenario,
+
+        Method,
+
+        Reward,
+
+        RewardSD,
+
+        FillRate,
+
+        Stockouts
+    )
+
+###############################################################
+# 39. SAVE ROBUSTNESS PUBLICATION TABLE
+###############################################################
+
+write.csv(
+    robustness_publication_table,
+    "results/Table2_Robustness.csv",
+    row.names = FALSE
+)
+
+###############################################################
+# 40. LATEX ROBUSTNESS TABLE
+###############################################################
+
+latex_robustness <-
+    knitr::kable(
+
+        robustness_publication_table,
+
+        format =
+            "latex",
+
+        booktabs =
+            TRUE,
+
+        caption =
+            "Robustness analysis across demand, lead-time, and service-level scenarios",
+
+        label =
+            "tab:robustness",
+
+        align =
+            "llrrrr"
+    )
+
+writeLines(
+    latex_robustness,
+    "results/Table2_Robustness.tex"
+)
+
+###############################################################
+# 41. LAMBDA PUBLICATION TABLE
+###############################################################
+
+lambda_publication_table <-
+    lambda_summary %>%
+
+    mutate(
+
+        MeanReward =
+            round(
+                MeanReward,
+                2
+            ),
+
+        SDReward =
+            round(
+                SDReward,
+                2
+            )
 
     )
 
-
-
-writeLines(
-
-    latex_table,
-
-    "results/Table1_MethodComparison.tex"
-
+write.csv(
+    lambda_publication_table,
+    "results/Table3_LambdaSensitivity.csv",
+    row.names = FALSE
 )
+
 ###############################################################
+# 42. COPULA PUBLICATION TABLE
+###############################################################
+
+copula_publication_table <-
+    copula_summary %>%
+
+    mutate(
+
+        MeanReward =
+            round(
+                MeanReward,
+                2
+            ),
+
+        SDReward =
+            round(
+                SDReward,
+                2
+            )
+
+    )
+
+write.csv(
+    copula_publication_table,
+    "results/Table4_CopulaSensitivity.csv",
+    row.names = FALSE
+)
+
+###############################################################
+# 43. FINAL PART 7 SUMMARY
+###############################################################
+
+cat("\n\n")
+cat("============================================================\n")
+cat("PART 7 COMPLETE\n")
+cat("============================================================\n")
+
+cat("\nRobustness scenarios:\n")
+print(
+    scenarios
+)
+
+cat("\nRobustness summary:\n")
+print(
+    robustness_summary
+)
+
+cat("\nLambda sensitivity:\n")
+print(
+    lambda_summary
+)
+
+cat("\nCopula sensitivity:\n")
+print(
+    copula_summary
+)
+
+cat("\nPublication table:\n")
+print(
+    publication_table
+)
+
+cat("\n============================================================\n")
+cat("PART 7 RESULTS SAVED TO results/\n")
+cat("============================================================\n")
+
+
+###############################################################
+#
 # FILE 04
 #
 # Benchmark Comparison Framework
 #
 # Copula Spatial SAR-Q Inventory System
+#
 ###############################################################
-
 
 cat("\n")
-cat("========================================\n")
+cat("============================================================\n")
 cat("FILE 04: Benchmark Comparison Framework\n")
-cat("========================================\n")
+cat("============================================================\n")
+
+
 ###############################################################
 # PART 1
+#
 # Setup
+#
 ###############################################################
-
 
 library(dplyr)
 library(ggplot2)
 library(effsize)
 library(boot)
-
+library(tidyr)
 
 select <- dplyr::select
 filter <- dplyr::filter
@@ -8144,15 +10690,30 @@ mutate <- dplyr::mutate
 summarise <- dplyr::summarise
 
 
+###############################################################
+# Create results directory
+###############################################################
+
+if (!dir.exists("results")) {
+
+    dir.create(
+        "results",
+        recursive = TRUE
+    )
+
+}
+
 
 ###############################################################
 # Load FILE 03 Results
+#
 ###############################################################
 
-
-if(!file.exists(
-    "results/SARQ_SimulationObjects.rds"
-)){
+if (
+    !file.exists(
+        "results/SARQ_SimulationObjects.rds"
+    )
+) {
 
     stop(
         "FILE 03 simulation objects not found."
@@ -8161,232 +10722,365 @@ if(!file.exists(
 }
 
 
-
 simulation_results <-
-
     readRDS(
-
         "results/SARQ_SimulationObjects.rds"
-
     )
 
 
+###############################################################
+# Load training rewards
+###############################################################
 
-reward_table <-
-
-    read.csv(
-
+if (
+    file.exists(
         "results/SARQ_TrainingRewards.csv"
-
     )
+) {
+
+    reward_table <-
+        read.csv(
+            "results/SARQ_TrainingRewards.csv"
+        )
+
+} else {
+
+    reward_table <-
+        NULL
+
+}
 
 
+###############################################################
+# Load final KPI table
+###############################################################
 
-kpi_table <-
-
-    read.csv(
-
+if (
+    file.exists(
         "results/SARQ_FinalKPI.csv"
-
     )
+) {
+
+    kpi_table <-
+        read.csv(
+            "results/SARQ_FinalKPI.csv"
+        )
+
+} else {
+
+    kpi_table <-
+        NULL
+
+}
+
+
+###############################################################
+# Check simulation objects
+###############################################################
+
+cat("\nSimulation objects loaded:\n")
+
+print(
+    length(
+        simulation_results
+    )
+)
+
+
 ###############################################################
 # PART 2
+#
 # Benchmark Models
+#
 ###############################################################
 
-
-BENCHMARK_MODELS <- c(
-
-    "Random",
-
-    "BaseStock",
-
-    "Q-Learning",
-
-    "SAR-Q",
-
-    "LASAR-Q"
-
-)
+BENCHMARK_MODELS <-
+    c(
+        "Random",
+        "BaseStock",
+        "Q-Learning",
+        "SAR-Q",
+        "LASAR-Q"
+    )
 
 
 N_BENCHMARK <-
-
     length(
-
         BENCHMARK_MODELS
-
     )
-
 
 
 cat(
-
-    "Benchmark Models:",
-
-    paste(
-
-        BENCHMARK_MODELS,
-
-        collapse=", "
-
-    ),
-
-    "\n"
-
+    "\nBenchmark Models:\n"
 )
+
+cat(
+    paste(
+        BENCHMARK_MODELS,
+        collapse = ", "
+    ),
+    "\n"
+)
+
+
 ###############################################################
+# PART 3
+#
 # Random Policy
+#
 ###############################################################
 
-
-random_policy <- function(){
-
+random_policy <- function(
+    env = NULL
+) {
 
     sample(
-
-        seq_len(N_ACTIONS),
-
+        seq_len(
+            N_ACTIONS
+        ),
         N_STORES,
-
-        replace=TRUE
-
+        replace = TRUE
     )
 
 }
+
+
 ###############################################################
-# Base Stock Policy
+# PART 4
+#
+# Base-Stock Policy
+#
 ###############################################################
 
-
-BASE_SERVICE_LEVEL <- 0.95
-
+BASE_SERVICE_LEVEL <-
+    0.95
 
 
 base_stock_policy <- function(
+    env
+) {
 
-        env
+    ###########################################################
+    # Safety-stock component
+    ###########################################################
 
-){
+    safety_stock <-
+        qnorm(
+            BASE_SERVICE_LEVEL
+        ) *
+        demand_sd *
+        sqrt(
+            LEAD_TIME
+        )
 
+
+    ###########################################################
+    # Target inventory
+    ###########################################################
 
     target_inventory <-
-
         demand_base *
-
         LEAD_TIME +
-
-        qnorm(
-
-            BASE_SERVICE_LEVEL
-
-        )
-
-        *
-
-        demand_sd *
-
-        sqrt(
-
-            LEAD_TIME
-
-        )
+        safety_stock
 
 
+    ###########################################################
+    # Order quantity
+    ###########################################################
 
     order_qty <-
-
         pmax(
-
             target_inventory -
-
             env$inventory,
-
             0
-
         )
 
 
+    ###########################################################
+    # Convert order quantity to action
+    ###########################################################
 
     action <-
-
         findInterval(
-
             order_qty,
-
             ACTION_SPACE
-
         )
 
 
+    ###########################################################
+    # Protect action boundaries
+    ###########################################################
 
     action <-
-
         pmin(
-
             pmax(
-
                 action,
-
                 1
-
             ),
-
             N_ACTIONS
-
         )
 
 
-
-    action
+    return(
+        action
+    )
 
 }
+
+
 ###############################################################
-# Evaluate Policy
+# PART 5
+#
+# Environment Output Helper
+#
 ###############################################################
 
+get_result_vector <- function(
+    result,
+    env,
+    variable,
+    default = 0
+) {
+
+    ###########################################################
+    # Prefer variable returned directly by environment_step
+    ###########################################################
+
+    if (
+        variable %in%
+        names(result)
+    ) {
+
+        value <-
+            result[[variable]]
+
+        if (
+            length(value) > 0
+        ) {
+
+            return(
+                value
+            )
+
+        }
+
+    }
+
+
+    ###########################################################
+    # Otherwise use updated environment
+    ###########################################################
+
+    if (
+        variable %in%
+        names(env)
+    ) {
+
+        value <-
+            env[[variable]]
+
+        if (
+            length(value) > 0
+        ) {
+
+            return(
+                value
+            )
+
+        }
+
+    }
+
+
+    ###########################################################
+    # Default
+    ###########################################################
+
+    return(
+        default
+    )
+
+}
+
+
+###############################################################
+# PART 6
+#
+# Evaluate Policy
+#
+###############################################################
 
 evaluate_policy <- function(
+    policy,
+    method_name,
+    replication
+) {
 
-        policy,
-
-        method_name,
-
-        replication
-
-){
-
+    ###########################################################
+    # Reset environment
+    ###########################################################
 
     env <-
-
         reset_environment()
 
 
+    ###########################################################
+    # Performance storage
+    ###########################################################
 
-    total_reward <- 0
+    total_reward <-
+        0
 
-    total_cost <- 0
+    total_cost <-
+        0
 
-    total_stockout <- 0
+    total_stockout <-
+        0
 
-    total_sales <- 0
+    total_sales <-
+        0
 
-    total_demand <- 0
-
-
-
-    for(day in seq_len(N_DAYS)){
+    total_demand <-
+        0
 
 
+    ###########################################################
+    # Daily simulation
+    ###########################################################
+
+    for (
+        day in seq_len(
+            N_DAYS
+        )
+    ) {
 
         #######################################################
-        # Action
+        # Select action
         #######################################################
 
         actions <-
+            policy(
+                env
+            )
 
-            policy(env)
 
+        #######################################################
+        # Validate actions
+        #######################################################
+
+        if (
+            length(actions) !=
+            N_STORES
+        ) {
+
+            stop(
+                paste(
+                    "Invalid action length for method:",
+                    method_name
+                )
+            )
+
+        }
 
 
         #######################################################
@@ -8394,218 +11088,360 @@ evaluate_policy <- function(
         #######################################################
 
         result <-
-
             environment_step(
-
                 env,
-
                 actions
-
             )
 
 
-        env <-
+        #######################################################
+        # Update environment
+        #######################################################
 
+        env <-
             result$env
 
 
+        #######################################################
+        # Reward
+        #######################################################
+
+        reward_value <-
+            get_result_vector(
+                result,
+                env,
+                "reward"
+            )
 
         total_reward <-
-
             total_reward +
-
             sum(
-
-                result$reward
-
+                reward_value,
+                na.rm = TRUE
             )
 
+
+        #######################################################
+        # Cost
+        #######################################################
+
+        cost_value <-
+            get_result_vector(
+                result,
+                env,
+                "cost"
+            )
 
         total_cost <-
-
             total_cost +
-
             sum(
-
-                env$cost
-
+                cost_value,
+                na.rm = TRUE
             )
 
+
+        #######################################################
+        # Stockouts
+        #######################################################
+
+        stockout_value <-
+            get_result_vector(
+                result,
+                env,
+                "stockout"
+            )
 
         total_stockout <-
-
             total_stockout +
-
             sum(
-
-                env$stockout
-
+                stockout_value,
+                na.rm = TRUE
             )
 
+
+        #######################################################
+        # Sales
+        #######################################################
+
+        sales_value <-
+            get_result_vector(
+                result,
+                env,
+                "sales"
+            )
 
         total_sales <-
-
             total_sales +
-
             sum(
-
-                env$sales
-
+                sales_value,
+                na.rm = TRUE
             )
 
+
+        #######################################################
+        # Demand
+        #######################################################
+
+        demand_value <-
+            get_result_vector(
+                result,
+                env,
+                "demand"
+            )
 
         total_demand <-
-
             total_demand +
-
             sum(
-
-                env$demand
-
+                demand_value,
+                na.rm = TRUE
             )
-
 
     }
 
 
+    ###########################################################
+    # Fill rate
+    ###########################################################
+
+    fill_rate <-
+        total_sales /
+        pmax(
+            total_demand,
+            1
+        )
+
+
+    ###########################################################
+    # Return replication-level result
+    ###########################################################
 
     data.frame(
 
-        Replication=
-
+        Replication =
             replication,
 
-        Method=
-
+        Method =
             method_name,
 
-        TotalReward=
-
+        TotalReward =
             total_reward,
 
-        TotalCost=
-
+        TotalCost =
             total_cost,
 
-        FillRate=
+        FillRate =
+            fill_rate,
 
-            total_sales /
+        Stockouts =
+            total_stockout,
 
-            pmax(
+        TotalSales =
+            total_sales,
 
-                total_demand,
+        TotalDemand =
+            total_demand,
 
-                1
-
-            ),
-
-        Stockouts=
-
-            total_stockout
-
+        stringsAsFactors =
+            FALSE
     )
 
 }
-###############################################################
-# RL Policy Extraction
-###############################################################
 
+
+###############################################################
+# PART 7
+#
+# RL Policy Extraction
+#
+###############################################################
 
 create_RL_policy <- function(
+    Q,
+    method
+) {
 
-        Q,
+    ###########################################################
+    # Check Q table
+    ###########################################################
 
-        method
+    if (
+        is.null(Q)
+    ) {
 
-){
-
-
-    function(env){
-
-
-
-        actions <-
-
-            integer(
-
-                N_STORES
-
+        stop(
+            paste(
+                "Q table is NULL for method:",
+                method
             )
+        )
+
+    }
 
 
+    ###########################################################
+    # Create deterministic policy
+    ###########################################################
 
-        for(i in seq_len(N_STORES)){
+    policy_function <-
+        function(
+            env
+        ) {
 
-
-
-            state <-
-
-                environment_state_index(
-
-                    env,
-
-                    i
-
+            actions <-
+                integer(
+                    N_STORES
                 )
 
 
+            ###################################################
+            # Select action for each store
+            ###################################################
 
-            q_values <-
-
-                get_Q(
-
-                    Q,
-
-                    state
-
+            for (
+                i in seq_len(
+                    N_STORES
                 )
+            ) {
+
+                state <-
+                    environment_state_index(
+                        env,
+                        i
+                    )
 
 
-            actions[i] <-
+                q_values <-
+                    get_Q(
+                        Q,
+                        state
+                    )
 
-                which.max(
 
-                    q_values
+                if (
+                    length(q_values) == 0
+                ) {
 
-                )
+                    stop(
+                        paste(
+                            "No Q-values found for state:",
+                            state
+                        )
+                    )
 
+                }
+
+
+                ################################################
+                # Greedy action
+                ################################################
+
+                actions[i] <-
+                    which.max(
+                        q_values
+                    )
+
+            }
+
+
+            return(
+                actions
+            )
 
         }
 
 
-
-        actions
-
-    }
+    return(
+        policy_function
+    )
 
 }
+
+
 ###############################################################
-# PART 7
-# Execute Benchmark
+# PART 8
+#
+# Find RL Simulation Objects
+#
 ###############################################################
 
+get_simulation_object <- function(
+    simulation_results,
+    replication,
+    method
+) {
+
+    ###########################################################
+    # Expected naming convention
+    ###########################################################
+
+    object_name <-
+        paste(
+            replication,
+            method,
+            sep = "_"
+        )
+
+
+    ###########################################################
+    # Direct lookup
+    ###########################################################
+
+    object <-
+        simulation_results[[
+            object_name
+        ]]
+
+
+    ###########################################################
+    # Return
+    ###########################################################
+
+    return(
+        object
+    )
+
+}
+
+
+###############################################################
+# PART 9
+#
+# Execute Benchmark
+#
+###############################################################
 
 benchmark_results <-
-
     data.frame()
 
 
+###############################################################
+# Number of benchmark replications
+###############################################################
 
-N_BENCH_REPLICATIONS <- 30
+N_BENCH_REPLICATIONS <-
+    30
 
 
+cat("\n")
+cat("============================================================\n")
+cat("STARTING BENCHMARK EXPERIMENT\n")
+cat("============================================================\n")
 
-for(r in seq_len(N_BENCH_REPLICATIONS)){
 
+###############################################################
+# Benchmark replications
+###############################################################
+
+for (
+    r in seq_len(
+        N_BENCH_REPLICATIONS
+    )
+) {
 
     cat(
-
         "Replication:",
-
         r,
-
         "\n"
-
     )
 
 
@@ -8614,7 +11450,6 @@ for(r in seq_len(N_BENCH_REPLICATIONS)){
     ###########################################################
 
     benchmark_results <-
-
         rbind(
 
             benchmark_results,
@@ -8628,9 +11463,7 @@ for(r in seq_len(N_BENCH_REPLICATIONS)){
                 r
 
             )
-
         )
-
 
 
     ###########################################################
@@ -8638,7 +11471,6 @@ for(r in seq_len(N_BENCH_REPLICATIONS)){
     ###########################################################
 
     benchmark_results <-
-
         rbind(
 
             benchmark_results,
@@ -8652,85 +11484,126 @@ for(r in seq_len(N_BENCH_REPLICATIONS)){
                 r
 
             )
-
         )
 
 
-
     ###########################################################
-    # RL Models
+    # RL models
     ###########################################################
 
+    for (
+        method in
+        c(
+            "Q-Learning",
+            "SAR-Q",
+            "LASAR-Q"
+        )
+    ) {
 
-    for(method in c(
-
-        "Q-Learning",
-
-        "SAR-Q",
-
-        "LASAR-Q"
-
-    )){
-
+        #######################################################
+        # Retrieve simulation object
+        #######################################################
 
         object <-
+            get_simulation_object(
 
-            simulation_results[[
+                simulation_results,
 
+                r,
+
+                method
+            )
+
+
+        #######################################################
+        # Check object
+        #######################################################
+
+        if (
+            is.null(object)
+        ) {
+
+            warning(
                 paste(
-
+                    "Simulation object not found:",
                     r,
+                    method
+                )
+            )
+
+            next
+
+        }
+
+
+        #######################################################
+        # Check Q table
+        #######################################################
+
+        if (
+            is.null(
+                object$Q
+            )
+        ) {
+
+            warning(
+                paste(
+                    "Q table not found:",
+                    r,
+                    method
+                )
+            )
+
+            next
+
+        }
+
+
+        #######################################################
+        # Extract policy
+        #######################################################
+
+        policy <-
+            create_RL_policy(
+
+                object$Q,
+
+                method
+
+            )
+
+
+        #######################################################
+        # Evaluate policy
+        #######################################################
+
+        benchmark_results <-
+            rbind(
+
+                benchmark_results,
+
+                evaluate_policy(
+
+                    policy,
 
                     method,
 
-                    sep="_"
+                    r
 
                 )
-
-            ]]
-
-
-
-        if(!is.null(object)){
-
-
-            policy <-
-
-                create_RL_policy(
-
-                    object$Q,
-
-                    method
-
-                )
-
-
-
-            benchmark_results <-
-
-                rbind(
-
-                    benchmark_results,
-
-                    evaluate_policy(
-
-                        policy,
-
-                        method,
-
-                        r
-
-                    )
-
-                )
-
-        }
+            )
 
     }
 
 }
 
 
+###############################################################
+# PART 10
+#
+# Save Replication-Level Results
+#
+###############################################################
 
 write.csv(
 
@@ -8738,65 +11611,123 @@ write.csv(
 
     "results/BenchmarkResults.csv",
 
-    row.names=FALSE
+    row.names = FALSE
 
 )
+
+
 ###############################################################
-# PART 8
-# Benchmark Summary
+# Check benchmark results
 ###############################################################
 
+cat("\n")
+cat("Benchmark observations:\n")
+
+print(
+    nrow(
+        benchmark_results
+    )
+)
+
+
+cat("\nMethods evaluated:\n")
+
+print(
+    unique(
+        benchmark_results$Method
+    )
+)
+
+
+###############################################################
+# PART 11
+#
+# Benchmark Summary
+#
+###############################################################
 
 benchmark_summary <-
-
     benchmark_results %>%
 
     group_by(
-
         Method
-
     ) %>%
 
     summarise(
 
-        MeanReward=
+        N =
+            n(),
 
-            mean(TotalReward),
+        MeanReward =
+            mean(
+                TotalReward,
+                na.rm = TRUE
+            ),
 
+        SDReward =
+            sd(
+                TotalReward,
+                na.rm = TRUE
+            ),
 
-        SDReward=
+        MeanCost =
+            mean(
+                TotalCost,
+                na.rm = TRUE
+            ),
 
-            sd(TotalReward),
+        SDCost =
+            sd(
+                TotalCost,
+                na.rm = TRUE
+            ),
 
+        MeanFillRate =
+            mean(
+                FillRate,
+                na.rm = TRUE
+            ),
 
-        MeanCost=
+        SDFillRate =
+            sd(
+                FillRate,
+                na.rm = TRUE
+            ),
 
-            mean(TotalCost),
+        MeanStockouts =
+            mean(
+                Stockouts,
+                na.rm = TRUE
+            ),
 
+        SDStockouts =
+            sd(
+                Stockouts,
+                na.rm = TRUE
+            ),
 
-        MeanFillRate=
-
-            mean(FillRate),
-
-
-        MeanStockouts=
-
-            mean(Stockouts),
-
-
-        .groups="drop"
-
+        .groups =
+            "drop"
     )
 
 
+###############################################################
+# Print summary
+###############################################################
+
+cat("\n")
+cat("============================================================\n")
+cat("BENCHMARK SUMMARY\n")
+cat("============================================================\n")
 
 print(
-
     benchmark_summary
-
 )
 
 
+###############################################################
+# Save summary
+###############################################################
 
 write.csv(
 
@@ -8804,110 +11735,342 @@ write.csv(
 
     "results/BenchmarkSummary.csv",
 
-    row.names=FALSE
+    row.names = FALSE
 
 )
+
+
 ###############################################################
-# PART 9
-# Statistical Tests
+# PART 12
+#
+# Confidence Intervals
+#
 ###############################################################
 
+benchmark_CI <-
+    benchmark_results %>%
+
+    group_by(
+        Method
+    ) %>%
+
+    summarise(
+
+        N =
+            n(),
+
+        MeanReward =
+            mean(
+                TotalReward,
+                na.rm = TRUE
+            ),
+
+        RewardSE =
+            sd(
+                TotalReward,
+                na.rm = TRUE
+            ) /
+            sqrt(
+                n()
+            ),
+
+        RewardLower95 =
+            MeanReward -
+            1.96 *
+            RewardSE,
+
+        RewardUpper95 =
+            MeanReward +
+            1.96 *
+            RewardSE,
+
+        MeanCost =
+            mean(
+                TotalCost,
+                na.rm = TRUE
+            ),
+
+        CostSE =
+            sd(
+                TotalCost,
+                na.rm = TRUE
+            ) /
+            sqrt(
+                n()
+            ),
+
+        CostLower95 =
+            MeanCost -
+            1.96 *
+            CostSE,
+
+        CostUpper95 =
+            MeanCost +
+            1.96 *
+            CostSE,
+
+        MeanFillRate =
+            mean(
+                FillRate,
+                na.rm = TRUE
+            ),
+
+        FillRateSE =
+            sd(
+                FillRate,
+                na.rm = TRUE
+            ) /
+            sqrt(
+                n()
+            ),
+
+        FillRateLower95 =
+            MeanFillRate -
+            1.96 *
+            FillRateSE,
+
+        FillRateUpper95 =
+            MeanFillRate +
+            1.96 *
+            FillRateSE,
+
+        .groups =
+            "drop"
+    )
+
+
+###############################################################
+# Save CI table
+###############################################################
+
+write.csv(
+
+    benchmark_CI,
+
+    "results/BenchmarkConfidenceIntervals.csv",
+
+    row.names = FALSE
+
+)
+
+
+###############################################################
+# PART 13
+#
+# Statistical Comparison Function
+#
+###############################################################
 
 benchmark_test <- function(
 
-        metric,
+    metric,
 
-        m1,
+    m1,
 
-        m2
+    m2
 
-){
+) {
 
+    ###########################################################
+    # Extract data
+    ###########################################################
 
     x <-
-
         benchmark_results %>%
 
         filter(
-
-            Method==m1
-
+            Method == m1
         ) %>%
 
-        pull(
-
-            metric
-
+        select(
+            Replication,
+            value = all_of(metric)
         )
-
 
 
     y <-
-
         benchmark_results %>%
 
         filter(
-
-            Method==m2
-
+            Method == m2
         ) %>%
 
-        pull(
-
-            metric
-
+        select(
+            Replication,
+            value = all_of(metric)
         )
 
 
+    ###########################################################
+    # Match replications
+    ###########################################################
+
+    paired_data <-
+        inner_join(
+
+            x,
+
+            y,
+
+            by =
+                "Replication",
+
+            suffix =
+                c(
+                    "_1",
+                    "_2"
+                )
+        )
+
+
+    ###########################################################
+    # Check sample size
+    ###########################################################
+
+    if (
+        nrow(
+            paired_data
+        ) < 2
+    ) {
+
+        return(
+            data.frame(
+
+                Model1 =
+                    m1,
+
+                Model2 =
+                    m2,
+
+                Metric =
+                    metric,
+
+                N =
+                    nrow(
+                        paired_data
+                    ),
+
+                PValue =
+                    NA_real_,
+
+                CliffDelta =
+                    NA_real_
+
+            )
+        )
+
+    }
+
+
+    ###########################################################
+    # Paired vectors
+    ###########################################################
+
+    x_value <-
+        paired_data$value_1
+
+    y_value <-
+        paired_data$value_2
+
+
+    ###########################################################
+    # Paired Wilcoxon test
+    ###########################################################
 
     wilcox <-
-
         wilcox.test(
 
-            x,
+            x_value,
 
-            y
+            y_value,
 
+            paired =
+                TRUE,
+
+            exact =
+                FALSE
         )
 
 
+    ###########################################################
+    # Paired Cliff's delta
+    ###########################################################
 
     effect <-
+        effsize::cliff.delta(
 
-        cliff.delta(
+            x_value,
 
-            x,
+            y_value,
 
-            y
-
+            paired =
+                TRUE
         )
 
+
+    ###########################################################
+    # Return
+    ###########################################################
 
     data.frame(
 
-        Model1=m1,
+        Model1 =
+            m1,
 
-        Model2=m2,
+        Model2 =
+            m2,
 
-        Metric=metric,
+        Metric =
+            metric,
 
-        PValue=wilcox$p.value,
+        N =
+            nrow(
+                paired_data
+            ),
 
-        CliffDelta=
+        PValue =
+            wilcox$p.value,
 
-            effect$estimate
+        CliffDelta =
+            as.numeric(
+                effect$estimate
+            ),
 
+        stringsAsFactors =
+            FALSE
     )
 
 }
-###############################################################
-# Final Tests
-###############################################################
 
+
+###############################################################
+# PART 14
+#
+# Final Statistical Tests
+#
+###############################################################
 
 comparison_results <-
-
     rbind(
+
+        #######################################################
+        # LASAR-Q vs SAR-Q: Reward
+        #######################################################
+
+        benchmark_test(
+
+            "TotalReward",
+
+            "LASAR-Q",
+
+            "SAR-Q"
+
+        ),
+
+
+        #######################################################
+        # LASAR-Q vs SAR-Q: Cost
+        #######################################################
 
         benchmark_test(
 
@@ -8919,6 +12082,40 @@ comparison_results <-
 
         ),
 
+
+        #######################################################
+        # LASAR-Q vs SAR-Q: Fill Rate
+        #######################################################
+
+        benchmark_test(
+
+            "FillRate",
+
+            "LASAR-Q",
+
+            "SAR-Q"
+
+        ),
+
+
+        #######################################################
+        # LASAR-Q vs Base Stock: Reward
+        #######################################################
+
+        benchmark_test(
+
+            "TotalReward",
+
+            "LASAR-Q",
+
+            "BaseStock"
+
+        ),
+
+
+        #######################################################
+        # LASAR-Q vs Base Stock: Cost
+        #######################################################
 
         benchmark_test(
 
@@ -8931,27 +12128,114 @@ comparison_results <-
         ),
 
 
+        #######################################################
+        # LASAR-Q vs Base Stock: Fill Rate
+        #######################################################
+
         benchmark_test(
 
             "FillRate",
 
             "LASAR-Q",
 
-            "SAR-Q"
+            "BaseStock"
+
+        ),
+
+
+        #######################################################
+        # LASAR-Q vs Q-Learning
+        #######################################################
+
+        benchmark_test(
+
+            "TotalReward",
+
+            "LASAR-Q",
+
+            "Q-Learning"
+
+        ),
+
+
+        benchmark_test(
+
+            "TotalCost",
+
+            "LASAR-Q",
+
+            "Q-Learning"
+
+        ),
+
+
+        benchmark_test(
+
+            "FillRate",
+
+            "LASAR-Q",
+
+            "Q-Learning"
+
+        ),
+
+
+        #######################################################
+        # LASAR-Q vs Random
+        #######################################################
+
+        benchmark_test(
+
+            "TotalReward",
+
+            "LASAR-Q",
+
+            "Random"
+
+        ),
+
+
+        benchmark_test(
+
+            "TotalCost",
+
+            "LASAR-Q",
+
+            "Random"
+
+        ),
+
+
+        benchmark_test(
+
+            "FillRate",
+
+            "LASAR-Q",
+
+            "Random"
 
         )
 
     )
 
 
+###############################################################
+# Print statistical results
+###############################################################
+
+cat("\n")
+cat("============================================================\n")
+cat("STATISTICAL COMPARISON RESULTS\n")
+cat("============================================================\n")
 
 print(
-
     comparison_results
-
 )
 
 
+###############################################################
+# Save statistical results
+###############################################################
 
 write.csv(
 
@@ -8959,598 +12243,321 @@ write.csv(
 
     "results/BenchmarkStatisticalTests.csv",
 
-    row.names=FALSE
+    row.names = FALSE
 
 )
+
+
 ###############################################################
-# FILE 05
+# PART 15
 #
-# Advanced Analysis and Visualization
+# Adjust P-values
 #
-# Copula Spatial SAR-Q Inventory System
 ###############################################################
 
+comparison_results_adjusted <-
+    comparison_results %>%
 
-cat("\n")
-cat("========================================\n")
-cat("FILE 05: Advanced Visualization\n")
-cat("========================================\n")
-###############################################################
-# PART 1
-# Libraries
-###############################################################
+    mutate(
 
-
-library(dplyr)
-library(ggplot2)
-library(reshape2)
-library(igraph)
-library(scales)
-
-
-select <- dplyr::select
-filter <- dplyr::filter
-mutate <- dplyr::mutate
-summarise <- dplyr::summarise
-
-
-
-###############################################################
-# Load Results
-###############################################################
-
-
-benchmark_results <-
-
-    read.csv(
-
-        "results/BenchmarkResults.csv"
+        PValueAdjusted =
+            p.adjust(
+                PValue,
+                method =
+                    "BH"
+            )
 
     )
 
 
-benchmark_summary <-
-
-    read.csv(
-
-        "results/BenchmarkSummary.csv"
-
-    )
-
-
-
-W_matrix <-
-
-    readRDS(
-
-        "results/SpatialWeightMatrix_W.rds"
-
-    )
-
-
-
-selected_stores <-
-
-    readRDS(
-
-        "results/SelectedStores.rds"
-
-    )
 ###############################################################
-# Reward Comparison
+# Save adjusted results
 ###############################################################
 
+write.csv(
 
-p_reward <-
+    comparison_results_adjusted,
 
+    "results/BenchmarkStatisticalTests_Adjusted.csv",
+
+    row.names = FALSE
+
+)
+
+
+###############################################################
+# PART 16
+#
+# Benchmark Performance Plot
+#
+###############################################################
+
+p_benchmark <-
     ggplot(
 
         benchmark_summary,
 
         aes(
 
-            Method,
+            x =
+                Method,
 
-            MeanReward
+            y =
+                MeanReward,
 
-        )
-
-    ) +
-
-    geom_col() +
-
-    theme_bw() +
-
-    labs(
-
-        title=
-
-        "Average Inventory Reward Comparison",
-
-        y="Mean Reward",
-
-        x=NULL
-
-    )
-
-
-
-ggsave(
-
-    "results/Figure1_RewardComparison.png",
-
-    p_reward,
-
-    width=8,
-
-    height=5
-
-)
-###############################################################
-# Cost Comparison
-###############################################################
-
-
-p_cost <-
-
-    ggplot(
-
-        benchmark_summary,
-
-        aes(
-
-            Method,
-
-            MeanCost
-
-        )
-
-    ) +
-
-    geom_col() +
-
-    theme_bw() +
-
-    labs(
-
-        title=
-
-        "Average Inventory Cost Comparison",
-
-        y="Total Cost",
-
-        x=NULL
-
-    )
-
-
-ggsave(
-
-    "results/Figure2_CostComparison.png",
-
-    p_cost,
-
-    width=8,
-
-    height=5
-
-)
-###############################################################
-# Pareto Frontier
-###############################################################
-
-
-pareto_data <-
-
-    benchmark_summary %>%
-
-    select(
-
-        Method,
-
-        MeanCost,
-
-        MeanFillRate
-
-    )
-
-
-
-p_pareto <-
-
-    ggplot(
-
-        pareto_data,
-
-        aes(
-
-            MeanCost,
-
-            MeanFillRate,
-
-            label=Method
+            group =
+                1
 
         )
 
     ) +
 
     geom_point(
-
-        size=4
-
-    ) +
-
-    geom_text(
-
-        vjust=-0.7
-
-    ) +
-
-    theme_bw() +
-
-    labs(
-
-        title=
-
-        "Inventory Cost-Service Pareto Frontier",
-
-        x="Mean Cost",
-
-        y="Fill Rate"
-
-    )
-
-
-
-ggsave(
-
-    "results/Figure3_ParetoFrontier.png",
-
-    p_pareto,
-
-    width=8,
-
-    height=5
-
-)
-###############################################################
-# Learning Efficiency
-###############################################################
-
-
-learning_curve <-
-
-    read.csv(
-
-        "results/SARQ_LearningCurveSummary.csv"
-
-    )
-
-
-
-p_learning <-
-
-    ggplot(
-
-        learning_curve,
-
-        aes(
-
-            Episode,
-
-            MeanReward,
-
-            color=Method
-
-        )
-
+        size = 3
     ) +
 
     geom_line(
-
-        linewidth=1
-
+        linewidth = 1
     ) +
 
     theme_bw() +
 
     labs(
 
-        title=
+        title =
+            "Benchmark Comparison of Inventory Policies",
 
-        "Learning Efficiency Comparison",
+        x =
+            "Method",
 
-        x="Episode",
-
-        y="Mean Reward"
-
+        y =
+            "Mean Total Reward"
     )
 
+
+###############################################################
+# Display
+###############################################################
+
+print(
+    p_benchmark
+)
+
+
+###############################################################
+# Save
+###############################################################
+
+ggsave(
+
+    "results/BenchmarkRewardComparison.png",
+
+    p_benchmark,
+
+    width =
+        8,
+
+    height =
+        5,
+
+    dpi =
+        300
+
+)
+
+
+###############################################################
+# PART 17
+#
+# Cost Comparison Plot
+#
+###############################################################
+
+p_cost <-
+    ggplot(
+
+        benchmark_summary,
+
+        aes(
+
+            x =
+                Method,
+
+            y =
+                MeanCost,
+
+            group =
+                1
+
+        )
+
+    ) +
+
+    geom_point(
+        size = 3
+    ) +
+
+    geom_line(
+        linewidth = 1
+    ) +
+
+    theme_bw() +
+
+    labs(
+
+        title =
+            "Benchmark Comparison of Total Cost",
+
+        x =
+            "Method",
+
+        y =
+            "Mean Total Cost"
+    )
+
+
+print(
+    p_cost
+)
 
 
 ggsave(
 
-    "results/Figure4_LearningEfficiency.png",
+    "results/BenchmarkCostComparison.png",
 
-    p_learning,
+    p_cost,
 
-    width=8,
+    width =
+        8,
 
-    height=5
+    height =
+        5,
 
-)
-###############################################################
-# Spatial Network
-###############################################################
-
-
-network_graph <-
-
-    graph_from_adjacency_matrix(
-
-        W_matrix,
-
-        mode="undirected",
-
-        weighted=TRUE
-
-    )
-
-
-
-png(
-
-    "results/Figure5_SpatialNetwork.png",
-
-    width=900,
-
-    height=700
+    dpi =
+        300
 
 )
 
 
-
-plot(
-
-    network_graph,
-
-    vertex.label=
-
-        selected_stores,
-
-    vertex.size=
-
-        30,
-
-    edge.width=
-
-        E(network_graph)$weight*5,
-
-    main=
-
-        "Spatial Store Dependence Network"
-
-)
-
-
-
-dev.off()
 ###############################################################
-# Store Level Improvement
+# PART 18
+#
+# Fill Rate Comparison
+#
 ###############################################################
 
+p_fillrate <-
+    ggplot(
 
-store_results <-
+        benchmark_summary,
 
-    benchmark_results %>%
+        aes(
 
-    group_by(
+            x =
+                Method,
 
-        Method,
-
-        Replication
-
-    ) %>%
-
-    summarise(
-
-        TotalCost=
-
-            mean(TotalCost),
-
-        .groups="drop"
-
-    )
-
-
-
-cost_difference <-
-
-    store_results %>%
-
-    filter(
-
-        Method %in%
-
-        c(
-
-            "SAR-Q",
-
-            "LASAR-Q"
-
-        )
-
-    ) %>%
-
-    pivot_wider(
-
-        names_from=Method,
-
-        values_from=TotalCost
-
-    ) %>%
-
-    mutate(
-
-        Improvement=
-
-            SAR-Q -
-
-            LASAR-Q
-
-    )
-cost_difference$Improvement <-
-
-    cost_difference$`SAR-Q` -
-
-    cost_difference$`LASAR-Q`
-
-
-
-write.csv(
-
-    cost_difference,
-
-    "results/SARQ_LASARQ_CostImprovement.csv",
-
-    row.names=FALSE
-
-)
-###############################################################
-# Improvement Percentage
-###############################################################
-
-
-improvement_table <-
-
-    benchmark_summary %>%
-
-    filter(
-
-        Method %in%
-
-        c(
-
-            "SAR-Q",
-
-            "LASAR-Q"
-
-        )
-
-    ) %>%
-
-    select(
-
-        Method,
-
-        MeanCost,
-
-        MeanFillRate
-
-    )
-
-
-
-sarq_cost <-
-
-    improvement_table$MeanCost[
-
-        improvement_table$Method=="SAR-Q"
-
-    ]
-
-
-
-lasarq_cost <-
-
-    improvement_table$MeanCost[
-
-        improvement_table$Method=="LASAR-Q"
-
-    ]
-
-
-
-improvement_percent <-
-
-    100 *
-
-    (
-
-        sarq_cost -
-
-        lasarq_cost
-
-    ) /
-
-    sarq_cost
-
-
-
-final_improvement <-
-
-    data.frame(
-
-        Metric=
-
-            "Cost Reduction (%)",
-
-        Value=
-
-            improvement_percent
-
-    )
-
-
-
-write.csv(
-
-    final_improvement,
-
-    "results/LASARQ_ImprovementPercentage.csv",
-
-    row.names=FALSE
-
-)
-###############################################################
-# Publication Table
-###############################################################
-
-
-publication_table <-
-
-    benchmark_summary %>%
-
-    mutate(
-
-        Reward=
-
-            round(
-
-                MeanReward,
-
-                2
-
-            ),
-
-        Cost=
-
-            round(
-
-                MeanCost,
-
-                2
-
-            ),
-
-        FillRate=
-
-            round(
-
+            y =
                 MeanFillRate,
 
-                4
+            group =
+                1
 
+        )
+
+    ) +
+
+    geom_point(
+        size = 3
+    ) +
+
+    geom_line(
+        linewidth = 1
+    ) +
+
+    theme_bw() +
+
+    labs(
+
+        title =
+            "Benchmark Comparison of Fill Rate",
+
+        x =
+            "Method",
+
+        y =
+            "Mean Fill Rate"
+    )
+
+
+print(
+    p_fillrate
+)
+
+
+ggsave(
+
+    "results/BenchmarkFillRateComparison.png",
+
+    p_fillrate,
+
+    width =
+        8,
+
+    height =
+        5,
+
+    dpi =
+        300
+
+)
+
+
+###############################################################
+# PART 19
+#
+# Publication Table
+#
+###############################################################
+
+publication_table <-
+    benchmark_summary %>%
+
+    mutate(
+
+        Reward =
+            sprintf(
+                "%.2f",
+                MeanReward
+            ),
+
+        RewardSD =
+            sprintf(
+                "%.2f",
+                SDReward
+            ),
+
+        Cost =
+            sprintf(
+                "%.2f",
+                MeanCost
+            ),
+
+        CostSD =
+            sprintf(
+                "%.2f",
+                SDCost
+            ),
+
+        FillRate =
+            sprintf(
+                "%.4f",
+                MeanFillRate
+            ),
+
+        Stockouts =
+            sprintf(
+                "%.2f",
+                MeanStockouts
             )
 
     ) %>%
@@ -9561,13 +12568,2020 @@ publication_table <-
 
         Reward,
 
+        RewardSD,
+
         Cost,
 
-        FillRate
+        CostSD,
+
+        FillRate,
+
+        Stockouts
+    )
+
+
+###############################################################
+# Print publication table
+###############################################################
+
+cat("\n")
+cat("============================================================\n")
+cat("PUBLICATION BENCHMARK TABLE\n")
+cat("============================================================\n")
+
+print(
+    publication_table
+)
+
+
+###############################################################
+# Save publication table
+###############################################################
+
+write.csv(
+
+    publication_table,
+
+    "results/Table_BenchmarkComparison.csv",
+
+    row.names = FALSE
+
+)
+
+
+###############################################################
+# PART 20
+#
+# LaTeX Publication Table
+#
+###############################################################
+
+latex_benchmark <-
+    knitr::kable(
+
+        publication_table,
+
+        format =
+            "latex",
+
+        booktabs =
+            TRUE,
+
+        caption =
+            paste(
+                "Benchmark comparison of inventory control methods."
+            ),
+
+        label =
+            "tab:benchmark-comparison",
+
+        align =
+            "lrrrrrr"
+    )
+
+
+###############################################################
+# Save LaTeX
+###############################################################
+
+writeLines(
+
+    latex_benchmark,
+
+    "results/Table_BenchmarkComparison.tex"
+
+)
+
+
+###############################################################
+# PART 21
+#
+# Statistical Test Publication Table
+#
+###############################################################
+
+statistical_publication_table <-
+    comparison_results_adjusted %>%
+
+    mutate(
+
+        PValue =
+            round(
+                PValue,
+                4
+            ),
+
+        PValueAdjusted =
+            round(
+                PValueAdjusted,
+                4
+            ),
+
+        CliffDelta =
+            round(
+                CliffDelta,
+                4
+            )
 
     )
 
 
+###############################################################
+# Save
+###############################################################
+
+write.csv(
+
+    statistical_publication_table,
+
+    "results/Table_BenchmarkStatisticalTests.csv",
+
+    row.names =
+        FALSE
+
+)
+
+
+###############################################################
+# PART 22
+#
+# LaTeX Statistical Table
+#
+###############################################################
+
+latex_statistical <-
+    knitr::kable(
+
+        statistical_publication_table,
+
+        format =
+            "latex",
+
+        booktabs =
+            TRUE,
+
+        caption =
+            paste(
+                "Paired statistical comparisons of benchmark inventory policies."
+            ),
+
+        label =
+            "tab:benchmark-statistical-tests"
+    )
+
+
+writeLines(
+
+    latex_statistical,
+
+    "results/Table_BenchmarkStatisticalTests.tex"
+
+)
+
+
+###############################################################
+# PART 23
+#
+# Final Diagnostic Checks
+#
+###############################################################
+
+cat("\n")
+cat("============================================================\n")
+cat("FINAL BENCHMARK DIAGNOSTICS\n")
+cat("============================================================\n")
+
+
+cat("\nNumber of benchmark observations:\n")
+
+print(
+    nrow(
+        benchmark_results
+    )
+)
+
+
+cat("\nObservations by method:\n")
+
+print(
+
+    benchmark_results %>%
+
+    count(
+        Method
+    )
+
+)
+
+
+cat("\nReplications by method:\n")
+
+print(
+
+    benchmark_results %>%
+
+    group_by(
+        Method
+    ) %>%
+
+    summarise(
+
+        MinReplication =
+            min(
+                Replication
+            ),
+
+        MaxReplication =
+            max(
+                Replication
+            ),
+
+        NReplications =
+            n(),
+
+        .groups =
+            "drop"
+    )
+
+)
+
+
+###############################################################
+# PART 24
+#
+# Final Output Summary
+#
+###############################################################
+
+cat("\n")
+cat("============================================================\n")
+cat("FILE 04 COMPLETE\n")
+cat("============================================================\n")
+
+cat("\nFiles generated:\n")
+
+cat(
+    "  results/BenchmarkResults.csv\n"
+)
+
+cat(
+    "  results/BenchmarkSummary.csv\n"
+)
+
+cat(
+    "  results/BenchmarkConfidenceIntervals.csv\n"
+)
+
+cat(
+    "  results/BenchmarkStatisticalTests.csv\n"
+)
+
+cat(
+    "  results/BenchmarkStatisticalTests_Adjusted.csv\n"
+)
+
+cat(
+    "  results/BenchmarkRewardComparison.png\n"
+)
+
+cat(
+    "  results/BenchmarkCostComparison.png\n"
+)
+
+cat(
+    "  results/BenchmarkFillRateComparison.png\n"
+)
+
+cat(
+    "  results/Table_BenchmarkComparison.csv\n"
+)
+
+cat(
+    "  results/Table_BenchmarkComparison.tex\n"
+)
+
+cat(
+    "  results/Table_BenchmarkStatisticalTests.csv\n"
+)
+
+cat(
+    "  results/Table_BenchmarkStatisticalTests.tex\n"
+)
+
+cat("\n")
+cat("============================================================\n")
+
+###############################################################
+#
+# FILE 05
+#
+# Advanced Analysis and Visualization
+#
+# Copula Spatial SAR-Q Inventory System
+#
+###############################################################
+
+cat("\n")
+cat("============================================================\n")
+cat("FILE 05: Advanced Analysis and Visualization\n")
+cat("============================================================\n")
+
+
+###############################################################
+# PART 1
+#
+# Libraries
+#
+###############################################################
+
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(igraph)
+library(scales)
+
+select <- dplyr::select
+filter <- dplyr::filter
+mutate <- dplyr::mutate
+summarise <- dplyr::summarise
+
+
+###############################################################
+# Create results directory
+###############################################################
+
+if (!dir.exists("results")) {
+
+    dir.create(
+        "results",
+        recursive = TRUE
+    )
+
+}
+
+
+###############################################################
+# PART 2
+#
+# Load Benchmark Results
+#
+###############################################################
+
+required_files <- c(
+
+    "results/BenchmarkResults.csv",
+
+    "results/BenchmarkSummary.csv"
+
+)
+
+
+for (
+    f in required_files
+) {
+
+    if (
+        !file.exists(f)
+    ) {
+
+        stop(
+            paste(
+                "Required FILE 04 output not found:",
+                f
+            )
+        )
+
+    }
+
+}
+
+
+benchmark_results <-
+    read.csv(
+        "results/BenchmarkResults.csv"
+    )
+
+
+benchmark_summary <-
+    read.csv(
+        "results/BenchmarkSummary.csv"
+    )
+
+
+###############################################################
+# Optional confidence intervals
+###############################################################
+
+if (
+    file.exists(
+        "results/BenchmarkConfidenceIntervals.csv"
+    )
+) {
+
+    benchmark_CI <-
+        read.csv(
+            "results/BenchmarkConfidenceIntervals.csv"
+        )
+
+} else {
+
+    benchmark_CI <-
+        NULL
+
+}
+
+
+###############################################################
+# Load spatial matrix if available
+###############################################################
+
+if (
+    file.exists(
+        "results/SpatialWeightMatrix_W.rds"
+    )
+) {
+
+    W_matrix <-
+        readRDS(
+            "results/SpatialWeightMatrix_W.rds"
+        )
+
+} else {
+
+    W_matrix <-
+        NULL
+
+    warning(
+        "SpatialWeightMatrix_W.rds not found. Spatial network figure will be skipped."
+    )
+
+}
+
+
+###############################################################
+# Load selected stores if available
+###############################################################
+
+if (
+    file.exists(
+        "results/SelectedStores.rds"
+    )
+) {
+
+    selected_stores <-
+        readRDS(
+            "results/SelectedStores.rds"
+        )
+
+} else {
+
+    selected_stores <-
+        NULL
+
+    warning(
+        "SelectedStores.rds not found. Store labels will use indices."
+    )
+
+}
+
+
+###############################################################
+# Diagnostic information
+###############################################################
+
+cat("\nBenchmark observations:\n")
+
+print(
+    nrow(
+        benchmark_results
+    )
+)
+
+
+cat("\nBenchmark methods:\n")
+
+print(
+    unique(
+        benchmark_results$Method
+    )
+)
+
+
+###############################################################
+# PART 3
+#
+# Reward Comparison
+#
+###############################################################
+
+p_reward <-
+    ggplot(
+
+        benchmark_summary,
+
+        aes(
+
+            x =
+                Method,
+
+            y =
+                MeanReward
+
+        )
+
+    ) +
+
+    geom_col(
+
+        width =
+            0.7
+
+    ) +
+
+    theme_bw() +
+
+    labs(
+
+        title =
+            "Average Inventory Reward Comparison",
+
+        x =
+            NULL,
+
+        y =
+            "Mean Total Reward"
+
+    ) +
+
+    theme(
+
+        axis.text.x =
+            element_text(
+                angle = 30,
+                hjust = 1
+            )
+
+    )
+
+
+print(
+    p_reward
+)
+
+
+ggsave(
+
+    "results/Figure1_RewardComparison.png",
+
+    p_reward,
+
+    width =
+        8,
+
+    height =
+        5,
+
+    dpi =
+        300
+
+)
+
+
+###############################################################
+# PART 4
+#
+# Reward Comparison with 95% CI
+#
+###############################################################
+
+if (
+    !is.null(benchmark_CI)
+) {
+
+    p_reward_CI <-
+        ggplot(
+
+            benchmark_CI,
+
+            aes(
+
+                x =
+                    Method,
+
+                y =
+                    MeanReward
+
+            )
+
+        ) +
+
+        geom_col(
+
+            width =
+                0.7
+
+        ) +
+
+        geom_errorbar(
+
+            aes(
+
+                ymin =
+                    RewardLower95,
+
+                ymax =
+                    RewardUpper95
+
+            ),
+
+            width =
+                0.15
+
+        ) +
+
+        theme_bw() +
+
+        labs(
+
+            title =
+                "Mean Total Reward with 95% Confidence Intervals",
+
+            x =
+                NULL,
+
+            y =
+                "Mean Total Reward"
+
+        ) +
+
+        theme(
+
+            axis.text.x =
+                element_text(
+                    angle = 30,
+                    hjust = 1
+                )
+
+        )
+
+
+    print(
+        p_reward_CI
+    )
+
+
+    ggsave(
+
+        "results/Figure1b_Reward_95CI.png",
+
+        p_reward_CI,
+
+        width =
+            8,
+
+        height =
+            5,
+
+        dpi =
+            300
+
+    )
+
+}
+
+
+###############################################################
+# PART 5
+#
+# Cost Comparison
+#
+###############################################################
+
+p_cost <-
+    ggplot(
+
+        benchmark_summary,
+
+        aes(
+
+            x =
+                Method,
+
+            y =
+                MeanCost
+
+        )
+
+    ) +
+
+    geom_col(
+
+        width =
+            0.7
+
+    ) +
+
+    theme_bw() +
+
+    labs(
+
+        title =
+            "Average Inventory Cost Comparison",
+
+        x =
+            NULL,
+
+        y =
+            "Mean Total Cost"
+
+    ) +
+
+    theme(
+
+        axis.text.x =
+            element_text(
+                angle = 30,
+                hjust = 1
+            )
+
+    )
+
+
+print(
+    p_cost
+)
+
+
+ggsave(
+
+    "results/Figure2_CostComparison.png",
+
+    p_cost,
+
+    width =
+        8,
+
+    height =
+        5,
+
+    dpi =
+        300
+
+)
+
+
+###############################################################
+# PART 6
+#
+# Cost Comparison with 95% CI
+#
+###############################################################
+
+if (
+    !is.null(benchmark_CI)
+) {
+
+    p_cost_CI <-
+        ggplot(
+
+            benchmark_CI,
+
+            aes(
+
+                x =
+                    Method,
+
+                y =
+                    MeanCost
+
+            )
+
+        ) +
+
+        geom_col(
+
+            width =
+                0.7
+
+            ) +
+
+        geom_errorbar(
+
+            aes(
+
+                ymin =
+                    CostLower95,
+
+                ymax =
+                    CostUpper95
+
+            ),
+
+            width =
+                0.15
+
+        ) +
+
+        theme_bw() +
+
+        labs(
+
+            title =
+                "Mean Total Cost with 95% Confidence Intervals",
+
+            x =
+                NULL,
+
+            y =
+                "Mean Total Cost"
+
+        ) +
+
+        theme(
+
+            axis.text.x =
+                element_text(
+                    angle = 30,
+                    hjust = 1
+                )
+
+        )
+
+
+    print(
+        p_cost_CI
+    )
+
+
+    ggsave(
+
+        "results/Figure2b_Cost_95CI.png",
+
+        p_cost_CI,
+
+        width =
+            8,
+
+        height =
+            5,
+
+        dpi =
+            300
+
+    )
+
+}
+
+
+###############################################################
+# PART 7
+#
+# Fill Rate Comparison
+#
+###############################################################
+
+p_fillrate <-
+    ggplot(
+
+        benchmark_summary,
+
+        aes(
+
+            x =
+                Method,
+
+            y =
+                MeanFillRate
+
+        )
+
+    ) +
+
+    geom_col(
+
+        width =
+            0.7
+
+        ) +
+
+    theme_bw() +
+
+    labs(
+
+        title =
+            "Average Inventory Fill Rate Comparison",
+
+        x =
+            NULL,
+
+        y =
+            "Mean Fill Rate"
+
+    ) +
+
+    scale_y_continuous(
+        labels =
+            scales::percent
+    ) +
+
+    theme(
+
+        axis.text.x =
+            element_text(
+                angle = 30,
+                hjust = 1
+            )
+
+    )
+
+
+print(
+    p_fillrate
+)
+
+
+ggsave(
+
+    "results/Figure2c_FillRateComparison.png",
+
+    p_fillrate,
+
+    width =
+        8,
+
+    height =
+        5,
+
+    dpi =
+        300
+
+)
+
+
+###############################################################
+# PART 8
+#
+# Pareto Frontier
+#
+###############################################################
+
+pareto_data <-
+    benchmark_summary %>%
+
+    select(
+
+        Method,
+
+        MeanCost,
+
+        MeanFillRate
+
+    )
+
+
+###############################################################
+# Determine Pareto-efficient methods
+#
+# Lower cost is better.
+# Higher fill rate is better.
+#
+###############################################################
+
+is_pareto_efficient <- function(
+    cost,
+    fill_rate
+) {
+
+    n <-
+        length(cost)
+
+    efficient <-
+        rep(
+            TRUE,
+            n
+        )
+
+
+    for (
+        i in seq_len(n)
+    ) {
+
+        for (
+            j in seq_len(n)
+        ) {
+
+            if (
+                i != j &&
+                cost[j] <= cost[i] &&
+                fill_rate[j] >= fill_rate[i] &&
+                (
+                    cost[j] < cost[i] ||
+                    fill_rate[j] > fill_rate[i]
+                )
+            ) {
+
+                efficient[i] <-
+                    FALSE
+
+                break
+
+            }
+
+        }
+
+    }
+
+
+    return(
+        efficient
+    )
+
+}
+
+
+pareto_data <-
+    pareto_data %>%
+
+    mutate(
+
+        ParetoEfficient =
+            is_pareto_efficient(
+                MeanCost,
+                MeanFillRate
+            )
+
+    )
+
+
+write.csv(
+
+    pareto_data,
+
+    "results/ParetoFrontierResults.csv",
+
+    row.names =
+        FALSE
+
+)
+
+
+###############################################################
+# Pareto plot
+###############################################################
+
+p_pareto <-
+    ggplot(
+
+        pareto_data,
+
+        aes(
+
+            x =
+                MeanCost,
+
+            y =
+                MeanFillRate
+
+        )
+
+    ) +
+
+    geom_point(
+
+        aes(
+
+            shape =
+                ParetoEfficient
+
+        ),
+
+        size =
+            4
+
+    ) +
+
+    geom_text(
+
+        aes(
+
+            label =
+                Method
+
+        ),
+
+        vjust =
+            -0.8
+
+    ) +
+
+    theme_bw() +
+
+    scale_y_continuous(
+
+        labels =
+            scales::percent
+
+    ) +
+
+    labs(
+
+        title =
+            "Inventory Cost-Service Pareto Frontier",
+
+        x =
+            "Mean Total Cost",
+
+        y =
+            "Mean Fill Rate",
+
+        shape =
+            "Pareto Efficient"
+
+    )
+
+
+print(
+    p_pareto
+)
+
+
+ggsave(
+
+    "results/Figure3_ParetoFrontier.png",
+
+    p_pareto,
+
+    width =
+        8,
+
+    height =
+        5,
+
+    dpi =
+        300
+
+)
+
+
+###############################################################
+# PART 9
+#
+# Learning Efficiency
+#
+###############################################################
+
+learning_files <- c(
+
+    "results/SARQ_LearningCurveSummary.csv",
+
+    "results/SARQ_ConvergenceTable.csv"
+
+)
+
+
+learning_file <-
+    learning_files[
+        file.exists(
+            learning_files
+        )
+    ][1]
+
+
+if (
+    length(learning_file) == 0 ||
+    is.na(learning_file)
+) {
+
+    warning(
+        "No learning-curve summary file found. Learning-efficiency figure skipped."
+    )
+
+} else {
+
+    learning_curve <-
+        read.csv(
+            learning_file
+        )
+
+
+    ###########################################################
+    # Standardize model column
+    ###########################################################
+
+    if (
+        "Method" %in%
+        names(learning_curve)
+    ) {
+
+        learning_curve$Model <-
+            learning_curve$Method
+
+    }
+
+
+    ###########################################################
+    # Plot
+    ###########################################################
+
+    p_learning <-
+        ggplot(
+
+            learning_curve,
+
+            aes(
+
+                x =
+                    Episode,
+
+                y =
+                    MeanReward,
+
+                color =
+                    Model,
+
+                group =
+                    Model
+
+            )
+
+        ) +
+
+        geom_line(
+
+            linewidth =
+                1
+
+        ) +
+
+        theme_bw() +
+
+        labs(
+
+            title =
+                "Learning Efficiency Comparison",
+
+            x =
+                "Episode",
+
+            y =
+                "Mean Reward",
+
+            color =
+                "Model"
+
+        )
+
+
+    print(
+        p_learning
+    )
+
+
+    ggsave(
+
+        "results/Figure4_LearningEfficiency.png",
+
+        p_learning,
+
+        width =
+            8,
+
+        height =
+            5,
+
+        dpi =
+            300
+
+    )
+
+}
+
+
+###############################################################
+# PART 10
+#
+# Spatial Network
+#
+###############################################################
+
+if (
+    !is.null(W_matrix)
+) {
+
+    ###########################################################
+    # Convert to numeric matrix
+    ###########################################################
+
+    W_matrix <-
+        as.matrix(
+            W_matrix
+        )
+
+
+    ###########################################################
+    # Remove diagonal
+    ###########################################################
+
+    diag(
+        W_matrix
+    ) <-
+        0
+
+
+    ###########################################################
+    # Symmetrize if necessary
+    ###########################################################
+
+    W_network <-
+        (
+            W_matrix +
+            t(W_matrix)
+        ) / 2
+
+
+    ###########################################################
+    # Create graph
+    ###########################################################
+
+    network_graph <-
+        igraph::graph_from_adjacency_matrix(
+
+            W_network,
+
+            mode =
+                "undirected",
+
+            weighted =
+                TRUE,
+
+            diag =
+                FALSE
+
+        )
+
+
+    ###########################################################
+    # Store labels
+    ###########################################################
+
+    if (
+        !is.null(
+            selected_stores
+        ) &&
+        length(
+            selected_stores
+        ) ==
+        igraph::vcount(
+            network_graph
+        )
+    ) {
+
+        V(
+            network_graph
+        )$label <-
+            as.character(
+                selected_stores
+            )
+
+    } else {
+
+        V(
+            network_graph
+        )$label <-
+            as.character(
+                seq_len(
+                    igraph::vcount(
+                        network_graph
+                    )
+                )
+            )
+
+    }
+
+
+    ###########################################################
+    # Network plot
+    ###########################################################
+
+    png(
+
+        "results/Figure5_SpatialNetwork.png",
+
+        width =
+            1000,
+
+        height =
+            800,
+
+        res =
+            120
+
+    )
+
+
+    plot(
+
+        network_graph,
+
+        vertex.label =
+            V(network_graph)$label,
+
+        vertex.size =
+            28,
+
+        vertex.color =
+            "lightgray",
+
+        vertex.frame.color =
+            "black",
+
+        edge.width =
+            1 +
+
+            4 *
+            E(network_graph)$weight,
+
+        edge.arrow.size =
+            0,
+
+        main =
+            "Spatial Store Dependence Network"
+
+    )
+
+
+    dev.off()
+
+}
+
+
+###############################################################
+# PART 11
+#
+# Replication-Level SAR-Q vs LASAR-Q Cost Improvement
+#
+###############################################################
+
+sarq_results <-
+    benchmark_results %>%
+
+    filter(
+        Method == "SAR-Q"
+    ) %>%
+
+    select(
+
+        Replication,
+
+        SARQ_Cost =
+            TotalCost
+
+    )
+
+
+lasarq_results <-
+    benchmark_results %>%
+
+    filter(
+        Method == "LASAR-Q"
+    ) %>%
+
+    select(
+
+        Replication,
+
+        LASARQ_Cost =
+            TotalCost
+
+    )
+
+
+cost_difference <-
+    inner_join(
+
+        sarq_results,
+
+        lasarq_results,
+
+        by =
+            "Replication"
+
+    ) %>%
+
+    mutate(
+
+        CostReduction =
+            SARQ_Cost -
+            LASARQ_Cost,
+
+        CostReductionPercent =
+            100 *
+            (
+                SARQ_Cost -
+                LASARQ_Cost
+            ) /
+            pmax(
+                SARQ_Cost,
+                .Machine$double.eps
+            )
+
+    )
+
+
+###############################################################
+# Save replication-level improvement
+###############################################################
+
+write.csv(
+
+    cost_difference,
+
+    "results/SARQ_LASARQ_CostImprovement.csv",
+
+    row.names =
+        FALSE
+
+)
+
+
+###############################################################
+# PART 12
+#
+# Cost Improvement Summary
+#
+###############################################################
+
+cost_improvement_summary <-
+    cost_difference %>%
+
+    summarise(
+
+        N =
+            n(),
+
+        MeanCostReduction =
+            mean(
+                CostReduction,
+                na.rm =
+                    TRUE
+            ),
+
+        SDCostReduction =
+            sd(
+                CostReduction,
+                na.rm =
+                    TRUE
+            ),
+
+        MeanCostReductionPercent =
+            mean(
+                CostReductionPercent,
+                na.rm =
+                    TRUE
+            ),
+
+        SDCostReductionPercent =
+            sd(
+                CostReductionPercent,
+                na.rm =
+                    TRUE
+            ),
+
+        MedianCostReductionPercent =
+            median(
+                CostReductionPercent,
+                na.rm =
+                    TRUE
+            ),
+
+        MinimumCostReductionPercent =
+            min(
+                CostReductionPercent,
+                na.rm =
+                    TRUE
+            ),
+
+        MaximumCostReductionPercent =
+            max(
+                CostReductionPercent,
+                na.rm =
+                    TRUE
+            )
+
+    )
+
+
+###############################################################
+# Save summary
+###############################################################
+
+write.csv(
+
+    cost_improvement_summary,
+
+    "results/LASARQ_CostImprovementSummary.csv",
+
+    row.names =
+        FALSE
+
+)
+
+
+print(
+    cost_improvement_summary
+)
+
+
+###############################################################
+# PART 13
+#
+# Cost Improvement Distribution
+#
+###############################################################
+
+p_improvement <-
+    ggplot(
+
+        cost_difference,
+
+        aes(
+
+            x =
+                CostReductionPercent
+
+        )
+
+    ) +
+
+    geom_histogram(
+
+        bins =
+            15
+
+    ) +
+
+    geom_vline(
+
+        xintercept =
+            0,
+
+        linetype =
+            "dashed"
+
+    ) +
+
+    theme_bw() +
+
+    labs(
+
+        title =
+            "LASAR-Q Cost Reduction Relative to SAR-Q",
+
+        x =
+            "Cost Reduction (%)",
+
+        y =
+            "Number of Replications"
+
+    )
+
+
+print(
+    p_improvement
+)
+
+
+ggsave(
+
+    "results/Figure6_LASARQ_CostReduction.png",
+
+    p_improvement,
+
+    width =
+        8,
+
+    height =
+        5,
+
+    dpi =
+        300
+
+)
+
+
+###############################################################
+# PART 14
+#
+# Improvement Percentage Based on Mean Cost
+#
+###############################################################
+
+sarq_cost <-
+    benchmark_summary %>%
+
+    filter(
+        Method == "SAR-Q"
+    ) %>%
+
+    pull(
+        MeanCost
+    )
+
+
+lasarq_cost <-
+    benchmark_summary %>%
+
+    filter(
+        Method == "LASAR-Q"
+    ) %>%
+
+    pull(
+        MeanCost
+    )
+
+
+if (
+    length(sarq_cost) == 1 &&
+    length(lasarq_cost) == 1
+) {
+
+    improvement_percent <-
+        100 *
+        (
+            sarq_cost -
+            lasarq_cost
+        ) /
+        pmax(
+            sarq_cost,
+            .Machine$double.eps
+        )
+
+
+} else {
+
+    improvement_percent <-
+        NA_real_
+
+}
+
+
+###############################################################
+# Final improvement table
+###############################################################
+
+final_improvement <-
+    data.frame(
+
+        Metric =
+            "Cost Reduction (%)",
+
+        Value =
+            improvement_percent
+
+    )
+
+
+write.csv(
+
+    final_improvement,
+
+    "results/LASARQ_ImprovementPercentage.csv",
+
+    row.names =
+        FALSE
+
+)
+
+
+###############################################################
+# PART 15
+#
+# Reward Improvement Relative to SAR-Q
+#
+###############################################################
+
+sarq_reward <-
+    benchmark_summary %>%
+
+    filter(
+        Method == "SAR-Q"
+    ) %>%
+
+    pull(
+        MeanReward
+    )
+
+
+lasarq_reward <-
+    benchmark_summary %>%
+
+    filter(
+        Method == "LASAR-Q"
+    ) %>%
+
+    pull(
+        MeanReward
+    )
+
+
+if (
+    length(sarq_reward) == 1 &&
+    length(lasarq_reward) == 1
+) {
+
+    reward_improvement_percent <-
+        100 *
+        (
+            lasarq_reward -
+            sarq_reward
+        ) /
+        pmax(
+            abs(sarq_reward),
+            .Machine$double.eps
+        )
+
+} else {
+
+    reward_improvement_percent <-
+        NA_real_
+
+}
+
+
+reward_improvement <-
+    data.frame(
+
+        Metric =
+            "Reward Improvement (%)",
+
+        Value =
+            reward_improvement_percent
+
+    )
+
+
+write.csv(
+
+    reward_improvement,
+
+    "results/LASARQ_RewardImprovementPercentage.csv",
+
+    row.names =
+        FALSE
+
+)
+
+
+###############################################################
+# PART 16
+#
+# Fill-Rate Difference
+#
+###############################################################
+
+sarq_fillrate <-
+    benchmark_summary %>%
+
+    filter(
+        Method == "SAR-Q"
+    ) %>%
+
+    pull(
+        MeanFillRate
+    )
+
+
+lasarq_fillrate <-
+    benchmark_summary %>%
+
+    filter(
+        Method == "LASAR-Q"
+    ) %>%
+
+    pull(
+        MeanFillRate
+    )
+
+
+fillrate_difference <-
+    data.frame(
+
+        Metric =
+            "Fill Rate Difference",
+
+        Value =
+            lasarq_fillrate -
+            sarq_fillrate
+
+    )
+
+
+write.csv(
+
+    fillrate_difference,
+
+    "results/LASARQ_FillRateDifference.csv",
+
+    row.names =
+        FALSE
+
+)
+
+
+###############################################################
+# PART 17
+#
+# Publication Table
+#
+###############################################################
+
+publication_table <-
+    benchmark_summary %>%
+
+    mutate(
+
+        Reward =
+            round(
+                MeanReward,
+                2
+            ),
+
+        RewardSD =
+            round(
+                SDReward,
+                2
+            ),
+
+        Cost =
+            round(
+                MeanCost,
+                2
+            ),
+
+        CostSD =
+            round(
+                SDCost,
+                2
+            ),
+
+        FillRate =
+            round(
+                MeanFillRate,
+                4
+            ),
+
+        FillRateSD =
+            round(
+                SDFillRate,
+                4
+            ),
+
+        Stockouts =
+            round(
+                MeanStockouts,
+                2
+            )
+
+    ) %>%
+
+    select(
+
+        Method,
+
+        Reward,
+
+        RewardSD,
+
+        Cost,
+
+        CostSD,
+
+        FillRate,
+
+        FillRateSD,
+
+        Stockouts
+
+    )
+
+
+###############################################################
+# Print
+###############################################################
+
+cat("\n")
+cat("============================================================\n")
+cat("PUBLICATION TABLE\n")
+cat("============================================================\n")
+
+print(
+    publication_table
+)
+
+
+###############################################################
+# Save CSV
+###############################################################
 
 write.csv(
 
@@ -9575,9 +14589,392 @@ write.csv(
 
     "results/Table_Benchmark_Performance.csv",
 
-    row.names=FALSE
+    row.names =
+        FALSE
 
 )
+
+
+###############################################################
+# PART 18
+#
+# Publication Table with 95% CIs
+#
+###############################################################
+
+if (
+    !is.null(benchmark_CI)
+) {
+
+    publication_CI <-
+        benchmark_CI %>%
+
+        mutate(
+
+            Reward =
+                sprintf(
+
+                    "%.2f (%.2f, %.2f)",
+
+                    MeanReward,
+
+                    RewardLower95,
+
+                    RewardUpper95
+
+                ),
+
+            Cost =
+                sprintf(
+
+                    "%.2f (%.2f, %.2f)",
+
+                    MeanCost,
+
+                    CostLower95,
+
+                    CostUpper95
+
+                ),
+
+            FillRate =
+                sprintf(
+
+                    "%.4f (%.4f, %.4f)",
+
+                    MeanFillRate,
+
+                    FillRateLower95,
+
+                    FillRateUpper95
+
+                )
+
+        ) %>%
+
+        select(
+
+            Method,
+
+            N,
+
+            Reward,
+
+            Cost,
+
+            FillRate
+
+        )
+
+
+    write.csv(
+
+        publication_CI,
+
+        "results/Table_Benchmark_Performance_95CI.csv",
+
+        row.names =
+            FALSE
+
+    )
+
+}
+
+
+###############################################################
+# PART 19
+#
+# LaTeX Publication Table
+#
+###############################################################
+
+latex_table <-
+    knitr::kable(
+
+        publication_table,
+
+        format =
+            "latex",
+
+        booktabs =
+            TRUE,
+
+        caption =
+            paste(
+
+                "Benchmark performance of inventory control methods.",
+
+                "Reward and cost are reported as means and standard deviations;",
+
+                "fill rate is reported as the mean and standard deviation."
+
+            ),
+
+        label =
+            "tab:benchmark-performance"
+
+    )
+
+
+writeLines(
+
+    latex_table,
+
+    "results/Table_Benchmark_Performance.tex"
+
+)
+
+
+###############################################################
+# PART 20
+#
+# LaTeX Cost Improvement Table
+#
+###############################################################
+
+improvement_publication <-
+    data.frame(
+
+        Comparison =
+            "LASAR-Q vs. SAR-Q",
+
+        MeanCostReduction =
+            round(
+                cost_improvement_summary$MeanCostReduction,
+                2
+            ),
+
+        MeanCostReductionPercent =
+            round(
+                cost_improvement_summary$MeanCostReductionPercent,
+                2
+            ),
+
+        SDPercent =
+            round(
+                cost_improvement_summary$SDCostReductionPercent,
+                2
+            ),
+
+        MedianPercent =
+            round(
+                cost_improvement_summary$MedianCostReductionPercent,
+                2
+            )
+
+    )
+
+
+write.csv(
+
+    improvement_publication,
+
+    "results/Table_LASARQ_Improvement.csv",
+
+    row.names =
+        FALSE
+
+)
+
+
+latex_improvement <-
+    knitr::kable(
+
+        improvement_publication,
+
+        format =
+            "latex",
+
+        booktabs =
+            TRUE,
+
+        caption =
+            "Cost improvement of LASAR-Q relative to SAR-Q.",
+
+        label =
+            "tab:lasarq-improvement"
+
+    )
+
+
+writeLines(
+
+    latex_improvement,
+
+    "results/Table_LASARQ_Improvement.tex"
+
+)
+
+
+###############################################################
+# PART 21
+#
+# Final Diagnostic Summary
+#
+###############################################################
+
+cat("\n")
+cat("============================================================\n")
+cat("FILE 05 DIAGNOSTIC SUMMARY\n")
+cat("============================================================\n")
+
+
+cat("\nBenchmark methods:\n")
+
+print(
+    unique(
+        benchmark_results$Method
+    )
+)
+
+
+cat("\nReplications per method:\n")
+
+print(
+
+    benchmark_results %>%
+
+    count(
+        Method
+    )
+
+)
+
+
+cat("\nPareto-efficient methods:\n")
+
+print(
+
+    pareto_data %>%
+
+    filter(
+        ParetoEfficient
+    ) %>%
+
+    select(
+        Method,
+        MeanCost,
+        MeanFillRate
+    )
+
+)
+
+
+cat("\nLASAR-Q vs SAR-Q mean cost reduction (%):\n")
+
+print(
+    improvement_percent
+)
+
+
+cat("\nLASAR-Q vs SAR-Q reward improvement (%):\n")
+
+print(
+    reward_improvement_percent
+)
+
+
+cat("\nLASAR-Q vs SAR-Q fill-rate difference:\n")
+
+print(
+    lasarq_fillrate -
+    sarq_fillrate
+)
+
+
+###############################################################
+# PART 22
+#
+# Final Output List
+#
+###############################################################
+
+cat("\n")
+cat("============================================================\n")
+cat("FILE 05 COMPLETE\n")
+cat("============================================================\n")
+
+cat("\nMain output files:\n")
+
+cat(
+    "  results/Figure1_RewardComparison.png\n"
+)
+
+cat(
+    "  results/Figure1b_Reward_95CI.png\n"
+)
+
+cat(
+    "  results/Figure2_CostComparison.png\n"
+)
+
+cat(
+    "  results/Figure2b_Cost_95CI.png\n"
+)
+
+cat(
+    "  results/Figure2c_FillRateComparison.png\n"
+)
+
+cat(
+    "  results/Figure3_ParetoFrontier.png\n"
+)
+
+cat(
+    "  results/Figure4_LearningEfficiency.png\n"
+)
+
+cat(
+    "  results/Figure5_SpatialNetwork.png\n"
+)
+
+cat(
+    "  results/Figure6_LASARQ_CostReduction.png\n"
+)
+
+cat(
+    "  results/ParetoFrontierResults.csv\n"
+)
+
+cat(
+    "  results/SARQ_LASARQ_CostImprovement.csv\n"
+)
+
+cat(
+    "  results/LASARQ_CostImprovementSummary.csv\n"
+)
+
+cat(
+    "  results/LASARQ_ImprovementPercentage.csv\n"
+)
+
+cat(
+    "  results/LASARQ_RewardImprovementPercentage.csv\n"
+)
+
+cat(
+    "  results/LASARQ_FillRateDifference.csv\n"
+)
+
+cat(
+    "  results/Table_Benchmark_Performance.csv\n"
+)
+
+cat(
+    "  results/Table_Benchmark_Performance.tex\n"
+)
+
+cat(
+    "  results/Table_LASARQ_Improvement.csv\n"
+)
+
+cat(
+    "  results/Table_LASARQ_Improvement.tex\n"
+)
+
+cat("\n")
+cat("============================================================\n")
+
 ###############################################################
 # FILE 06
 #

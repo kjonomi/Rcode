@@ -3862,10 +3862,10 @@ PURCHASE_COST <- 5
 ###############################################################
 
 
-N_EPISODES <- 500
+N_EPISODES <- 50
 
 
-N_REPLICATIONS <- 30
+N_REPLICATIONS <- 3
 
 
 ALPHA <- 0.10

@@ -5120,10 +5120,10 @@ PURCHASE_COST <- 5
 ###############################################################
 
 
-N_EPISODES <- 50
+N_EPISODES <- 300
 
 
-N_REPLICATIONS <- 10
+N_REPLICATIONS <- 30
 
 
 ALPHA <- 0.10
@@ -12738,7 +12738,6 @@ writeLines(
 
 )
 
-
 ###############################################################
 # PART 23
 #
@@ -12751,28 +12750,45 @@ cat("============================================================\n")
 cat("FINAL BENCHMARK DIAGNOSTICS\n")
 cat("============================================================\n")
 
-
 cat("\nNumber of benchmark observations:\n")
 
 print(
-    nrow(
-        benchmark_results
-    )
+    nrow(benchmark_results)
 )
 
+cat("\nBenchmark object structure:\n")
+
+print(
+    class(benchmark_results)
+)
+
+cat("\nColumn names:\n")
+
+print(
+    names(benchmark_results)
+)
 
 cat("\nObservations by method:\n")
 
-print(
+method_vector <- benchmark_results$Method
 
-    benchmark_results %>%
-
-    count(
-        Method
+# Convert list-column to ordinary vector if necessary
+if (is.list(method_vector)) {
+    
+    method_vector <- unlist(
+        method_vector,
+        use.names = FALSE
     )
+}
 
+method_vector <- as.character(method_vector)
+
+print(
+    table(
+        method_vector,
+        useNA = "ifany"
+    )
 )
-
 
 cat("\nReplications by method:\n")
 
@@ -12870,7 +12886,6 @@ cat(
 
 cat("\n")
 cat("============================================================\n")
-
 ###############################################################
 #
 # FILE 05
@@ -12921,6 +12936,270 @@ if (!dir.exists("results")) {
 
 
 ###############################################################
+# Helper Functions
+###############################################################
+
+###############################################################
+# Convert list-columns to ordinary atomic vectors
+###############################################################
+
+flatten_column <- function(x) {
+
+    if (is.list(x)) {
+
+        x <- unlist(
+            x,
+            recursive = TRUE,
+            use.names = FALSE
+        )
+
+    }
+
+    return(x)
+
+}
+
+
+###############################################################
+# Normalize benchmark data columns
+###############################################################
+
+normalize_benchmark_columns <- function(df) {
+
+    columns_to_normalize <- c(
+        "Method",
+        "Replication",
+        "TotalReward",
+        "Reward",
+        "TotalCost",
+        "Cost",
+        "FillRate",
+        "Stockouts"
+    )
+
+    for (nm in columns_to_normalize) {
+
+        if (nm %in% names(df)) {
+
+            df[[nm]] <-
+                flatten_column(
+                    df[[nm]]
+                )
+
+        }
+
+    }
+
+    ###########################################################
+    # Standardize Method
+    ###########################################################
+
+    if ("Method" %in% names(df)) {
+
+        df$Method <-
+            as.character(
+                df$Method
+            )
+
+    }
+
+    ###########################################################
+    # Standardize Replication
+    ###########################################################
+
+    if ("Replication" %in% names(df)) {
+
+        df$Replication <-
+            suppressWarnings(
+                as.integer(
+                    df$Replication
+                )
+            )
+
+    }
+
+    ###########################################################
+    # Standardize numeric variables
+    ###########################################################
+
+    numeric_columns <- c(
+        "TotalReward",
+        "Reward",
+        "TotalCost",
+        "Cost",
+        "FillRate",
+        "Stockouts"
+    )
+
+    for (nm in numeric_columns) {
+
+        if (nm %in% names(df)) {
+
+            df[[nm]] <-
+                suppressWarnings(
+                    as.numeric(
+                        df[[nm]]
+                    )
+                )
+
+        }
+
+    }
+
+    return(df)
+
+}
+
+
+###############################################################
+# Safe percentage calculation
+###############################################################
+
+safe_percent_change <- function(
+    old_value,
+    new_value
+) {
+
+    if (
+        length(old_value) != 1 ||
+        length(new_value) != 1 ||
+        is.na(old_value) ||
+        is.na(new_value) ||
+        !is.finite(old_value) ||
+        !is.finite(new_value) ||
+        abs(old_value) < .Machine$double.eps
+    ) {
+
+        return(
+            NA_real_
+        )
+
+    }
+
+    return(
+        100 *
+        (
+            old_value -
+            new_value
+        ) /
+        old_value
+    )
+
+}
+
+
+###############################################################
+# Safe reward improvement
+###############################################################
+
+safe_reward_improvement <- function(
+    baseline,
+    new_value
+) {
+
+    if (
+        length(baseline) != 1 ||
+        length(new_value) != 1 ||
+        is.na(baseline) ||
+        is.na(new_value) ||
+        !is.finite(baseline) ||
+        !is.finite(new_value) ||
+        abs(baseline) < .Machine$double.eps
+    ) {
+
+        return(
+            NA_real_
+        )
+
+    }
+
+    return(
+        100 *
+        (
+            new_value -
+            baseline
+        ) /
+        abs(baseline)
+    )
+
+}
+
+
+###############################################################
+# Pareto efficiency function
+###############################################################
+
+is_pareto_efficient <- function(
+    cost,
+    fill_rate
+) {
+
+    n <-
+        length(cost)
+
+    efficient <-
+        rep(
+            FALSE,
+            n
+        )
+
+    valid <-
+        is.finite(cost) &
+        is.finite(fill_rate)
+
+    if (!any(valid)) {
+
+        return(
+            efficient
+        )
+
+    }
+
+    valid_indices <-
+        which(valid)
+
+    for (i in valid_indices) {
+
+        dominated <-
+            FALSE
+
+        for (j in valid_indices) {
+
+            if (i == j) {
+                next
+            }
+
+            if (
+                cost[j] <= cost[i] &&
+                fill_rate[j] >= fill_rate[i] &&
+                (
+                    cost[j] < cost[i] ||
+                    fill_rate[j] > fill_rate[i]
+                )
+            ) {
+
+                dominated <-
+                    TRUE
+
+                break
+
+            }
+
+        }
+
+        efficient[i] <-
+            !dominated
+
+    }
+
+    return(
+        efficient
+    )
+
+}
+
+
+###############################################################
 # PART 2
 #
 # Load Benchmark Results
@@ -12936,13 +13215,9 @@ required_files <- c(
 )
 
 
-for (
-    f in required_files
-) {
+for (f in required_files) {
 
-    if (
-        !file.exists(f)
-    ) {
+    if (!file.exists(f)) {
 
         stop(
             paste(
@@ -12958,13 +13233,31 @@ for (
 
 benchmark_results <-
     read.csv(
-        "results/BenchmarkResults.csv"
+        "results/BenchmarkResults.csv",
+        stringsAsFactors = FALSE
     )
 
 
 benchmark_summary <-
     read.csv(
-        "results/BenchmarkSummary.csv"
+        "results/BenchmarkSummary.csv",
+        stringsAsFactors = FALSE
+    )
+
+
+###############################################################
+# Normalize imported benchmark objects
+###############################################################
+
+benchmark_results <-
+    normalize_benchmark_columns(
+        benchmark_results
+    )
+
+
+benchmark_summary <-
+    normalize_benchmark_columns(
+        benchmark_summary
     )
 
 
@@ -12980,7 +13273,13 @@ if (
 
     benchmark_CI <-
         read.csv(
-            "results/BenchmarkConfidenceIntervals.csv"
+            "results/BenchmarkConfidenceIntervals.csv",
+            stringsAsFactors = FALSE
+        )
+
+    benchmark_CI <-
+        normalize_benchmark_columns(
+            benchmark_CI
         )
 
 } else {
@@ -13012,7 +13311,10 @@ if (
         NULL
 
     warning(
-        "SpatialWeightMatrix_W.rds not found. Spatial network figure will be skipped."
+        paste(
+            "SpatialWeightMatrix_W.rds not found.",
+            "Spatial network figure will be skipped."
+        )
     )
 
 }
@@ -13039,15 +13341,36 @@ if (
         NULL
 
     warning(
-        "SelectedStores.rds not found. Store labels will use indices."
+        paste(
+            "SelectedStores.rds not found.",
+            "Store labels will use indices."
+        )
     )
 
 }
 
 
 ###############################################################
-# Diagnostic information
+# PART 2A
+#
+# Benchmark Data Diagnostics
+#
 ###############################################################
+
+cat("\n")
+cat("============================================================\n")
+cat("BENCHMARK DATA DIAGNOSTICS\n")
+cat("============================================================\n")
+
+
+cat("\nBenchmark object class:\n")
+
+print(
+    class(
+        benchmark_results
+    )
+)
+
 
 cat("\nBenchmark observations:\n")
 
@@ -13058,13 +13381,201 @@ print(
 )
 
 
-cat("\nBenchmark methods:\n")
+cat("\nBenchmark columns:\n")
 
 print(
-    unique(
-        benchmark_results$Method
+    names(
+        benchmark_results
     )
 )
+
+
+###############################################################
+# Check Method
+###############################################################
+
+if (
+    "Method" %in%
+    names(benchmark_results)
+) {
+
+    benchmark_methods <-
+        unique(
+            benchmark_results$Method
+        )
+
+    cat("\nBenchmark methods:\n")
+
+    print(
+        benchmark_methods
+    )
+
+} else {
+
+    stop(
+        "Column 'Method' is missing from BenchmarkResults.csv."
+    )
+
+}
+
+
+###############################################################
+# Method frequency
+###############################################################
+
+cat("\nObservations by method:\n")
+
+method_frequency <-
+    table(
+        benchmark_results$Method,
+        useNA = "ifany"
+    )
+
+print(
+    method_frequency
+)
+
+
+###############################################################
+# Replication count
+###############################################################
+
+if (
+    "Replication" %in%
+    names(benchmark_results)
+) {
+
+    cat("\nUnique replications:\n")
+
+    print(
+        length(
+            unique(
+                benchmark_results$Replication
+            )
+        )
+    )
+
+}
+
+
+###############################################################
+# Numeric diagnostics
+###############################################################
+
+if (
+    "TotalCost" %in%
+    names(benchmark_results)
+) {
+
+    cat("\nTotalCost summary:\n")
+
+    print(
+        summary(
+            benchmark_results$TotalCost
+        )
+    )
+
+}
+
+
+if (
+    "FillRate" %in%
+    names(benchmark_results)
+) {
+
+    cat("\nFillRate summary:\n")
+
+    print(
+        summary(
+            benchmark_results$FillRate
+        )
+    )
+
+}
+
+
+if (
+    "Stockouts" %in%
+    names(benchmark_results)
+) {
+
+    cat("\nStockouts summary:\n")
+
+    print(
+        summary(
+            benchmark_results$Stockouts
+        )
+    )
+
+}
+
+
+###############################################################
+# Detect invalid fill rates
+###############################################################
+
+invalid_fillrate <-
+    FALSE
+
+if (
+    "FillRate" %in%
+    names(benchmark_results)
+) {
+
+    invalid_fillrate <-
+        any(
+            benchmark_results$FillRate < 0 |
+            benchmark_results$FillRate > 1,
+            na.rm = TRUE
+        )
+
+}
+
+
+if (invalid_fillrate) {
+
+    warning(
+        paste(
+            "BenchmarkResults contains fill rates outside [0,1].",
+            "FILE 05 will NOT alter these values.",
+            "Check FILE 04 benchmark calculations."
+        )
+    )
+
+}
+
+
+###############################################################
+# Detect zero costs
+###############################################################
+
+zero_cost_problem <-
+    FALSE
+
+if (
+    "TotalCost" %in%
+    names(benchmark_results)
+) {
+
+    zero_cost_problem <-
+        all(
+            benchmark_results$TotalCost == 0,
+            na.rm = TRUE
+        )
+
+}
+
+
+if (zero_cost_problem) {
+
+    warning(
+        paste(
+            "All TotalCost values are zero.",
+            "This strongly suggests an upstream FILE 04 problem."
+        )
+    )
+
+}
 
 
 ###############################################################
@@ -13080,28 +13591,19 @@ p_reward <-
         benchmark_summary,
 
         aes(
-
-            x =
-                Method,
-
-            y =
-                MeanReward
-
+            x = Method,
+            y = MeanReward
         )
 
     ) +
 
     geom_col(
-
-        width =
-            0.7
-
+        width = 0.7
     ) +
 
     theme_bw() +
 
     labs(
-
         title =
             "Average Inventory Reward Comparison",
 
@@ -13110,17 +13612,14 @@ p_reward <-
 
         y =
             "Mean Total Reward"
-
     ) +
 
     theme(
-
         axis.text.x =
             element_text(
                 angle = 30,
                 hjust = 1
             )
-
     )
 
 
@@ -13130,20 +13629,11 @@ print(
 
 
 ggsave(
-
     "results/Figure1_RewardComparison.png",
-
     p_reward,
-
-    width =
-        8,
-
-    height =
-        5,
-
-    dpi =
-        300
-
+    width = 8,
+    height = 5,
+    dpi = 300
 )
 
 
@@ -13155,7 +13645,9 @@ ggsave(
 ###############################################################
 
 if (
-    !is.null(benchmark_CI)
+    !is.null(
+        benchmark_CI
+    )
 ) {
 
     p_reward_CI <-
@@ -13164,39 +13656,24 @@ if (
             benchmark_CI,
 
             aes(
-
-                x =
-                    Method,
-
-                y =
-                    MeanReward
-
+                x = Method,
+                y = MeanReward
             )
 
         ) +
 
         geom_col(
-
-            width =
-                0.7
-
+            width = 0.7
         ) +
 
         geom_errorbar(
 
             aes(
-
-                ymin =
-                    RewardLower95,
-
-                ymax =
-                    RewardUpper95
-
+                ymin = RewardLower95,
+                ymax = RewardUpper95
             ),
 
-            width =
-                0.15
-
+            width = 0.15
         ) +
 
         theme_bw() +
@@ -13236,14 +13713,11 @@ if (
 
         p_reward_CI,
 
-        width =
-            8,
+        width = 8,
 
-        height =
-            5,
+        height = 5,
 
-        dpi =
-            300
+        dpi = 300
 
     )
 
@@ -13263,22 +13737,14 @@ p_cost <-
         benchmark_summary,
 
         aes(
-
-            x =
-                Method,
-
-            y =
-                MeanCost
-
+            x = Method,
+            y = MeanCost
         )
 
     ) +
 
     geom_col(
-
-        width =
-            0.7
-
+        width = 0.7
     ) +
 
     theme_bw() +
@@ -13318,14 +13784,11 @@ ggsave(
 
     p_cost,
 
-    width =
-        8,
+    width = 8,
 
-    height =
-        5,
+    height = 5,
 
-    dpi =
-        300
+    dpi = 300
 
 )
 
@@ -13338,7 +13801,9 @@ ggsave(
 ###############################################################
 
 if (
-    !is.null(benchmark_CI)
+    !is.null(
+        benchmark_CI
+    )
 ) {
 
     p_cost_CI <-
@@ -13347,23 +13812,15 @@ if (
             benchmark_CI,
 
             aes(
-
-                x =
-                    Method,
-
-                y =
-                    MeanCost
-
+                x = Method,
+                y = MeanCost
             )
 
         ) +
 
         geom_col(
-
-            width =
-                0.7
-
-            ) +
+            width = 0.7
+        ) +
 
         geom_errorbar(
 
@@ -13419,14 +13876,11 @@ if (
 
         p_cost_CI,
 
-        width =
-            8,
+        width = 8,
 
-        height =
-            5,
+        height = 5,
 
-        dpi =
-            300
+        dpi = 300
 
     )
 
@@ -13446,23 +13900,15 @@ p_fillrate <-
         benchmark_summary,
 
         aes(
-
-            x =
-                Method,
-
-            y =
-                MeanFillRate
-
+            x = Method,
+            y = MeanFillRate
         )
 
     ) +
 
     geom_col(
-
-        width =
-            0.7
-
-        ) +
+        width = 0.7
+    ) +
 
     theme_bw() +
 
@@ -13506,14 +13952,11 @@ ggsave(
 
     p_fillrate,
 
-    width =
-        8,
+    width = 8,
 
-    height =
-        5,
+    height = 5,
 
-    dpi =
-        300
+    dpi = 300
 
 )
 
@@ -13529,75 +13972,15 @@ pareto_data <-
     benchmark_summary %>%
 
     select(
-
         Method,
-
         MeanCost,
-
         MeanFillRate
-
     )
 
 
 ###############################################################
 # Determine Pareto-efficient methods
-#
-# Lower cost is better.
-# Higher fill rate is better.
-#
 ###############################################################
-
-is_pareto_efficient <- function(
-    cost,
-    fill_rate
-) {
-
-    n <-
-        length(cost)
-
-    efficient <-
-        rep(
-            TRUE,
-            n
-        )
-
-
-    for (
-        i in seq_len(n)
-    ) {
-
-        for (
-            j in seq_len(n)
-        ) {
-
-            if (
-                i != j &&
-                cost[j] <= cost[i] &&
-                fill_rate[j] >= fill_rate[i] &&
-                (
-                    cost[j] < cost[i] ||
-                    fill_rate[j] > fill_rate[i]
-                )
-            ) {
-
-                efficient[i] <-
-                    FALSE
-
-                break
-
-            }
-
-        }
-
-    }
-
-
-    return(
-        efficient
-    )
-
-}
-
 
 pareto_data <-
     pareto_data %>%
@@ -13606,8 +13989,11 @@ pareto_data <-
 
         ParetoEfficient =
             is_pareto_efficient(
+
                 MeanCost,
+
                 MeanFillRate
+
             )
 
     )
@@ -13619,8 +14005,7 @@ write.csv(
 
     "results/ParetoFrontierResults.csv",
 
-    row.names =
-        FALSE
+    row.names = FALSE
 
 )
 
@@ -13635,13 +14020,8 @@ p_pareto <-
         pareto_data,
 
         aes(
-
-            x =
-                MeanCost,
-
-            y =
-                MeanFillRate
-
+            x = MeanCost,
+            y = MeanFillRate
         )
 
     ) +
@@ -13649,38 +14029,28 @@ p_pareto <-
     geom_point(
 
         aes(
-
-            shape =
-                ParetoEfficient
-
+            shape = ParetoEfficient
         ),
 
-        size =
-            4
+        size = 4
 
     ) +
 
     geom_text(
 
         aes(
-
-            label =
-                Method
-
+            label = Method
         ),
 
-        vjust =
-            -0.8
+        vjust = -0.8
 
     ) +
 
     theme_bw() +
 
     scale_y_continuous(
-
         labels =
             scales::percent
-
     ) +
 
     labs(
@@ -13711,14 +14081,11 @@ ggsave(
 
     p_pareto,
 
-    width =
-        8,
+    width = 8,
 
-    height =
-        5,
+    height = 5,
 
-    dpi =
-        300
+    dpi = 300
 
 )
 
@@ -13739,28 +14106,43 @@ learning_files <- c(
 )
 
 
-learning_file <-
+existing_learning_files <-
     learning_files[
         file.exists(
             learning_files
         )
-    ][1]
+    ]
 
 
 if (
-    length(learning_file) == 0 ||
-    is.na(learning_file)
+    length(
+        existing_learning_files
+    ) == 0
 ) {
 
     warning(
-        "No learning-curve summary file found. Learning-efficiency figure skipped."
+        paste(
+            "No learning-curve summary file found.",
+            "Learning-efficiency figure skipped."
+        )
     )
 
 } else {
 
+    learning_file <-
+        existing_learning_files[1]
+
+
     learning_curve <-
         read.csv(
-            learning_file
+            learning_file,
+            stringsAsFactors = FALSE
+        )
+
+
+    learning_curve <-
+        normalize_benchmark_columns(
+            learning_curve
         )
 
 
@@ -13774,7 +14156,19 @@ if (
     ) {
 
         learning_curve$Model <-
-            learning_curve$Method
+            as.character(
+                learning_curve$Method
+            )
+
+    } else if (
+        "Model" %in%
+        names(learning_curve)
+    ) {
+
+        learning_curve$Model <-
+            as.character(
+                learning_curve$Model
+            )
 
     }
 
@@ -13783,76 +14177,85 @@ if (
     # Plot
     ###########################################################
 
-    p_learning <-
-        ggplot(
+    if (
+        all(
+            c(
+                "Episode",
+                "MeanReward",
+                "Model"
+            ) %in%
+            names(learning_curve)
+        )
+    ) {
 
-            learning_curve,
+        p_learning <-
+            ggplot(
 
-            aes(
+                learning_curve,
+
+                aes(
+
+                    x = Episode,
+
+                    y = MeanReward,
+
+                    color = Model,
+
+                    group = Model
+
+                )
+
+            ) +
+
+            geom_line(
+                linewidth = 1
+            ) +
+
+            theme_bw() +
+
+            labs(
+
+                title =
+                    "Learning Efficiency Comparison",
 
                 x =
-                    Episode,
+                    "Episode",
 
                 y =
-                    MeanReward,
+                    "Mean Reward",
 
                 color =
-                    Model,
-
-                group =
-                    Model
+                    "Model"
 
             )
 
-        ) +
 
-        geom_line(
-
-            linewidth =
-                1
-
-        ) +
-
-        theme_bw() +
-
-        labs(
-
-            title =
-                "Learning Efficiency Comparison",
-
-            x =
-                "Episode",
-
-            y =
-                "Mean Reward",
-
-            color =
-                "Model"
-
+        print(
+            p_learning
         )
 
 
-    print(
-        p_learning
-    )
+        ggsave(
 
+            "results/Figure4_LearningEfficiency.png",
 
-    ggsave(
+            p_learning,
 
-        "results/Figure4_LearningEfficiency.png",
+            width = 8,
 
-        p_learning,
+            height = 5,
 
-        width =
-            8,
+            dpi = 300
 
-        height =
-            5,
+        )
 
-        dpi =
-            300
+    } else {
 
-    )
+        warning(
+            "Learning file does not contain Episode, MeanReward, and Model."
+        )
+
+    }
 
 }
 
@@ -13865,7 +14268,9 @@ if (
 ###############################################################
 
 if (
-    !is.null(W_matrix)
+    !is.null(
+        W_matrix
+    )
 ) {
 
     ###########################################################
@@ -13876,6 +14281,12 @@ if (
         as.matrix(
             W_matrix
         )
+
+
+    storage.mode(
+        W_matrix
+    ) <-
+        "numeric"
 
 
     ###########################################################
@@ -13889,7 +14300,7 @@ if (
 
 
     ###########################################################
-    # Symmetrize if necessary
+    # Symmetrize
     ###########################################################
 
     W_network <-
@@ -13897,6 +14308,18 @@ if (
             W_matrix +
             t(W_matrix)
         ) / 2
+
+
+    ###########################################################
+    # Replace missing values
+    ###########################################################
+
+    W_network[
+        !is.finite(
+            W_network
+        )
+    ] <-
+        0
 
 
     ###########################################################
@@ -13925,15 +14348,18 @@ if (
     ###########################################################
 
     if (
+
         !is.null(
             selected_stores
         ) &&
+
         length(
             selected_stores
         ) ==
         igraph::vcount(
             network_graph
         )
+
     ) {
 
         V(
@@ -13960,6 +14386,38 @@ if (
 
 
     ###########################################################
+    # Edge width
+    ###########################################################
+
+    edge_weights <-
+        E(
+            network_graph
+        )$weight
+
+
+    if (
+        length(edge_weights) > 0
+    ) {
+
+        edge_width <-
+            1 +
+            4 *
+            pmax(
+                0,
+                abs(
+                    edge_weights
+                )
+            )
+
+    } else {
+
+        edge_width <-
+            numeric(0)
+
+    }
+
+
+    ###########################################################
     # Network plot
     ###########################################################
 
@@ -13967,14 +14425,11 @@ if (
 
         "results/Figure5_SpatialNetwork.png",
 
-        width =
-            1000,
+        width = 1000,
 
-        height =
-            800,
+        height = 800,
 
-        res =
-            120
+        res = 120
 
     )
 
@@ -13996,10 +14451,7 @@ if (
             "black",
 
         edge.width =
-            1 +
-
-            4 *
-            E(network_graph)$weight,
+            edge_width,
 
         edge.arrow.size =
             0,
@@ -14056,6 +14508,36 @@ lasarq_results <-
     )
 
 
+###############################################################
+# Check required columns
+###############################################################
+
+if (
+    nrow(sarq_results) == 0
+) {
+
+    warning(
+        "No SAR-Q observations found in BenchmarkResults."
+    )
+
+}
+
+
+if (
+    nrow(lasarq_results) == 0
+) {
+
+    warning(
+        "No LASAR-Q observations found in BenchmarkResults."
+    )
+
+}
+
+
+###############################################################
+# Join replications
+###############################################################
+
 cost_difference <-
     inner_join(
 
@@ -14075,14 +14557,21 @@ cost_difference <-
             LASARQ_Cost,
 
         CostReductionPercent =
-            100 *
-            (
-                SARQ_Cost -
-                LASARQ_Cost
-            ) /
-            pmax(
+            ifelse(
+
+                is.finite(SARQ_Cost) &
+                abs(SARQ_Cost) >
+                .Machine$double.eps,
+
+                100 *
+                (
+                    SARQ_Cost -
+                    LASARQ_Cost
+                ) /
                 SARQ_Cost,
-                .Machine$double.eps
+
+                NA_real_
+
             )
 
     )
@@ -14098,8 +14587,7 @@ write.csv(
 
     "results/SARQ_LASARQ_CostImprovement.csv",
 
-    row.names =
-        FALSE
+    row.names = FALSE
 
 )
 
@@ -14122,50 +14610,43 @@ cost_improvement_summary <-
         MeanCostReduction =
             mean(
                 CostReduction,
-                na.rm =
-                    TRUE
+                na.rm = TRUE
             ),
 
         SDCostReduction =
             sd(
                 CostReduction,
-                na.rm =
-                    TRUE
+                na.rm = TRUE
             ),
 
         MeanCostReductionPercent =
             mean(
                 CostReductionPercent,
-                na.rm =
-                    TRUE
+                na.rm = TRUE
             ),
 
         SDCostReductionPercent =
             sd(
                 CostReductionPercent,
-                na.rm =
-                    TRUE
+                na.rm = TRUE
             ),
 
         MedianCostReductionPercent =
             median(
                 CostReductionPercent,
-                na.rm =
-                    TRUE
+                na.rm = TRUE
             ),
 
         MinimumCostReductionPercent =
             min(
                 CostReductionPercent,
-                na.rm =
-                    TRUE
+                na.rm = TRUE
             ),
 
         MaximumCostReductionPercent =
             max(
                 CostReductionPercent,
-                na.rm =
-                    TRUE
+                na.rm = TRUE
             )
 
     )
@@ -14181,8 +14662,7 @@ write.csv(
 
     "results/LASARQ_CostImprovementSummary.csv",
 
-    row.names =
-        FALSE
+    row.names = FALSE
 
 )
 
@@ -14205,19 +14685,14 @@ p_improvement <-
         cost_difference,
 
         aes(
-
             x =
                 CostReductionPercent
-
         )
 
     ) +
 
     geom_histogram(
-
-        bins =
-            15
-
+        bins = 15
     ) +
 
     geom_vline(
@@ -14257,14 +14732,11 @@ ggsave(
 
     p_improvement,
 
-    width =
-        8,
+    width = 8,
 
-    height =
-        5,
+    height = 5,
 
-    dpi =
-        300
+    dpi = 300
 
 )
 
@@ -14306,16 +14778,13 @@ if (
 ) {
 
     improvement_percent <-
-        100 *
-        (
-            sarq_cost -
-            lasarq_cost
-        ) /
-        pmax(
-            sarq_cost,
-            .Machine$double.eps
-        )
+        safe_percent_change(
 
+            sarq_cost,
+
+            lasarq_cost
+
+        )
 
 } else {
 
@@ -14347,8 +14816,7 @@ write.csv(
 
     "results/LASARQ_ImprovementPercentage.csv",
 
-    row.names =
-        FALSE
+    row.names = FALSE
 
 )
 
@@ -14390,14 +14858,12 @@ if (
 ) {
 
     reward_improvement_percent <-
-        100 *
-        (
-            lasarq_reward -
-            sarq_reward
-        ) /
-        pmax(
-            abs(sarq_reward),
-            .Machine$double.eps
+        safe_reward_improvement(
+
+            sarq_reward,
+
+            lasarq_reward
+
         )
 
 } else {
@@ -14426,8 +14892,7 @@ write.csv(
 
     "results/LASARQ_RewardImprovementPercentage.csv",
 
-    row.names =
-        FALSE
+    row.names = FALSE
 
 )
 
@@ -14463,6 +14928,23 @@ lasarq_fillrate <-
     )
 
 
+if (
+    length(sarq_fillrate) == 1 &&
+    length(lasarq_fillrate) == 1
+) {
+
+    fillrate_difference_value <-
+        lasarq_fillrate -
+        sarq_fillrate
+
+} else {
+
+    fillrate_difference_value <-
+        NA_real_
+
+}
+
+
 fillrate_difference <-
     data.frame(
 
@@ -14470,8 +14952,7 @@ fillrate_difference <-
             "Fill Rate Difference",
 
         Value =
-            lasarq_fillrate -
-            sarq_fillrate
+            fillrate_difference_value
 
     )
 
@@ -14482,8 +14963,7 @@ write.csv(
 
     "results/LASARQ_FillRateDifference.csv",
 
-    row.names =
-        FALSE
+    row.names = FALSE
 
 )
 
@@ -14531,10 +15011,21 @@ publication_table <-
             ),
 
         FillRateSD =
-            round(
-                SDFillRate,
-                4
-            ),
+            if (
+                "SDFillRate" %in%
+                names(.)
+            ) {
+
+                round(
+                    SDFillRate,
+                    4
+                )
+
+            } else {
+
+                NA_real_
+
+            },
 
         Stockouts =
             round(
@@ -14589,8 +15080,7 @@ write.csv(
 
     "results/Table_Benchmark_Performance.csv",
 
-    row.names =
-        FALSE
+    row.names = FALSE
 
 )
 
@@ -14603,7 +15093,9 @@ write.csv(
 ###############################################################
 
 if (
-    !is.null(benchmark_CI)
+    !is.null(
+        benchmark_CI
+    )
 ) {
 
     publication_CI <-
@@ -14673,8 +15165,7 @@ if (
 
         "results/Table_Benchmark_Performance_95CI.csv",
 
-        row.names =
-            FALSE
+        row.names = FALSE
 
     )
 
@@ -14732,78 +15223,83 @@ writeLines(
 #
 ###############################################################
 
-improvement_publication <-
-    data.frame(
+if (
+    nrow(cost_improvement_summary) == 1
+) {
 
-        Comparison =
-            "LASAR-Q vs. SAR-Q",
+    improvement_publication <-
+        data.frame(
 
-        MeanCostReduction =
-            round(
-                cost_improvement_summary$MeanCostReduction,
-                2
-            ),
+            Comparison =
+                "LASAR-Q vs. SAR-Q",
 
-        MeanCostReductionPercent =
-            round(
-                cost_improvement_summary$MeanCostReductionPercent,
-                2
-            ),
+            MeanCostReduction =
+                round(
+                    cost_improvement_summary$MeanCostReduction,
+                    2
+                ),
 
-        SDPercent =
-            round(
-                cost_improvement_summary$SDCostReductionPercent,
-                2
-            ),
+            MeanCostReductionPercent =
+                round(
+                    cost_improvement_summary$MeanCostReductionPercent,
+                    2
+                ),
 
-        MedianPercent =
-            round(
-                cost_improvement_summary$MedianCostReductionPercent,
-                2
-            )
+            SDPercent =
+                round(
+                    cost_improvement_summary$SDCostReductionPercent,
+                    2
+                ),
 
-    )
+            MedianPercent =
+                round(
+                    cost_improvement_summary$MedianCostReductionPercent,
+                    2
+                )
 
-
-write.csv(
-
-    improvement_publication,
-
-    "results/Table_LASARQ_Improvement.csv",
-
-    row.names =
-        FALSE
-
-)
+        )
 
 
-latex_improvement <-
-    knitr::kable(
+    write.csv(
 
         improvement_publication,
 
-        format =
-            "latex",
+        "results/Table_LASARQ_Improvement.csv",
 
-        booktabs =
-            TRUE,
-
-        caption =
-            "Cost improvement of LASAR-Q relative to SAR-Q.",
-
-        label =
-            "tab:lasarq-improvement"
+        row.names = FALSE
 
     )
 
 
-writeLines(
+    latex_improvement <-
+        knitr::kable(
 
-    latex_improvement,
+            improvement_publication,
 
-    "results/Table_LASARQ_Improvement.tex"
+            format =
+                "latex",
 
-)
+            booktabs =
+                TRUE,
+
+            caption =
+                "Cost improvement of LASAR-Q relative to SAR-Q.",
+
+            label =
+                "tab:lasarq-improvement"
+
+        )
+
+
+    writeLines(
+
+        latex_improvement,
+
+        "results/Table_LASARQ_Improvement.tex"
+
+    )
+
+}
 
 
 ###############################################################
@@ -14830,16 +15326,79 @@ print(
 
 cat("\nReplications per method:\n")
 
-print(
-
-    benchmark_results %>%
-
-    count(
-        Method
+method_counts <-
+    as.data.frame(
+        table(
+            benchmark_results$Method,
+            useNA = "ifany"
+        )
     )
 
+names(method_counts) <-
+    c(
+        "Method",
+        "N"
+    )
+
+print(
+    method_counts
 )
 
+
+cat("\nTotal benchmark observations:\n")
+
+print(
+    nrow(
+        benchmark_results
+    )
+)
+
+
+###############################################################
+# Check expected number of methods
+###############################################################
+
+expected_methods <-
+    c(
+        "BaseStock",
+        "LASAR-Q",
+        "Q-Learning",
+        "Random",
+        "SAR-Q"
+    )
+
+
+missing_methods <-
+    setdiff(
+        expected_methods,
+        unique(
+            benchmark_results$Method
+        )
+    )
+
+
+if (
+    length(
+        missing_methods
+    ) > 0
+) {
+
+    warning(
+        paste(
+            "Missing expected benchmark methods:",
+            paste(
+                missing_methods,
+                collapse = ", "
+            )
+        )
+    )
+
+}
+
+
+###############################################################
+# Pareto-efficient methods
+###############################################################
 
 cat("\nPareto-efficient methods:\n")
 
@@ -14847,18 +15406,22 @@ print(
 
     pareto_data %>%
 
-    filter(
-        ParetoEfficient
-    ) %>%
+        filter(
+            ParetoEfficient
+        ) %>%
 
-    select(
-        Method,
-        MeanCost,
-        MeanFillRate
-    )
+        select(
+            Method,
+            MeanCost,
+            MeanFillRate
+        )
 
 )
 
+
+###############################################################
+# Cost reduction
+###############################################################
 
 cat("\nLASAR-Q vs SAR-Q mean cost reduction (%):\n")
 
@@ -14867,6 +15430,10 @@ print(
 )
 
 
+###############################################################
+# Reward improvement
+###############################################################
+
 cat("\nLASAR-Q vs SAR-Q reward improvement (%):\n")
 
 print(
@@ -14874,11 +15441,124 @@ print(
 )
 
 
+###############################################################
+# Fill-rate difference
+###############################################################
+
 cat("\nLASAR-Q vs SAR-Q fill-rate difference:\n")
 
 print(
-    lasarq_fillrate -
-    sarq_fillrate
+    fillrate_difference_value
+)
+
+
+###############################################################
+# Benchmark validity diagnostics
+###############################################################
+
+cat("\nBenchmark validity checks:\n")
+
+
+if (
+    "FillRate" %in%
+    names(benchmark_results)
+) {
+
+    cat(
+        "  Fill rate within [0,1]: "
+    )
+
+    if (invalid_fillrate) {
+
+        cat("NO\n")
+
+    } else {
+
+        cat("YES\n")
+
+    }
+
+}
+
+
+if (
+    "TotalCost" %in%
+    names(benchmark_results)
+) {
+
+    cat(
+        "  Total cost nonzero: "
+    )
+
+    if (zero_cost_problem) {
+
+        cat("NO\n")
+
+    } else {
+
+        cat("YES\n")
+
+    }
+
+}
+
+
+###############################################################
+# Save diagnostic report
+###############################################################
+
+diagnostic_report <-
+    data.frame(
+
+        Metric =
+            c(
+
+                "BenchmarkObservations",
+
+                "NumberOfMethods",
+
+                "ExpectedMethodsPresent",
+
+                "FillRateValid",
+
+                "TotalCostNonzero"
+
+            ),
+
+        Value =
+            c(
+
+                nrow(
+                    benchmark_results
+                ),
+
+                length(
+                    unique(
+                        benchmark_results$Method
+                    )
+                ),
+
+                length(
+                    missing_methods
+                ) == 0,
+
+                !invalid_fillrate,
+
+                !zero_cost_problem
+
+            )
+
+    )
+
+
+write.csv(
+
+    diagnostic_report,
+
+    "results/BenchmarkDiagnosticReport.csv",
+
+    row.names = FALSE
+
 )
 
 
@@ -14894,23 +15574,40 @@ cat("============================================================\n")
 cat("FILE 05 COMPLETE\n")
 cat("============================================================\n")
 
+
 cat("\nMain output files:\n")
 
 cat(
     "  results/Figure1_RewardComparison.png\n"
 )
 
-cat(
-    "  results/Figure1b_Reward_95CI.png\n"
-)
+if (
+    !is.null(
+        benchmark_CI
+    )
+) {
+
+    cat(
+        "  results/Figure1b_Reward_95CI.png\n"
+    )
+
+}
 
 cat(
     "  results/Figure2_CostComparison.png\n"
 )
 
-cat(
-    "  results/Figure2b_Cost_95CI.png\n"
-)
+if (
+    !is.null(
+        benchmark_CI
+    )
+) {
+
+    cat(
+        "  results/Figure2b_Cost_95CI.png\n"
+    )
+
+}
 
 cat(
     "  results/Figure2c_FillRateComparison.png\n"
@@ -14972,32 +15669,41 @@ cat(
     "  results/Table_LASARQ_Improvement.tex\n"
 )
 
+cat(
+    "  results/BenchmarkDiagnosticReport.csv\n"
+)
+
 cat("\n")
+cat("============================================================\n")
+cat("END OF FILE 05\n")
 cat("============================================================\n")
 
 ###############################################################
+#
 # FILE 06
 #
 # Full Experimental Reporting Module
 #
 # Copula Spatial SAR-Q Inventory System
+#
 ###############################################################
-
 
 cat("\n")
-cat("========================================\n")
+cat("============================================================\n")
 cat("FILE 06: Experimental Reporting Module\n")
-cat("========================================\n")
+cat("============================================================\n")
+
+
 ###############################################################
 # PART 1
+#
 # Libraries
+#
 ###############################################################
-
 
 library(dplyr)
 library(knitr)
 library(kableExtra)
-
 
 select <- dplyr::select
 filter <- dplyr::filter
@@ -15005,137 +15711,236 @@ mutate <- dplyr::mutate
 summarise <- dplyr::summarise
 
 
+###############################################################
+# Global Settings
+###############################################################
 
 RESULT_DIR <- "results"
-###############################################################
-# PART 2
-# Load Results
-###############################################################
 
+if (!dir.exists(RESULT_DIR)) {
 
-benchmark_summary <-
-
-    read.csv(
-
-        file.path(
-
-            RESULT_DIR,
-
-            "BenchmarkSummary.csv"
-
-        )
-
+    dir.create(
+        RESULT_DIR,
+        recursive = TRUE
     )
 
+}
+
+
+###############################################################
+# Helper Function
+###############################################################
+
+flatten_column <- function(x) {
+
+    if (is.list(x)) {
+
+        x <-
+            unlist(
+                x,
+                recursive = TRUE,
+                use.names = FALSE
+            )
+
+    }
+
+    return(x)
+
+}
+
+
+normalize_dataframe <- function(df) {
+
+    if ("Method" %in% names(df)) {
+
+        df$Method <-
+            as.character(
+                flatten_column(
+                    df$Method
+                )
+            )
+
+    }
+
+    return(df)
+
+}
+
+
+safe_read_csv <- function(
+    filename,
+    required = TRUE
+) {
+
+    path <-
+        file.path(
+            RESULT_DIR,
+            filename
+        )
+
+    if (!file.exists(path)) {
+
+        if (required) {
+
+            stop(
+                paste(
+                    "Required result file not found:",
+                    path
+                )
+            )
+
+        } else {
+
+            warning(
+                paste(
+                    "Optional result file not found:",
+                    path
+                )
+            )
+
+            return(NULL)
+
+        }
+
+    }
+
+    df <-
+        read.csv(
+            path,
+            stringsAsFactors = FALSE
+        )
+
+    return(
+        normalize_dataframe(df)
+    )
+
+}
+
+
+###############################################################
+# PART 2
+#
+# Load Results
+#
+###############################################################
+
+benchmark_summary <-
+    safe_read_csv(
+        "BenchmarkSummary.csv",
+        required = TRUE
+    )
 
 
 benchmark_results <-
-
-    read.csv(
-
-        file.path(
-
-            RESULT_DIR,
-
-            "BenchmarkResults.csv"
-
-        )
-
+    safe_read_csv(
+        "BenchmarkResults.csv",
+        required = TRUE
     )
-
 
 
 stat_tests <-
-
-    read.csv(
-
-        file.path(
-
-            RESULT_DIR,
-
-            "BenchmarkStatisticalTests.csv"
-
-        )
-
+    safe_read_csv(
+        "BenchmarkStatisticalTests.csv",
+        required = FALSE
     )
-
 
 
 robustness_summary <-
-
-    read.csv(
-
-        file.path(
-
-            RESULT_DIR,
-
-            "SARQ_RobustnessSummary.csv"
-
-        )
-
+    safe_read_csv(
+        "SARQ_RobustnessSummary.csv",
+        required = FALSE
     )
-
 
 
 learning_curve <-
-
-    read.csv(
-
-        file.path(
-
-            RESULT_DIR,
-
-            "SARQ_LearningCurveSummary.csv"
-
-        )
-
+    safe_read_csv(
+        "SARQ_LearningCurveSummary.csv",
+        required = FALSE
     )
+
+
+###############################################################
+# Optional diagnostic report from FILE 05
+###############################################################
+
+diagnostic_report <-
+    safe_read_csv(
+        "BenchmarkDiagnosticReport.csv",
+        required = FALSE
+    )
+
+
 ###############################################################
 # PART 3
+#
 # Main Performance Table
+#
 ###############################################################
+
+required_summary_columns <-
+    c(
+        "Method",
+        "MeanReward",
+        "MeanCost",
+        "MeanFillRate",
+        "MeanStockouts"
+    )
+
+
+missing_summary_columns <-
+    setdiff(
+        required_summary_columns,
+        names(benchmark_summary)
+    )
+
+
+if (
+    length(
+        missing_summary_columns
+    ) > 0
+) {
+
+    stop(
+        paste(
+            "BenchmarkSummary.csv is missing:",
+            paste(
+                missing_summary_columns,
+                collapse = ", "
+            )
+        )
+    )
+
+}
 
 
 Table1_Performance <-
-
     benchmark_summary %>%
 
     mutate(
 
-        Reward = round(
+        Reward =
+            round(
+                MeanReward,
+                2
+            ),
 
-            MeanReward,
+        Cost =
+            round(
+                MeanCost,
+                2
+            ),
 
-            2
+        FillRate =
+            round(
+                MeanFillRate,
+                4
+            ),
 
-        ),
-
-
-        Cost = round(
-
-            MeanCost,
-
-            2
-
-        ),
-
-
-        FillRate = round(
-
-            MeanFillRate,
-
-            4
-
-        ),
-
-
-        Stockouts = round(
-
-            MeanStockouts,
-
-            2
-
-        )
+        Stockouts =
+            round(
+                MeanStockouts,
+                2
+            )
 
     ) %>%
 
@@ -15154,44 +15959,47 @@ Table1_Performance <-
     )
 
 
-
 write.csv(
 
     Table1_Performance,
 
     file.path(
-
         RESULT_DIR,
-
         "Table1_Performance.csv"
-
     ),
 
-    row.names=FALSE
+    row.names = FALSE
 
 )
+
+
 ###############################################################
 # PART 4
-# Latex Table
+#
+# LaTeX Table
+#
 ###############################################################
 
-
 latex_table1 <-
-
     kable(
 
         Table1_Performance,
 
-        format="latex",
+        format =
+            "latex",
 
-        booktabs=TRUE,
+        booktabs =
+            TRUE,
 
-        caption=
+        caption =
+            paste(
+                "Benchmark comparison of inventory control policies."
+            ),
 
-        "Benchmark comparison of inventory control policies"
+        label =
+            "tab:experimental-performance"
 
     )
-
 
 
 writeLines(
@@ -15199,69 +16007,120 @@ writeLines(
     latex_table1,
 
     file.path(
-
         RESULT_DIR,
-
         "Table1_Performance.tex"
-
     )
 
 )
+
+
 ###############################################################
 # PART 5
+#
 # Learning Analysis
+#
 ###############################################################
 
-
-learning_summary <-
-
-    learning_curve %>%
-
-    group_by(
-
-        Method
-
-    ) %>%
-
-    summarise(
-
-        InitialReward =
-
-            first(
-
-                MeanReward
-
-            ),
-
-
-        FinalReward =
-
-            last(
-
-                MeanReward
-
-            ),
-
-
-        Improvement =
-
-            last(
-
-                MeanReward
-
-            ) -
-
-            first(
-
-                MeanReward
-
-            ),
-
-
-        .groups="drop"
-
+if (
+    !is.null(
+        learning_curve
     )
+) {
 
+    ###########################################################
+    # Standardize Method/Model
+    ###########################################################
+
+    if (
+        "Method" %in%
+        names(learning_curve)
+    ) {
+
+        learning_curve$Method <-
+            as.character(
+                learning_curve$Method
+            )
+
+    } else if (
+        "Model" %in%
+        names(learning_curve)
+    ) {
+
+        learning_curve$Method <-
+            as.character(
+                learning_curve$Model
+            )
+
+    }
+
+
+    ###########################################################
+    # Check required columns
+    ###########################################################
+
+    if (
+        all(
+            c(
+                "Method",
+                "MeanReward"
+            ) %in%
+            names(learning_curve)
+        )
+    ) {
+
+        learning_summary <-
+            learning_curve %>%
+
+            group_by(
+                Method
+            ) %>%
+
+            summarise(
+
+                InitialReward =
+                    first(
+                        MeanReward
+                    ),
+
+                FinalReward =
+                    last(
+                        MeanReward
+                    ),
+
+                Improvement =
+                    last(
+                        MeanReward
+                    ) -
+                    first(
+                        MeanReward
+                    ),
+
+                .groups =
+                    "drop"
+
+            )
+
+    } else {
+
+        warning(
+            paste(
+                "Learning curve does not contain",
+                "Method and MeanReward.",
+                "Learning summary skipped."
+            )
+        )
+
+        learning_summary <-
+            data.frame()
+
+    }
+
+} else {
+
+    learning_summary <-
+        data.frame()
+
+}
 
 
 write.csv(
@@ -15269,51 +16128,53 @@ write.csv(
     learning_summary,
 
     file.path(
-
         RESULT_DIR,
-
         "Table2_LearningSummary.csv"
-
     ),
 
-    row.names=FALSE
+    row.names = FALSE
 
 )
+
+
 ###############################################################
 # PART 6
+#
 # Robustness Results
+#
 ###############################################################
 
-
-Table3_Robustness <-
-
-    robustness_summary %>%
-
-    mutate(
-
-        MeanReward=
-
-            round(
-
-                MeanReward,
-
-                2
-
-            ),
-
-
-        SDReward=
-
-            round(
-
-                SDReward,
-
-                2
-
-            )
-
+if (
+    !is.null(
+        robustness_summary
     )
+) {
 
+    Table3_Robustness <-
+        robustness_summary %>%
+
+        mutate(
+
+            MeanReward =
+                round(
+                    MeanReward,
+                    2
+                ),
+
+            SDReward =
+                round(
+                    SDReward,
+                    2
+                )
+
+        )
+
+} else {
+
+    Table3_Robustness <-
+        data.frame()
+
+}
 
 
 write.csv(
@@ -15321,51 +16182,73 @@ write.csv(
     Table3_Robustness,
 
     file.path(
-
         RESULT_DIR,
-
         "Table3_Robustness.csv"
-
     ),
 
-    row.names=FALSE
+    row.names = FALSE
 
 )
+
+
 ###############################################################
 # PART 7
+#
 # Statistical Tests
+#
 ###############################################################
 
+if (
+    !is.null(
+        stat_tests
+    )
+) {
 
-Table4_Statistics <-
+    Table4_Statistics <-
+        stat_tests
 
-    stat_tests %>%
 
-    mutate(
+    if (
+        "PValue" %in%
+        names(
+            Table4_Statistics
+        )
+    ) {
 
-        PValue=
-
+        Table4_Statistics$PValue <-
             signif(
-
-                PValue,
-
+                Table4_Statistics$PValue,
                 4
-
-            ),
-
-
-        Effect=
-
-            round(
-
-                CliffDelta,
-
-                3
-
             )
 
+    }
+
+
+    if (
+        "CliffDelta" %in%
+        names(
+            Table4_Statistics
+        )
+    ) {
+
+        Table4_Statistics$Effect <-
+            round(
+                Table4_Statistics$CliffDelta,
+                3
+            )
+
+    }
+
+} else {
+
+    Table4_Statistics <-
+        data.frame()
+
+    warning(
+        "BenchmarkStatisticalTests.csv not available."
     )
 
+}
 
 
 write.csv(
@@ -15373,798 +16256,566 @@ write.csv(
     Table4_Statistics,
 
     file.path(
-
         RESULT_DIR,
-
         "Table4_StatisticalTests.csv"
-
     ),
 
-    row.names=FALSE
+    row.names = FALSE
 
 )
+
+
 ###############################################################
 # PART 8
-# Text Report
+#
+# Experimental Validity Diagnostics
+#
 ###############################################################
 
+benchmark_validity <-
+    data.frame(
 
-sink(
+        Metric = character(),
 
-    file.path(
+        Value = character(),
 
-        RESULT_DIR,
+        Status = character(),
 
-        "Experimental_Report.txt"
+        stringsAsFactors = FALSE
 
     )
 
-)
 
-
-
-cat("\n")
-cat("Copula Spatial SAR-Q Inventory System\n")
-cat("Experimental Summary Report\n")
-cat("------------------------------------\n\n")
-
-
-cat(
-
-    "Generated:",
-
-    Sys.Date(),
-
-    "\n\n"
-
-)
-
-
-
-cat(
-    "Benchmark Performance\n"
-)
-
-print(
-
-    Table1_Performance
-
-)
-
-
-
-cat("\n\n")
-
-cat(
-    "Learning Summary\n"
-)
-
-print(
-
-    learning_summary
-
-)
-
-
-
-cat("\n\n")
-
-cat(
-    "Statistical Tests\n"
-)
-
-print(
-
-    Table4_Statistics
-
-)
-
-
-
-sink()
 ###############################################################
-# PART 9
-# Create Manuscript Folder
+# Number of observations
 ###############################################################
 
+benchmark_validity <-
+    rbind(
 
-if(
+        benchmark_validity,
 
-    !dir.exists(
+        data.frame(
 
-        "manuscript_tables"
+            Metric =
+                "Benchmark observations",
+
+            Value =
+                nrow(
+                    benchmark_results
+                ),
+
+            Status =
+                ifelse(
+                    nrow(
+                        benchmark_results
+                    ) > 0,
+                    "OK",
+                    "ERROR"
+                )
+
+        )
 
     )
 
-){
 
-    dir.create(
+###############################################################
+# Method count
+###############################################################
 
-        "manuscript_tables"
+if (
+    "Method" %in%
+    names(benchmark_results)
+) {
 
-    )
+    n_methods <-
+        length(
+            unique(
+                benchmark_results$Method
+            )
+        )
+
+} else {
+
+    n_methods <-
+        0
 
 }
 
 
+benchmark_validity <-
+    rbind(
 
-file.copy(
+        benchmark_validity,
 
-    list.files(
+        data.frame(
 
-        "results",
+            Metric =
+                "Number of benchmark methods",
 
-        pattern="Table",
+            Value =
+                n_methods,
 
-        full.names=TRUE
-
-    ),
-
-    "manuscript_tables",
-
-    overwrite=TRUE
-
-)
-###############################################################
-# PART 10
-# Validation
-###############################################################
-
-
-required_files <- c(
-
-    "Table1_Performance.csv",
-
-    "Table2_LearningSummary.csv",
-
-    "Table3_Robustness.csv",
-
-    "Table4_StatisticalTests.csv",
-
-    "Experimental_Report.txt"
-
-)
-
-
-
-check <- data.frame(
-
-    File=required_files,
-
-    Exists=file.exists(
-
-        file.path(
-
-            RESULT_DIR,
-
-            required_files
+            Status =
+                ifelse(
+                    n_methods >= 2,
+                    "OK",
+                    "WARNING"
+                )
 
         )
 
     )
 
-)
 
-
-
-print(check)
 ###############################################################
-# FILE 07
-#
-# Reproducible Simulation Validation & Debugging Module
-#
-# Copula Spatial SAR-Q Inventory System
+# Fill-rate validation
 ###############################################################
 
+if (
+    "FillRate" %in%
+    names(benchmark_results)
+) {
 
-cat("\n")
-cat("========================================\n")
-cat("FILE 07: Validation and Debugging\n")
-cat("========================================\n")
-###############################################################
-# PART 1
-# Libraries
-###############################################################
+    invalid_fillrate <-
+        any(
 
+            benchmark_results$FillRate < 0 |
+            benchmark_results$FillRate > 1,
 
-library(dplyr)
-library(data.table)
-
-
-select <- dplyr::select
-filter <- dplyr::filter
-mutate <- dplyr::mutate
-summarise <- dplyr::summarise
-
-
-
-RESULT_DIR <- "results"
-###############################################################
-# PART 2
-# Required Files
-###############################################################
-
-
-required_files <- c(
-
-    # FILE 01
-    "SalesMatrix.rds",
-    "DemandBase.rds",
-    "DemandSD.rds",
-    "DemandResiduals.rds",
-
-    # FILE 02
-    "GaussianDependenceMatrix.rds",
-    "SpatialDistanceMatrix.rds",
-    "SpatialWeightMatrix_W.rds",
-    "CopulaModels.rds",
-    "CopulaParameters.rds",
-
-    # FILE 03
-    "SARQ_SimulationObjects.rds",
-    "SARQ_TrainingRewards.csv",
-
-    # FILE 04
-    "BenchmarkResults.csv",
-
-    # FILE 05
-    "Table_Benchmark_Performance.csv"
-
-)
-
-
-
-file_check <- data.frame(
-
-    File=required_files,
-
-    Exists=file.exists(
-
-        file.path(
-
-            RESULT_DIR,
-
-            required_files
+            na.rm = TRUE
 
         )
 
-    )
+} else {
 
-)
-
-
-
-print(file_check)
-
-
-
-write.csv(
-
-    file_check,
-
-    "results/Validation_FileCheck.csv",
-
-    row.names=FALSE
-
-)
-
-###############################################################
-# PART 3
-# Demand Validation
-###############################################################
-
-
-sales_matrix <-
-
-    readRDS(
-
-        "results/SalesMatrix.rds"
-
-    )
-
-
-
-demand_base <-
-
-    readRDS(
-
-        "results/DemandBase.rds"
-
-    )
-
-
-
-demand_sd <-
-
-    readRDS(
-
-        "results/DemandSD.rds"
-
-    )
-
-
-
-demand_check <- data.frame(
-
-    Object=c(
-
-        "Sales Matrix",
-
-        "Demand Mean",
-
-        "Demand SD"
-
-    ),
-
-    Rows=c(
-
-        nrow(sales_matrix),
-
-        length(demand_base),
-
-        length(demand_sd)
-
-    ),
-
-    Columns=c(
-
-        ncol(sales_matrix),
-
-        NA,
-
+    invalid_fillrate <-
         NA
 
-    )
+}
 
-)
 
+benchmark_validity <-
+    rbind(
 
+        benchmark_validity,
 
-print(demand_check)
-###############################################################
-# PART 4
-# Spatial Matrix Check
-###############################################################
+        data.frame(
 
+            Metric =
+                "Fill rate within [0,1]",
 
-W_matrix <-
+            Value =
+                ifelse(
+                    is.na(invalid_fillrate),
+                    "Not available",
+                    !invalid_fillrate
+                ),
 
-    readRDS(
+            Status =
+                ifelse(
 
-        "results/SpatialWeightMatrix_W.rds"
+                    is.na(invalid_fillrate),
 
-    )
+                    "WARNING",
 
-
-
-W_check <- list(
-
-    Dimension=
-
-        dim(W_matrix),
-
-
-    Diagonal=
-
-        diag(W_matrix),
-
-
-    RowSums=
-
-        rowSums(W_matrix),
-
-
-    Symmetric=
-
-        isTRUE(
-
-            all.equal(
-
-                W_matrix,
-
-                t(W_matrix)
-
-            )
-
-        ),
-
-
-    Missing=
-
-        sum(
-
-            is.na(W_matrix)
-
-        )
-
-)
-
-
-
-print(W_check)
-###############################################################
-# PART 5
-# Copula Validation
-###############################################################
-
-
-copula_matrix <-
-
-    readRDS(
-
-        "results/GaussianDependenceMatrix.rds"
-
-    )
-
-
-
-copula_check <- data.frame(
-
-    Min=
-
-        min(
-
-            copula_matrix
-
-        ),
-
-
-    Max=
-
-        max(
-
-            copula_matrix
-
-        ),
-
-
-    NA_Count=
-
-        sum(
-
-            is.na(copula_matrix)
-
-        ),
-
-
-    Dimension=
-
-        paste(
-
-            dim(copula_matrix),
-
-            collapse="x"
-
-        )
-
-)
-
-
-
-print(copula_check)
-###############################################################
-# PART 6
-# SAR-Q State Check
-###############################################################
-
-
-simulation_objects <-
-
-    readRDS(
-
-        "results/SARQ_SimulationObjects.rds"
-
-    )
-
-
-
-state_check <- data.frame(
-
-    Replication=
-
-        names(simulation_objects)[1:5],
-
-    Exists=
-
-        sapply(
-
-            simulation_objects[1:5],
-
-            function(x)
-
-                !is.null(x$Q)
-
-        )
-
-)
-
-
-
-print(state_check)
-###############################################################
-# PART 7
-# Q-table Validation
-###############################################################
-
-
-validate_Q <- function(Q){
-
-
-    keys <-
-
-        ls(
-
-            envir=Q
-
-        )
-
-
-
-    values <-
-
-        sapply(
-
-            keys,
-
-            function(k)
-
-                length(
-
-                    get(
-
-                        k,
-
-                        envir=Q
-
+                    ifelse(
+                        invalid_fillrate,
+                        "ERROR",
+                        "OK"
                     )
 
                 )
 
         )
 
+    )
 
 
-    data.frame(
+###############################################################
+# Cost validation
+###############################################################
 
-        States=
+if (
+    "TotalCost" %in%
+    names(benchmark_results)
+) {
 
-            length(keys),
+    all_zero_cost <-
+        all(
+            benchmark_results$TotalCost == 0,
+            na.rm = TRUE
+        )
 
-        MinActions=
+} else {
 
-            min(values),
+    all_zero_cost <-
+        NA
 
-        MaxActions=
+}
 
-            max(values)
+
+benchmark_validity <-
+    rbind(
+
+        benchmark_validity,
+
+        data.frame(
+
+            Metric =
+                "Total cost nonzero",
+
+            Value =
+                ifelse(
+                    is.na(all_zero_cost),
+                    "Not available",
+                    !all_zero_cost
+                ),
+
+            Status =
+                ifelse(
+
+                    is.na(all_zero_cost),
+
+                    "WARNING",
+
+                    ifelse(
+                        all_zero_cost,
+                        "ERROR",
+                        "OK"
+                    )
+
+                )
+
+        )
+
+    )
+
+
+###############################################################
+# Save diagnostics
+###############################################################
+
+write.csv(
+
+    benchmark_validity,
+
+    file.path(
+        RESULT_DIR,
+        "Table_ExperimentalValidity.csv"
+    ),
+
+    row.names = FALSE
+
+)
+
+
+###############################################################
+# PART 9
+#
+# Text Report
+#
+###############################################################
+
+report_file <-
+    file.path(
+        RESULT_DIR,
+        "Experimental_Report.txt"
+    )
+
+
+sink(
+    report_file
+)
+
+
+cat("\n")
+cat("Copula Spatial SAR-Q Inventory System\n")
+cat("Experimental Summary Report\n")
+cat("=====================================\n\n")
+
+
+cat(
+    "Generated:",
+    as.character(
+        Sys.Date()
+    ),
+    "\n\n"
+)
+
+
+###############################################################
+# Benchmark performance
+###############################################################
+
+cat(
+    "BENCHMARK PERFORMANCE\n"
+)
+
+cat(
+    "---------------------\n\n"
+)
+
+print(
+    Table1_Performance
+)
+
+
+###############################################################
+# Validity
+###############################################################
+
+cat(
+    "\n\nEXPERIMENTAL VALIDITY\n"
+)
+
+cat(
+    "---------------------\n\n"
+)
+
+print(
+    benchmark_validity
+)
+
+
+###############################################################
+# Learning
+###############################################################
+
+cat(
+    "\n\nLEARNING SUMMARY\n"
+)
+
+cat(
+    "----------------\n\n"
+)
+
+print(
+    learning_summary
+)
+
+
+###############################################################
+# Robustness
+###############################################################
+
+cat(
+    "\n\nROBUSTNESS SUMMARY\n"
+)
+
+cat(
+    "------------------\n\n"
+)
+
+print(
+    Table3_Robustness
+)
+
+
+###############################################################
+# Statistical tests
+###############################################################
+
+cat(
+    "\n\nSTATISTICAL TESTS\n"
+)
+
+cat(
+    "-----------------\n\n"
+)
+
+print(
+    Table4_Statistics
+)
+
+
+###############################################################
+# Diagnostic interpretation
+###############################################################
+
+cat(
+    "\n\nDIAGNOSTIC INTERPRETATION\n"
+)
+
+cat(
+    "-------------------------\n\n"
+)
+
+
+if (
+    isTRUE(
+        invalid_fillrate
+    )
+) {
+
+    cat(
+        "WARNING: Fill-rate values outside [0,1] were detected.\n"
+    )
+
+    cat(
+        "These values should be investigated in FILE 04 before publication.\n"
+    )
+
+}
+
+
+if (
+    isTRUE(
+        all_zero_cost
+    )
+) {
+
+    cat(
+        "WARNING: All benchmark total-cost values are zero.\n"
+    )
+
+    cat(
+        "This indicates a likely upstream inventory-cost calculation problem.\n"
+    )
+
+}
+
+
+sink()
+
+
+###############################################################
+# PART 10
+#
+# Create Manuscript Folder
+#
+###############################################################
+
+MANUSCRIPT_DIR <-
+    "manuscript_tables"
+
+
+if (
+    !dir.exists(
+        MANUSCRIPT_DIR
+    )
+) {
+
+    dir.create(
+        MANUSCRIPT_DIR,
+        recursive = TRUE
+    )
+
+}
+
+
+table_files <-
+    list.files(
+
+        RESULT_DIR,
+
+        pattern =
+            "^Table.*\\.(csv|tex)$",
+
+        full.names = TRUE
+
+    )
+
+
+if (
+    length(
+        table_files
+    ) > 0
+) {
+
+    file.copy(
+
+        table_files,
+
+        MANUSCRIPT_DIR,
+
+        overwrite = TRUE
 
     )
 
 }
-example_Q <-
-
-    simulation_objects[[1]]$Q
 
 
+###############################################################
+# PART 11
+#
+# Validation
+#
+###############################################################
+
+required_output_files <-
+    c(
+
+        "Table1_Performance.csv",
+
+        "Table2_LearningSummary.csv",
+
+        "Table3_Robustness.csv",
+
+        "Table4_StatisticalTests.csv",
+
+        "Table_ExperimentalValidity.csv",
+
+        "Experimental_Report.txt"
+
+    )
+
+
+check <-
+    data.frame(
+
+        File =
+            required_output_files,
+
+        Exists =
+            file.exists(
+
+                file.path(
+
+                    RESULT_DIR,
+
+                    required_output_files
+
+                )
+
+            )
+
+    )
+
+
+cat("\n")
+cat("============================================================\n")
+cat("FILE 06 OUTPUT VALIDATION\n")
+cat("============================================================\n")
 
 print(
+    check
+)
 
-    validate_Q(example_Q)
+
+write.csv(
+
+    check,
+
+    file.path(
+        RESULT_DIR,
+        "File06_OutputValidation.csv"
+    ),
+
+    row.names = FALSE
 
 )
+
+
 ###############################################################
-# PART 8
-# Reward Diagnostics
-###############################################################
-
-
-reward_table <-
-
-    read.csv(
-
-        "results/SARQ_TrainingRewards.csv"
-
-    )
-
-
-
-reward_check <-
-
-    reward_table %>%
-
-    group_by(
-
-        Method
-
-    ) %>%
-
-    summarise(
-
-        NA_Count=
-
-            sum(
-
-                is.na(Reward)
-
-            ),
-
-
-        MinReward=
-
-            min(
-
-                Reward
-
-            ),
-
-
-        MaxReward=
-
-            max(
-
-                Reward
-
-            ),
-
-
-        SDReward=
-
-            sd(
-
-                Reward
-
-            ),
-
-
-        .groups="drop"
-
-    )
-
-
-
-print(reward_check)
-###############################################################
-# PART 9
-# Seed Reproducibility
+# Final message
 ###############################################################
 
+cat("\n")
+cat("============================================================\n")
+cat("FILE 06 COMPLETE\n")
+cat("============================================================\n")
 
-MASTER_SEED <- 2026
-
-
-
-set.seed(
-
-    MASTER_SEED
-
-)
-
-
-x1 <-
-
-    rnorm(10)
-
-
-
-set.seed(
-
-    MASTER_SEED
-
-)
-
-
-x2 <-
-
-    rnorm(10)
-
-
-
-reproducibility_test <-
-
-    identical(
-
-        x1,
-
-        x2
-
-    )
-
-
-
-cat(
-
-    "Seed reproducibility:",
-
-    reproducibility_test,
-
-    "\n"
-
-)
-###############################################################
-# PART 10
-# Final Validation Report
-###############################################################
-
-
-sink(
-
-    "results/Validation_Report.txt"
-
-)
-
-
-
-cat(
-"Copula Spatial SAR-Q System Validation Report\n"
-)
-
-cat(
-"============================================\n\n"
-)
-
-
-
-cat(
-
-"File Check\n"
-
-)
-
-print(file_check)
-
-
-
-cat(
-
-"\nDemand Check\n"
-
-)
-
-print(demand_check)
-
-
-
-cat(
-
-"\nSpatial Weight Check\n"
-
-)
-
-print(W_check)
-
-
-
-cat(
-
-"\nCopula Check\n"
-
-)
-
-print(copula_check)
-
-
-
-cat(
-
-"\nReward Stability\n"
-
-)
-
-print(reward_check)
-
-
-
-cat(
-
-"\nReproducibility\n"
-
-)
-
-print(reproducibility_test)
-
-
-
-sink()
 
 # 08/03/2026 R code
 ###############################################################

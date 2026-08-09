@@ -6543,373 +6543,580 @@ write.csv(
 # Convergence Diagnostics
 # Statistical Tests
 ###############################################################
-
-
-cat("\n")
-cat("========================================\n")
-cat("PART 6: Evaluation and Statistical Tests\n")
-cat("========================================\n")
-###############################################################
-# Load Results
-###############################################################
-
-
-reward_table <-
-
-    read.csv(
-
-        "results/SARQ_TrainingRewards.csv"
-
-    )
-
-
-kpi_table <-
-
-    read.csv(
-
-        "results/SARQ_FinalKPI.csv"
-
-    )
-###############################################################
-# Mean Learning Curve
-###############################################################
-
-
-learning_curve <-
-
-    reward_table %>%
-
-    group_by(
-
-        Method,
-
-        Episode
-
-    ) %>%
-
-    summarise(
-
-        MeanReward =
-            mean(Reward),
-
-
-        SDReward =
-            sd(Reward),
-
-
-        N =
-            n(),
-
-
-        SE =
-            SDReward /
-
-            sqrt(N),
-
-
-        Lower95 =
-            MeanReward -
-
-            1.96*SE,
-
-
-        Upper95 =
-            MeanReward +
-
-            1.96*SE,
-
-
-        .groups="drop"
-
-    )
-
-
-
-write.csv(
-
-    learning_curve,
-
-    "results/SARQ_LearningCurveSummary.csv",
-
-    row.names=FALSE
-
-)
 ###############################################################
 # Learning Curve Plot
 ###############################################################
 
 
+library(dplyr)
+library(ggplot2)
+
+learning_curve <- learning_curve %>%
+    mutate(
+        Lower95 = MeanReward - 1.96 * SDReward,
+        Upper95 = MeanReward + 1.96 * SDReward
+    )
+
 p_learning <-
-
     ggplot(
-
         learning_curve,
-
         aes(
-
-            Episode,
-
-            MeanReward,
-
-            color=Method
-
+            x = Episode,
+            y = MeanReward,
+            color = Model,
+            group = Model
         )
-
-    ) +
-
-    geom_line(
-
-        linewidth=1
-
     ) +
 
     geom_ribbon(
-
         aes(
-
-            ymin=Lower95,
-
-            ymax=Upper95,
-
-            fill=Method
-
+            ymin = Lower95,
+            ymax = Upper95,
+            fill = Model,
+            group = Model
         ),
+        alpha = 0.15,
+        color = NA
+    ) +
 
-        alpha=0.15,
-
-        color=NA
-
+    geom_line(
+        linewidth = 1
     ) +
 
     theme_bw() +
 
     labs(
+        title = "SAR-Q vs LASAR-Q Learning Curves",
+        x = "Episode",
+        y = "Mean Reward",
+        color = "Model",
+        fill = "Model"
+    )
 
-        title =
-            "SAR-Q vs LASAR-Q Learning Curves",
+ggsave(
+    "results/SARQ_LearningCurves.png",
+    p_learning,
+    width = 8,
+    height = 5,
+    dpi = 300
+)
 
-        x =
-            "Episode",
 
-        y =
-            "Mean Reward"
+###############################################################
+# SAR-Q / LASAR-Q LEARNING CURVE ANALYSIS
+###############################################################
 
+library(dplyr)
+library(ggplot2)
+
+###############################################################
+# 1. Check Data Structure
+###############################################################
+
+print(names(learning_curve))
+
+print(head(learning_curve))
+
+print(unique(learning_curve$Model))
+
+
+###############################################################
+# 2. Moving Average Function
+###############################################################
+
+moving_average <- function(x, window = 50) {
+    
+    stats::filter(
+        x,
+        rep(1 / window, window),
+        sides = 1
+    )
+}
+
+
+###############################################################
+# 3. Calculate 95% Confidence Bands
+###############################################################
+
+learning_curve <- learning_curve %>%
+    
+    mutate(
+        
+        Lower95 =
+            MeanReward -
+            1.96 * SDReward,
+        
+        Upper95 =
+            MeanReward +
+            1.96 * SDReward
+        
     )
 
 
+###############################################################
+# 4. Calculate Smoothed Reward
+###############################################################
+
+convergence_table <-
+    
+    learning_curve %>%
+    
+    group_by(
+        Model
+    ) %>%
+    
+    arrange(
+        Episode,
+        .by_group = TRUE
+    ) %>%
+    
+    mutate(
+        
+        SmoothedReward =
+            as.numeric(
+                moving_average(
+                    MeanReward,
+                    window = 50
+                )
+            )
+        
+    ) %>%
+    
+    ungroup()
+
+
+###############################################################
+# 5. View Convergence Table
+###############################################################
+
+print(
+    convergence_table,
+    n = 20
+)
+
+
+###############################################################
+# 6. Save Convergence Table
+###############################################################
+
+write.csv(
+    convergence_table,
+    "results/SARQ_ConvergenceTable.csv",
+    row.names = FALSE
+)
+
+
+###############################################################
+# 7. Learning Curve with 95% Bands
+###############################################################
+
+p_learning <-
+    
+    ggplot(
+        
+        learning_curve,
+        
+        aes(
+            x = Episode,
+            y = MeanReward,
+            color = Model,
+            fill = Model,
+            group = Model
+        )
+        
+    ) +
+    
+    geom_ribbon(
+        
+        aes(
+            ymin = Lower95,
+            ymax = Upper95
+        ),
+        
+        alpha = 0.15,
+        color = NA
+    ) +
+    
+    geom_line(
+        linewidth = 1
+    ) +
+    
+    theme_bw() +
+    
+    labs(
+        
+        title =
+            "SAR-Q vs LASAR-Q Learning Curves",
+        
+        x =
+            "Episode",
+        
+        y =
+            "Mean Reward",
+        
+        color =
+            "Model",
+        
+        fill =
+            "Model"
+    )
+
+
+###############################################################
+# 8. Save Learning Curve
+###############################################################
 
 ggsave(
-
+    
     "results/SARQ_LearningCurves.png",
-
+    
     p_learning,
+    
+    width = 8,
+    height = 5,
+    dpi = 300
+)
 
-    width=8,
 
-    height=5
+###############################################################
+# 9. Smoothed Convergence Plot
+###############################################################
 
+p_convergence <-
+    
+    ggplot(
+        
+        convergence_table,
+        
+        aes(
+            x = Episode,
+            y = SmoothedReward,
+            color = Model,
+            group = Model
+        )
+        
+    ) +
+    
+    geom_line(
+        linewidth = 1.1
+    ) +
+    
+    theme_bw() +
+    
+    labs(
+        
+        title =
+            "SAR-Q vs LASAR-Q Convergence",
+        
+        x =
+            "Episode",
+        
+        y =
+            "Smoothed Mean Reward",
+        
+        color =
+            "Model"
+    )
+
+
+###############################################################
+# 10. Save Convergence Plot
+###############################################################
+
+ggsave(
+    
+    "results/SARQ_Convergence.png",
+    
+    p_convergence,
+    
+    width = 8,
+    height = 5,
+    dpi = 300
+)
+
+
+###############################################################
+# 11. Final Performance by Model
+###############################################################
+
+final_performance <-
+    
+    learning_curve %>%
+    
+    group_by(
+        Model
+    ) %>%
+    
+    arrange(
+        Episode,
+        .by_group = TRUE
+    ) %>%
+    
+    summarise(
+        
+        FinalEpisode =
+            max(Episode),
+        
+        FinalReward =
+            MeanReward[which.max(Episode)],
+        
+        FinalSD =
+            SDReward[which.max(Episode)],
+        
+        BestReward =
+            max(MeanReward),
+        
+        WorstReward =
+            min(MeanReward),
+        
+        AverageReward =
+            mean(MeanReward),
+        
+        .groups = "drop"
+    )
+
+
+###############################################################
+# 12. Print Final Performance
+###############################################################
+
+print(final_performance)
+
+
+###############################################################
+# 13. Save Final Performance Table
+###############################################################
+
+write.csv(
+    
+    final_performance,
+    
+    "results/SARQ_FinalPerformance.csv",
+    
+    row.names = FALSE
+)
+
+
+###############################################################
+# 14. Check Model Names
+###############################################################
+
+cat("\nModels included:\n")
+
+print(
+    unique(learning_curve$Model)
+)
+
+
+###############################################################
+# 15. Check Number of Episodes
+###############################################################
+
+cat("\nNumber of observations:\n")
+
+print(
+    nrow(learning_curve)
+)
+
+cat("\nEpisodes per model:\n")
+
+print(
+    learning_curve %>%
+        group_by(Model) %>%
+        summarise(
+            Episodes = n(),
+            .groups = "drop"
+        )
 )
 ###############################################################
 # Moving Average Function
 ###############################################################
 
-
-moving_average <- function(
-
-        x,
-
-        window=50
-
-){
-
+moving_average <- function(x, window = 50) {
+    
     stats::filter(
-
         x,
-
-        rep(
-
-            1/window,
-
-            window
-
-        ),
-
-        sides=1
-
+        rep(1 / window, window),
+        sides = 1
     )
-
 }
-###############################################################
-# Convergence Table
-###############################################################
 
+
+###############################################################
+# Create Convergence Table
+###############################################################
 
 convergence_table <-
-
-    reward_table %>%
-
+    
+    learning_curve %>%
+    
     group_by(
-
-        Replication,
-
-        Method
-
+        Model
     ) %>%
-
+    
     arrange(
-
-        Episode
-
+        Episode,
+        .by_group = TRUE
     ) %>%
-
+    
     mutate(
-
+        
         SmoothedReward =
-
             as.numeric(
-
                 moving_average(
-
-                    Reward,
-
-                    50
-
+                    MeanReward,
+                    window = 50
                 )
-
             )
-
     ) %>%
-
+    
     ungroup()
 
 
+###############################################################
+# Convergence Plot Data
+###############################################################
 
-write.csv(
+p_conv_data <-
+    
+    convergence_table %>%
+    
+    group_by(
+        Model,
+        Episode
+    ) %>%
+    
+    summarise(
+        
+        MeanSmooth =
+            mean(
+                SmoothedReward,
+                na.rm = TRUE
+            ),
+        
+        .groups = "drop"
+    )
 
-    convergence_table,
 
-    "results/SARQ_ConvergenceDiagnostics.csv",
-
-    row.names=FALSE
-
-)
 ###############################################################
 # Convergence Plot
 ###############################################################
 
-
 p_conv <-
-
-    convergence_table %>%
-
-    group_by(
-
-        Method,
-
-        Episode
-
-    ) %>%
-
-    summarise(
-
-        MeanSmooth =
-
-            mean(
-
-                SmoothedReward,
-
-                na.rm=TRUE
-
-            ),
-
-        .groups="drop"
-
-    ) %>%
-
+    
     ggplot(
-
+        
+        p_conv_data,
+        
         aes(
-
-            Episode,
-
-            MeanSmooth,
-
-            color=Method
-
+            x = Episode,
+            y = MeanSmooth,
+            color = Model,
+            group = Model
         )
-
+        
     ) +
-
+    
     geom_line(
-
-        linewidth=1
-
+        linewidth = 1
     ) +
-
+    
     theme_bw() +
-
+    
     labs(
-
-        title="SAR-Q Convergence Diagnostics",
-
-        y="Moving Average Reward"
-
+        
+        title =
+            "SAR-Q Convergence Diagnostics",
+        
+        x =
+            "Episode",
+        
+        y =
+            "Moving Average Reward",
+        
+        color =
+            "Model"
     )
 
 
+###############################################################
+# Display
+###############################################################
+
+print(p_conv)
+
+
+###############################################################
+# Save
+###############################################################
 
 ggsave(
-
-    "results/SARQ_Convergence.png",
-
+    
+    "results/SARQ_ConvergenceDiagnostics.png",
+    
     p_conv,
-
-    width=8,
-
-    height=5
-
+    
+    width = 8,
+    height = 5,
+    dpi = 300
 )
-###############################################################
-# AULC
-###############################################################
 
+###############################################################
+# AULC - Area Under the Learning Curve
+###############################################################
 
 aulc_results <-
-
-    reward_table %>%
-
+    
+    learning_curve %>%
+    
     group_by(
-
-        Replication,
-
-        Method
-
+        Model
     ) %>%
-
+    
+    arrange(
+        Episode,
+        .by_group = TRUE
+    ) %>%
+    
     summarise(
-
+        
         AULC =
-
             sum(
-
-                Reward
-
+                MeanReward,
+                na.rm = TRUE
             ),
-
-        .groups="drop"
-
+        
+        MeanReward =
+            mean(
+                MeanReward,
+                na.rm = TRUE
+            ),
+        
+        FinalReward =
+            MeanReward[which.max(Episode)],
+        
+        .groups = "drop"
     )
 
 
+###############################################################
+# Print AULC Results
+###############################################################
+
+print(aulc_results)
+
+
+###############################################################
+# Save AULC Results
+###############################################################
 
 write.csv(
-
+    
     aulc_results,
-
+    
     "results/SARQ_AULC.csv",
-
-    row.names=FALSE
-
+    
+    row.names = FALSE
 )
 ###############################################################
 # Final KPI Comparison

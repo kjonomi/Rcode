@@ -184,6 +184,57 @@ compute_rmse_multi_safe <- function(model, Xseq, Yseq, nout){
   list(per_output_rmse=rmse_vec, overall_rmse=overall_rmse)
 }
 ###############################################################
+# 2) Spatial detrending: polynomial
+###############################################################
+
+detrend_spatial_poly <- function(Y_vec, coords3) {
+
+    x <- coords3[, 1]
+    y <- coords3[, 2]
+    z <- coords3[, 3]
+
+    B <- cbind(
+        1,
+        x,
+        y,
+        z,
+        x^2,
+        x*y,
+        x*z,
+        y^2,
+        y*z,
+        z^2
+    )
+
+    residuals(
+        lm(Y_vec ~ B - 1)
+    )
+}
+
+
+detrend_all_times_poly <- function(Xmat, coords3) {
+
+    N  <- nrow(Xmat)
+    Tt <- ncol(Xmat)
+
+    resid <- matrix(
+        0,
+        nrow = N,
+        ncol = Tt
+    )
+
+    for (t in 1:Tt) {
+
+        resid[, t] <-
+            detrend_spatial_poly(
+                Xmat[, t],
+                coords3
+            )
+    }
+
+    resid
+}
+###############################################################
 # 7) Full example: compare polynomial vs spherical harmonics
 ###############################################################
 run_example_compare_methods <- function(nlon=84,nlat=42,Tt=30,L_in=5,nout=3,seed=1){

@@ -3664,7 +3664,326 @@ saveRDS(
     "TerraClimate_CNN_LSTM_GF_results.rds"
 )
 
+###############################################################
+# 31) GRAPH vs NO-GRAPH MODEL COMPARISON
+###############################################################
 
+###############################################################
+# 31.1 Prepare original and graph-frequency inputs
+###############################################################
+
+# Original climate data
+X_original <- climate_array
+
+# Graph-frequency data
+# Combine ppt, tmin, tmax into N_city x Time x 3
+X_gf <- array(
+    0,
+    dim = c(
+        nlat,
+        n_time,
+        n_var
+    )
+)
+
+X_gf[,,1] <- gf_ppt$X_graph_frequency
+X_gf[,,2] <- gf_tmin$X_graph_frequency
+X_gf[,,3] <- gf_tmax$X_graph_frequency
+
+
+###############################################################
+# 31.2 Convert to CNN-LSTM format
+###############################################################
+
+# Original:
+# Time x City x 1 x Variable
+
+imgs_original <- climate_array
+
+# Graph-frequency:
+# Currently city x frequency x time structure.
+# Transpose to Time x Frequency x 1 x Variable.
+
+imgs_gf <- array(
+    0,
+    dim = c(
+        n_time,
+        nlat,
+        1,
+        n_var
+    )
+)
+
+for(k in 1:n_var){
+
+    imgs_gf[,,,k] <-
+        t(X_gf[,,k]) |>
+        array(
+            dim = c(
+                n_time,
+                nlat,
+                1
+            )
+        )
+}
+
+
+###############################################################
+# 31.3 Create identical sequences
+###############################################################
+
+seq_original <- make_sequences_multi(
+    imgs_original,
+    L_in = 5
+)
+
+seq_gf <- make_sequences_multi(
+    imgs_gf,
+    L_in = 5
+)
+
+
+X_original_seq <- seq_original$X
+Y_original_seq <- seq_original$Y
+
+X_gf_seq <- seq_gf$X
+Y_gf_seq <- seq_gf$Y
+
+
+###############################################################
+# 31.4 Flatten targets
+###############################################################
+
+nSamples <- dim(X_original_seq)[1]
+
+Y_flat_original <- array(
+    0,
+    dim = c(
+        nSamples,
+        nlat * nlon,
+        n_var
+    )
+)
+
+Y_flat_gf <- array(
+    0,
+    dim = c(
+        nSamples,
+        nlat * nlon,
+        n_var
+    )
+)
+
+
+for(i in 1:nSamples){
+
+    for(k in 1:n_var){
+
+        Y_flat_original[i,,k] <-
+            as.numeric(
+                Y_original_seq[i,,,k]
+            )
+
+        Y_flat_gf[i,,k] <-
+            as.numeric(
+                Y_original_seq[i,,,k]
+            )
+    }
+}
+
+
+###############################################################
+# 31.5 Build NO-GRAPH model
+###############################################################
+
+set.seed(123)
+tf$random$set_seed(123)
+
+model_no_graph <-
+    build_cnn_lstm_multi(
+        nlat = nlat,
+        nlon = nlon,
+        nout = n_var,
+        L_in = 5
+    )
+
+
+model_no_graph %>%
+    compile(
+        optimizer =
+            optimizer_adam(
+                learning_rate = 1e-3
+            ),
+        loss =
+            nll_gaussian_multi()
+    )
+
+
+history_no_graph <-
+    model_no_graph %>%
+    fit(
+        X_original_seq,
+        Y_flat_original,
+        epochs = 20,
+        batch_size = 8,
+        validation_split = 0.20,
+        shuffle = FALSE,
+        verbose = 2
+    )
+
+
+###############################################################
+# 31.6 Build GRAPH-FREQUENCY model
+###############################################################
+
+set.seed(123)
+tf$random$set_seed(123)
+
+model_graph <-
+    build_cnn_lstm_multi(
+        nlat = nlat,
+        nlon = nlon,
+        nout = n_var,
+        L_in = 5
+    )
+
+
+model_graph %>%
+    compile(
+        optimizer =
+            optimizer_adam(
+                learning_rate = 1e-3
+            ),
+        loss =
+            nll_gaussian_multi()
+    )
+
+
+history_graph <-
+    model_graph %>%
+    fit(
+        X_gf_seq,
+        Y_flat_gf,
+        epochs = 20,
+        batch_size = 8,
+        validation_split = 0.20,
+        shuffle = FALSE,
+        verbose = 2
+    )
+
+###############################################################
+# 31.7 Prediction
+###############################################################
+
+pred_no_graph <-
+    predict_and_reshape(
+        model_no_graph,
+        X_original_seq,
+        nlat,
+        nlon,
+        n_var
+    )
+
+pred_graph <-
+    predict_and_reshape(
+        model_graph,
+        X_gf_seq,
+        nlat,
+        nlon,
+        n_var
+    )
+
+
+###############################################################
+# 31.8 Evaluation function
+###############################################################
+
+evaluate_model <- function(
+    Y_true,
+    pred
+){
+
+    results <- data.frame(
+        Variable = variable_names,
+        RMSE = NA_real_,
+        MAE = NA_real_,
+        Avg_NLL = NA_real_
+    )
+
+    for(k in 1:n_var){
+
+        true_vals <-
+            as.vector(
+                Y_true[,,,k]
+            )
+
+        pred_vals <-
+            as.vector(
+                pred$mean[,,,k]
+            )
+
+        sd_vals <-
+            exp(
+                as.vector(
+                    pred$logsd[,,,k]
+                )
+            ) + 1e-6
+
+
+        results$RMSE[k] <-
+            sqrt(
+                mean(
+                    (true_vals - pred_vals)^2,
+                    na.rm = TRUE
+                )
+            )
+
+
+        results$MAE[k] <-
+            mean(
+                abs(
+                    true_vals - pred_vals
+                ),
+                na.rm = TRUE
+            )
+
+
+        results$Avg_NLL[k] <-
+            mean(
+                0.5 * log(2*pi) +
+                log(sd_vals) +
+                0.5 *
+                (
+                    (true_vals - pred_vals) /
+                    sd_vals
+                )^2,
+                na.rm = TRUE
+            )
+    }
+
+    results
+}
+
+
+###############################################################
+# 31.9 Evaluate both models
+###############################################################
+
+results_no_graph <-
+    evaluate_model(
+        Y_original_seq,
+        pred_no_graph
+    )
+
+results_graph <-
+    evaluate_model(
+        Y_original_seq,
+        pred_graph
+    )
+
+
+results_no_graph
+results_graph
 ###############################################################
 # END OF FILE
 ###############################################################

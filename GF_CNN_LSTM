@@ -157,15 +157,40 @@ build_cnn_lstm_multi <- function(nlat, nlon, nout, L_in=5){
 }
 
 # Negative log-likelihood loss for Gaussian outputs
-nll_gaussian_multi <- function(eps = 1e-5){
-  function(y_true, y_pred){
-    pred_mean <- y_pred[,,,1]
-    pred_logsd <- y_pred[,,,2]
-    sd <- k_exp(pred_logsd) + eps
-    nll <- 0.5 * k_log(2*pi) + k_log(sd) + 0.5 * k_square((y_true - pred_mean)/sd)
-    k_mean(nll)
-  }
+###############################################################
+# Gaussian negative log-likelihood loss
+# Keras 3 compatible
+###############################################################
+
+nll_gaussian_multi <- function(eps = 1e-5) {
+
+    function(y_true, y_pred) {
+
+        pred_mean  <- y_pred[,,,1]
+        pred_logsd <- y_pred[,,,2]
+
+        # Stable standard deviation
+        sd <- tf$math$exp(
+            tf$clip_by_value(
+                pred_logsd,
+                -10,
+                10
+            )
+        ) + eps
+
+        # Gaussian negative log-likelihood
+        nll <-
+            0.5 * log(2 * pi) +
+            tf$math$log(sd) +
+            0.5 *
+            tf$square(
+                (y_true - pred_mean) / sd
+            )
+
+        tf$reduce_mean(nll)
+    }
 }
+
 ###############################################################
 # 6) RMSE computation (safe)
 ###############################################################

@@ -260,6 +260,220 @@ detrend_all_times_poly <- function(Xmat, coords3) {
     resid
 }
 ###############################################################
+# 2) Spatial detrending: spherical harmonics
+###############################################################
+
+assoc_legendre_seq <- function(L, m, x) {
+
+    x <- as.numeric(x)
+    nx <- length(x)
+
+    P <- matrix(
+        0,
+        nrow = nx,
+        ncol = (L - m + 1)
+    )
+
+    if (m == 0) {
+
+        P[, 1] <- 1
+
+    } else {
+
+        dfac <- 2^m * gamma(m + 0.5) / sqrt(pi)
+
+        P[, 1] <-
+            (-1)^m *
+            dfac *
+            (1 - x^2)^(m / 2)
+    }
+
+    if (L == m)
+        return(P[, 1, drop = FALSE])
+
+    if ((m + 1) <= L)
+        P[, 2] <- x * (2*m + 1) * P[, 1]
+
+    if ((m + 2) <= L) {
+
+        for (l in (m + 2):L) {
+
+            idx  <- l - m + 1
+            idx1 <- idx - 1
+            idx2 <- idx - 2
+
+            P[, idx] <-
+                (
+                    (2*l - 1) * x * P[, idx1] -
+                    (l + m - 1) * P[, idx2]
+                ) / (l - m)
+        }
+    }
+
+    P
+}
+
+
+norm_const <- function(l, m) {
+
+    sqrt(
+        ((2*l + 1) / (4*pi)) *
+        exp(
+            lgamma(l - m + 1) -
+            lgamma(l + m + 1)
+        )
+    )
+}
+
+
+sph_harm_basis <- function(coords3, L = 3) {
+
+    x <- coords3[, 1]
+    y <- coords3[, 2]
+    z <- coords3[, 3]
+
+    costheta <- z
+    phi <- atan2(y, x)
+
+    cols <- list()
+    colnames <- character(0)
+
+    for (l in 0:L) {
+
+        for (m in 0:l) {
+
+            Pseq <- assoc_legendre_seq(
+                l,
+                m,
+                costheta
+            )
+
+            P_lm <-
+                as.numeric(
+                    Pseq[, ncol(Pseq)]
+                )
+
+            Nlm <- norm_const(l, m)
+
+            if (m == 0) {
+
+                col <- Nlm * P_lm
+
+                cols[[length(cols) + 1]] <- col
+
+                colnames <-
+                    c(
+                        colnames,
+                        paste0("Y_l", l, "_m0")
+                    )
+
+            } else {
+
+                factor <-
+                    sqrt(2) *
+                    Nlm *
+                    P_lm
+
+                cols[[length(cols) + 1]] <-
+                    factor * cos(m * phi)
+
+                colnames <-
+                    c(
+                        colnames,
+                        paste0(
+                            "Y_l", l,
+                            "_m", m,
+                            "_c"
+                        )
+                    )
+
+                cols[[length(cols) + 1]] <-
+                    factor * sin(m * phi)
+
+                colnames <-
+                    c(
+                        colnames,
+                        paste0(
+                            "Y_l", l,
+                            "_m", m,
+                            "_s"
+                        )
+                    )
+            }
+        }
+    }
+
+    B <- do.call(cbind, cols)
+
+    colnames(B) <- colnames
+
+    B
+}
+
+
+detrend_spatial_sph <- function(
+    Y_vec,
+    coords3,
+    L = 3,
+    intercept = TRUE,
+    tol = 1e-8
+) {
+
+    B <- sph_harm_basis(
+        coords3,
+        L = L
+    )
+
+    if (intercept)
+        B <- cbind(1, B)
+
+    qrB <- qr(
+        B,
+        tol = tol
+    )
+
+    coef <- qr.coef(
+        qrB,
+        Y_vec
+    )
+
+    resid <-
+        Y_vec -
+        B %*% coef
+
+    as.numeric(resid)
+}
+
+
+detrend_all_times_sph <- function(
+    Xmat,
+    coords3,
+    L = 3
+) {
+
+    N  <- nrow(Xmat)
+    Tt <- ncol(Xmat)
+
+    resid <-
+        matrix(
+            0,
+            nrow = N,
+            ncol = Tt
+        )
+
+    for (t in 1:Tt) {
+
+        resid[, t] <-
+            detrend_spatial_sph(
+                Xmat[, t],
+                coords3,
+                L = L
+            )
+    }
+
+    resid
+}
+###############################################################
 # 7) Full example: compare polynomial vs spherical harmonics
 ###############################################################
 run_example_compare_methods <- function(nlon=84,nlat=42,Tt=30,L_in=5,nout=3,seed=1){

@@ -981,794 +981,2691 @@ res_summary <- summarize_and_plot_cnn_lstm_large(
 res_summary$summary_table
 res_summary$metrics_table
 
-## Real Data
-# ================================
+###############################################################
+# REAL DATA: TERRACLIMATE + CNN-LSTM + GRAPH FREQUENCY
+# Five U.S. Cities
+#
+# Cities:
+# Minneapolis, Chicago, New York, Los Angeles, Miami
+#
+# Period:
+# January 2000 - December 2020
+#
+# Variables:
+# ppt, tmin, tmax
+###############################################################
+
+
+###############################################################
 # 0) Load required libraries
-# ================================
-library(QBMS)
+###############################################################
+
+library(terra)
 library(keras)
 library(tensorflow)
 library(ggplot2)
 library(reshape2)
 library(viridis)
+library(igraph)
 
-# ================================
+
+###############################################################
 # 1) Define multiple cities
-# ================================
+###############################################################
+
 locations <- data.frame(
-  city = c("Minneapolis","Chicago","New York","Los Angeles","Miami"),
-  lat  = c(44.9778, 41.8781, 40.7128, 34.0522, 25.7617),
-  lon  = c(-93.2650, -87.6298, -74.0060, -118.2437, -80.1918)
+
+  city = c(
+    "Minneapolis",
+    "Chicago",
+    "New York",
+    "Los Angeles",
+    "Miami"
+  ),
+
+  lat = c(
+    44.9778,
+    41.8781,
+    40.7128,
+    34.0522,
+    25.7617
+  ),
+
+  lon = c(
+    -93.2650,
+    -87.6298,
+    -74.0060,
+    -118.2437,
+    -80.1918
+  )
 )
 
-nlat <- nrow(locations)
-nlon <- 1  # each city is a separate "column"
-latitudes <- locations$lat
-longitudes <- locations$lon
-city_names <- locations$city   # <-- always define city_names
 
-# ================================
-# 2) Download TerraClimate data
-# ================================
+nlat <- nrow(locations)
+nlon <- 1
+
+latitudes  <- locations$lat
+longitudes <- locations$lon
+city_names <- locations$city
+
+
+###############################################################
+# 2) TerraClimate settings
+###############################################################
+
 start_date <- "2000-01-01"
 end_date   <- "2020-12-31"
 
-climate_list <- lapply(1:nlat, function(i){
-  get_terraclimate(lat=latitudes[i], lon=longitudes[i],
-                   from=start_date, to=end_date,
-                   clim_vars=c("ppt","tmin","tmax"))$climate[[1]]
-})
+start_year <- 2000
+end_year   <- 2020
 
-# Convert to array: time x nlat x nlon x nvar
-n_time <- nrow(climate_list[[1]])
-n_var  <- 3
-climate_array <- array(0, dim=c(n_time, nlat, nlon, n_var))
-for(i in 1:nlat){
-  climate_array[,i,1,1] <- climate_list[[i]]$ppt
-  climate_array[,i,1,2] <- climate_list[[i]]$tmin
-  climate_array[,i,1,3] <- climate_list[[i]]$tmax
+clim_vars <- c(
+  "ppt",
+  "tmin",
+  "tmax"
+)
+
+
+###############################################################
+# 3) Directory for TerraClimate files
+###############################################################
+
+tc_dir <- file.path(
+  getwd(),
+  "TerraClimate_Data"
+)
+
+if(!dir.exists(tc_dir)) {
+  dir.create(
+    tc_dir,
+    recursive = TRUE
+  )
 }
 
-# Normalize per variable
-for(k in 1:n_var){
-  climate_array[,,,k] <- (climate_array[,,,k] - mean(climate_array[,,,k])) / sd(climate_array[,,,k])
+
+###############################################################
+# 4) Direct TerraClimate download
+###############################################################
+
+base_url <-
+  "https://climate.northwestknowledge.net/TERRACLIMATE-DATA"
+
+
+download_terraclimate_file <- function(
+    variable,
+    year,
+    data_dir
+) {
+
+  file_name <- paste0(
+    "TerraClimate_",
+    variable,
+    "_",
+    year,
+    ".nc"
+  )
+
+  local_file <- file.path(
+    data_dir,
+    file_name
+  )
+
+  remote_file <- paste0(
+    base_url,
+    "/",
+    file_name
+  )
+
+
+  if(file.exists(local_file)) {
+
+    cat(
+      "Already exists:",
+      file_name,
+      "\n"
+    )
+
+    return(local_file)
+  }
+
+
+  cat(
+    "Downloading:",
+    file_name,
+    "\n"
+  )
+
+
+  tryCatch({
+
+    download.file(
+      url = remote_file,
+      destfile = local_file,
+      mode = "wb",
+      method = "libcurl",
+      quiet = FALSE
+    )
+
+  }, error = function(e) {
+
+    if(file.exists(local_file)) {
+      file.remove(local_file)
+    }
+
+    stop(
+      paste0(
+        "\nTerraClimate download failed:\n",
+        remote_file,
+        "\n\nError: ",
+        conditionMessage(e)
+      )
+    )
+  })
+
+
+  if(!file.exists(local_file)) {
+
+    stop(
+      paste(
+        "File was not downloaded:",
+        file_name
+      )
+    )
+  }
+
+
+  file_size <- file.info(
+    local_file
+  )$size
+
+
+  if(is.na(file_size) || file_size < 100000) {
+
+    file.remove(local_file)
+
+    stop(
+      paste(
+        "Downloaded TerraClimate file appears invalid:",
+        file_name
+      )
+    )
+  }
+
+
+  cat(
+    "Successfully downloaded:",
+    file_name,
+    "\n"
+  )
+
+
+  local_file
 }
 
-# ================================
-# 3) Temporal detrending
-# ================================
-detrend_temporal_poly <- function(Y_array, degree=2){
-  N <- dim(Y_array)[2]; T <- dim(Y_array)[1]; nout <- dim(Y_array)[4]
-  Y_resid <- array(0, dim=dim(Y_array))
-  for(i in 1:N){
-    for(k in 1:nout){
-      y <- Y_array[,i,1,k]
-      B <- poly(1:T, degree=degree, raw=TRUE)
-      fit <- lm(y ~ B -1)
-      Y_resid[,i,1,k] <- residuals(fit)
+
+###############################################################
+# 5) Download all required annual files
+###############################################################
+
+tc_files <- list()
+
+
+for(v in clim_vars) {
+
+  tc_files[[v]] <- list()
+
+  for(y in start_year:end_year) {
+
+    tc_files[[v]][[as.character(y)]] <-
+      download_terraclimate_file(
+        variable = v,
+        year = y,
+        data_dir = tc_dir
+      )
+  }
+}
+
+
+###############################################################
+# 6) Extract nearest TerraClimate grid cell for each city
+###############################################################
+
+extract_city_variable <- function(
+    variable,
+    locations,
+    tc_files
+) {
+
+  result_list <- list()
+
+  counter <- 1
+
+
+  for(y in start_year:end_year) {
+
+    file_path <-
+      tc_files[[variable]][[as.character(y)]]
+
+
+    r <- terra::rast(
+      file_path
+    )
+
+
+    # Convert city coordinates to spatial points
+    city_points <- terra::vect(
+      locations,
+      geom = c("lon", "lat"),
+      crs = "EPSG:4326"
+    )
+
+
+    # Extract nearest grid cell
+    values <- terra::extract(
+      r,
+      city_points,
+      method = "near"
+    )
+
+
+    # Remove ID column
+    values <- values[, -1, drop = FALSE]
+
+
+    # Convert to matrix
+    values <- as.matrix(values)
+
+
+    result_list[[counter]] <- values
+
+    counter <- counter + 1
+
+
+    rm(r)
+
+    gc()
+  }
+
+
+  # Combine all years
+  result <- do.call(
+    rbind,
+    result_list
+  )
+
+
+  result
+}
+
+
+###############################################################
+# 7) Extract ppt, tmin and tmax
+###############################################################
+
+cat("\n")
+cat("========================================\n")
+cat("Extracting precipitation\n")
+cat("========================================\n")
+
+
+ppt_matrix <- extract_city_variable(
+  variable = "ppt",
+  locations = locations,
+  tc_files = tc_files
+)
+
+
+cat("\n")
+cat("========================================\n")
+cat("Extracting minimum temperature\n")
+cat("========================================\n")
+
+
+tmin_matrix <- extract_city_variable(
+  variable = "tmin",
+  locations = locations,
+  tc_files = tc_files
+)
+
+
+cat("\n")
+cat("========================================\n")
+cat("Extracting maximum temperature\n")
+cat("========================================\n")
+
+
+tmax_matrix <- extract_city_variable(
+  variable = "tmax",
+  locations = locations,
+  tc_files = tc_files
+)
+
+
+###############################################################
+# 8) Check dimensions
+###############################################################
+
+cat("\n")
+cat("Dimensions:\n")
+
+cat(
+  "ppt:",
+  dim(ppt_matrix),
+  "\n"
+)
+
+cat(
+  "tmin:",
+  dim(tmin_matrix),
+  "\n"
+)
+
+cat(
+  "tmax:",
+  dim(tmax_matrix),
+  "\n"
+)
+
+
+###############################################################
+# 9) Construct climate array
+###############################################################
+
+# 252 months
+# 5 cities
+# 1 longitude dimension
+# 3 climate variables
+
+n_time <- nrow(ppt_matrix)
+
+n_var <- 3
+
+
+climate_array <- array(
+  NA_real_,
+  dim = c(
+    n_time,
+    nlat,
+    nlon,
+    n_var
+  )
+)
+
+
+for(i in seq_len(nlat)) {
+
+  climate_array[, i, 1, 1] <-
+    ppt_matrix[, i]
+
+  climate_array[, i, 1, 2] <-
+    tmin_matrix[, i]
+
+  climate_array[, i, 1, 3] <-
+    tmax_matrix[, i]
+}
+
+
+###############################################################
+# 10) Climate variable names
+###############################################################
+
+variable_names <- c(
+  "ppt",
+  "tmin",
+  "tmax"
+)
+
+
+dimnames(climate_array) <- list(
+
+  Time =
+    seq.Date(
+      as.Date(start_date),
+      as.Date(end_date),
+      by = "month"
+    ),
+
+  City =
+    city_names,
+
+  Longitude =
+    "city",
+
+  Variable =
+    variable_names
+)
+
+
+###############################################################
+# 11) Check missing values
+###############################################################
+
+cat("\n")
+cat(
+  "Total missing values:",
+  sum(is.na(climate_array)),
+  "\n"
+)
+
+
+###############################################################
+# 12) Normalize each climate variable
+###############################################################
+
+for(k in seq_len(n_var)) {
+
+  mu <- mean(
+    climate_array[,,,k],
+    na.rm = TRUE
+  )
+
+
+  sigma <- sd(
+    climate_array[,,,k],
+    na.rm = TRUE
+  )
+
+
+  climate_array[,,,k] <-
+    (
+      climate_array[,,,k] - mu
+    ) / sigma
+}
+
+
+###############################################################
+# 13) Temporal detrending
+###############################################################
+
+detrend_temporal_poly <- function(
+    Y_array,
+    degree = 2
+) {
+
+  N <- dim(Y_array)[2]
+
+  T <- dim(Y_array)[1]
+
+  nout <- dim(Y_array)[4]
+
+
+  Y_resid <- array(
+    NA_real_,
+    dim = dim(Y_array)
+  )
+
+
+  for(i in seq_len(N)) {
+
+    for(k in seq_len(nout)) {
+
+      y <- Y_array[, i, 1, k]
+
+
+      time_index <- seq_len(T)
+
+
+      B <- poly(
+        time_index,
+        degree = degree,
+        raw = TRUE
+      )
+
+
+      fit <- lm(
+        y ~ B - 1
+      )
+
+
+      Y_resid[, i, 1, k] <-
+        residuals(fit)
     }
   }
+
+
   Y_resid
 }
 
-Y_array <- detrend_temporal_poly(climate_array, degree=2)
 
-# ================================
-# 4) CNN-LSTM sequence preparation
-# ================================
-make_sequences_multi <- function(imgs, L_in=5){
-  T <- dim(imgs)[1]; nlat <- dim(imgs)[2]; nlon <- dim(imgs)[3]; nout <- dim(imgs)[4]
+Y_array <- detrend_temporal_poly(
+  climate_array,
+  degree = 2
+)
+
+
+###############################################################
+# 14) CNN-LSTM sequence preparation
+###############################################################
+
+make_sequences_multi <- function(
+    imgs,
+    L_in = 5
+) {
+
+  T <- dim(imgs)[1]
+
+  nlat <- dim(imgs)[2]
+
+  nlon <- dim(imgs)[3]
+
+  nout <- dim(imgs)[4]
+
+
   nSamples <- T - L_in
-  X <- array(0, dim=c(nSamples, L_in, nlat, nlon, nout))
-  Y <- array(0, dim=c(nSamples, nlat, nlon, nout))
-  for(i in 1:nSamples){
-    X[i,,,,] <- imgs[i:(i+L_in-1),,,, drop=FALSE]
-    Y[i,,,] <- imgs[i+L_in,,,, drop=FALSE][1,,,]
+
+
+  X <- array(
+    0,
+    dim = c(
+      nSamples,
+      L_in,
+      nlat,
+      nlon,
+      nout
+    )
+  )
+
+
+  Y <- array(
+    0,
+    dim = c(
+      nSamples,
+      nlat,
+      nlon,
+      nout
+    )
+  )
+
+
+  for(i in seq_len(nSamples)) {
+
+    X[i,,,,] <-
+      imgs[
+        i:(i + L_in - 1),
+        ,,
+        ,
+        ,
+        drop = FALSE
+      ]
+
+
+    Y[i,,,] <-
+      imgs[
+        i + L_in,
+        ,,
+        ,
+        drop = FALSE
+      ][1,,,]
   }
-  list(X=X, Y=Y)
+
+
+  list(
+    X = X,
+    Y = Y
+  )
 }
 
-seqs <- make_sequences_multi(Y_array, L_in=5)
+
+seqs <- make_sequences_multi(
+  Y_array,
+  L_in = 5
+)
+
+
 Xseq <- seqs$X
+
 Yseq <- seqs$Y
+
 nSamples <- dim(Xseq)[1]
+
 nout <- dim(Y_array)[4]
 
-# Flatten Y for probabilistic output
-Y_flat <- array(0, dim=c(nSamples, nlat*nlon, nout))
-for(i in 1:nSamples) for(k in 1:nout) Y_flat[i,,k] <- as.numeric(Yseq[i,,,k])
 
-# ================================
-# 5) Build CNN-LSTM model
-# ================================
-build_cnn_lstm_multi <- function(nlat,nlon,nout,L_in=5){
-  input <- layer_input(shape=c(L_in,nlat,nlon,nout))
-  td <- input %>%
-    time_distributed(layer_conv_2d(filters=16,kernel_size=c(3,1),padding="same",activation="relu")) %>%
-    time_distributed(layer_max_pooling_2d(pool_size=c(2,1))) %>%
-    time_distributed(layer_conv_2d(filters=32,kernel_size=c(3,1),padding="same",activation="relu")) %>%
-    time_distributed(layer_max_pooling_2d(pool_size=c(2,1))) %>%
-    time_distributed(layer_flatten())
-  lstm <- td %>% layer_lstm(units=128,return_sequences=FALSE)
-  dense_out <- lstm %>% layer_dense(units=nlat*nlon*nout*2)
-  out <- layer_reshape(dense_out, target_shape=c(nlat*nlon,nout,2))
-  keras_model(inputs=input, outputs=out)
+###############################################################
+# 15) Flatten Y
+###############################################################
+
+Y_flat <- array(
+  0,
+  dim = c(
+    nSamples,
+    nlat * nlon,
+    nout
+  )
+)
+
+
+for(i in seq_len(nSamples)) {
+
+  for(k in seq_len(nout)) {
+
+    Y_flat[i,,k] <-
+      as.numeric(
+        Yseq[i,,,k]
+      )
+  }
 }
 
-nll_gaussian_multi <- function(){
-  function(y_true, y_pred){
-    pred_mean <- y_pred[,,,1]
-    pred_logsd <- y_pred[,,,2]
-    sd <- k_exp(pred_logsd)+1e-6
-    nll <- 0.5*k_log(2*pi) + k_log(sd) + 0.5*k_square((y_true-pred_mean)/sd)
+
+###############################################################
+# 16) Build CNN-LSTM model
+###############################################################
+
+build_cnn_lstm_multi <- function(
+    nlat,
+    nlon,
+    nout,
+    L_in = 5
+) {
+
+  input <- layer_input(
+    shape = c(
+      L_in,
+      nlat,
+      nlon,
+      nout
+    )
+  )
+
+
+  td <- input %>%
+
+    time_distributed(
+      layer_conv_2d(
+        filters = 16,
+        kernel_size = c(3,1),
+        padding = "same",
+        activation = "relu"
+      )
+    ) %>%
+
+    # Pool only longitude dimension.
+    # Do NOT pool the five-city dimension.
+    time_distributed(
+      layer_max_pooling_2d(
+        pool_size = c(1,1)
+      )
+    ) %>%
+
+    time_distributed(
+      layer_conv_2d(
+        filters = 32,
+        kernel_size = c(3,1),
+        padding = "same",
+        activation = "relu"
+      )
+    ) %>%
+
+    time_distributed(
+      layer_flatten()
+    )
+
+
+  lstm <- td %>%
+
+    layer_lstm(
+      units = 128,
+      return_sequences = FALSE
+    )
+
+
+  dense_out <- lstm %>%
+
+    layer_dense(
+      units = nlat * nlon * nout * 2
+    )
+
+
+  out <- dense_out %>%
+
+    layer_reshape(
+      target_shape =
+        c(
+          nlat * nlon,
+          nout,
+          2
+        )
+    )
+
+
+  keras_model(
+    inputs = input,
+    outputs = out
+  )
+}
+
+
+###############################################################
+# 17) Gaussian negative log-likelihood
+###############################################################
+
+nll_gaussian_multi <- function() {
+
+  function(
+      y_true,
+      y_pred
+  ) {
+
+    pred_mean <-
+      y_pred[,,,1]
+
+
+    pred_logsd <-
+      y_pred[,,,2]
+
+
+    sd <- k_exp(
+      pred_logsd
+    ) + 1e-6
+
+
+    nll <-
+      0.5 * k_log(2 * pi) +
+      k_log(sd) +
+      0.5 *
+      k_square(
+        (y_true - pred_mean) / sd
+      )
+
+
     k_mean(nll)
   }
 }
 
-model <- build_cnn_lstm_multi(nlat, nlon, nout, L_in=5)
-model %>% compile(optimizer=optimizer_adam(1e-3), loss=nll_gaussian_multi())
 
-# ================================
-# 6) Train model
-# ================================
-history <- model %>% fit(Xseq, Y_flat, epochs=5, batch_size=4, validation_split=0.2, verbose=2)
+###############################################################
+# 18) Build model
+###############################################################
 
-locations <- data.frame(
-  city = c("Minneapolis","Chicago","New York","Los Angeles","Miami"),
-  lat  = c(44.9778, 41.8781, 40.7128, 34.0522, 25.7617),
-  lon  = c(-93.2650, -87.6298, -74.0060, -118.2437, -80.1918)
-)
-
-nlat <- nrow(locations)
-nlon <- 1
-latitudes <- locations$lat
-longitudes <- locations$lon
-city_names <- locations$city   # <-- This line defines city_names
-
-
-# -------------------------------
-# 7) Robust predict & reshape helper
-# -------------------------------
-predict_and_reshape <- function(model, Xseq, nlat, nlon, nout, batch_size=8) {
-  pred_raw <- model %>% predict(Xseq, batch_size=batch_size)
-  pred_raw <- as.array(pred_raw)
-  
-  nSamples <- dim(Xseq)[1]
-  total_pixels <- nlat * nlon
-  
-  if (length(dim(pred_raw)) == 2) {
-    pred_raw <- array(pred_raw, dim = c(nSamples, total_pixels, nout, 2))
-  } else if (length(dim(pred_raw)) == 3 && dim(pred_raw)[3] == total_pixels * nout * 2) {
-    pred_raw <- array(pred_raw, dim = c(nSamples, total_pixels, nout, 2))
-  }
-  pred_mean <- pred_raw[,,,1]
-  pred_logsd <- pred_raw[,,,2]
-  
-  mean_arr  <- array(pred_mean,  dim=c(nSamples, nlat, nlon, nout))
-  logsd_arr <- array(pred_logsd, dim=c(nSamples, nlat, nlon, nout))
-  list(mean = mean_arr, logsd = logsd_arr)
-}
-
-# -------------------------------
-# 8) Consolidated summarize + plotting function
-# -------------------------------
-summarize_and_plot_cnn_lstm_cities <- function(model, Xseq, Yseq, city_names,
-                                               latitudes, longitudes, nout,
-                                               num_samples_plot=3, random_seed=NULL,
-                                               save_plots=FALSE, out_prefix="plot") {
-  if(!is.null(random_seed)) set.seed(random_seed)
-  
-  nSamples <- dim(Xseq)[1]
-  nlat <- length(city_names)
-  nlon <- 1
-  
-  preds <- predict_and_reshape(model, Xseq, nlat, nlon, nout)
-  Y_pred <- preds$mean         # [samples, nlat, nlon, nout]
-  Y_pred_logsd <- preds$logsd
-  
-  # Summary table
-  summary_table <- data.frame(
-    Output = 1:nout,
-    True_Mean = sapply(1:nout, function(k) mean(Yseq[,,,k])),
-    Pred_Mean = sapply(1:nout, function(k) mean(Y_pred[,,,k])),
-    True_SD   = sapply(1:nout, function(k) sd(Yseq[,,,k])),
-    Pred_SD   = sapply(1:nout, function(k) sd(Y_pred[,,,k]))
-  )
-  print("Summary Table (Mean & SD per Output):")
-  print(summary_table)
-  
-  # Metrics table
-  metrics_table <- data.frame(Output=1:nout, RMSE=NA_real_, Avg_NLL=NA_real_)
-  for(k in 1:nout){
-    true_vals <- as.vector(Yseq[,,,k])
-    pred_vals <- as.vector(Y_pred[,,,k])
-    sd_vals   <- exp(as.vector(Y_pred_logsd[,,,k])) + 1e-6
-    metrics_table$RMSE[k] <- sqrt(mean((pred_vals - true_vals)^2))
-    metrics_table$Avg_NLL[k] <- mean(0.5*log(2*pi) + log(sd_vals) + 0.5*((true_vals - pred_vals)/sd_vals)^2)
-  }
-  print("Per-output RMSE and Average NLL:")
-  print(metrics_table)
-  
-  # -----------------------
-  # Time series plots (random cities)
-  # -----------------------
-  ts_plots <- list()
-  for(s in 1:num_samples_plot){
-    ci <- sample(1:nlat, 1)
-    df_ts <- data.frame(Time = 1:nSamples)
-    for(k in 1:nout){
-      df_ts[[paste0("True_Y",k)]] <- Yseq[1:nSamples, ci, 1, k]
-      df_ts[[paste0("Pred_Y",k)]] <- Y_pred[1:nSamples, ci, 1, k]
-    }
-    df_long <- reshape2::melt(df_ts, id.vars="Time")
-    p <- ggplot(df_long, aes(x=Time, y=value, color=variable)) +
-      geom_line() +
-      ggtitle(paste0("Time Series - ", city_names[ci])) +
-      ylab("Value") +
-      theme_minimal()
-    print(p)
-    ts_plots[[paste0("city_",ci)]] <- p
-    if(save_plots) ggsave(sprintf("%s_timeseries_city%s.png", out_prefix, ci), p, width=7, height=4)
-  }
-  
-  # -----------------------
-  # City-wise mean True vs Pred and residuals (bar plots)
-  # -----------------------
-  bar_plots <- list()
-  for(k in 1:nout){
-    df_city <- data.frame(
-      City = city_names,
-      True = sapply(1:nlat, function(i) mean(Yseq[,i,1,k])),
-      Pred = sapply(1:nlat, function(i) mean(Y_pred[,i,1,k]))
-    )
-    df_city$Residual <- df_city$True - df_city$Pred
-    df_long <- reshape2::melt(df_city, id.vars="City")
-    
-    p1 <- ggplot(df_long[df_long$variable %in% c("True","Pred"),], aes(x=factor(City), y=value, fill=variable)) +
-      geom_bar(stat="identity", position="dodge") +
-      ggtitle(paste0("Output ", k, " — True vs Pred (mean over time)")) +
-      xlab("") + ylab("Mean value") + theme_minimal() +
-      theme(axis.text.x = element_text(angle=45, hjust=1))
-    
-    p2 <- ggplot(df_city, aes(x=factor(City), y=Residual, fill=Residual)) +
-      geom_bar(stat="identity") +
-      scale_fill_viridis_c(option="magma") +
-      ggtitle(paste0("Output ", k, " — Residuals (True - Pred)")) +
-      xlab("") + ylab("Residual") + theme_minimal() +
-      theme(axis.text.x = element_text(angle=45, hjust=1))
-    
-    print(p1); print(p2)
-    bar_plots[[paste0("out",k,"_truepred")]] <- p1
-    bar_plots[[paste0("out",k,"_resid")]] <- p2
-    
-    if(save_plots){
-      ggsave(sprintf("%s_out%d_truepred.png", out_prefix, k), p1, width=7, height=4)
-      ggsave(sprintf("%s_out%d_resid.png", out_prefix, k), p2, width=7, height=4)
-    }
-  }
-  
-  # -----------------------
-  # City x Output heatmaps (True, Pred, Residual)
-  # -----------------------
-  mean_true <- sapply(1:nout, function(k) sapply(1:nlat, function(i) mean(Yseq[,i,1,k])))
-  mean_pred <- sapply(1:nout, function(k) sapply(1:nlat, function(i) mean(Y_pred[,i,1,k])))
-  mean_resid <- mean_true - mean_pred
-  
-  df_mean <- data.frame(
-    City = rep(city_names, times = nout),
-    Output = rep(paste0("Out",1:nout), each = nlat),
-    True = as.vector(mean_true),
-    Pred = as.vector(mean_pred),
-    Residual = as.vector(mean_resid)
-  )
-  
-  plot_heatmap <- function(colname, title){
-    ggplot(df_mean, aes(x=Output, y=City, fill=.data[[colname]])) +
-      geom_tile(color="white") +
-      scale_fill_viridis_c() +
-      labs(x="Output", y="City", fill=colname, title=title) +
-      theme_minimal() +
-      theme(axis.text.x = element_text(angle=0))
-  }
-  
-  p_heat_true <- plot_heatmap("True", "City-wise True Mean per Output")
-  p_heat_pred <- plot_heatmap("Pred", "City-wise Predicted Mean per Output")
-  p_heat_resid <- plot_heatmap("Residual", "City-wise Residual Mean per Output")
-  
-  print(p_heat_true); print(p_heat_pred); print(p_heat_resid)
-  if(save_plots){
-    ggsave(sprintf("%s_heat_true.png", out_prefix), p_heat_true, width=6, height=4)
-    ggsave(sprintf("%s_heat_pred.png", out_prefix), p_heat_pred, width=6, height=4)
-    ggsave(sprintf("%s_heat_resid.png", out_prefix), p_heat_resid, width=6, height=4)
-  }
-  
-  # Return everything
-  list(
-    summary_table = summary_table,
-    metrics_table = metrics_table,
-    time_series_plots = ts_plots,
-    bar_plots = bar_plots,
-    heatmaps = list(true = p_heat_true, pred = p_heat_pred, resid = p_heat_resid),
-    Y_pred = Y_pred,
-    Y_pred_logsd = Y_pred_logsd
-  )
-}
-
-# -------------------------------
-# 9) Run summarize + plots
-# -------------------------------
-res_plots <- summarize_and_plot_cnn_lstm_cities(
-  model = model,
-  Xseq = Xseq,
-  Yseq = Yseq,
-  city_names = city_names,
-  latitudes = latitudes,
-  longitudes = longitudes,
+model <- build_cnn_lstm_multi(
+  nlat = nlat,
+  nlon = nlon,
   nout = nout,
-  num_samples_plot = 2,
-  random_seed = 123,
-  save_plots = FALSE,
-  out_prefix = "city_model"
+  L_in = 5
 )
 
-# View tables
-print(res_plots$summary_table)
-print(res_plots$metrics_table)
+
+model %>%
+
+  compile(
+    optimizer =
+      optimizer_adam(
+        learning_rate = 1e-3
+      ),
+
+    loss =
+      nll_gaussian_multi()
+  )
+
 
 ###############################################################
-# 11_graph_frequency_transform.R
-# Graph-frequency preprocessing for the GF-CNN-LSTM model
+# 19) Model summary
 ###############################################################
 
-# Required packages
-library(igraph)
+summary(model)
+
 
 ###############################################################
-# 1. Construct a geographic graph
+# 20) Train model
 ###############################################################
 
-make_geographic_weight_matrix <- function(latitudes,
-                                           longitudes,
-                                           sigma = NULL,
-                                           self_weight = 0) {
+set.seed(123)
 
-  stopifnot(length(latitudes) == length(longitudes))
+tf$random$set_seed(123)
 
-  n <- length(latitudes)
 
-  # Convert longitude/latitude to radians
-  lat <- latitudes * pi / 180
-  lon <- longitudes * pi / 180
+history <- model %>%
 
-  # Great-circle distance in kilometers
+  fit(
+    Xseq,
+    Y_flat,
+
+    epochs = 20,
+
+    batch_size = 8,
+
+    validation_split = 0.20,
+
+    verbose = 2,
+
+    shuffle = FALSE
+  )
+
+
+###############################################################
+# 21) Robust prediction and reshape
+###############################################################
+
+predict_and_reshape <- function(
+    model,
+    Xseq,
+    nlat,
+    nlon,
+    nout,
+    batch_size = 8
+) {
+
+  pred_raw <- model %>%
+
+    predict(
+      Xseq,
+      batch_size = batch_size
+    )
+
+
+  pred_raw <- as.array(
+    pred_raw
+  )
+
+
+  nSamples <- dim(Xseq)[1]
+
+  total_pixels <- nlat * nlon
+
+
+  if(length(dim(pred_raw)) == 2) {
+
+    pred_raw <- array(
+      pred_raw,
+      dim = c(
+        nSamples,
+        total_pixels,
+        nout,
+        2
+      )
+    )
+
+
+  } else if(
+    length(dim(pred_raw)) == 3
+  ) {
+
+    if(
+      dim(pred_raw)[2] ==
+      total_pixels &&
+      dim(pred_raw)[3] ==
+      nout * 2
+    ) {
+
+      pred_raw <- array(
+        pred_raw,
+        dim = c(
+          nSamples,
+          total_pixels,
+          nout,
+          2
+        )
+      )
+
+    } else {
+
+      stop(
+        "Unexpected prediction dimensions."
+      )
+    }
+  }
+
+
+  pred_mean <-
+    pred_raw[,,,1]
+
+
+  pred_logsd <-
+    pred_raw[,,,2]
+
+
+  mean_arr <- array(
+    pred_mean,
+    dim = c(
+      nSamples,
+      nlat,
+      nlon,
+      nout
+    )
+  )
+
+
+  logsd_arr <- array(
+    pred_logsd,
+    dim = c(
+      nSamples,
+      nlat,
+      nlon,
+      nout
+    )
+  )
+
+
+  list(
+    mean = mean_arr,
+    logsd = logsd_arr
+  )
+}
+
+
+###############################################################
+# 22) Summary and plotting
+###############################################################
+
+summarize_and_plot_cnn_lstm_cities <- function(
+
+    model,
+    Xseq,
+    Yseq,
+    city_names,
+    latitudes,
+    longitudes,
+    nout,
+
+    num_samples_plot = 3,
+
+    random_seed = NULL,
+
+    save_plots = FALSE,
+
+    out_prefix = "plot"
+) {
+
+
+  if(!is.null(random_seed)) {
+
+    set.seed(
+      random_seed
+    )
+  }
+
+
+  nSamples <- dim(Xseq)[1]
+
+  nlat <- length(city_names)
+
+  nlon <- 1
+
+
+  preds <- predict_and_reshape(
+    model,
+    Xseq,
+    nlat,
+    nlon,
+    nout
+  )
+
+
+  Y_pred <-
+    preds$mean
+
+
+  Y_pred_logsd <-
+    preds$logsd
+
+
+  #############################################################
+  # Summary table
+  #############################################################
+
+  summary_table <- data.frame(
+
+    Output = 1:nout,
+
+    Variable = c(
+      "ppt",
+      "tmin",
+      "tmax"
+    ),
+
+    True_Mean =
+      sapply(
+        1:nout,
+        function(k)
+          mean(
+            Yseq[,,,k],
+            na.rm = TRUE
+          )
+      ),
+
+    Pred_Mean =
+      sapply(
+        1:nout,
+        function(k)
+          mean(
+            Y_pred[,,,k],
+            na.rm = TRUE
+          )
+      ),
+
+    True_SD =
+      sapply(
+        1:nout,
+        function(k)
+          sd(
+            Yseq[,,,k],
+            na.rm = TRUE
+          )
+      ),
+
+    Pred_SD =
+      sapply(
+        1:nout,
+        function(k)
+          sd(
+            Y_pred[,,,k],
+            na.rm = TRUE
+          )
+      )
+  )
+
+
+  print(
+    "Summary Table:"
+  )
+
+  print(
+    summary_table
+  )
+
+
+  #############################################################
+  # Metrics
+  #############################################################
+
+  metrics_table <- data.frame(
+
+    Output = 1:nout,
+
+    Variable = c(
+      "ppt",
+      "tmin",
+      "tmax"
+    ),
+
+    RMSE = NA_real_,
+
+    MAE = NA_real_,
+
+    Avg_NLL = NA_real_
+  )
+
+
+  for(k in 1:nout) {
+
+    true_vals <-
+      as.vector(
+        Yseq[,,,k]
+      )
+
+
+    pred_vals <-
+      as.vector(
+        Y_pred[,,,k]
+      )
+
+
+    sd_vals <-
+      exp(
+        as.vector(
+          Y_pred_logsd[,,,k]
+        )
+      ) + 1e-6
+
+
+    metrics_table$RMSE[k] <-
+      sqrt(
+        mean(
+          (pred_vals - true_vals)^2,
+          na.rm = TRUE
+        )
+      )
+
+
+    metrics_table$MAE[k] <-
+      mean(
+        abs(
+          pred_vals - true_vals
+        ),
+        na.rm = TRUE
+      )
+
+
+    metrics_table$Avg_NLL[k] <-
+      mean(
+        0.5 * log(2*pi) +
+        log(sd_vals) +
+        0.5 *
+        (
+          (true_vals - pred_vals) /
+            sd_vals
+        )^2,
+
+        na.rm = TRUE
+      )
+  }
+
+
+  print(
+    "Per-output metrics:"
+  )
+
+  print(
+    metrics_table
+  )
+
+
+  #############################################################
+  # Time-series plots
+  #############################################################
+
+  ts_plots <- list()
+
+
+  for(s in 1:num_samples_plot) {
+
+    ci <- sample(
+      1:nlat,
+      1
+    )
+
+
+    df_ts <- data.frame(
+      Time = 1:nSamples
+    )
+
+
+    for(k in 1:nout) {
+
+      df_ts[
+        [paste0("True_", variable_names[k])]
+      ] <-
+        Yseq[
+          1:nSamples,
+          ci,
+          1,
+          k
+        ]
+
+
+      df_ts[
+        [paste0("Pred_", variable_names[k])]
+      ] <-
+        Y_pred[
+          1:nSamples,
+          ci,
+          1,
+          k
+        ]
+    }
+
+
+    df_long <-
+      reshape2::melt(
+        df_ts,
+        id.vars = "Time"
+      )
+
+
+    p <- ggplot(
+      df_long,
+      aes(
+        x = Time,
+        y = value,
+        color = variable
+      )
+    ) +
+
+      geom_line() +
+
+      ggtitle(
+        paste(
+          "CNN-LSTM:",
+          city_names[ci]
+        )
+      ) +
+
+      xlab(
+        "Month"
+      ) +
+
+      ylab(
+        "Standardized value"
+      ) +
+
+      theme_minimal()
+
+
+    print(p)
+
+
+    ts_plots[
+      [paste0("city_", ci)]
+    ] <- p
+
+
+    if(save_plots) {
+
+      ggsave(
+        sprintf(
+          "%s_timeseries_city%s.png",
+          out_prefix,
+          ci
+        ),
+        p,
+        width = 7,
+        height = 4
+      )
+    }
+  }
+
+
+  #############################################################
+  # City-wise mean True vs Predicted
+  #############################################################
+
+  bar_plots <- list()
+
+
+  for(k in 1:nout) {
+
+    df_city <- data.frame(
+
+      City = city_names,
+
+      True =
+        sapply(
+          1:nlat,
+          function(i)
+            mean(
+              Yseq[,i,1,k],
+              na.rm = TRUE
+            )
+        ),
+
+      Pred =
+        sapply(
+          1:nlat,
+          function(i)
+            mean(
+              Y_pred[,i,1,k],
+              na.rm = TRUE
+            )
+        )
+    )
+
+
+    df_city$Residual <-
+      df_city$True -
+      df_city$Pred
+
+
+    df_long <-
+      reshape2::melt(
+        df_city,
+        id.vars = "City"
+      )
+
+
+    p1 <- ggplot(
+
+      df_long[
+        df_long$variable %in%
+          c("True", "Pred"),
+      ],
+
+      aes(
+        x = factor(City),
+        y = value,
+        fill = variable
+      )
+    ) +
+
+      geom_bar(
+        stat = "identity",
+        position = "dodge"
+      ) +
+
+      ggtitle(
+        paste(
+          variable_names[k],
+          ": True vs Predicted"
+        )
+      ) +
+
+      xlab("") +
+
+      ylab(
+        "Mean standardized value"
+      ) +
+
+      theme_minimal() +
+
+      theme(
+        axis.text.x =
+          element_text(
+            angle = 45,
+            hjust = 1
+          )
+      )
+
+
+    p2 <- ggplot(
+
+      df_city,
+
+      aes(
+        x = factor(City),
+        y = Residual,
+        fill = Residual
+      )
+    ) +
+
+      geom_bar(
+        stat = "identity"
+      ) +
+
+      scale_fill_viridis_c(
+        option = "magma"
+      ) +
+
+      ggtitle(
+        paste(
+          variable_names[k],
+          ": Residual"
+        )
+      ) +
+
+      xlab("") +
+
+      ylab(
+        "True - Predicted"
+      ) +
+
+      theme_minimal() +
+
+      theme(
+        axis.text.x =
+          element_text(
+            angle = 45,
+            hjust = 1
+          )
+      )
+
+
+    print(p1)
+
+    print(p2)
+
+
+    bar_plots[
+      [paste0(
+        "out",
+        k,
+        "_truepred"
+      )]
+    ] <- p1
+
+
+    bar_plots[
+      [paste0(
+        "out",
+        k,
+        "_resid"
+      )]
+    ] <- p2
+  }
+
+
+  #############################################################
+  # Heatmaps
+  #############################################################
+
+  mean_true <-
+    sapply(
+      1:nout,
+      function(k)
+        sapply(
+          1:nlat,
+          function(i)
+            mean(
+              Yseq[,i,1,k],
+              na.rm = TRUE
+            )
+        )
+    )
+
+
+  mean_pred <-
+    sapply(
+      1:nout,
+      function(k)
+        sapply(
+          1:nlat,
+          function(i)
+            mean(
+              Y_pred[,i,1,k],
+              na.rm = TRUE
+            )
+        )
+    )
+
+
+  mean_resid <-
+    mean_true -
+    mean_pred
+
+
+  df_mean <- data.frame(
+
+    City =
+      rep(
+        city_names,
+        times = nout
+      ),
+
+    Output =
+      rep(
+        variable_names,
+        each = nlat
+      ),
+
+    True =
+      as.vector(mean_true),
+
+    Pred =
+      as.vector(mean_pred),
+
+    Residual =
+      as.vector(mean_resid)
+  )
+
+
+  plot_heatmap <- function(
+      colname,
+      title
+  ) {
+
+    ggplot(
+      df_mean,
+      aes(
+        x = Output,
+        y = City,
+        fill = .data[[colname]]
+      )
+    ) +
+
+      geom_tile(
+        color = "white"
+      ) +
+
+      scale_fill_viridis_c() +
+
+      labs(
+        x = "Climate variable",
+        y = "City",
+        fill = colname,
+        title = title
+      ) +
+
+      theme_minimal()
+  }
+
+
+  p_heat_true <-
+    plot_heatmap(
+      "True",
+      "City-wise True Mean"
+    )
+
+
+  p_heat_pred <-
+    plot_heatmap(
+      "Pred",
+      "City-wise Predicted Mean"
+    )
+
+
+  p_heat_resid <-
+    plot_heatmap(
+      "Residual",
+      "City-wise Residual Mean"
+    )
+
+
+  print(p_heat_true)
+
+  print(p_heat_pred)
+
+  print(p_heat_resid)
+
+
+  #############################################################
+  # Return results
+  #############################################################
+
+  list(
+
+    summary_table =
+      summary_table,
+
+    metrics_table =
+      metrics_table,
+
+    time_series_plots =
+      ts_plots,
+
+    bar_plots =
+      bar_plots,
+
+    heatmaps =
+      list(
+        true = p_heat_true,
+        pred = p_heat_pred,
+        resid = p_heat_resid
+      ),
+
+    Y_pred =
+      Y_pred,
+
+    Y_pred_logsd =
+      Y_pred_logsd
+  )
+}
+
+
+###############################################################
+# 23) Run CNN-LSTM summary
+###############################################################
+
+res_plots <-
+
+  summarize_and_plot_cnn_lstm_cities(
+
+    model = model,
+
+    Xseq = Xseq,
+
+    Yseq = Yseq,
+
+    city_names = city_names,
+
+    latitudes = latitudes,
+
+    longitudes = longitudes,
+
+    nout = nout,
+
+    num_samples_plot = 2,
+
+    random_seed = 123,
+
+    save_plots = FALSE,
+
+    out_prefix = "city_model"
+  )
+
+
+###############################################################
+# 24) View results
+###############################################################
+
+print(
+  res_plots$summary_table
+)
+
+
+print(
+  res_plots$metrics_table
+)
+
+
+###############################################################
+# 25) GRAPH-FREQUENCY PREPROCESSING
+###############################################################
+
+
+###############################################################
+# Geographic weight matrix
+###############################################################
+
+make_geographic_weight_matrix <- function(
+
+    latitudes,
+
+    longitudes,
+
+    sigma = NULL,
+
+    self_weight = 0
+
+) {
+
+
+  stopifnot(
+    length(latitudes) ==
+      length(longitudes)
+  )
+
+
+  n <- length(
+    latitudes
+  )
+
+
+  lat <- latitudes *
+    pi / 180
+
+
+  lon <- longitudes *
+    pi / 180
+
+
   earth_radius <- 6371
 
-  Wdist <- matrix(0, n, n)
+
+  Wdist <- matrix(
+    0,
+    n,
+    n
+  )
+
 
   for(i in 1:n) {
+
     for(j in 1:n) {
 
-      cos_d <- sin(lat[i]) * sin(lat[j]) +
-        cos(lat[i]) * cos(lat[j]) *
-        cos(lon[i] - lon[j])
+      cos_d <-
 
-      cos_d <- max(-1, min(1, cos_d))
+        sin(lat[i]) *
+        sin(lat[j]) +
 
-      Wdist[i,j] <- earth_radius * acos(cos_d)
+        cos(lat[i]) *
+        cos(lat[j]) *
+        cos(
+          lon[i] - lon[j]
+        )
+
+
+      cos_d <-
+        max(
+          -1,
+          min(
+            1,
+            cos_d
+          )
+        )
+
+
+      Wdist[i,j] <-
+        earth_radius *
+        acos(cos_d)
     }
   }
 
-  # Choose bandwidth automatically if not supplied
+
   if(is.null(sigma)) {
-    positive_dist <- Wdist[Wdist > 0]
 
-    if(length(positive_dist) == 0) {
+    positive_dist <-
+      Wdist[
+        Wdist > 0
+      ]
+
+
+    if(
+      length(
+        positive_dist
+      ) == 0
+    ) {
+
       sigma <- 1
+
     } else {
-      sigma <- median(positive_dist)
+
+      sigma <-
+        median(
+          positive_dist
+        )
     }
   }
 
-  # Gaussian spatial similarity
-  W <- exp(-(Wdist^2) / (2 * sigma^2))
 
-  diag(W) <- self_weight
+  W <-
+    exp(
+      -(Wdist^2) /
+        (2 * sigma^2)
+    )
 
-  # Remove numerical issues
-  W[!is.finite(W)] <- 0
+
+  diag(W) <-
+    self_weight
+
+
+  W[
+    !is.finite(W)
+  ] <- 0
+
 
   W
 }
 
 
 ###############################################################
-# 2. Optional correlation graph
+# Correlation weight matrix
 ###############################################################
 
-make_correlation_weight_matrix <- function(X,
-                                           threshold = 0,
-                                           absolute = TRUE) {
+make_correlation_weight_matrix <- function(
 
-  # X: N x T matrix
-  C <- cor(t(X), use = "pairwise.complete.obs")
+    X,
+
+    threshold = 0,
+
+    absolute = TRUE
+
+) {
+
+
+  C <- cor(
+    t(X),
+    use = "pairwise.complete.obs"
+  )
+
 
   if(absolute) {
+
     W <- abs(C)
+
   } else {
+
     W <- C
   }
 
-  # Remove self-connections
+
   diag(W) <- 0
 
-  # Remove weak edges
+
   if(threshold > 0) {
-    W[W < threshold] <- 0
+
+    W[
+      W < threshold
+    ] <- 0
   }
 
-  W[!is.finite(W)] <- 0
+
+  W[
+    !is.finite(W)
+  ] <- 0
+
 
   W
 }
 
 
 ###############################################################
-# 3. Hybrid spatial-correlation graph
+# Hybrid graph
 ###############################################################
 
-make_hybrid_weight_matrix <- function(W_geo,
-                                      W_corr = NULL,
-                                      alpha_geo = 1,
-                                      alpha_corr = 0) {
+make_hybrid_weight_matrix <- function(
 
-  if(is.null(W_corr)) {
+    W_geo,
+
+    W_corr = NULL,
+
+    alpha_geo = 1,
+
+    alpha_corr = 0
+
+) {
+
+
+  if(
+    is.null(W_corr)
+  ) {
+
     return(W_geo)
   }
 
-  W <- alpha_geo * W_geo +
-       alpha_corr * W_corr
+
+  W <-
+
+    alpha_geo * W_geo +
+
+    alpha_corr * W_corr
+
 
   diag(W) <- 0
 
-  W[!is.finite(W)] <- 0
+
+  W[
+    !is.finite(W)
+  ] <- 0
+
 
   W
 }
 
 
 ###############################################################
-# 4. Graph Laplacian
+# Graph Laplacian
 ###############################################################
 
-make_graph_laplacian <- function(W,
-                                 normalized = TRUE) {
+make_graph_laplacian <- function(
+
+    W,
+
+    normalized = TRUE
+
+) {
+
 
   W <- as.matrix(W)
 
-  # Symmetrize the graph
-  W <- (W + t(W)) / 2
+
+  W <-
+    (W + t(W)) / 2
+
 
   diag(W) <- 0
 
-  degree <- rowSums(W)
 
-  D <- diag(degree)
+  degree <-
+    rowSums(W)
+
+
+  D <-
+    diag(degree)
+
 
   if(normalized) {
 
-    degree_inv_sqrt <- rep(0, length(degree))
 
-    positive <- degree > 1e-12
+    degree_inv_sqrt <-
+      rep(
+        0,
+        length(degree)
+      )
 
-    degree_inv_sqrt[positive] <-
-      1 / sqrt(degree[positive])
 
-    D_inv_sqrt <- diag(degree_inv_sqrt)
+    positive <-
+      degree > 1e-12
 
-    L <- diag(nrow(W)) -
-      D_inv_sqrt %*% W %*% D_inv_sqrt
+
+    degree_inv_sqrt[
+      positive
+    ] <-
+
+      1 /
+      sqrt(
+        degree[
+          positive
+        ]
+      )
+
+
+    D_inv_sqrt <-
+      diag(
+        degree_inv_sqrt
+      )
+
+
+    L <-
+
+      diag(
+        nrow(W)
+      ) -
+
+      D_inv_sqrt %*%
+      W %*%
+      D_inv_sqrt
+
 
   } else {
 
-    L <- D - W
+
+    L <-
+      D - W
   }
 
-  # Numerical symmetrization
-  L <- (L + t(L)) / 2
+
+  L <-
+    (L + t(L)) / 2
+
 
   L
 }
 
 
 ###############################################################
-# 5. Graph Fourier basis
+# Graph Fourier basis
 ###############################################################
 
-graph_fourier_basis <- function(L) {
+graph_fourier_basis <- function(
+    L
+) {
 
-  eig <- eigen(L, symmetric = TRUE)
 
-  # Sort eigenvalues from low to high frequency
-  ord <- order(eig$values)
+  eig <-
+    eigen(
+      L,
+      symmetric = TRUE
+    )
 
-  eigenvalues <- eig$values[ord]
-  U <- eig$vectors[, ord, drop = FALSE]
 
-  # Numerical cleanup
-  eigenvalues[eigenvalues < 0 &
-                eigenvalues > -1e-10] <- 0
+  ord <-
+    order(
+      eig$values
+    )
+
+
+  eigenvalues <-
+    eig$values[
+      ord
+    ]
+
+
+  U <-
+    eig$vectors[
+      ,
+      ord,
+      drop = FALSE
+    ]
+
+
+  eigenvalues[
+    eigenvalues < 0 &
+      eigenvalues > -1e-10
+  ] <- 0
+
 
   list(
-    eigenvalues = eigenvalues,
-    U = U
+
+    eigenvalues =
+      eigenvalues,
+
+    U =
+      U
   )
 }
 
 
 ###############################################################
-# 6. Graph Fourier transform
+# Graph Fourier transform
 ###############################################################
 
-graph_fourier_transform <- function(X,
-                                    U) {
+graph_fourier_transform <- function(
 
-  # X may be:
-  # N x T
-  # N x T x P
+    X,
+
+    U
+
+) {
+
 
   d <- dim(X)
 
-  if(length(d) == 2) {
 
-    # N x T
-    Xtilde <- t(U) %*% X
+  if(
+    length(d) == 2
+  ) {
 
-    return(Xtilde)
+    return(
+      t(U) %*% X
+    )
   }
 
-  if(length(d) == 3) {
+
+  if(
+    length(d) == 3
+  ) {
+
 
     N <- d[1]
+
     T <- d[2]
+
     P <- d[3]
 
-    Xtilde <- array(
-      0,
-      dim = c(N, T, P)
-    )
+
+    Xtilde <-
+      array(
+        0,
+        dim = c(
+          N,
+          T,
+          P
+        )
+      )
+
 
     for(p in 1:P) {
 
       Xtilde[,,p] <-
-        t(U) %*% X[,,p]
+
+        t(U) %*%
+        X[,,p]
     }
 
-    return(Xtilde)
+
+    return(
+      Xtilde
+    )
   }
 
-  stop("X must be either N x T or N x T x P.")
+
+  stop(
+    "X must be either N x T or N x T x P."
+  )
 }
 
 
 ###############################################################
-# 7. Inverse graph Fourier transform
+# Inverse graph Fourier transform
 ###############################################################
 
-inverse_graph_fourier_transform <- function(Xtilde,
-                                            U) {
+inverse_graph_fourier_transform <- function(
 
-  d <- dim(Xtilde)
+    Xtilde,
 
-  if(length(d) == 2) {
+    U
 
-    X <- U %*% Xtilde
+) {
 
-    return(X)
+
+  d <- dim(
+    Xtilde
+  )
+
+
+  if(
+    length(d) == 2
+  ) {
+
+    return(
+      U %*% Xtilde
+    )
   }
 
-  if(length(d) == 3) {
+
+  if(
+    length(d) == 3
+  ) {
+
 
     N <- d[1]
+
     T <- d[2]
+
     P <- d[3]
 
-    X <- array(
-      0,
-      dim = c(N, T, P)
-    )
+
+    X <-
+      array(
+        0,
+        dim = c(
+          N,
+          T,
+          P
+        )
+      )
+
 
     for(p in 1:P) {
 
       X[,,p] <-
-        U %*% Xtilde[,,p]
+
+        U %*%
+        Xtilde[,,p]
     }
 
-    return(X)
+
+    return(
+      X
+    )
   }
 
-  stop("Xtilde must be either N x T or N x T x P.")
+
+  stop(
+    "Xtilde must be either N x T or N x T x P."
+  )
 }
 
 
 ###############################################################
-# 8. Frequency-specific graph filtering
+# Graph-frequency filter
 ###############################################################
 
-graph_frequency_filter <- function(Xtilde,
-                                   eigenvalues,
-                                   cutoff = NULL) {
+graph_frequency_filter <- function(
 
-  d <- dim(Xtilde)
+    Xtilde,
 
-  if(is.null(cutoff)) {
-    cutoff <- length(eigenvalues)
+    eigenvalues,
+
+    cutoff = NULL
+
+) {
+
+
+  d <- dim(
+    Xtilde
+  )
+
+
+  if(
+    is.null(cutoff)
+  ) {
+
+    cutoff <-
+      length(
+        eigenvalues
+      )
   }
 
-  cutoff <- min(cutoff, length(eigenvalues))
 
-  if(length(d) == 2) {
+  cutoff <-
+    min(
+      cutoff,
+      length(
+        eigenvalues
+      )
+    )
 
-    Xfiltered <- Xtilde
 
-    if(cutoff < d[1]) {
-      Xfiltered[(cutoff + 1):d[1], ] <- 0
+  if(
+    length(d) == 2
+  ) {
+
+
+    Xfiltered <-
+      Xtilde
+
+
+    if(
+      cutoff < d[1]
+    ) {
+
+      Xfiltered[
+        (cutoff + 1):d[1],
+        ,
+        drop = FALSE
+      ] <- 0
     }
 
-    return(Xfiltered)
+
+    return(
+      Xfiltered
+    )
   }
 
-  if(length(d) == 3) {
 
-    Xfiltered <- Xtilde
+  if(
+    length(d) == 3
+  ) {
 
-    if(cutoff < d[1]) {
-      Xfiltered[(cutoff + 1):d[1], , ] <- 0
+
+    Xfiltered <-
+      Xtilde
+
+
+    if(
+      cutoff < d[1]
+    ) {
+
+      Xfiltered[
+        (cutoff + 1):d[1],
+        ,
+        ,
+        drop = FALSE
+      ] <- 0
     }
 
-    return(Xfiltered)
+
+    return(
+      Xfiltered
+    )
   }
 
-  stop("Unsupported dimension.")
+
+  stop(
+    "Unsupported dimension."
+  )
 }
 
 
 ###############################################################
-# 9. Graph-frequency energy
+# Graph-frequency energy
 ###############################################################
 
-graph_frequency_energy <- function(Xtilde) {
+graph_frequency_energy <- function(
+    Xtilde
+) {
 
-  d <- dim(Xtilde)
 
-  if(length(d) == 2) {
+  d <- dim(
+    Xtilde
+  )
 
-    energy <- rowSums(Xtilde^2)
 
-  } else if(length(d) == 3) {
+  if(
+    length(d) == 2
+  ) {
 
-    energy <- numeric(d[1])
+    energy <-
+      rowSums(
+        Xtilde^2
+      )
+
+
+  } else if(
+    length(d) == 3
+  ) {
+
+
+    energy <-
+      numeric(
+        d[1]
+      )
+
 
     for(k in 1:d[1]) {
 
       energy[k] <-
-        sum(Xtilde[k,,]^2)
+        sum(
+          Xtilde[k,,]^2
+        )
     }
+
 
   } else {
 
-    stop("Unsupported dimension.")
+    stop(
+      "Unsupported dimension."
+    )
   }
 
-  total <- sum(energy)
+
+  total <-
+    sum(energy)
+
 
   relative_energy <-
-    if(total > 0) energy / total else energy
+
+    if(
+      total > 0
+    ) {
+
+      energy / total
+
+    } else {
+
+      energy
+    }
+
 
   data.frame(
-    Frequency = seq_along(energy),
-    Energy = energy,
-    RelativeEnergy = relative_energy
+
+    Frequency =
+      seq_along(
+        energy
+      ),
+
+    Eigenvalue = NA_real_,
+
+    Energy =
+      energy,
+
+    RelativeEnergy =
+      relative_energy
   )
 }
 
 
 ###############################################################
-# 10. Complete graph-frequency preprocessing
+# Complete graph-frequency preprocessing
 ###############################################################
 
-prepare_graph_frequency_data <- function(X,
-                                         latitudes,
-                                         longitudes,
-                                         W_corr = NULL,
-                                         alpha_geo = 1,
-                                         alpha_corr = 0,
-                                         normalized_laplacian = TRUE) {
+prepare_graph_frequency_data <- function(
 
-  W_geo <- make_geographic_weight_matrix(
-    latitudes = latitudes,
-    longitudes = longitudes
-  )
+    X,
 
-  W <- make_hybrid_weight_matrix(
-    W_geo = W_geo,
-    W_corr = W_corr,
-    alpha_geo = alpha_geo,
-    alpha_corr = alpha_corr
-  )
+    latitudes,
 
-  L <- make_graph_laplacian(
-    W = W,
-    normalized = normalized_laplacian
-  )
+    longitudes,
 
-  gf <- graph_fourier_basis(L)
+    W_corr = NULL,
 
-  Xtilde <- graph_fourier_transform(
-    X = X,
-    U = gf$U
-  )
+    alpha_geo = 1,
 
-  energy <- graph_frequency_energy(Xtilde)
+    alpha_corr = 0,
+
+    normalized_laplacian = TRUE
+
+) {
+
+
+  W_geo <-
+
+    make_geographic_weight_matrix(
+
+      latitudes =
+        latitudes,
+
+      longitudes =
+        longitudes
+    )
+
+
+  W <-
+
+    make_hybrid_weight_matrix(
+
+      W_geo =
+        W_geo,
+
+      W_corr =
+        W_corr,
+
+      alpha_geo =
+        alpha_geo,
+
+      alpha_corr =
+        alpha_corr
+    )
+
+
+  L <-
+
+    make_graph_laplacian(
+
+      W = W,
+
+      normalized =
+        normalized_laplacian
+    )
+
+
+  gf <-
+
+    graph_fourier_basis(
+      L
+    )
+
+
+  Xtilde <-
+
+    graph_fourier_transform(
+
+      X = X,
+
+      U = gf$U
+    )
+
+
+  energy <-
+
+    graph_frequency_energy(
+      Xtilde
+    )
+
+
+  energy$Eigenvalue <-
+    gf$eigenvalues
+
 
   list(
-    W_geo = W_geo,
-    W = W,
-    L = L,
-    U = gf$U,
-    eigenvalues = gf$eigenvalues,
-    X_original = X,
-    X_graph_frequency = Xtilde,
-    frequency_energy = energy
+
+    W_geo =
+      W_geo,
+
+    W =
+      W,
+
+    L =
+      L,
+
+    U =
+      gf$U,
+
+    eigenvalues =
+      gf$eigenvalues,
+
+    X_original =
+      X,
+
+    X_graph_frequency =
+      Xtilde,
+
+    frequency_energy =
+      energy
   )
 }
 
 
 ###############################################################
-# 11. Example using the five-city real-data structure
+# 26) Prepare graph-frequency data
 ###############################################################
 
-# locations <- data.frame(
-#   city = c("Minneapolis","Chicago","New York",
-#            "Los Angeles","Miami"),
-#   lat = c(44.9778, 41.8781, 40.7128,
-#           34.0522, 25.7617),
-#   lon = c(-93.2650, -87.6298, -74.0060,
-#           -118.2437, -80.1918)
-# )
+# X must be:
 #
-# Example for one climate variable:
+# city x time
 #
-# X_example <- t(climate_array[,,1,1])
-#
-# gf_data <- prepare_graph_frequency_data(
-#   X = X_example,
-#   latitudes = locations$lat,
-#   longitudes = locations$lon
-# )
-#
-# print(gf_data$W)
-# print(gf_data$eigenvalues)
-# print(gf_data$frequency_energy)
-#
-# Reconstruction check:
-#
-# X_reconstructed <- inverse_graph_fourier_transform(
-#   gf_data$X_graph_frequency,
-#   gf_data$U
-# )
-#
-# max(abs(X_example - X_reconstructed))
+# Therefore transpose the climate array.
+
+X_ppt <-
+  t(
+    climate_array[
+      ,,1,1
+    ]
+  )
+
+
+X_tmin <-
+  t(
+    climate_array[
+      ,,1,2
+    ]
+  )
+
+
+X_tmax <-
+  t(
+    climate_array[
+      ,,1,3
+    ]
+  )
 
 
 ###############################################################
-# 12. Save graph-frequency objects
+# 27) Construct geographic graph
 ###############################################################
 
-# saveRDS(
-#   gf_data,
-#   file = "graph_frequency_data.rds"
-# )
+gf_ppt <-
+
+  prepare_graph_frequency_data(
+
+    X = X_ppt,
+
+    latitudes =
+      latitudes,
+
+    longitudes =
+      longitudes,
+
+    alpha_geo = 1,
+
+    alpha_corr = 0
+  )
+
+
+gf_tmin <-
+
+  prepare_graph_frequency_data(
+
+    X = X_tmin,
+
+    latitudes =
+      latitudes,
+
+    longitudes =
+      longitudes,
+
+    alpha_geo = 1,
+
+    alpha_corr = 0
+  )
+
+
+gf_tmax <-
+
+  prepare_graph_frequency_data(
+
+    X = X_tmax,
+
+    latitudes =
+      latitudes,
+
+    longitudes =
+      longitudes,
+
+    alpha_geo = 1,
+
+    alpha_corr = 0
+  )
+
 
 ###############################################################
-# End of File 11
+# 28) Display graph results
 ###############################################################
+
+cat("\n")
+cat("========================================\n")
+cat("GEOGRAPHIC WEIGHT MATRIX\n")
+cat("========================================\n")
+
+print(
+  round(
+    gf_ppt$W,
+    4
+  )
+)
+
+
+cat("\n")
+cat("========================================\n")
+cat("GRAPH LAPLACIAN EIGENVALUES\n")
+cat("========================================\n")
+
+print(
+  gf_ppt$eigenvalues
+)
+
+
+cat("\n")
+cat("========================================\n")
+cat("PPT GRAPH-FREQUENCY ENERGY\n")
+cat("========================================\n")
+
+print(
+  gf_ppt$frequency_energy
+)
+
+
+cat("\n")
+cat("========================================\n")
+cat("TMIN GRAPH-FREQUENCY ENERGY\n")
+cat("========================================\n")
+
+print(
+  gf_tmin$frequency_energy
+)
+
+
+cat("\n")
+cat("========================================\n")
+cat("TMAX GRAPH-FREQUENCY ENERGY\n")
+cat("========================================\n")
+
+print(
+  gf_tmax$frequency_energy
+)
+
+
+###############################################################
+# 29) Reconstruction check
+###############################################################
+
+X_ppt_reconstructed <-
+
+  inverse_graph_fourier_transform(
+
+    gf_ppt$X_graph_frequency,
+
+    gf_ppt$U
+  )
+
+
+reconstruction_error <-
+
+  max(
+    abs(
+      X_ppt -
+        X_ppt_reconstructed
+    ),
+    na.rm = TRUE
+  )
+
+
+cat("\n")
+cat(
+  "Maximum PPT reconstruction error:",
+  reconstruction_error,
+  "\n"
+)
+
+
+###############################################################
+# 30) Save results
+###############################################################
+
+saveRDS(
+
+  list(
+
+    locations =
+      locations,
+
+    climate_array =
+      climate_array,
+
+    Y_array =
+      Y_array,
+
+    Xseq =
+      Xseq,
+
+    Yseq =
+      Yseq,
+
+    model =
+      model,
+
+    history =
+      history,
+
+    gf_ppt =
+      gf_ppt,
+
+    gf_tmin =
+      gf_tmin,
+
+    gf_tmax =
+      gf_tmax,
+
+    metrics =
+      res_plots$metrics_table
+
+  ),
+
+  file =
+    "TerraClimate_CNN_LSTM_GF_results.rds"
+)
+
+
+###############################################################
+# END OF FILE
+###############################################################
+

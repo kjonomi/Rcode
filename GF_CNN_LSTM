@@ -3,7 +3,7 @@
 ###############################################################
 library(keras3)
 library(tensorflow, lib.loc = "/opt/R/4.4.0/lib/R/library")
-library(keras)
+#library(keras)
 library(pracma)
 library(reshape2)
 library(ggplot2)

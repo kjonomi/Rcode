@@ -1,985 +1,1936 @@
 ###############################################################
-# Required libraries
+# GRAPH-FREQUENCY CNN-LSTM VS CNN-LSTM WITHOUT GRAPH
+# Fair spatial-domain comparison
 ###############################################################
+
+###############################################################
+# 0) Required libraries
+###############################################################
+
 library(keras3)
 library(tensorflow, lib.loc = "/opt/R/4.4.0/lib/R/library")
-#library(keras)
 library(pracma)
 library(reshape2)
 library(ggplot2)
+library(dplyr)
+library(tidyr)
 
 ###############################################################
-# 1) Grid and spatial simulation
+# 1) Reproducibility
 ###############################################################
-deg2rad <- function(deg) deg * pi / 180
-sphere_grid <- function(nlon = 84, nlat = 42) {
-  lon <- seq(-180, 180 - 360/nlon, length.out = nlon)
-  lat <- seq(-90 + 180/(nlat*2), 90 - 180/(nlat*2), length.out = nlat)
-  grid <- expand.grid(lon=lon, lat=lat)
-  x <- cos(deg2rad(grid$lat)) * cos(deg2rad(grid$lon))
-  y <- cos(deg2rad(grid$lat)) * sin(deg2rad(grid$lon))
-  z <- sin(deg2rad(grid$lat))
-  coords3 <- cbind(x,y,z)
-  list(grid=grid, coords3=coords3, nlon=nlon, nlat=nlat)
+
+set.seed(42)
+
+###############################################################
+# 2) Spherical grid
+###############################################################
+
+deg2rad <- function(deg) {
+  deg * pi / 180
 }
 
-angular_dist <- function(u,v) {
-  if(is.vector(u)) u <- matrix(u, nrow=1)
+sphere_grid <- function(nlon = 84, nlat = 42) {
+
+  lon <- seq(
+    -180,
+    180 - 360 / nlon,
+    length.out = nlon
+  )
+
+  lat <- seq(
+    -90 + 180 / (2 * nlat),
+    90 - 180 / (2 * nlat),
+    length.out = nlat
+  )
+
+  grid <- expand.grid(
+    lon = lon,
+    lat = lat
+  )
+
+  x <- cos(deg2rad(grid$lat)) *
+       cos(deg2rad(grid$lon))
+
+  y <- cos(deg2rad(grid$lat)) *
+       sin(deg2rad(grid$lon))
+
+  z <- sin(deg2rad(grid$lat))
+
+  coords3 <- cbind(x, y, z)
+
+  list(
+    grid = grid,
+    coords3 = coords3,
+    nlon = nlon,
+    nlat = nlat
+  )
+}
+
+###############################################################
+# 3) Angular distance
+###############################################################
+
+angular_dist <- function(u, v) {
+
+  if (is.vector(u)) {
+    u <- matrix(u, nrow = 1)
+  }
+
   res <- u %*% t(v)
-  pmax(0, pmin(pi, acos(pmin(1, pmax(-1, res)))))
+
+  res <- pmax(
+    -1,
+    pmin(1, res)
+  )
+
+  acos(res)
 }
 
 pairwise_ang_dist_mat <- function(coords3) {
-  N <- nrow(coords3); M <- matrix(0,N,N)
-  for(i in 1:N) M[i,] <- angular_dist(coords3[i,], coords3)
+
+  N <- nrow(coords3)
+
+  M <- matrix(
+    0,
+    nrow = N,
+    ncol = N
+  )
+
+  for (i in seq_len(N)) {
+
+    M[i, ] <-
+      angular_dist(
+        coords3[i, ],
+        coords3
+      )
+  }
+
   M
 }
 
-make_sigma_spatial <- function(coords3, alpha0=1, alpha1=0.5, alpha2=0.2) {
-  x <- coords3[,1]; y <- coords3[,2]; z <- coords3[,3]
-  sigma <- alpha0 + alpha1*z + alpha2*(x^2 - y^2)
-  pmax(0.05, sigma)
+###############################################################
+# 4) Spatially varying covariance
+###############################################################
+
+make_sigma_spatial <- function(
+    coords3,
+    alpha0 = 1,
+    alpha1 = 0.5,
+    alpha2 = 0.2) {
+
+  x <- coords3[, 1]
+  y <- coords3[, 2]
+  z <- coords3[, 3]
+
+  sigma <-
+    alpha0 +
+    alpha1 * z +
+    alpha2 * (x^2 - y^2)
+
+  pmax(
+    0.05,
+    sigma
+  )
 }
 
-iscf_cov_matrix <- function(coords3, phi=0.4, alpha0=1, alpha1=0.5, alpha2=0.2, nugget=1e-6) {
-  sigma <- make_sigma_spatial(coords3, alpha0, alpha1, alpha2)
-  ang <- pairwise_ang_dist_mat(coords3)
-  K <- outer(sigma,sigma,"*") * exp(-(ang/phi)^2)
-  diag(K) <- diag(K) + nugget
+iscf_cov_matrix <- function(
+    coords3,
+    phi = 0.4,
+    alpha0 = 1,
+    alpha1 = 0.5,
+    alpha2 = 0.2,
+    nugget = 1e-6) {
+
+  sigma <- make_sigma_spatial(
+    coords3,
+    alpha0,
+    alpha1,
+    alpha2
+  )
+
+  ang <- pairwise_ang_dist_mat(
+    coords3
+  )
+
+  K <-
+    outer(
+      sigma,
+      sigma,
+      "*"
+    ) *
+    exp(
+      -(ang / phi)^2
+    )
+
+  diag(K) <-
+    diag(K) + nugget
+
   K
 }
 
-simulate_spatio_temporal <- function(coords3, T=30, seed=1) {
-  set.seed(seed); N <- nrow(coords3)
-  CovW <- iscf_cov_matrix(coords3)
-  L <- chol(CovW)
-  W <- matrix(rnorm(N*T), nrow=N, ncol=T)
-  W <- L %*% W
-  X <- matrix(0, N, T); X[,1] <- W[,1]
-  if(T>1) for(t in 2:T) X[,t] <- X[,t-1] + W[,t]
-  X
-}
-
 ###############################################################
-# 3) Temporal detrending + normalization (safe)
-###############################################################
-detrend_temporal_poly_safe <- function(Y_array, degree=2) {
-  N <- dim(Y_array)[1]; Tt <- dim(Y_array)[2]; nout <- dim(Y_array)[3]
-  Y_resid <- array(0, dim=c(N,Tt,nout))
-  for(i in 1:N){
-    for(k in 1:nout){
-      y <- Y_array[i,,k]
-      if(any(is.na(y)) || sd(y, na.rm=TRUE) < 1e-8){
-        Y_resid[i,,k] <- 0; next
-      }
-      B <- poly(1:Tt, degree=degree, raw=TRUE)
-      Y_resid[i,,k] <- residuals(lm(y ~ B -1))
-    }
-  }
-  Y_resid
-}
-
-normalize_array_per_output <- function(Y_array) {
-  nout <- dim(Y_array)[3]
-  for(k in 1:nout){
-    sd_k <- sd(Y_array[,,k])
-    if(sd_k < 1e-8) Y_array[,,k] <- Y_array[,,k] + rnorm(length(Y_array[,,k]),0,1e-3)
-    Y_array[,,k] <- (Y_array[,,k]-mean(Y_array[,,k]))/sd(Y_array[,,k])
-  }
-  Y_array
-}
-###############################################################
-# 4) Copula outcome simulation
-###############################################################
-simulate_copula_outcomes <- function(X, R_dep=matrix(c(1,0.5,0.3,0.5,1,0.4,0.3,0.4,1),3,3), seed=123){
-  set.seed(seed); N <- nrow(X); Tt <- ncol(X); nout <- nrow(R_dep)
-  Y_array <- array(0, dim=c(N,Tt,nout))
-  L_R <- chol(R_dep)
-  for(t in 1:Tt){
-    Z <- matrix(rnorm(N*nout), nrow=N, ncol=nout)
-    Z_dep <- Z %*% L_R
-    for(k in 1:nout) Y_array[,t,k] <- X[,t] + Z_dep[,k]
-  }
-  Y_array
-}
-###############################################################
-# 5) CNN-LSTM model
+# 5) Spatio-temporal simulation
 ###############################################################
 
-# Convert Y_array (N x T x nout) to (T x nlat x nlon x nout) tensor
-make_image_tensor_multi <- function(Y_array, nlon, nlat){
-  N <- dim(Y_array)[1]  # number of spatial locations
-  Tt <- dim(Y_array)[2] # number of time points
-  nout <- dim(Y_array)[3] # number of outputs
-  imgs <- array(0, dim=c(Tt, nlat, nlon, nout))
-  
-  for(t in 1:Tt){
-    for(k in 1:nout){
-      imgs[t,,,k] <- matrix(Y_array[,t,k], nrow=nlat, ncol=nlon, byrow=FALSE)
-    }
-  }
-  imgs
-}
-
-# Create input-output sequences for L_in time steps
-make_sequences_multi <- function(imgs, L_in=5){
-  Tt <- dim(imgs)[1]; nlat <- dim(imgs)[2]; nlon <- dim(imgs)[3]; nout <- dim(imgs)[4]
-  nSamples <- Tt - L_in
-  X <- array(0, dim=c(nSamples, L_in, nlat, nlon, nout))
-  Y <- array(0, dim=c(nSamples, nlat, nlon, nout))
-  
-  for(i in 1:nSamples){
-    X[i,,,,] <- imgs[i:(i+L_in-1),,,, drop=FALSE]
-    Y[i,,,] <- imgs[i+L_in,,,, drop=FALSE][1,,,]
-  }
-  
-  list(X=X, Y=Y)
-}
-
-# Build CNN-LSTM model for multi-output grid
-build_cnn_lstm_multi <- function(nlat, nlon, nout, L_in=5){
-  input <- layer_input(shape=c(L_in, nlat, nlon, nout))
-  
-  td <- input %>%
-    time_distributed(layer_conv_2d(filters=16, kernel_size=c(3,3), padding="same", activation="relu")) %>%
-    time_distributed(layer_max_pooling_2d(pool_size=c(2,2))) %>%
-    time_distributed(layer_conv_2d(filters=32, kernel_size=c(3,3), padding="same", activation="relu")) %>%
-    time_distributed(layer_max_pooling_2d(pool_size=c(2,2))) %>%
-    time_distributed(layer_flatten())
-  
-  lstm <- td %>% layer_lstm(units=128, return_sequences=FALSE)
-  
-  total_pixels <- nlat * nlon
-  dense_out <- lstm %>% layer_dense(units=total_pixels * nout * 2)  # mean + log(sd) per pixel/output
-  out <- layer_reshape(dense_out, target_shape=c(total_pixels, nout, 2))
-  
-  keras_model(inputs=input, outputs=out)
-}
-
-# Negative log-likelihood loss for Gaussian outputs
-###############################################################
-# Gaussian negative log-likelihood loss
-# Keras 3 compatible
-###############################################################
-
-nll_gaussian_multi <- function(eps = 1e-5) {
-
-    function(y_true, y_pred) {
-
-        pred_mean  <- y_pred[,,,1]
-        pred_logsd <- y_pred[,,,2]
-
-        # Stable standard deviation
-        sd <- tf$math$exp(
-            tf$clip_by_value(
-                pred_logsd,
-                -10,
-                10
-            )
-        ) + eps
-
-        # Gaussian negative log-likelihood
-        nll <-
-            0.5 * log(2 * pi) +
-            tf$math$log(sd) +
-            0.5 *
-            tf$square(
-                (y_true - pred_mean) / sd
-            )
-
-        tf$reduce_mean(nll)
-    }
-}
-
-###############################################################
-# 6) RMSE computation (safe)
-###############################################################
-compute_rmse_multi_safe <- function(model, Xseq, Yseq, nout){
-  preds <- predict(model,Xseq)
-  pred_mean <- preds[,, ,1]
-  
-  nSamples <- dim(Xseq)[1]; nlat <- dim(Yseq)[2]; nlon <- dim(Yseq)[3]
-  Y_flat <- array(0, dim=c(nSamples, nlat*nlon, nout))
-  for(i in 1:nSamples) for(k in 1:nout) Y_flat[i,,k] <- as.numeric(Yseq[i,,,k])
-  
-  rmse_vec <- numeric(nout)
-  for(k in 1:nout) rmse_vec[k] <- sqrt(mean((Y_flat[,,k]-pred_mean[,,k])^2))
-  names(rmse_vec) <- paste0("Output_",1:nout)
-  overall_rmse <- sqrt(mean((Y_flat-pred_mean)^2))
-  list(per_output_rmse=rmse_vec, overall_rmse=overall_rmse)
-}
-###############################################################
-# 2) Spatial detrending: polynomial
-###############################################################
-
-detrend_spatial_poly <- function(Y_vec, coords3) {
-
-    x <- coords3[, 1]
-    y <- coords3[, 2]
-    z <- coords3[, 3]
-
-    B <- cbind(
-        1,
-        x,
-        y,
-        z,
-        x^2,
-        x*y,
-        x*z,
-        y^2,
-        y*z,
-        z^2
-    )
-
-    residuals(
-        lm(Y_vec ~ B - 1)
-    )
-}
-
-
-detrend_all_times_poly <- function(Xmat, coords3) {
-
-    N  <- nrow(Xmat)
-    Tt <- ncol(Xmat)
-
-    resid <- matrix(
-        0,
-        nrow = N,
-        ncol = Tt
-    )
-
-    for (t in 1:Tt) {
-
-        resid[, t] <-
-            detrend_spatial_poly(
-                Xmat[, t],
-                coords3
-            )
-    }
-
-    resid
-}
-###############################################################
-# 2) Spatial detrending: spherical harmonics
-###############################################################
-
-assoc_legendre_seq <- function(L, m, x) {
-
-    x <- as.numeric(x)
-    nx <- length(x)
-
-    P <- matrix(
-        0,
-        nrow = nx,
-        ncol = (L - m + 1)
-    )
-
-    if (m == 0) {
-
-        P[, 1] <- 1
-
-    } else {
-
-        dfac <- 2^m * gamma(m + 0.5) / sqrt(pi)
-
-        P[, 1] <-
-            (-1)^m *
-            dfac *
-            (1 - x^2)^(m / 2)
-    }
-
-    if (L == m)
-        return(P[, 1, drop = FALSE])
-
-    if ((m + 1) <= L)
-        P[, 2] <- x * (2*m + 1) * P[, 1]
-
-    if ((m + 2) <= L) {
-
-        for (l in (m + 2):L) {
-
-            idx  <- l - m + 1
-            idx1 <- idx - 1
-            idx2 <- idx - 2
-
-            P[, idx] <-
-                (
-                    (2*l - 1) * x * P[, idx1] -
-                    (l + m - 1) * P[, idx2]
-                ) / (l - m)
-        }
-    }
-
-    P
-}
-
-
-norm_const <- function(l, m) {
-
-    sqrt(
-        ((2*l + 1) / (4*pi)) *
-        exp(
-            lgamma(l - m + 1) -
-            lgamma(l + m + 1)
-        )
-    )
-}
-
-
-sph_harm_basis <- function(coords3, L = 3) {
-
-    x <- coords3[, 1]
-    y <- coords3[, 2]
-    z <- coords3[, 3]
-
-    costheta <- z
-    phi <- atan2(y, x)
-
-    cols <- list()
-    colnames <- character(0)
-
-    for (l in 0:L) {
-
-        for (m in 0:l) {
-
-            Pseq <- assoc_legendre_seq(
-                l,
-                m,
-                costheta
-            )
-
-            P_lm <-
-                as.numeric(
-                    Pseq[, ncol(Pseq)]
-                )
-
-            Nlm <- norm_const(l, m)
-
-            if (m == 0) {
-
-                col <- Nlm * P_lm
-
-                cols[[length(cols) + 1]] <- col
-
-                colnames <-
-                    c(
-                        colnames,
-                        paste0("Y_l", l, "_m0")
-                    )
-
-            } else {
-
-                factor <-
-                    sqrt(2) *
-                    Nlm *
-                    P_lm
-
-                cols[[length(cols) + 1]] <-
-                    factor * cos(m * phi)
-
-                colnames <-
-                    c(
-                        colnames,
-                        paste0(
-                            "Y_l", l,
-                            "_m", m,
-                            "_c"
-                        )
-                    )
-
-                cols[[length(cols) + 1]] <-
-                    factor * sin(m * phi)
-
-                colnames <-
-                    c(
-                        colnames,
-                        paste0(
-                            "Y_l", l,
-                            "_m", m,
-                            "_s"
-                        )
-                    )
-            }
-        }
-    }
-
-    B <- do.call(cbind, cols)
-
-    colnames(B) <- colnames
-
-    B
-}
-
-
-detrend_spatial_sph <- function(
-    Y_vec,
+simulate_spatio_temporal <- function(
     coords3,
-    L = 3,
-    intercept = TRUE,
-    tol = 1e-8
-) {
+    T = 30,
+    seed = 1) {
 
-    B <- sph_harm_basis(
-        coords3,
-        L = L
-    )
-
-    if (intercept)
-        B <- cbind(1, B)
-
-    qrB <- qr(
-        B,
-        tol = tol
-    )
-
-    coef <- qr.coef(
-        qrB,
-        Y_vec
-    )
-
-    resid <-
-        Y_vec -
-        B %*% coef
-
-    as.numeric(resid)
-}
-
-
-detrend_all_times_sph <- function(
-    Xmat,
-    coords3,
-    L = 3
-) {
-
-    N  <- nrow(Xmat)
-    Tt <- ncol(Xmat)
-
-    resid <-
-        matrix(
-            0,
-            nrow = N,
-            ncol = Tt
-        )
-
-    for (t in 1:Tt) {
-
-        resid[, t] <-
-            detrend_spatial_sph(
-                Xmat[, t],
-                coords3,
-                L = L
-            )
-    }
-
-    resid
-}
-###############################################################
-# 7) Full example: compare polynomial vs spherical harmonics
-###############################################################
-run_example_compare_methods <- function(nlon=84,nlat=42,Tt=30,L_in=5,nout=3,seed=1){
   set.seed(seed)
-  grid <- sphere_grid(nlon,nlat)
-  coords3 <- grid$coords3
-  
-  # Simulate spatio-temporal
-  X <- simulate_spatio_temporal(coords3, T=Tt, seed=seed)
-  
-  ## Method 1: Polynomial detrending
-  R_poly <- detrend_all_times_poly(X, coords3)
-  Y_poly <- simulate_copula_outcomes(R_poly)
-  Y_poly <- detrend_temporal_poly_safe(Y_poly, degree=2)
-  Y_poly <- normalize_array_per_output(Y_poly)
-  imgs_poly <- make_image_tensor_multi(Y_poly, nlon, nlat)
-  seqs_poly <- make_sequences_multi(imgs_poly,L_in=L_in)
-  
-  # Flatten Y for NLL
-  nSamples <- dim(seqs_poly$X)[1]
-  Y_flat_poly <- array(0, dim=c(nSamples,nlon*nlat,nout))
-  for(i in 1:nSamples) for(k in 1:nout) Y_flat_poly[i,,k] <- as.numeric(seqs_poly$Y[i,,,k])
-  
-  model_poly <- build_cnn_lstm_multi(nlat,nlon,nout,L_in=L_in)
-  model_poly %>% compile(optimizer=optimizer_adam(1e-3), loss=nll_gaussian_multi())
-  history_poly <- model_poly %>% fit(seqs_poly$X,Y_flat_poly,epochs=5,batch_size=4,validation_split=0.2,verbose=2)
-  
-  ## Method 2: Spherical harmonics detrending
-  R_sph <- detrend_all_times_sph(X, coords3, L=3)
-  Y_sph <- simulate_copula_outcomes(R_sph)
-  Y_sph <- detrend_temporal_poly_safe(Y_sph, degree=2)
-  Y_sph <- normalize_array_per_output(Y_sph)
-  imgs_sph <- make_image_tensor_multi(Y_sph, nlon, nlat)
-  seqs_sph <- make_sequences_multi(imgs_sph,L_in=L_in)
-  
-  Y_flat_sph <- array(0, dim=c(nSamples,nlon*nlat,nout))
-  for(i in 1:nSamples) for(k in 1:nout) Y_flat_sph[i,,k] <- as.numeric(seqs_sph$Y[i,,,k])
-  
-  model_sph <- build_cnn_lstm_multi(nlat,nlon,nout,L_in=L_in)
-  model_sph %>% compile(optimizer=optimizer_adam(1e-3), loss=nll_gaussian_multi())
-  history_sph <- model_sph %>% fit(seqs_sph$X,Y_flat_sph,epochs=5,batch_size=4,validation_split=0.2,verbose=2)
-  
-  # Compute RMSE
-  rmse_poly <- compute_rmse_multi_safe(model_poly, seqs_poly$X, seqs_poly$Y, nout)
-  rmse_sph <- compute_rmse_multi_safe(model_sph, seqs_sph$X, seqs_sph$Y, nout)
-  
-  list(rmse_poly=rmse_poly, rmse_sph=rmse_sph,
-       model_poly=model_poly, model_sph=model_sph,
-       seqs_poly=seqs_poly, seqs_sph=seqs_sph)
-}
 
-###############################################################
-# Run the comparison
-###############################################################
-res_compare <- run_example_compare_methods()
-res_compare$rmse_poly
-res_compare$rmse_sph
+  N <- nrow(coords3)
 
-# Paired t-test (Poly vs Spherical across outputs)
-t_test <- t.test(
-  res_compare$rmse_poly$per_output_rmse,
-  res_compare$rmse_sph$per_output_rmse,
-  paired = TRUE
-)
-t_test
+  CovW <- iscf_cov_matrix(
+    coords3
+  )
 
-library(ggplot2)
-
-per_output_df <- data.frame(
-  Output = rep(names(res_compare$rmse_poly$per_output_rmse), 2),
-  RMSE   = c(res_compare$rmse_poly$per_output_rmse,
-             res_compare$rmse_sph$per_output_rmse),
-  Method = rep(c("Polynomial", "Spherical Harmonics"),
-               each = length(res_compare$rmse_poly$per_output_rmse))
-)
-
-# Add differences
-per_output_df <- per_output_df %>%
-  tidyr::pivot_wider(names_from = Method, values_from = RMSE) %>%
-  dplyr::mutate(Diff = `Polynomial` - `Spherical Harmonics`)
-
-# Convert back to long for plotting
-plot_df <- tidyr::pivot_longer(per_output_df,
-                               cols = c("Polynomial","Spherical Harmonics"),
-                               names_to = "Method", values_to = "RMSE")
-
-# Add manual stars (example: "*" if Poly < Sph, else "")
-plot_df$Signif <- ifelse(plot_df$Method == "Polynomial" &
-                           plot_df$RMSE < plot_df$RMSE[plot_df$Method=="Spherical Harmonics"], "*", "")
-
-# Plot with annotation
-p_per_output_sig <- ggplot(plot_df, aes(x = Output, y = RMSE, fill = Method)) +
-  geom_bar(stat = "identity", position = "dodge", width = 0.7) +
-  geom_text(aes(label = Signif, y = RMSE + 0.01),
-            position = position_dodge(width = 0.7), vjust = 0) +
-  theme_minimal(base_size = 14) +
-  labs(title = "Per-Output RMSE Comparison", y = "RMSE", x = "Output") +
-  scale_fill_brewer(palette = "Set2")
-
-p_per_output_sig
-
-library(ggplot2)
-
-# ---- Overall RMSE ----
-overall_df <- data.frame(
-  Method  = c("Polynomial", "Spherical Harmonics"),
-  Overall = c(res_compare$rmse_poly$overall_rmse,
-              res_compare$rmse_sph$overall_rmse)
-)
-
-p_overall <- ggplot(overall_df, aes(x = Method, y = Overall, fill = Method)) +
-  geom_bar(stat = "identity", width = 0.6) +
-  theme_minimal(base_size = 14) +
-  labs(title = "Overall RMSE Comparison", y = "RMSE", x = "Method") +
-  scale_fill_brewer(palette = "Set2") +
-  theme(legend.position = "none")
-
-# ---- Per-output RMSE ----
-per_output_df <- data.frame(
-  Output = rep(names(res_compare$rmse_poly$per_output_rmse), 2),
-  RMSE   = c(res_compare$rmse_poly$per_output_rmse,
-             res_compare$rmse_sph$per_output_rmse),
-  Method = rep(c("Polynomial", "Spherical Harmonics"),
-               each = length(res_compare$rmse_poly$per_output_rmse))
-)
-
-p_per_output <- ggplot(per_output_df, aes(x = Output, y = RMSE, fill = Method)) +
-  geom_bar(stat = "identity", position = "dodge", width = 0.7) +
-  theme_minimal(base_size = 14) +
-  labs(title = "Per-Output RMSE Comparison", y = "RMSE", x = "Output") +
-  scale_fill_brewer(palette = "Set2")
-
-# Show plots
-p_overall
-p_per_output
-
-#############################
-# Polynomial Model Only
-###############################################################
-
-###############################################################
-# Required libraries
-###############################################################
-library(keras3)
-library(tensorflow, lib.loc = "/opt/R/4.4.0/lib/R/library")
-library(keras)
-library(pracma)
-library(reshape2)
-library(ggplot2)
-
-###############################################################
-# 1) Grid and spatial simulation
-###############################################################
-deg2rad <- function(deg) deg * pi / 180
-sphere_grid <- function(nlon = 84, nlat = 42) {
-  lon <- seq(-180, 180 - 360/nlon, length.out = nlon)
-  lat <- seq(-90 + 180/(nlat*2), 90 - 180/(nlat*2), length.out = nlat)
-  grid <- expand.grid(lon=lon, lat=lat)
-  x <- cos(deg2rad(grid$lat)) * cos(deg2rad(grid$lon))
-  y <- cos(deg2rad(grid$lat)) * sin(deg2rad(grid$lon))
-  z <- sin(deg2rad(grid$lat))
-  coords3 <- cbind(x,y,z)
-  list(grid=grid, coords3=coords3, nlon=nlon, nlat=nlat)
-}
-
-angular_dist <- function(u,v) {
-  if(is.vector(u)) u <- matrix(u, nrow=1)
-  res <- u %*% t(v)
-  pmax(0, pmin(pi, acos(pmin(1, pmax(-1, res)))))
-}
-
-pairwise_ang_dist_mat <- function(coords3) {
-  N <- nrow(coords3); M <- matrix(0,N,N)
-  for(i in 1:N) M[i,] <- angular_dist(coords3[i,], coords3)
-  M
-}
-
-make_sigma_spatial <- function(coords3, alpha0=1, alpha1=0.5, alpha2=0.2) {
-  x <- coords3[,1]; y <- coords3[,2]; z <- coords3[,3]
-  sigma <- alpha0 + alpha1*z + alpha2*(x^2 - y^2)
-  pmax(0.05, sigma)
-}
-
-iscf_cov_matrix <- function(coords3, phi=0.4, alpha0=1, alpha1=0.5, alpha2=0.2, nugget=1e-6) {
-  sigma <- make_sigma_spatial(coords3, alpha0, alpha1, alpha2)
-  ang <- pairwise_ang_dist_mat(coords3)
-  K <- outer(sigma,sigma,"*") * exp(-(ang/phi)^2)
-  diag(K) <- diag(K) + nugget
-  K
-}
-
-simulate_spatio_temporal <- function(coords3, T=30, seed=1) {
-  set.seed(seed); N <- nrow(coords3)
-  CovW <- iscf_cov_matrix(coords3)
   L <- chol(CovW)
-  W <- matrix(rnorm(N*T), nrow=N, ncol=T)
+
+  W <- matrix(
+    rnorm(N * T),
+    nrow = N,
+    ncol = T
+  )
+
   W <- L %*% W
-  X <- matrix(0, N, T); X[,1] <- W[,1]
-  if(T>1) for(t in 2:T) X[,t] <- X[,t-1] + W[,t]
+
+  X <- matrix(
+    0,
+    nrow = N,
+    ncol = T
+  )
+
+  X[, 1] <- W[, 1]
+
+  if (T > 1) {
+
+    for (t in 2:T) {
+
+      X[, t] <-
+        X[, t - 1] +
+        W[, t]
+    }
+  }
+
   X
 }
 
 ###############################################################
-# 2) Detrending functions
+# 6) Spatial polynomial detrending
 ###############################################################
-# Placeholder for spatial detrending via spherical harmonics (simplified)
-detrend_spatial_sph <- function(Y_vec, coords3, L=2) {
-  # Here you could implement real spherical harmonics; simplified as polynomial
-  x <- coords3[,1]; y <- coords3[,2]; z <- coords3[,3]
-  B <- cbind(1,x,y,z,x^2,x*y,x*z,y^2,y*z,z^2)
-  fit <- lm(Y_vec ~ B - 1)
+
+detrend_spatial_poly <- function(
+    Y_vec,
+    coords3) {
+
+  x <- coords3[, 1]
+  y <- coords3[, 2]
+  z <- coords3[, 3]
+
+  B <- cbind(
+    1,
+    x,
+    y,
+    z,
+    x^2,
+    x * y,
+    x * z,
+    y^2,
+    y * z,
+    z^2
+  )
+
+  fit <- lm(
+    Y_vec ~ B - 1
+  )
+
   residuals(fit)
 }
 
-detrend_all_times <- function(Xmat, coords3) {
-  N <- nrow(Xmat); T <- ncol(Xmat)
-  resid <- matrix(0, N, T)
-  for(t in 1:T) resid[,t] <- detrend_spatial_sph(Xmat[,t], coords3)
+detrend_all_times_poly <- function(
+    Xmat,
+    coords3) {
+
+  N <- nrow(Xmat)
+  Tt <- ncol(Xmat)
+
+  resid <- matrix(
+    0,
+    nrow = N,
+    ncol = Tt
+  )
+
+  for (t in seq_len(Tt)) {
+
+    resid[, t] <-
+      detrend_spatial_poly(
+        Xmat[, t],
+        coords3
+      )
+  }
+
   resid
 }
 
-# Temporal polynomial detrending
-detrend_temporal_poly <- function(Y_array, degree=2) {
-  N <- dim(Y_array)[1]; T <- dim(Y_array)[2]; nout <- dim(Y_array)[3]
-  Y_resid <- array(0, dim=c(N,T,nout))
-  for(i in 1:N) {
-    for(k in 1:nout) {
-      y <- Y_array[i,,k]
-      B <- poly(1:T, degree=degree, raw=TRUE)
-      fit <- lm(y ~ B - 1)
-      Y_resid[i,,k] <- residuals(fit)
+###############################################################
+# 7) Temporal polynomial detrending
+###############################################################
+
+detrend_temporal_poly_safe <- function(
+    Y_array,
+    degree = 2) {
+
+  N <- dim(Y_array)[1]
+  Tt <- dim(Y_array)[2]
+  nout <- dim(Y_array)[3]
+
+  Y_resid <- array(
+    0,
+    dim = c(N, Tt, nout)
+  )
+
+  B <- poly(
+    seq_len(Tt),
+    degree = degree,
+    raw = TRUE
+  )
+
+  for (i in seq_len(N)) {
+
+    for (k in seq_len(nout)) {
+
+      y <- Y_array[i, , k]
+
+      if (
+        any(is.na(y)) ||
+        sd(y, na.rm = TRUE) < 1e-8
+      ) {
+
+        Y_resid[i, , k] <- 0
+
+        next
+      }
+
+      fit <- lm(
+        y ~ B - 1
+      )
+
+      Y_resid[i, , k] <-
+        residuals(fit)
     }
   }
+
   Y_resid
 }
 
-# Normalize per output
-normalize_array_per_output <- function(Y_array) {
+###############################################################
+# 8) Normalization
+###############################################################
+
+normalize_array_per_output <- function(
+    Y_array) {
+
   nout <- dim(Y_array)[3]
-  for(k in 1:nout) {
-    Y_array[,,k] <- (Y_array[,,k] - mean(Y_array[,,k])) / sd(Y_array[,,k])
+
+  for (k in seq_len(nout)) {
+
+    mu <- mean(
+      Y_array[, , k]
+    )
+
+    s <- sd(
+      Y_array[, , k]
+    )
+
+    if (
+      !is.finite(s) ||
+      s < 1e-8
+    ) {
+
+      s <- 1
+    }
+
+    Y_array[, , k] <-
+      (Y_array[, , k] - mu) / s
   }
+
   Y_array
 }
 
 ###############################################################
-# 3) Multi-output copula simulation
+# 9) Multivariate copula outcome simulation
 ###############################################################
-simulate_copula_outcomes <- function(X, R_dep = matrix(c(1,0.5,0.3,0.5,1,0.4,0.3,0.4,1),3,3), seed=123) {
+
+simulate_copula_outcomes <- function(
+    X,
+    R_dep = matrix(
+      c(
+        1, 0.5, 0.3,
+        0.5, 1, 0.4,
+        0.3, 0.4, 1
+      ),
+      3,
+      3
+    ),
+    seed = 123) {
+
   set.seed(seed)
-  N <- nrow(X); T <- ncol(X); nout <- nrow(R_dep)
-  Y_array <- array(0, dim=c(N,T,nout))
+
+  N <- nrow(X)
+  Tt <- ncol(X)
+  nout <- nrow(R_dep)
+
+  Y_array <- array(
+    0,
+    dim = c(N, Tt, nout)
+  )
+
   L_R <- chol(R_dep)
-  for(t in 1:T) {
-    Z_indep <- matrix(rnorm(N*nout), nrow=N, ncol=nout)
-    Z_dep <- Z_indep %*% L_R
-    for(k in 1:nout) Y_array[,t,k] <- X[,t] + Z_dep[,k]
+
+  for (t in seq_len(Tt)) {
+
+    Z <- matrix(
+      rnorm(N * nout),
+      nrow = N,
+      ncol = nout
+    )
+
+    Z_dep <-
+      Z %*% L_R
+
+    for (k in seq_len(nout)) {
+
+      Y_array[, t, k] <-
+        X[, t] +
+        Z_dep[, k]
+    }
   }
+
   Y_array
 }
 
 ###############################################################
-# 4) CNN-LSTM preparation functions
+# 10) Geographic graph construction
 ###############################################################
-make_image_tensor_multi <- function(Y_array, nlon, nlat) {
-  N <- dim(Y_array)[1]; T <- dim(Y_array)[2]; nout <- dim(Y_array)[3]
-  imgs <- array(0, dim=c(T, nlat, nlon, nout))
-  for(t in 1:T) for(k in 1:nout) imgs[t,,,k] <- matrix(Y_array[,t,k], nrow=nlat, ncol=nlon, byrow=FALSE)
+
+build_geographic_graph <- function(
+    coords3) {
+
+  N <- nrow(coords3)
+
+  D_geo <-
+    pairwise_ang_dist_mat(
+      coords3
+    )
+
+  positive_distances <-
+    D_geo[D_geo > 0]
+
+  sigma <-
+    median(
+      positive_distances
+    )
+
+  W <-
+    exp(
+      -(D_geo^2) /
+      (2 * sigma^2)
+    )
+
+  diag(W) <- 0
+
+  W <-
+    (W + t(W)) / 2
+
+  degree <-
+    rowSums(W)
+
+  degree[
+    degree < 1e-10
+  ] <- 1e-10
+
+  D_inv_sqrt <-
+    diag(
+      1 / sqrt(degree)
+    )
+
+  L <-
+    diag(N) -
+    D_inv_sqrt %*%
+    W %*%
+    D_inv_sqrt
+
+  L <-
+    (L + t(L)) / 2
+
+  eig <-
+    eigen(
+      L,
+      symmetric = TRUE
+    )
+
+  list(
+    W = W,
+    L = L,
+    eigenvalues = eig$values,
+    U = eig$vectors,
+    sigma = sigma
+  )
+}
+
+###############################################################
+# 11) Graph Fourier transform
+###############################################################
+
+graph_fourier_transform <- function(
+    Y_array,
+    U) {
+
+  N <- dim(Y_array)[1]
+  Tt <- dim(Y_array)[2]
+  nout <- dim(Y_array)[3]
+
+  Y_graph <- array(
+    0,
+    dim = c(N, Tt, nout)
+  )
+
+  for (t in seq_len(Tt)) {
+
+    for (k in seq_len(nout)) {
+
+      Y_graph[, t, k] <-
+        as.numeric(
+          t(U) %*%
+          Y_array[, t, k]
+        )
+    }
+  }
+
+  Y_graph
+}
+
+###############################################################
+# 12) Inverse graph Fourier transform
+###############################################################
+
+inverse_graph_fourier_transform <- function(
+    Y_graph,
+    U) {
+
+  N <- dim(Y_graph)[1]
+  Tt <- dim(Y_graph)[2]
+  nout <- dim(Y_graph)[3]
+
+  Y_spatial <- array(
+    0,
+    dim = c(N, Tt, nout)
+  )
+
+  for (t in seq_len(Tt)) {
+
+    for (k in seq_len(nout)) {
+
+      Y_spatial[, t, k] <-
+        as.numeric(
+          U %*%
+          Y_graph[, t, k]
+        )
+    }
+  }
+
+  Y_spatial
+}
+
+###############################################################
+# 13) Convert spatial array to image tensor
+###############################################################
+
+make_image_tensor_multi <- function(
+    Y_array,
+    nlon,
+    nlat) {
+
+  Tt <- dim(Y_array)[2]
+  nout <- dim(Y_array)[3]
+
+  imgs <- array(
+    0,
+    dim = c(
+      Tt,
+      nlat,
+      nlon,
+      nout
+    )
+  )
+
+  for (t in seq_len(Tt)) {
+
+    for (k in seq_len(nout)) {
+
+      imgs[t, , , k] <-
+        matrix(
+          Y_array[, t, k],
+          nrow = nlat,
+          ncol = nlon,
+          byrow = FALSE
+        )
+    }
+  }
+
   imgs
 }
 
-make_sequences_multi <- function(imgs, L_in=5) {
-  T <- dim(imgs)[1]; nlat <- dim(imgs)[2]; nlon <- dim(imgs)[3]; nout <- dim(imgs)[4]
-  nSamples <- T - L_in
-  X <- array(0, dim=c(nSamples, L_in, nlat, nlon, nout))
-  Y <- array(0, dim=c(nSamples, nlat, nlon, nout))
-  for(i in 1:nSamples) {
-    X[i,,,,] <- imgs[i:(i+L_in-1),,,, drop=FALSE]
-    Y[i,,,] <- imgs[i + L_in,,,, drop=FALSE][1,,,]
+###############################################################
+# 14) Create CNN-LSTM sequences
+###############################################################
+
+make_sequences_multi <- function(
+    imgs,
+    L_in = 5) {
+
+  Tt <- dim(imgs)[1]
+  nlat <- dim(imgs)[2]
+  nlon <- dim(imgs)[3]
+  nout <- dim(imgs)[4]
+
+  nSamples <-
+    Tt - L_in
+
+  X <- array(
+    0,
+    dim = c(
+      nSamples,
+      L_in,
+      nlat,
+      nlon,
+      nout
+    )
+  )
+
+  Y <- array(
+    0,
+    dim = c(
+      nSamples,
+      nlat,
+      nlon,
+      nout
+    )
+  )
+
+  for (i in seq_len(nSamples)) {
+
+    X[i, , , , ] <-
+      imgs[
+        i:(i + L_in - 1),
+        , ,
+        ,
+        drop = FALSE
+      ]
+
+    Y[i, , , ] <-
+      imgs[
+        i + L_in,
+        , ,
+        ,
+        drop = FALSE
+      ][1, , , ]
   }
-  list(X=X, Y=Y)
+
+  list(
+    X = X,
+    Y = Y
+  )
 }
 
-build_cnn_lstm_multi <- function(nlat,nlon,nout,L_in=5) {
-  input <- layer_input(shape=c(L_in,nlat,nlon,nout))
-  td <- input %>%
-    time_distributed(layer_conv_2d(filters=16,kernel_size=c(3,3),padding="same",activation="relu")) %>%
-    time_distributed(layer_max_pooling_2d(pool_size=c(2,2))) %>%
-    time_distributed(layer_conv_2d(filters=32,kernel_size=c(3,3),padding="same",activation="relu")) %>%
-    time_distributed(layer_max_pooling_2d(pool_size=c(2,2))) %>%
-    time_distributed(layer_flatten())
-  lstm <- td %>% layer_lstm(units=128,return_sequences=FALSE)
-  total_pixels <- nlat*nlon
-  dense_out <- lstm %>% layer_dense(units=total_pixels*nout*2)
-  out <- layer_reshape(dense_out, target_shape=c(total_pixels,nout,2))
-  keras_model(inputs=input, outputs=out)
+###############################################################
+# 15) Flatten spatial response
+###############################################################
+
+flatten_response <- function(
+    Yseq) {
+
+  nSamples <- dim(Yseq)[1]
+  nlat <- dim(Yseq)[2]
+  nlon <- dim(Yseq)[3]
+  nout <- dim(Yseq)[4]
+
+  total_pixels <-
+    nlat * nlon
+
+  Y_flat <- array(
+    0,
+    dim = c(
+      nSamples,
+      total_pixels,
+      nout
+    )
+  )
+
+  for (i in seq_len(nSamples)) {
+
+    for (k in seq_len(nout)) {
+
+      Y_flat[i, , k] <-
+        as.numeric(
+          Yseq[i, , , k]
+        )
+    }
+  }
+
+  Y_flat
 }
 
-nll_gaussian_multi <- function() {
-  function(y_true, y_pred) {
-    pred_mean <- y_pred[,, ,1]
-    pred_logsd <- y_pred[,, ,2]
-    sd <- k_exp(pred_logsd)+1e-6
-    nll <- 0.5*k_log(2*pi) + k_log(sd) + 0.5*k_square((y_true-pred_mean)/sd)
-    k_mean(nll)
+###############################################################
+# 16) CNN-LSTM architecture
+###############################################################
+
+build_cnn_lstm_multi <- function(
+    nlat,
+    nlon,
+    nout,
+    L_in = 5) {
+
+  input <-
+    layer_input(
+      shape = c(
+        L_in,
+        nlat,
+        nlon,
+        nout
+      )
+    )
+
+  td <-
+    input %>%
+
+    time_distributed(
+      layer_conv_2d(
+        filters = 16,
+        kernel_size = c(3, 3),
+        padding = "same",
+        activation = "relu"
+      )
+    ) %>%
+
+    time_distributed(
+      layer_max_pooling_2d(
+        pool_size = c(2, 2)
+      )
+    ) %>%
+
+    time_distributed(
+      layer_conv_2d(
+        filters = 32,
+        kernel_size = c(3, 3),
+        padding = "same",
+        activation = "relu"
+      )
+    ) %>%
+
+    time_distributed(
+      layer_max_pooling_2d(
+        pool_size = c(2, 2)
+      )
+    ) %>%
+
+    time_distributed(
+      layer_flatten()
+    )
+
+  lstm <-
+    td %>%
+    layer_lstm(
+      units = 128,
+      return_sequences = FALSE
+    )
+
+  total_pixels <-
+    nlat * nlon
+
+  dense_out <-
+    lstm %>%
+    layer_dense(
+      units =
+        total_pixels *
+        nout *
+        2
+    )
+
+  out <-
+    dense_out %>%
+    layer_reshape(
+      target_shape =
+        c(
+          total_pixels,
+          nout,
+          2
+        )
+    )
+
+  keras_model(
+    inputs = input,
+    outputs = out
+  )
+}
+
+###############################################################
+# 17) Gaussian negative log-likelihood
+###############################################################
+
+nll_gaussian_multi <- function(
+    eps = 1e-5) {
+
+  function(
+      y_true,
+      y_pred) {
+
+    pred_mean <-
+      y_pred[, , , 1]
+
+    pred_logsd <-
+      y_pred[, , , 2]
+
+    pred_logsd <-
+      tf$clip_by_value(
+        pred_logsd,
+        -10,
+        10
+      )
+
+    sd <-
+      tf$math$exp(
+        pred_logsd
+      ) +
+      eps
+
+    nll <-
+      0.5 * log(2 * pi) +
+      tf$math$log(sd) +
+      0.5 *
+      tf$square(
+        (y_true - pred_mean) / sd
+      )
+
+    tf$reduce_mean(
+      nll
+    )
   }
 }
 
 ###############################################################
-# 5) Run full example
+# 18) Convert model prediction to spatial array
 ###############################################################
-run_example_multi_joint_fixed <- function(nlon=84, nlat=42, T=30, L_in=5, seed=1) {
+
+prediction_to_array <- function(
+    pred,
+    nlat,
+    nlon,
+    nout) {
+
+  nSamples <-
+    dim(pred)[1]
+
+  pred_mean <-
+    pred[, , , 1]
+
+  out <-
+    array(
+      0,
+      dim = c(
+        nSamples,
+        nlat,
+        nlon,
+        nout
+      )
+    )
+
+  for (i in seq_len(nSamples)) {
+
+    for (k in seq_len(nout)) {
+
+      out[i, , , k] <-
+        matrix(
+          pred_mean[i, , k],
+          nrow = nlat,
+          ncol = nlon,
+          byrow = FALSE
+        )
+    }
+  }
+
+  out
+}
+
+###############################################################
+# 19) Inverse graph transformation of predictions
+###############################################################
+
+inverse_prediction_graph <- function(
+    pred,
+    U,
+    nlat,
+    nlon,
+    nout) {
+
+  nSamples <-
+    dim(pred)[1]
+
+  N <-
+    nlat * nlon
+
+  pred_spatial <-
+    array(
+      0,
+      dim = c(
+        nSamples,
+        N,
+        nout
+      )
+    )
+
+  pred_mean <-
+    pred[, , , 1]
+
+  for (i in seq_len(nSamples)) {
+
+    for (k in seq_len(nout)) {
+
+      pred_spatial[i, , k] <-
+        as.numeric(
+          U %*%
+          pred_mean[i, , k]
+        )
+    }
+  }
+
+  pred_spatial
+}
+
+###############################################################
+# 20) Fair comparison metrics
+###############################################################
+
+calculate_metrics <- function(
+    Y_true,
+    pred_mean,
+    pred_logsd,
+    model_name) {
+
+  nout <-
+    dim(Y_true)[3]
+
+  rmse <-
+    numeric(nout)
+
+  mae <-
+    numeric(nout)
+
+  nll <-
+    numeric(nout)
+
+  for (k in seq_len(nout)) {
+
+    true_k <-
+      as.vector(
+        Y_true[, , k]
+      )
+
+    pred_k <-
+      as.vector(
+        pred_mean[, , k]
+      )
+
+    logsd_k <-
+      as.vector(
+        pred_logsd[, , k]
+      )
+
+    sd_k <-
+      exp(
+        pmin(
+          pmax(
+            logsd_k,
+            -10
+          ),
+          10
+        )
+      ) +
+      1e-6
+
+    rmse[k] <-
+      sqrt(
+        mean(
+          (true_k - pred_k)^2
+        )
+      )
+
+    mae[k] <-
+      mean(
+        abs(
+          true_k - pred_k
+        )
+      )
+
+    nll[k] <-
+      mean(
+        0.5 * log(2 * pi) +
+        log(sd_k) +
+        0.5 *
+        ((true_k - pred_k) /
+           sd_k)^2
+      )
+  }
+
+  data.frame(
+    Model = model_name,
+    Output = seq_len(nout),
+    RMSE = rmse,
+    MAE = mae,
+    NLL = nll
+  )
+}
+
+###############################################################
+# 21) MAIN TWO-MODEL EXPERIMENT
+###############################################################
+
+run_example_compare_graph <- function(
+    nlon = 84,
+    nlat = 42,
+    Tt = 30,
+    L_in = 5,
+    nout = 3,
+    seed = 42,
+    epochs = 5,
+    batch_size = 4) {
+
+  #############################################################
+  # Reproducibility
+  #############################################################
+
   set.seed(seed)
-  gr <- sphere_grid(nlon=nlon, nlat=nlat)
-  coords3 <- gr$coords3
-  
-  
-  # 1) Simulate spatio-temporal
-  X <- simulate_spatio_temporal(coords3, T=T)
-  
-  # 2) Spatial detrend
-  R <- detrend_all_times(X, coords3)
-  
-  # 3) Multi-output copula outcomes
-  Y_array <- simulate_copula_outcomes(R)
-  
-  # 4) Temporal detrend
-  Y_array <- detrend_temporal_poly(Y_array, degree=2)
-  
-  # 5) Normalize per output
-  Y_array <- normalize_array_per_output(Y_array)
-  
-  # 6) CNN-LSTM input
-  imgs <- make_image_tensor_multi(Y_array, nlon, nlat)
-  seqs <- make_sequences_multi(imgs,L_in=L_in)
-  Xseq <- seqs$X; Yseq <- seqs$Y
-  
-  nSamples <- dim(Xseq)[1]; nout <- dim(Y_array)[3]; total_pixels <- nlat*nlon
-  Y_flat <- array(0, dim=c(nSamples,total_pixels,nout))
-  for(i in 1:nSamples) for(k in 1:nout) Y_flat[i,,k] <- as.numeric(Yseq[i,,,k])
-  
-  # 7) Build and train model
-  model <- build_cnn_lstm_multi(nlat,nlon,nout,L_in=L_in)
-  model %>% compile(optimizer=optimizer_adam(1e-3), loss=nll_gaussian_multi())
-  history <- model %>% fit(Xseq,Y_flat,epochs=5,batch_size=4,validation_split=0.2,verbose=2)
-  
-  list(model=model, history=history, Y_array=Y_array, Xseq=Xseq, Yseq=Yseq, gr=gr)
+
+  #############################################################
+  # Generate spherical grid
+  #############################################################
+
+  gr <-
+    sphere_grid(
+      nlon,
+      nlat
+    )
+
+  coords3 <-
+    gr$coords3
+
+  #############################################################
+  # Simulate common spatio-temporal process
+  #############################################################
+
+  X <-
+    simulate_spatio_temporal(
+      coords3,
+      T = Tt,
+      seed = seed
+    )
+
+  #############################################################
+  # Common spatial detrending
+  #############################################################
+
+  R <-
+    detrend_all_times_poly(
+      X,
+      coords3
+    )
+
+  #############################################################
+  # Common multivariate climate outcomes
+  #############################################################
+
+  Y_array <-
+    simulate_copula_outcomes(
+      R,
+      seed = seed + 100
+    )
+
+  #############################################################
+  # Common temporal detrending
+  #############################################################
+
+  Y_array <-
+    detrend_temporal_poly_safe(
+      Y_array,
+      degree = 2
+    )
+
+  #############################################################
+  # Common normalization
+  #############################################################
+
+  Y_array <-
+    normalize_array_per_output(
+      Y_array
+    )
+
+  #############################################################
+  # Spatial image representation
+  #############################################################
+
+  imgs_spatial <-
+    make_image_tensor_multi(
+      Y_array,
+      nlon,
+      nlat
+    )
+
+  #############################################################
+  # ==========================================================
+  # MODEL 1: CNN-LSTM WITHOUT GRAPH
+  # ==========================================================
+  #############################################################
+
+  cat(
+    "\n============================================\n"
+  )
+
+  cat(
+    "MODEL 1: CNN-LSTM WITHOUT GRAPH\n"
+  )
+
+  cat(
+    "============================================\n"
+  )
+
+  seqs_nograph <-
+    make_sequences_multi(
+      imgs_spatial,
+      L_in
+    )
+
+  X_nograph <-
+    seqs_nograph$X
+
+  Y_nograph <-
+    seqs_nograph$Y
+
+  Y_flat_nograph <-
+    flatten_response(
+      Y_nograph
+    )
+
+  model_nograph <-
+    build_cnn_lstm_multi(
+      nlat,
+      nlon,
+      nout,
+      L_in
+    )
+
+  model_nograph %>%
+    compile(
+      optimizer =
+        optimizer_adam(
+          learning_rate = 0.001
+        ),
+      loss =
+        nll_gaussian_multi()
+    )
+
+  history_nograph <-
+    model_nograph %>%
+    fit(
+      X_nograph,
+      Y_flat_nograph,
+      epochs = epochs,
+      batch_size = batch_size,
+      validation_split = 0.20,
+      shuffle = FALSE,
+      verbose = 2
+    )
+
+  #############################################################
+  # Predictions: no graph
+  #############################################################
+
+  pred_nograph <-
+    model_nograph %>%
+    predict(
+      X_nograph
+    )
+
+  pred_mean_nograph <-
+    pred_nograph[, , , 1]
+
+  pred_logsd_nograph <-
+    pred_nograph[, , , 2]
+
+  #############################################################
+  # ==========================================================
+  # MODEL 2: GRAPH-FREQUENCY CNN-LSTM
+  # ==========================================================
+  #############################################################
+
+  cat(
+    "\n============================================\n"
+  )
+
+  cat(
+    "MODEL 2: GRAPH-FREQUENCY CNN-LSTM\n"
+  )
+
+  cat(
+    "============================================\n"
+  )
+
+  #############################################################
+  # Construct geographic graph
+  #############################################################
+
+  graph <-
+    build_geographic_graph(
+      coords3
+    )
+
+  #############################################################
+  # Graph Fourier transform
+  #############################################################
+
+  Y_graph <-
+    graph_fourier_transform(
+      Y_array,
+      graph$U
+    )
+
+  #############################################################
+  # Graph-frequency image representation
+  #############################################################
+
+  imgs_graph <-
+    make_image_tensor_multi(
+      Y_graph,
+      nlon,
+      nlat
+    )
+
+  #############################################################
+  # Graph sequences
+  #############################################################
+
+  seqs_graph <-
+    make_sequences_multi(
+      imgs_graph,
+      L_in
+    )
+
+  X_graph <-
+    seqs_graph$X
+
+  Y_graph_seq <-
+    seqs_graph$Y
+
+  Y_flat_graph <-
+    flatten_response(
+      Y_graph_seq
+    )
+
+  #############################################################
+  # Build graph-frequency CNN-LSTM
+  #############################################################
+
+  model_graph <-
+    build_cnn_lstm_multi(
+      nlat,
+      nlon,
+      nout,
+      L_in
+    )
+
+  model_graph %>%
+    compile(
+      optimizer =
+        optimizer_adam(
+          learning_rate = 0.001
+        ),
+      loss =
+        nll_gaussian_multi()
+    )
+
+  history_graph <-
+    model_graph %>%
+    fit(
+      X_graph,
+      Y_flat_graph,
+      epochs = epochs,
+      batch_size = batch_size,
+      validation_split = 0.20,
+      shuffle = FALSE,
+      verbose = 2
+    )
+
+  #############################################################
+  # Graph-domain prediction
+  #############################################################
+
+  pred_graph <-
+    model_graph %>%
+    predict(
+      X_graph
+    )
+
+  #############################################################
+  # Inverse graph transform
+  #
+  # This is the critical correction:
+  # graph predictions are converted back to spatial domain
+  # before comparing them with the original spatial targets.
+  #############################################################
+
+  pred_graph_spatial <-
+    inverse_prediction_graph(
+      pred_graph,
+      graph$U,
+      nlat,
+      nlon,
+      nout
+    )
+
+  #############################################################
+  # Original spatial-domain target
+  #############################################################
+
+  Y_true_spatial <-
+    array(
+      0,
+      dim = c(
+        dim(Y_nograph)[1],
+        nlat * nlon,
+        nout
+      )
+    )
+
+  for (i in seq_len(dim(Y_nograph)[1])) {
+
+    for (k in seq_len(nout)) {
+
+      Y_true_spatial[i, , k] <-
+        as.numeric(
+          Y_nograph[i, , , k]
+        )
+    }
+  }
+
+  #############################################################
+  # Spatial predictions from no-graph model
+  #############################################################
+
+  pred_nograph_spatial <-
+    pred_mean_nograph
+
+  #############################################################
+  # Calculate fair spatial-domain metrics
+  #############################################################
+
+  metrics_nograph <-
+    calculate_metrics(
+      Y_true_spatial,
+      pred_nograph_spatial,
+      pred_logsd_nograph,
+      "CNN-LSTM without graph"
+    )
+
+  #############################################################
+  # Graph model uncertainty
+  #
+  # The predicted uncertainty is initially in graph space.
+  # For the primary RMSE/MAE comparison, spatial mean prediction
+  # is sufficient. NLL is reported in graph space separately.
+  #############################################################
+
+  pred_logsd_graph <-
+    pred_graph[, , , 2]
+
+  #############################################################
+  # Spatial-domain graph metrics
+  #
+  # Use transformed spatial mean prediction.
+  #############################################################
+
+  metrics_graph_spatial <-
+    data.frame(
+      Model =
+        "Graph-frequency CNN-LSTM",
+
+      Output =
+        seq_len(nout),
+
+      RMSE =
+        numeric(nout),
+
+      MAE =
+        numeric(nout),
+
+      NLL =
+        NA_real_
+    )
+
+  for (k in seq_len(nout)) {
+
+    true_k <-
+      as.vector(
+        Y_true_spatial[, , k]
+      )
+
+    pred_k <-
+      as.vector(
+        pred_graph_spatial[, , k]
+      )
+
+    metrics_graph_spatial$RMSE[k] <-
+      sqrt(
+        mean(
+          (true_k - pred_k)^2
+        )
+      )
+
+    metrics_graph_spatial$MAE[k] <-
+      mean(
+        abs(
+          true_k - pred_k
+        )
+      )
+  }
+
+  #############################################################
+  # Combine RMSE/MAE comparison
+  #############################################################
+
+  comparison_table <-
+    rbind(
+      metrics_nograph,
+      metrics_graph_spatial
+    )
+
+  #############################################################
+  # Overall RMSE and MAE
+  #############################################################
+
+  overall_rmse_nograph <-
+    sqrt(
+      mean(
+        (
+          Y_true_spatial -
+          pred_nograph_spatial
+        )^2
+      )
+    )
+
+  overall_rmse_graph <-
+    sqrt(
+      mean(
+        (
+          Y_true_spatial -
+          pred_graph_spatial
+        )^2
+      )
+    )
+
+  overall_mae_nograph <-
+    mean(
+      abs(
+        Y_true_spatial -
+        pred_nograph_spatial
+      )
+    )
+
+  overall_mae_graph <-
+    mean(
+      abs(
+        Y_true_spatial -
+        pred_graph_spatial
+      )
+    )
+
+  #############################################################
+  # Percentage improvements
+  #############################################################
+
+  improvement_table <-
+    data.frame(
+
+      Metric = c(
+        "RMSE",
+        "MAE"
+      ),
+
+      CNN_LSTM_without_graph = c(
+        overall_rmse_nograph,
+        overall_mae_nograph
+      ),
+
+      Graph_frequency_CNN_LSTM = c(
+        overall_rmse_graph,
+        overall_mae_graph
+      ),
+
+      Improvement_Percent = c(
+
+        100 *
+        (
+          overall_rmse_nograph -
+          overall_rmse_graph
+        ) /
+        overall_rmse_nograph,
+
+        100 *
+        (
+          overall_mae_nograph -
+          overall_mae_graph
+        ) /
+        overall_mae_nograph
+      )
+    )
+
+  #############################################################
+  # Per-output comparison
+  #############################################################
+
+  per_output_comparison <-
+    data.frame(
+
+      Output =
+        seq_len(nout),
+
+      RMSE_NoGraph =
+        metrics_nograph$RMSE,
+
+      RMSE_Graph =
+        metrics_graph_spatial$RMSE,
+
+      MAE_NoGraph =
+        metrics_nograph$MAE,
+
+      MAE_Graph =
+        metrics_graph_spatial$MAE
+    ) %>%
+
+    mutate(
+
+      RMSE_Improvement =
+        100 *
+        (
+          RMSE_NoGraph -
+          RMSE_Graph
+        ) /
+        RMSE_NoGraph,
+
+      MAE_Improvement =
+        100 *
+        (
+          MAE_NoGraph -
+          MAE_Graph
+        ) /
+        MAE_NoGraph
+    )
+
+  #############################################################
+  # Return results
+  #############################################################
+
+  list(
+
+    comparison_table =
+      comparison_table,
+
+    per_output_comparison =
+      per_output_comparison,
+
+    improvement_table =
+      improvement_table,
+
+    overall_rmse_nograph =
+      overall_rmse_nograph,
+
+    overall_rmse_graph =
+      overall_rmse_graph,
+
+    overall_mae_nograph =
+      overall_mae_nograph,
+
+    overall_mae_graph =
+      overall_mae_graph,
+
+    model_nograph =
+      model_nograph,
+
+    model_graph =
+      model_graph,
+
+    history_nograph =
+      history_nograph,
+
+    history_graph =
+      history_graph,
+
+    graph =
+      graph,
+
+    Y_array =
+      Y_array,
+
+    Y_true_spatial =
+      Y_true_spatial,
+
+    X_nograph =
+      X_nograph,
+
+    Y_nograph =
+      Y_nograph,
+
+    X_graph =
+      X_graph,
+
+    Y_graph =
+      Y_graph_seq,
+
+    pred_nograph =
+      pred_nograph,
+
+    pred_graph =
+      pred_graph,
+
+    pred_graph_spatial =
+      pred_graph_spatial,
+
+    grid =
+      gr
+  )
 }
 
-summarize_and_plot_cnn_lstm_large <- function(model, Xseq, Yseq, gr, nout,
-                                              batch_size=8, num_samples_plot=3,
-                                              save_plots=FALSE, random_seed=NULL) {
-  
-  library(reshape2)
-  library(ggplot2)
-  library(viridis)
-  
-  nlat <- gr$nlat
-  nlon <- gr$nlon
-  nSamples <- dim(Xseq)[1]
-  total_pixels <- nlat * nlon
-  
-  # Set seed if given
-  if(!is.null(random_seed)) set.seed(random_seed)
-  
-  # ---------------------------
-  # 1) Predict using CNN-LSTM
-  # ---------------------------
-  Y_pred_array <- model %>% predict(Xseq, batch_size=batch_size)
-  # Assuming shape: [nSamples, total_pixels, nout, 2] -> mean + logSD
-  
-  # Vectorized mean predictions
-  Y_pred <- array(Y_pred_array[,,,1], dim=c(nSamples, total_pixels, nout))
-  dim(Y_pred) <- c(nSamples, nlat, nlon, nout)  # reshape to grid
-  
-  # ---------------------------
-  # 2) Summary Table: Mean & SD
-  # ---------------------------
-  summary_table <- data.frame(
-    Output = 1:nout,
-    True_Mean = sapply(1:nout, function(k) mean(Yseq[,,,k])),
-    Pred_Mean = sapply(1:nout, function(k) mean(Y_pred[,,,k])),
-    True_SD   = sapply(1:nout, function(k) sd(Yseq[,,,k])),
-    Pred_SD   = sapply(1:nout, function(k) sd(Y_pred[,,,k]))
-  )
-  
-  print("Summary Table (Mean & SD per Output):")
-  print(summary_table)
-  
-  # ---------------------------
-  # 3) Metrics Table: RMSE & NLL
-  # ---------------------------
-  metrics_table <- data.frame(
-    Output = 1:nout,
-    RMSE = numeric(nout),
-    Avg_NLL = numeric(nout)
-  )
-  
-  for(k in 1:nout) {
-    true_vals <- as.vector(Yseq[,,,k])
-    pred_vals <- as.vector(Y_pred[,,,k])
-    
-    rmse <- sqrt(mean((pred_vals - true_vals)^2))
-    
-    sd_vals <- exp(as.vector(Y_pred_array[,,k,2])) + 1e-6
-    nll <- mean(0.5*log(2*pi) + log(sd_vals) + 0.5*((true_vals - pred_vals)/sd_vals)^2)
-    
-    metrics_table[k, c("RMSE","Avg_NLL")] <- c(rmse, nll)
-  }
-  
-  print("Per-output RMSE and Average NLL:")
-  print(metrics_table)
-  
-  # ---------------------------
-  # 4) Time Series Plots
-  # ---------------------------
-  for(s in 1:num_samples_plot) {
-    lat_idx <- sample(1:nlat,1)
-    lon_idx <- sample(1:nlon,1)
-    
-    df_ts <- data.frame(Time = 1:nSamples)
-    for(k in 1:nout) {
-      df_ts[[paste0("True_Y",k)]] <- Yseq[1:nSamples,lat_idx,lon_idx,k]
-      df_ts[[paste0("Pred_Y",k)]] <- Y_pred[1:nSamples,lat_idx,lon_idx,k]
-    }
-    
-    df_long <- melt(df_ts, id.vars="Time")
-    
-    p <- ggplot(df_long, aes(x=Time, y=value, color=variable)) +
-      geom_line() +
-      ggtitle(paste("Time Series at lat =", lat_idx, "lon =", lon_idx)) +
-      ylab("Value") +
-      theme_minimal()
-    
-    print(p)
-  }
-  
-  # ---------------------------
-  # 5) Heatmaps: True, Predicted & Residual
-  # ---------------------------
-  for(t_idx in c(1, round(nSamples/2), nSamples)) {
-    for(k in 1:nout) {
-      
-      # True
-      df_true <- melt(Yseq[t_idx,,,k])
-      names(df_true) <- c("Lat","Lon","Value")
-      p_true <- ggplot(df_true, aes(x=Lon, y=Lat, fill=Value)) +
-        geom_tile() + scale_fill_viridis_c() +
-        ggtitle(paste("True Y", k, "at time", t_idx)) +
-        theme_minimal()
-      
-      # Predicted
-      df_pred <- melt(Y_pred[t_idx,,,k])
-      names(df_pred) <- c("Lat","Lon","Value")
-      p_pred <- ggplot(df_pred, aes(x=Lon, y=Lat, fill=Value)) +
-        geom_tile() + scale_fill_viridis_c() +
-        ggtitle(paste("Predicted Y", k, "at time", t_idx)) +
-        theme_minimal()
-      
-      # Residual
-      df_resid <- df_true
-      df_resid$Value <- df_true$Value - df_pred$Value
-      p_resid <- ggplot(df_resid, aes(x=Lon, y=Lat, fill=Value)) +
-        geom_tile() + scale_fill_viridis_c(option="magma") +
-        ggtitle(paste("Residual Y", k, "at time", t_idx)) +
-        theme_minimal()
-      
-      print(p_true); print(p_pred); print(p_resid)
-      
-      if(save_plots) {
-        ggsave(paste0("Heatmap_TrueY",k,"_t",t_idx,".png"), p_true, width=5, height=4)
-        ggsave(paste0("Heatmap_PredY",k,"_t",t_idx,".png"), p_pred, width=5, height=4)
-        ggsave(paste0("Heatmap_ResidY",k,"_t",t_idx,".png"), p_resid, width=5, height=4)
-      }
-    }
-  }
-  
-  list(summary_table = summary_table,
-       metrics_table = metrics_table,
-       Y_pred = Y_pred)
-}
+###############################################################
+# 22) Run experiment
+###############################################################
 
-# ---------------------------
-# 6) Run full simulation + CNN-LSTM training
-# ---------------------------
-res_example <- run_example_multi_joint_fixed(nlon=84, nlat=42, T=30, L_in=5, seed=42)
+res_compare <-
+  run_example_compare_graph(
+    nlon = 84,
+    nlat = 42,
+    Tt = 30,
+    L_in = 5,
+    nout = 3,
+    seed = 42,
+    epochs = 5,
+    batch_size = 4
+  )
 
-# ---------------------------
-# 7) Summarize + plot predictions
-# ---------------------------
-res_summary <- summarize_and_plot_cnn_lstm_large(
-  model = res_example$model,
-  Xseq = res_example$Xseq,
-  Yseq = res_example$Yseq,
-  gr = res_example$gr,
-  nout = dim(res_example$Yseq)[4],
-  num_samples_plot = 2,
-  random_seed = 123,
-  save_plots = FALSE
+###############################################################
+# 23) Display per-output comparison
+###############################################################
+
+print(
+  res_compare$per_output_comparison
 )
 
-# ---------------------------
-# 8) View outputs
-# ---------------------------
-res_summary$summary_table
-res_summary$metrics_table
+###############################################################
+# 24) Display overall improvement
+###############################################################
+
+print(
+  res_compare$improvement_table
+)
+
+###############################################################
+# 25) Long-format RMSE data
+###############################################################
+
+rmse_plot_df <-
+  res_compare$per_output_comparison %>%
+
+  select(
+    Output,
+    RMSE_NoGraph,
+    RMSE_Graph
+  ) %>%
+
+  pivot_longer(
+    cols = c(
+      RMSE_NoGraph,
+      RMSE_Graph
+    ),
+    names_to = "Model",
+    values_to = "RMSE"
+  ) %>%
+
+  mutate(
+
+    Model =
+      recode(
+        Model,
+
+        RMSE_NoGraph =
+          "CNN-LSTM without graph",
+
+        RMSE_Graph =
+          "Graph-frequency CNN-LSTM"
+      ),
+
+    Output =
+      factor(
+        Output,
+        labels = c(
+          "Precipitation",
+          "Minimum temperature",
+          "Maximum temperature"
+        )
+      )
+  )
+
+###############################################################
+# 26) RMSE plot
+###############################################################
+
+p_rmse <-
+  ggplot(
+    rmse_plot_df,
+    aes(
+      x = Output,
+      y = RMSE,
+      fill = Model
+    )
+  ) +
+
+  geom_col(
+    position = "dodge",
+    width = 0.7
+  ) +
+
+  theme_minimal(
+    base_size = 14
+  ) +
+
+  labs(
+    title =
+      "Spatial-Domain RMSE Comparison",
+
+    x =
+      "Climate Variable",
+
+    y =
+      "RMSE",
+
+    fill =
+      "Model"
+  )
+
+print(p_rmse)
+
+###############################################################
+# 27) MAE plot
+###############################################################
+
+mae_plot_df <-
+  res_compare$per_output_comparison %>%
+
+  select(
+    Output,
+    MAE_NoGraph,
+    MAE_Graph
+  ) %>%
+
+  pivot_longer(
+    cols = c(
+      MAE_NoGraph,
+      MAE_Graph
+    ),
+    names_to = "Model",
+    values_to = "MAE"
+  ) %>%
+
+  mutate(
+
+    Model =
+      recode(
+        Model,
+
+        MAE_NoGraph =
+          "CNN-LSTM without graph",
+
+        MAE_Graph =
+          "Graph-frequency CNN-LSTM"
+      ),
+
+    Output =
+      factor(
+        Output,
+        labels = c(
+          "Precipitation",
+          "Minimum temperature",
+          "Maximum temperature"
+        )
+      )
+  )
+
+###############################################################
+# 28) MAE plot
+###############################################################
+
+p_mae <-
+  ggplot(
+    mae_plot_df,
+    aes(
+      x = Output,
+      y = MAE,
+      fill = Model
+    )
+  ) +
+
+  geom_col(
+    position = "dodge",
+    width = 0.7
+  ) +
+
+  theme_minimal(
+    base_size = 14
+  ) +
+
+  labs(
+    title =
+      "Spatial-Domain MAE Comparison",
+
+    x =
+      "Climate Variable",
+
+    y =
+      "MAE",
+
+    fill =
+      "Model"
+  )
+
+print(p_mae)
+
+###############################################################
+# 29) Overall RMSE plot
+###############################################################
+
+overall_plot_df <-
+  data.frame(
+
+    Model = c(
+      "CNN-LSTM without graph",
+      "Graph-frequency CNN-LSTM"
+    ),
+
+    RMSE = c(
+      res_compare$overall_rmse_nograph,
+      res_compare$overall_rmse_graph
+    ),
+
+    MAE = c(
+      res_compare$overall_mae_nograph,
+      res_compare$overall_mae_graph
+    )
+  )
+
+###############################################################
+# 30) Overall RMSE
+###############################################################
+
+p_overall_rmse <-
+  ggplot(
+    overall_plot_df,
+    aes(
+      x = Model,
+      y = RMSE,
+      fill = Model
+    )
+  ) +
+
+  geom_col(
+    width = 0.6
+  ) +
+
+  theme_minimal(
+    base_size = 14
+  ) +
+
+  theme(
+    legend.position = "none"
+  ) +
+
+  labs(
+    title =
+      "Overall Spatial-Domain RMSE",
+
+    x =
+      "Model",
+
+    y =
+      "RMSE"
+  )
+
+print(p_overall_rmse)
+
+###############################################################
+# 31) Overall MAE
+###############################################################
+
+p_overall_mae <-
+  ggplot(
+    overall_plot_df,
+    aes(
+      x = Model,
+      y = MAE,
+      fill = Model
+    )
+  ) +
+
+  geom_col(
+    width = 0.6
+  ) +
+
+  theme_minimal(
+    base_size = 14
+  ) +
+
+  theme(
+    legend.position = "none"
+  ) +
+
+  labs(
+    title =
+      "Overall Spatial-Domain MAE",
+
+    x =
+      "Model",
+
+    y =
+      "MAE"
+  )
+
+print(p_overall_mae)
+
+###############################################################
+# 32) Print final results
+###############################################################
+
+cat("\n============================================\n")
+cat("FINAL MODEL COMPARISON\n")
+cat("============================================\n\n")
+
+print(
+  res_compare$per_output_comparison
+)
+
+cat("\n============================================\n")
+cat("OVERALL IMPROVEMENT\n")
+cat("============================================\n\n")
+
+print(
+  res_compare$improvement_table
+)
 
 ###############################################################
 # REAL DATA: TERRACLIMATE + CNN-LSTM + GRAPH FREQUENCY
@@ -3984,6 +4935,127 @@ results_graph <-
 
 results_no_graph
 results_graph
+
+###############################################################
+# 31.10 Comparison table
+###############################################################
+
+comparison_table <- rbind(
+
+    data.frame(
+        Model = "CNN-LSTM without Graph",
+        results_no_graph
+    ),
+
+    data.frame(
+        Model = "Graph-Frequency CNN-LSTM",
+        results_graph
+    )
+)
+
+print(comparison_table)
+
+###############################################################
+# 31.12 RMSE comparison plot
+###############################################################
+
+library(ggplot2)
+
+rmse_plot_data <- rbind(
+
+    data.frame(
+        Variable = results_no_graph$Variable,
+        RMSE = results_no_graph$RMSE,
+        Model = "CNN-LSTM without Graph"
+    ),
+
+    data.frame(
+        Variable = results_graph$Variable,
+        RMSE = results_graph$RMSE,
+        Model = "Graph-Frequency CNN-LSTM"
+    )
+)
+
+
+p_rmse <- ggplot(
+    rmse_plot_data,
+    aes(
+        x = Variable,
+        y = RMSE,
+        fill = Model
+    )
+) +
+
+    geom_bar(
+        stat = "identity",
+        position = "dodge",
+        width = 0.7
+    ) +
+
+    labs(
+        title =
+            "Prediction Performance: Graph vs. No-Graph CNN-LSTM",
+
+        x =
+            "Climate Variable",
+
+        y =
+            "RMSE",
+
+        fill =
+            "Model"
+    ) +
+
+    theme_minimal(
+        base_size = 14
+    )
+
+print(p_rmse)
+
+###############################################################
+# 31.13 Overall RMSE
+###############################################################
+
+overall_rmse_plot <- ggplot(
+    overall_comparison,
+    aes(
+        x = Model,
+        y = Overall_RMSE,
+        fill = Model
+    )
+) +
+
+    geom_bar(
+        stat = "identity",
+        width = 0.6
+    ) +
+
+    labs(
+        title =
+            "Overall RMSE: Graph-Frequency vs. No-Graph CNN-LSTM",
+
+        x =
+            "",
+
+        y =
+            "Overall RMSE"
+    ) +
+
+    theme_minimal(
+        base_size = 14
+    ) +
+
+    theme(
+        legend.position = "none",
+        axis.text.x =
+            element_text(
+                angle = 15,
+                hjust = 1
+            )
+    )
+
+print(overall_rmse_plot)
+
 ###############################################################
 # END OF FILE
 ###############################################################

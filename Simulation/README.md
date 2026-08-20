@@ -798,22 +798,6 @@ define_actor_model()
 define_critic_model()
 ```
 
-In R, a later function definition replaces an earlier definition with the same name. Therefore, **do not source the entire historical code file blindly if exact replication is required**.
-
-For a publication replication package, it is recommended to place the final manuscript version in a clean script such as:
-
-```text
-code/01_simulation.R
-code/02_ablation.R
-code/03_trajectory_analysis.R
-code/04_real_data.R
-```
-
-and remove superseded experimental versions.
-
-This avoids ambiguity about which parameter values and function definitions were used for the reported results.
-
----
 
 ## 20. Reproducibility Checklist
 

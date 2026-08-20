@@ -81,28 +81,7 @@ If TensorFlow/Keras is already configured on the machine, do **not** reinstall i
 
 ---
 
-## 2. Recommended Directory Structure
-
-A convenient project structure is:
-
-```text
-project/
-├── README.md
-├── code/
-│   ├── simulation.R
-│   ├── real_data.R
-│   └── visualization.R
-├── results/
-│   ├── tables/
-│   └── figures/
-└── data/
-```
-
-The supplied code can also be run as a single R script. For a clean replication package, however, it is recommended to separate the simulation, real-data, and visualization sections into individual files.
-
----
-
-## 3. Quick Start
+## 2. Quick Start
 
 After installing the required packages:
 
@@ -147,7 +126,7 @@ Baseline     : use_copula = FALSE, use_entanglement = FALSE
 
 ---
 
-## 4. Simulation Environment
+## 3. Simulation Environment
 
 The simulation uses a two-dimensional state space:
 
@@ -186,7 +165,7 @@ The episode terminates for an individual agent after reaching an obstacle or the
 
 ---
 
-## 5. State Representation
+## 4. State Representation
 
 Each two-dimensional state is transformed using a phase embedding:
 
@@ -227,7 +206,7 @@ for the baseline representation.
 
 ---
 
-## 6. Copula Transformation
+## 5. Copula Transformation
 
 The action dependence mechanism is implemented through a rank-based transformation:
 
@@ -258,7 +237,7 @@ use_copula = FALSE
 
 ---
 
-## 7. Actor and Critic Networks
+## 6. Actor and Critic Networks
 
 ### Actor
 
@@ -300,11 +279,11 @@ critic_lr = 0.001
 
 ---
 
-## 8. Reproducing the Three-Model Ablation Study
+## 7. Reproducing the Three-Model Ablation Study
 
 Run the following three configurations.
 
-### 8.1 Copula Model
+### 7.1 Copula Model
 
 ```r
 copula_runs <- lapply(1:10, function(s) {
@@ -316,7 +295,7 @@ copula_runs <- lapply(1:10, function(s) {
 })
 ```
 
-### 8.2 No-Copula Model
+### 7.2 No-Copula Model
 
 ```r
 nocopula_runs <- lapply(1:10, function(s) {
@@ -328,7 +307,7 @@ nocopula_runs <- lapply(1:10, function(s) {
 })
 ```
 
-### 8.3 Baseline Model
+### 7.3 Baseline Model
 
 ```r
 baseline_runs <- lapply(1:10, function(s) {
@@ -368,7 +347,7 @@ This produces the main model-comparison table containing the mean reward and sta
 
 ---
 
-## 9. Reward-Evolution Analysis
+## 8. Reward-Evolution Analysis
 
 The code records the shared reward at every simulation step.
 
@@ -403,7 +382,7 @@ The resulting figure is intended to show the evolution and stability of the thre
 
 ---
 
-## 10. Hyperparameter Sensitivity Analysis
+## 9. Hyperparameter Sensitivity Analysis
 
 The supplied simulation evaluates several actor learning rates:
 
@@ -436,7 +415,7 @@ and/or the number of repetitions inside `replicate()`.
 
 ---
 
-## 11. Trajectory and Coordination Analysis
+## 10. Trajectory and Coordination Analysis
 
 The trajectory version of the simulation is implemented through:
 
@@ -492,7 +471,7 @@ SD Coordination
 
 ---
 
-## 12. Chicago Crime Real-Data Demonstration
+## 11. Chicago Crime Real-Data Demonstration
 
 The real-data section downloads Chicago crime observations directly from the City of Chicago open-data endpoint.
 
@@ -525,7 +504,7 @@ If the external endpoint changes or becomes unavailable, download the data separ
 
 ---
 
-## 13. Geographic Rescaling
+## 12. Geographic Rescaling
 
 Longitude and latitude are transformed to the simulation scale `[0, 2]`:
 
@@ -543,7 +522,7 @@ These hotspots are determined from the observed crime locations rather than bein
 
 ---
 
-## 14. Real-Data Simulation
+## 13. Real-Data Simulation
 
 The real-data demonstration initializes six agents and runs the multi-agent simulation.
 
@@ -579,7 +558,7 @@ to display the results.
 
 ---
 
-## 15. Interactive Map
+## 14. Interactive Map
 
 The real-data analysis converts the simulated trajectories back to longitude/latitude coordinates using:
 
@@ -607,7 +586,7 @@ In RStudio, evaluating `map` should open/display the interactive Leaflet visuali
 
 ---
 
-## 16. Reproducibility
+## 15. Reproducibility
 
 For reproducible results, keep the following fixed:
 
@@ -636,7 +615,7 @@ For the real-data experiment, reproducibility also depends on the version and co
 
 ---
 
-## 17. Recommended Execution Order
+## 16. Recommended Execution Order
 
 For a complete replication, run the code in the following order:
 
@@ -718,7 +697,7 @@ map
 
 ---
 
-## 18. Computational Considerations
+## 17. Computational Considerations
 
 The experiments repeatedly train Keras/TensorFlow models inside simulation loops. Consequently, execution time depends strongly on:
 
@@ -751,7 +730,7 @@ After confirming that the code runs correctly, restore the manuscript settings b
 
 ---
 
-## 19. Troubleshooting
+## 18. Troubleshooting
 
 ### `could not find function "keras_model_sequential"`
 
@@ -805,7 +784,7 @@ Make sure the `leaflet` package is installed and that the code is being executed
 
 ---
 
-## 20. Notes on the Supplied Code
+## 19. Notes on the Supplied Code
 
 The supplied R source contains multiple versions of several functions and experiments, including multiple definitions of:
 
@@ -836,7 +815,7 @@ This avoids ambiguity about which parameter values and function definitions were
 
 ---
 
-## 21. Reproducibility Checklist
+## 20. Reproducibility Checklist
 
 Before submitting the replication package, verify:
 
@@ -856,7 +835,7 @@ Before submitting the replication package, verify:
 
 ---
 
-## 22. Citation and Attribution
+## 21. Citation and Attribution
 
 If you use this code or adapt the implementation for another study, please cite the associated manuscript and acknowledge the original data source when using the Chicago crime data.
 

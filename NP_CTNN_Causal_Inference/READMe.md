@@ -41,7 +41,7 @@ Change `N`, `P`, and `R` at the top of the script for the final simulation grid.
 
 The real-data analysis uses the **Criteo uplift dataset**.
 
-Place the downloaded CSV in the `02_Real_Data` directory and change:
+Place the downloaded CSV in the ` https://huggingface.co/datasets/criteo/criteo-uplift/blob/main/criteo-research-uplift-v2.1.csv.gz`:
 
 ```r
 CRITEO_FILE <- "criteo-uplift-v2.1.csv"

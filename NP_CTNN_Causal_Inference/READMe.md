@@ -33,8 +33,7 @@ The script produces:
 
 - `simulation_results.csv`
 - `simulation_summary.csv`
-- `Figure_1_ATE_Bias.png`
-- `Figure_2_PEHE.png`
+- `p_ate.png, p_bias.png, p_pehe.png, and p_policy.png`
 
 Change `N`, `P`, and `R` at the top of the script for the final simulation grid.
 

@@ -64,16 +64,17 @@ NP_CTNN_Causal_Inference/
 ## 1. Simulation Study
 
 The simulation study evaluates the performance of NP-CTNN under complex causal mechanisms featuring nonlinear treatment assignments, heterogeneous treatment effects (CATE), heteroskedasticity, and non-Gaussian dependence between potential outcomes via a shared-frailty structure.
-### Covariate Generation and Configurations
+
+## Covariate Generation and Configurations
 
 The covariates are generated from a multivariate normal distribution as
-\[
-\mathbf{X} \sim \mathcal{N}_p(\mathbf{0},\boldsymbol{\Sigma}),
+
+$$
+\mathbf{X} \sim \mathcal{N}_p(\mathbf{0}, \boldsymbol{\Sigma}),
 \qquad
 \Sigma_{jk} = 0.5^{|j-k|},
 \quad j,k=1,\ldots,p.
-\]
-
+$$
 **Primary Configuration:**
 * **Sample Size ($N$):** $10000$
 * **Covariates ($P$):** $50$

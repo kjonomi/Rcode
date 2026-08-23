@@ -13,9 +13,9 @@
 #   3. Causal Forest
 #
 # SIMULATION:
-#   N = 3000
+#   N = 100000
 #   P = 50
-#   R = 100
+#   R = 1000
 #
 # DATA GENERATING MECHANISM:
 #   - Correlated Gaussian covariates

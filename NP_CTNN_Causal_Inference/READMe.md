@@ -141,21 +141,9 @@ To evaluate estimation stability, the real-data pipeline runs across $30$ repeat
 
 ### Benchmarking (Empirical PEHE)
 
-Because counterfactual outcomes `Y(1)` and `Y(0)` are never simultaneously observable for an individual, a full-sample Causal Forest model ($\hat{\tau}_{\text{GRF}}(x)$) serves as the **empirical benchmark CATE**:
+Because counterfactual outcomes `Y(1)` and `Y(0)` are never simultaneously observable for an individual, a full-sample Causal Forest model ($\hat{\tau}_{\mathrm{GRF}}(x)$) serves as the **empirical benchmark CATE**.
 
-$$
-\text{PEHE}_{\text{GRF}}
-=
-\left[
-\frac{1}{n_{\text{test}}}
-\sum_{i \in \mathcal{I}_{\text{test}}}
-\left\{
-\hat{\tau}(X_i)
--
-\hat{\tau}_{\text{GRF}}(X_i)
-\right\}^{2}
-\right]^{1/2}.
-$$
+$$\mathrm{PEHE}_{\mathrm{GRF}} = \left[\frac{1}{n_{\mathrm{test}}}\sum_{i\in I_{\mathrm{test}}}\left(\hat{\tau}(X_i)-\hat{\tau}_{\mathrm{GRF}}(X_i)\right)^2\right]^{1/2}$$
 
 > **Note:** Performance metrics referencing PEHE should be interpreted strictly as *benchmark PEHE* relative to the empirical Causal Forest benchmark, rather than true ground-truth PEHE.
 

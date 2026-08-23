@@ -15,7 +15,7 @@
 # SIMULATION:
 #   N = 100000
 #   P = 50
-#   R = 1000
+#   R = 100
 #
 # DATA GENERATING MECHANISM:
 #   - Correlated Gaussian covariates
@@ -98,7 +98,7 @@ N <- 10000
 
 P <- 50
 
-R <- 1000
+R <- 100
 
 TRAIN_PROP <- 0.70
 

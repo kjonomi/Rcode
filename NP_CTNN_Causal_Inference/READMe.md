@@ -67,6 +67,8 @@ The simulation study evaluates the performance of NP-CTNN under complex causal m
 
 ## Covariate Generation and Configurations
 
+[Covariate Generation and Configurations](https://github.com/kjonomi/Rcode/blob/main/NP_CTNN_Causal_Inference/README.md#covariate-generation-and-configurations)
+
 The covariates are generated from a multivariate normal distribution as
 
 $$
@@ -75,11 +77,13 @@ $$
 \Sigma_{jk} = 0.5^{|j-k|},
 \quad j,k=1,\ldots,p.
 $$
-**Primary Configuration:**
-* **Sample Size ($N$):** $10000$
-* **Covariates ($P$):** $50$
-* **Monte Carlo Replications ($R$):** $100$
 
+**Primary Configuration:**
+
+- **Sample Size (`N`):** `10000`
+- **Covariates (`P`):** `50`
+- **Monte Carlo Replications (`R`):** `100`
+  
 ### Methods Evaluated
 1. **NP-CTNN** (Proposed)
 2. **Neural S-learner**

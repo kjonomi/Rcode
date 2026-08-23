@@ -81,7 +81,7 @@ tf$random$set_seed(20260822L)
 ############################################################
 
 # Number of repeated train-test replications
-N_REP <- 3
+N_REP <- 30
 
 # Training proportion
 TRAIN_PROP <- 0.70

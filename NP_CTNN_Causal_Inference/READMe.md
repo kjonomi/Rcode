@@ -139,12 +139,25 @@ To evaluate estimation stability, the real-data pipeline runs across $30$ repeat
 | **NP-CTNN & S-learner** | `Epochs`: 40 \| `Batch Size`: 128 \| `Patience`: 5 \| `Learning Rate`: 0.001 |
 | **Causal Forest** | `Trees`: 300 \| `Min Node Size`: 10 |
 
-### CATE Benchmarking (Empirical PEHE)
-Because counterfactual outcomes $Y(1)$ and $Y(0)$ are never simultaneously observable for an individual, a full-sample Causal Forest model ($\hat{\tau}_{\text{GRF}}(x)$) serves as the **empirical benchmark CATE**:
+### Benchmarking (Empirical PEHE)
 
-$$\text{PEHE}_{\text{GRF}} = \left[ \frac{1}{n_{\text{test}}} \sum_{i \in \mathcal{I}_{\text{test}}} \left\{ \hat{\tau}(X_i) - \hat{\tau}_{\text{GRF}}(X_i) \right\}^2 \right]^{1/2}$$
+Because counterfactual outcomes `Y(1)` and `Y(0)` are never simultaneously observable for an individual, a full-sample Causal Forest model ($\hat{\tau}_{\text{GRF}}(x)$) serves as the **empirical benchmark CATE**:
 
-> **Note:** Performance metrics referencing PEHE should be interpreted strictly as *benchmark PEHE* relative to the empirical benchmark, rather than true ground-truth PEHE.
+$$
+\text{PEHE}_{\text{GRF}}
+=
+\left[
+\frac{1}{n_{\text{test}}}
+\sum_{i \in \mathcal{I}_{\text{test}}}
+\left\{
+\hat{\tau}(X_i)
+-
+\hat{\tau}_{\text{GRF}}(X_i)
+\right\}^{2}
+\right]^{1/2}.
+$$
+
+> **Note:** Performance metrics referencing PEHE should be interpreted strictly as *benchmark PEHE* relative to the empirical Causal Forest benchmark, rather than true ground-truth PEHE.
 
 ### Treatment Policy Evaluation
 Policy value is evaluated on test sets using Inverse Propensity Weighting (IPW):

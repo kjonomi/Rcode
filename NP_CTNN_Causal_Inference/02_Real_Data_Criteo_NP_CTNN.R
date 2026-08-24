@@ -132,7 +132,7 @@ cat(
 
 set.seed(SEED_BASE)
 
-N_SAMPLE <- 50000
+N_SAMPLE <- 100000
 
 if (nrow(dat) > N_SAMPLE) {
 

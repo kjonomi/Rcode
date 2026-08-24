@@ -81,7 +81,7 @@ tf$random$set_seed(20260822L)
 ############################################################
 
 # Number of repeated train-test replications
-N_REP <- 30
+N_REP <- 100
 
 # Training proportion
 TRAIN_PROP <- 0.70
@@ -121,7 +121,39 @@ dat <- fread(
 )
 
 cat(
-  "Rows:",
+  "Original rows:",
+  nrow(dat),
+  "\n"
+)
+
+############################################################
+# DOWNSAMPLE TO 10,000 OBSERVATIONS
+############################################################
+
+set.seed(SEED_BASE)
+
+N_SAMPLE <- 10000
+
+if (nrow(dat) > N_SAMPLE) {
+
+  dat <- dat[
+    sample(.N, N_SAMPLE)
+  ]
+
+} else {
+
+  warning(
+    paste(
+      "Dataset contains only",
+      nrow(dat),
+      "observations; no downsampling performed."
+    )
+  )
+
+}
+
+cat(
+  "Rows after downsampling:",
   nrow(dat),
   "\n"
 )
@@ -2022,12 +2054,12 @@ results_list <- vector(
 
 
 ############################################################
-# 27. RUN 30 REPLICATIONS
+# 27. RUN 100 REPLICATIONS
 ############################################################
 
 cat("\n")
 cat("============================================================\n")
-cat("STARTING CRITEO NP-CTNN ANALYSIS\n")
+cat("STARTING CRITEO NP-CTNN ANALYSIS (100 REPLICATIONS)\n")
 cat("============================================================\n")
 
 
@@ -2479,7 +2511,7 @@ write.csv(
 
   results,
 
-  "criteo_np_ctnn_tensor_results_30_replications.csv",
+  "criteo_np_ctnn_tensor_results_100_replications.csv",
 
   row.names = FALSE
 
@@ -2671,7 +2703,7 @@ write.csv(
 
   publication_table,
 
-  "criteo_np_ctnn_tensor_summary_30_replications.csv",
+  "criteo_np_ctnn_tensor_summary_100_replications.csv",
 
   row.names = FALSE
 
@@ -2737,7 +2769,7 @@ p_ate <- ggplot(
   labs(
 
     title =
-      "ATE Estimates Across 30 Criteo Replications",
+      "ATE Estimates Across 100 Criteo Replications",
 
     subtitle =
       "Dashed line represents the full-sample GRF benchmark ATE",
@@ -2849,7 +2881,7 @@ p_bias <- ggplot(
   labs(
 
     title =
-      "Distribution of ATE Bias Across 30 Criteo Replications",
+      "Distribution of ATE Bias Across 100 Criteo Replications",
 
     subtitle =
       "Bias relative to the full-sample GRF benchmark",
@@ -2945,7 +2977,7 @@ p_pehe <- ggplot(
   labs(
 
     title =
-      "Distribution of CATE Benchmark Error Across 30 Criteo Replications",
+      "Distribution of CATE Benchmark Error Across 100 Criteo Replications",
 
     subtitle =
       "PEHE relative to the full-sample GRF CATE benchmark",
@@ -3041,7 +3073,7 @@ p_policy <- ggplot(
   labs(
 
     title =
-      "Distribution of Policy Value Across 30 Criteo Replications",
+      "Distribution of Policy Value Across 100 Criteo Replications",
 
     subtitle =
       "IPW policy value under the estimated treatment policy",
@@ -3262,11 +3294,11 @@ cat("\n")
 cat("Output files:\n")
 
 cat(
-  "  criteo_np_ctnn_tensor_results_30_replications.csv\n"
+  "  criteo_np_ctnn_tensor_results_100_replications.csv\n"
 )
 
 cat(
-  "  criteo_np_ctnn_tensor_summary_30_replications.csv\n"
+  "  criteo_np_ctnn_tensor_summary_100_replications.csv\n"
 )
 
 cat(

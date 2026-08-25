@@ -1,31 +1,74 @@
 ################################################################################
-# CRITEO UPLIFT DATA
-# NP-CTNN vs Neural S-Learner vs Causal Forest
+# 02_REAL_DATA_CRITEO_NP_CTNN_TENSOR.R
 #
-# Updated version
+# NONPARAMETRIC COPULA-TENSOR NEURAL NETWORK
+# FOR THE CRITEO UPLIFT DATA
 #
-# 1. NP-CTNN:
-#       - empirical copula transformation
-#       - tensor representation
-#       - Conv1D architecture
+# METHODS:
+#   1. NP-CTNN
+#   2. Neural S-Learner
+#   3. Causal Forest
 #
-# 2. Neural S-learner
+# REAL DATA:
+#   Criteo Uplift Dataset
 #
-# 3. Causal Forest
+# COVARIATES:
+#   f0 - f11
+#
+# TREATMENT:
+#   treatment
+#
+# OUTCOME:
+#   conversion
+#
+# ADDITIONAL COLUMNS:
+#   visit
+#   exposure
+#
+# NP-CTNN REPRESENTATION:
+#
+#   Z_i in R^(12 x 4)
+#
+#   Channel 1 = standardized covariates X*
+#   Channel 2 = empirical copula features U
+#   Channel 3 = treatment T
+#   Channel 4 = treatment x copula interaction T*U
+#
+# Therefore:
+#
+#   Individual tensor = 12 x 4
+#   Training tensor   = n_train x 12 x 4
+#   Test tensor       = n_test  x 12 x 4
 #
 # IMPORTANT:
-# Criteo does not provide observed individual potential outcomes.
-# The full-sample GRF is therefore used only as an empirical benchmark.
 #
-# Major preprocessing rules:
-#   - Explicit 70/15/15 train/validation/test split
-#   - Training-only imputation
-#   - Training-only standardization
-#   - Training-only empirical copula fitting
-#   - Training-only copula centering/scaling
-#   - Same test sets for all three methods
-#   - Same full-sample GRF benchmark
-#   - Keras 3 predictions converted using as.array()
+# Unlike the simulation study, the Criteo data do NOT contain the true
+# individual treatment effect tau(X).
+#
+# Therefore:
+#
+#   - Causal Forest is used as a reference CATE benchmark.
+#   - Reference ATE = mean(Causal Forest CATE)
+#   - NP-CTNN and Neural S-learner are compared with this benchmark.
+#
+# POLICY VALUE:
+#
+#   IPW policy value using the randomized treatment probability estimated
+#   from the training data.
+#
+# OUTPUT:
+#
+#   criteo_np_ctnn_tensor_results_30_replications.csv
+#   criteo_np_ctnn_tensor_summary_30_replications.csv
+#
+# FIGURES:
+#
+#   Figure1_Criteo_NP_CTNN_Tensor_ATE.png
+#   Figure2_Criteo_NP_CTNN_Tensor_CATE.png
+#   Figure3_Criteo_NP_CTNN_Tensor_PolicyValue.png
+#   Figure4_Criteo_NP_CTNN_Tensor_PositiveCATE.png
+#   Figure5_Criteo_NP_CTNN_Tensor_ATE_SD.png
+#
 ################################################################################
 
 
@@ -50,7 +93,7 @@ suppressPackageStartupMessages({
 # 2. ENVIRONMENT
 ############################################################
 
-# Disable GPU
+# CPU only
 Sys.setenv(
   CUDA_VISIBLE_DEVICES = "-1"
 )
@@ -69,56 +112,140 @@ tf$random$set_seed(
 # 3. SETTINGS
 ############################################################
 
-N_REP <- 100
+DATA_FILE <-
+  "criteo-research-uplift-v2.1.csv.gz"
+
+
+############################################################
+# REAL-DATA SAMPLE SIZE
+############################################################
+
+N_DATA <- 50000
+
+
+############################################################
+# NUMBER OF REPLICATIONS
+############################################################
+
+R <- 30
+
+
+############################################################
+# TRAIN / VALIDATION / TEST
+############################################################
 
 TRAIN_PROP <- 0.70
+
 VALID_PROP <- 0.15
-TEST_PROP  <- 0.15
 
-SEED_BASE <- 20260822
-
-N_SAMPLE <- 100000
-
-
-############################################################
-# CAUSAL FOREST SETTINGS
-############################################################
-
-NUM_TREES <- 100
-
-MIN_NODE_SIZE <- 10
+TEST_PROP <-
+  1 -
+  TRAIN_PROP -
+  VALID_PROP
 
 
 ############################################################
-# NEURAL NETWORK SETTINGS
+# SEED
 ############################################################
 
-NN_EPOCHS <- 60
-
-NN_BATCH_SIZE <- 128
-
-NN_PATIENCE <- 8
-
-NN_LEARNING_RATE <- 0.0005
+SEED_BASE <-
+  20260822
 
 
 ############################################################
-# NP-CTNN ARCHITECTURE
+# COVARIATES
 ############################################################
 
-CTNN_FILTERS_1 <- 48
+X_NAMES <-
+  paste0(
+    "f",
+    0:11
+  )
 
-CTNN_FILTERS_2 <- 48
 
-CTNN_DENSE_1 <- 64
-
-CTNN_DENSE_2 <- 32
-
-CTNN_DROPOUT <- 0.10
+P <- length(
+  X_NAMES
+)
 
 
 ############################################################
-# 4. LOAD DATA
+# OUTCOME / TREATMENT
+############################################################
+
+OUTCOME_NAME <-
+  "conversion"
+
+TREATMENT_NAME <-
+  "treatment"
+
+
+############################################################
+# NEURAL NETWORK
+############################################################
+
+NN_EPOCHS <-
+  40
+
+NN_BATCH_SIZE <-
+  128
+
+NN_PATIENCE <-
+  5
+
+NN_LEARNING_RATE <-
+  0.001
+
+
+############################################################
+# CAUSAL FOREST
+############################################################
+
+NUM_TREES <-
+  300
+
+MIN_NODE_SIZE <-
+  10
+
+
+############################################################
+# TENSOR CHANNELS
+############################################################
+
+N_CHANNELS <-
+  4
+
+
+############################################################
+# POLICY PROPENSITY FLOOR
+############################################################
+
+PROPENSITY_FLOOR <-
+  0.05
+
+
+############################################################
+# 4. CHECK DATA FILE
+############################################################
+
+if (
+  !file.exists(DATA_FILE)
+) {
+
+  stop(
+    paste0(
+      "\nData file not found:\n",
+      DATA_FILE,
+      "\n\nPlace the Criteo file in the working directory:\n",
+      getwd(),
+      "\n"
+    )
+  )
+
+}
+
+
+############################################################
+# 5. LOAD CRITEO DATA
 ############################################################
 
 cat("\n")
@@ -126,95 +253,55 @@ cat("============================================================\n")
 cat("LOADING CRITEO UPLIFT DATA\n")
 cat("============================================================\n")
 
-dat <- fread(
-  "criteo-research-uplift-v2.1.csv.gz"
-)
 
-cat(
-  "Original rows:",
-  nrow(dat),
-  "\n"
-)
-
-
-############################################################
-# RANDOM DOWNSAMPLING
-############################################################
-
-set.seed(
-  SEED_BASE
-)
-
-if (
-  nrow(dat) > N_SAMPLE
-) {
-
-  dat <- dat[
-    sample(.N, N_SAMPLE)
-  ]
-
-} else {
-
-  warning(
-    paste(
-      "Dataset contains only",
-      nrow(dat),
-      "observations; no downsampling performed."
-    )
+criteo_raw <-
+  fread(
+    DATA_FILE
   )
 
-}
-
 
 cat(
-  "Rows after downsampling:",
-  nrow(dat),
+  "Original observations:",
+  nrow(criteo_raw),
   "\n"
 )
 
+
 cat(
-  "Columns:",
-  ncol(dat),
+  "Original variables:",
+  ncol(criteo_raw),
   "\n"
 )
 
 
 ############################################################
-# 5. VARIABLES
+# 6. CHECK REQUIRED VARIABLES
 ############################################################
 
-covariate_names <- paste0(
-  "f",
-  0:11
-)
-
-treatment_name <- "treatment"
-
-outcome_name <- "conversion"
+required_columns <-
+  c(
+    X_NAMES,
+    TREATMENT_NAME,
+    OUTCOME_NAME
+  )
 
 
-required_variables <- c(
-  covariate_names,
-  treatment_name,
-  outcome_name
-)
-
-
-missing_variables <- setdiff(
-  required_variables,
-  names(dat)
-)
+missing_columns <-
+  setdiff(
+    required_columns,
+    names(criteo_raw)
+  )
 
 
 if (
-  length(missing_variables) > 0
+  length(missing_columns) > 0
 ) {
 
   stop(
     paste(
-      "Missing variables:",
+      "Missing required columns:",
       paste(
-        missing_variables,
+        missing_columns,
         collapse = ", "
       )
     )
@@ -224,128 +311,188 @@ if (
 
 
 ############################################################
-# 6. ANALYSIS DATA
+# 7. SELECT VARIABLES
 ############################################################
 
-analysis_dat <- dat[
-  ,
-  c(
-    covariate_names,
-    treatment_name,
-    outcome_name
-  ),
-  with = FALSE
-]
-
-
-############################################################
-# Remove invalid treatment/outcome observations
-############################################################
-
-analysis_dat <- analysis_dat[
-  is.finite(
-    analysis_dat[[treatment_name]]
-  ) &
-    is.finite(
-      analysis_dat[[outcome_name]]
-    )
-]
+criteo <-
+  criteo_raw[
+    ,
+    c(
+      X_NAMES,
+      TREATMENT_NAME,
+      OUTCOME_NAME
+    ),
+    with = FALSE
+  ]
 
 
 ############################################################
-# Treatment and outcome
+# 8. NUMERIC CONVERSION
 ############################################################
 
-T <- as.numeric(
-  analysis_dat[[treatment_name]]
-)
-
-Y <- as.numeric(
-  analysis_dat[[outcome_name]]
-)
-
-
-############################################################
-# Treatment check
-############################################################
-
-if (
-  !all(
-    sort(
-      unique(T)
-    ) %in% c(0, 1)
-  )
+for (
+  v in X_NAMES
 ) {
 
-  stop(
-    "Treatment must be coded 0/1."
+  criteo[
+    ,
+    (v) := as.numeric(
+      get(v)
+    )
+  ]
+
+}
+
+
+criteo[
+  ,
+  treatment := as.numeric(
+    treatment
   )
+]
+
+
+criteo[
+  ,
+  conversion := as.numeric(
+    conversion
+  )
+]
+
+
+############################################################
+# 9. REMOVE INVALID TREATMENT / OUTCOME
+############################################################
+
+criteo <-
+  criteo[
+    is.finite(treatment) &
+    is.finite(conversion)
+  ]
+
+
+############################################################
+# 10. CONVERT BINARY VARIABLES
+############################################################
+
+criteo[
+  ,
+  treatment := ifelse(
+    treatment > 0,
+    1,
+    0
+  )
+]
+
+
+criteo[
+  ,
+  conversion := ifelse(
+    conversion > 0,
+    1,
+    0
+  )
+]
+
+
+############################################################
+# 11. REMOVE DUPLICATE / INVALID OBSERVATIONS
+############################################################
+
+criteo <-
+  criteo[
+    is.finite(treatment) &
+    is.finite(conversion)
+  ]
+
+
+############################################################
+# 12. RANDOM SAMPLE
+############################################################
+
+set.seed(
+  SEED_BASE
+)
+
+
+if (
+  nrow(criteo) > N_DATA
+) {
+
+  sample_index <-
+    sample(
+      seq_len(
+        nrow(criteo)
+      ),
+      size = N_DATA,
+      replace = FALSE
+    )
+
+  criteo <-
+    criteo[
+      sample_index
+    ]
 
 }
 
 
 ############################################################
-# Covariate matrix
-############################################################
-
-X <- as.matrix(
-  analysis_dat[
-    ,
-    covariate_names,
-    with = FALSE
-  ]
-)
-
-storage.mode(X) <- "double"
-
-
-n <- nrow(X)
-
-p <- ncol(X)
-
-
-############################################################
-# DATA SUMMARY
+# 13. DATA SUMMARY
 ############################################################
 
 cat("\n")
 cat("============================================================\n")
-cat("CRITEO ANALYSIS DATA\n")
+cat("CRITEO DATA SUMMARY\n")
 cat("============================================================\n")
 
+
 cat(
-  "Observations:",
-  n,
+  "Analysis observations:",
+  nrow(criteo),
   "\n"
 )
+
 
 cat(
   "Covariates:",
-  p,
+  P,
   "\n"
 )
+
 
 cat(
   "Treatment rate:",
   round(
-    mean(T),
+    mean(criteo$treatment),
+    4
+  ),
+  "\n"
+)
+
+
+cat(
+  "Conversion rate:",
+  round(
+    mean(criteo$conversion),
     6
   ),
   "\n"
 )
 
+
 cat(
-  "Conversion rate:",
-  round(
-    mean(Y),
-    6
+  "Tensor dimension:",
+  paste(
+    P,
+    "x",
+    N_CHANNELS
   ),
   "\n"
 )
 
 
 ############################################################
-# 7. IMPUTATION
+# 14. IMPUTATION
 ############################################################
 
 impute_train_test <- function(
@@ -353,22 +500,26 @@ impute_train_test <- function(
     Xte
 ) {
 
-  Xtr <- as.matrix(
+  Xtr <-
+    as.matrix(
+      Xtr
+    )
+
+  Xte <-
+    as.matrix(
+      Xte
+    )
+
+
+  storage.mode(
     Xtr
-  )
+  ) <- "double"
 
-  Xte <- as.matrix(
+
+  storage.mode(
     Xte
-  )
+  ) <- "double"
 
-  storage.mode(Xtr) <- "double"
-
-  storage.mode(Xte) <- "double"
-
-
-  ##########################################################
-  # Training-derived median imputation
-  ##########################################################
 
   for (
     j in seq_len(
@@ -376,35 +527,47 @@ impute_train_test <- function(
     )
   ) {
 
-    trj <- Xtr[, j]
+    bad_tr <-
+      !is.finite(
+        Xtr[, j]
+      )
 
-    trj[
-      !is.finite(trj)
-    ] <- NA
+    bad_te <-
+      !is.finite(
+        Xte[, j]
+      )
 
 
-    med_j <- median(
-      trj,
-      na.rm = TRUE
-    )
+    valid_tr <-
+      Xtr[
+        !bad_tr,
+        j
+      ]
 
 
     if (
-      !is.finite(med_j)
+      length(valid_tr) == 0
     ) {
 
       med_j <- 0
 
+    } else {
+
+      med_j <-
+        median(
+          valid_tr,
+          na.rm = TRUE
+        )
+
+      if (
+        !is.finite(med_j)
+      ) {
+
+        med_j <- 0
+
+      }
+
     }
-
-
-    bad_tr <- !is.finite(
-      Xtr[, j]
-    )
-
-    bad_te <- !is.finite(
-      Xte[, j]
-    )
 
 
     Xtr[
@@ -430,28 +593,39 @@ impute_train_test <- function(
 
 
 ############################################################
-# 8. STANDARDIZATION
+# 15. STANDARDIZATION
 ############################################################
 
-fit_standardizer <- function(
-    Xtr
+standardize_train_test <- function(
+    Xtr,
+    Xte
 ) {
 
-  Xtr <- as.matrix(
-    Xtr
-  )
+  Xtr <-
+    as.matrix(
+      Xtr
+    )
 
-  center <- apply(
-    Xtr,
-    2,
-    mean
-  )
+  Xte <-
+    as.matrix(
+      Xte
+    )
 
-  scalev <- apply(
-    Xtr,
-    2,
-    sd
-  )
+
+  center <-
+    apply(
+      Xtr,
+      2,
+      mean
+    )
+
+
+  scalev <-
+    apply(
+      Xtr,
+      2,
+      sd
+    )
 
 
   center[
@@ -461,11 +635,59 @@ fit_standardizer <- function(
 
   scalev[
     !is.finite(scalev) |
-      scalev < 1e-8
+    scalev < 1e-8
   ] <- 1
 
 
+  Xtr_s <-
+    sweep(
+      Xtr,
+      2,
+      center,
+      "-"
+    )
+
+
+  Xtr_s <-
+    sweep(
+      Xtr_s,
+      2,
+      scalev,
+      "/"
+    )
+
+
+  Xte_s <-
+    sweep(
+      Xte,
+      2,
+      center,
+      "-"
+    )
+
+
+  Xte_s <-
+    sweep(
+      Xte_s,
+      2,
+      scalev,
+      "/"
+    )
+
+
+  storage.mode(
+    Xtr_s
+  ) <- "double"
+
+
+  storage.mode(
+    Xte_s
+  ) <- "double"
+
+
   list(
+    Xtr = Xtr_s,
+    Xte = Xte_s,
     center = center,
     scale = scalev
   )
@@ -474,84 +696,38 @@ fit_standardizer <- function(
 
 
 ############################################################
-# APPLY STANDARDIZATION
-############################################################
-
-apply_standardizer <- function(
-    X,
-    fit
-) {
-
-  X <- as.matrix(
-    X
-  )
-
-  Z <- sweep(
-    X,
-    2,
-    fit$center,
-    "-"
-  )
-
-  Z <- sweep(
-    Z,
-    2,
-    fit$scale,
-    "/"
-  )
-
-  storage.mode(Z) <- "double"
-
-  Z
-
-}
-
-
-############################################################
-# 9. EMPIRICAL COPULA FIT
-############################################################
-#
-# IMPORTANT:
-#
-# Everything below is estimated from TRAINING DATA ONLY.
-#
-#   1. Training means
-#   2. Training SDs
-#   3. Training empirical distributions
-#   4. Training Gaussianized copula means
-#   5. Training Gaussianized copula SDs
-#
-# These quantities are then frozen and applied to validation
-# and test observations.
-#
+# 16. EMPIRICAL COPULA FIT
 ############################################################
 
 empirical_copula_fit <- function(
     X_train
 ) {
 
-  X_train <- as.matrix(
+  X_train <-
+    as.matrix(
+      X_train
+    )
+
+
+  storage.mode(
     X_train
-  )
-
-  storage.mode(X_train) <- "double"
+  ) <- "double"
 
 
-  ##########################################################
-  # Training standardization
-  ##########################################################
+  center <-
+    apply(
+      X_train,
+      2,
+      mean
+    )
 
-  center <- apply(
-    X_train,
-    2,
-    mean
-  )
 
-  scalev <- apply(
-    X_train,
-    2,
-    sd
-  )
+  scalev <-
+    apply(
+      X_train,
+      2,
+      sd
+    )
 
 
   center[
@@ -561,173 +737,21 @@ empirical_copula_fit <- function(
 
   scalev[
     !is.finite(scalev) |
-      scalev < 1e-8
+    scalev < 1e-8
   ] <- 1
 
-
-  ##########################################################
-  # Standardized training covariates
-  ##########################################################
-
-  Z_train <- sweep(
-    X_train,
-    2,
-    center,
-    "-"
-  )
-
-  Z_train <- sweep(
-    Z_train,
-    2,
-    scalev,
-    "/"
-  )
-
-
-  ##########################################################
-  # Sorted training empirical distributions
-  ##########################################################
-
-  train_sorted <- lapply(
-    seq_len(
-      ncol(Z_train)
-    ),
-    function(j) {
-
-      sort(
-        Z_train[, j]
-      )
-
-    }
-  )
-
-
-  ##########################################################
-  # Gaussianized training copula variables
-  ##########################################################
-
-  n_train <- nrow(
-    Z_train
-  )
-
-
-  U_train <- matrix(
-    NA_real_,
-    nrow = n_train,
-    ncol = ncol(Z_train)
-  )
-
-
-  for (
-    j in seq_len(
-      ncol(Z_train)
-    )
-  ) {
-
-    ########################################################
-    # Empirical rank
-    ########################################################
-
-    u <- (
-      rank(
-        Z_train[, j],
-        ties.method = "average"
-      ) - 0.5
-    ) / n_train
-
-
-    ########################################################
-    # Numerical protection
-    ########################################################
-
-    u <- pmin(
-      pmax(
-        u,
-        1e-5
-      ),
-      1 - 1e-5
-    )
-
-
-    ########################################################
-    # Gaussian copula transformation
-    ########################################################
-
-    U_train[, j] <- qnorm(
-      u
-    )
-
-  }
-
-
-  ##########################################################
-  # Training copula mean
-  ##########################################################
-
-  U_center <- colMeans(
-    U_train
-  )
-
-
-  ##########################################################
-  # Training copula SD
-  ##########################################################
-
-  U_scale <- apply(
-    U_train,
-    2,
-    sd
-  )
-
-
-  U_center[
-    !is.finite(U_center)
-  ] <- 0
-
-
-  U_scale[
-    !is.finite(U_scale) |
-      U_scale < 1e-8
-  ] <- 1
-
-
-  ##########################################################
-  # Return fitted copula object
-  ##########################################################
 
   list(
-
     center = center,
-
     scale = scalev,
-
-    train_Z = Z_train,
-
-    train_sorted = train_sorted,
-
-    U_center = U_center,
-
-    U_scale = U_scale
-
+    X_train = X_train
   )
 
 }
 
 
 ############################################################
-# 10. EMPIRICAL COPULA TRANSFORMATION
-############################################################
-#
-# Uses ONLY the empirical distribution learned from training.
-#
-# No validation/test information is used to estimate:
-#
-#   - location
-#   - scale
-#   - empirical CDF
-#   - copula mean
-#   - copula SD
-#
+# 17. EMPIRICAL COPULA TRANSFORMATION
 ############################################################
 
 empirical_copula_transform <- function(
@@ -735,46 +759,68 @@ empirical_copula_transform <- function(
     fit
 ) {
 
-  X <- as.matrix(
+  X <-
+    as.matrix(
+      X
+    )
+
+
+  storage.mode(
     X
-  )
-
-  storage.mode(X) <- "double"
+  ) <- "double"
 
 
   ##########################################################
-  # Apply training standardization
+  # STANDARDIZE
   ##########################################################
 
-  Z <- sweep(
-    X,
-    2,
-    fit$center,
-    "-"
-  )
+  Z <-
+    sweep(
+      X,
+      2,
+      fit$center,
+      "-"
+    )
 
-  Z <- sweep(
-    Z,
-    2,
-    fit$scale,
-    "/"
-  )
+
+  Z <-
+    sweep(
+      Z,
+      2,
+      fit$scale,
+      "/"
+    )
+
+
+  Z_train <-
+    sweep(
+      fit$X_train,
+      2,
+      fit$center,
+      "-"
+    )
+
+
+  Z_train <-
+    sweep(
+      Z_train,
+      2,
+      fit$scale,
+      "/"
+    )
 
 
   ##########################################################
-  # Initialize copula matrix
+  # EMPIRICAL CDF
   ##########################################################
 
-  U <- matrix(
-    NA_real_,
-    nrow = nrow(Z),
-    ncol = ncol(Z)
-  )
+  U <-
+    matrix(
+      0,
+      nrow = nrow(Z),
+      ncol = ncol(Z)
+    )
 
-
-  ##########################################################
-  # Empirical CDF transformation
-  ##########################################################
 
   for (
     j in seq_len(
@@ -782,94 +828,164 @@ empirical_copula_transform <- function(
     )
   ) {
 
-    train_z <- fit$train_sorted[[j]]
-
-    n_train <- length(
-      train_z
-    )
-
-
-    ########################################################
-    # Find location in training empirical distribution
-    ########################################################
-
-    idx <- findInterval(
-      Z[, j],
-      train_z,
-      all.inside = TRUE
-    )
-
-
-    idx <- pmax(
-      1L,
-      pmin(
-        idx,
-        n_train
+    train_sorted <-
+      sort(
+        Z_train[, j]
       )
-    )
 
 
-    ########################################################
-    # Convert empirical CDF to pseudo-observation
-    ########################################################
-
-    u <- (
-      idx - 0.5
-    ) / n_train
+    n_train <-
+      length(
+        train_sorted
+      )
 
 
-    ########################################################
-    # Avoid qnorm(0) and qnorm(1)
-    ########################################################
+    U[, j] <-
+      findInterval(
+        Z[, j],
+        train_sorted
+      ) /
+      (
+        n_train + 1
+      )
 
-    u <- pmin(
+  }
+
+
+  ##########################################################
+  # PROTECTION
+  ##########################################################
+
+  U <-
+    pmin(
       pmax(
-        u,
+        U,
         1e-5
       ),
       1 - 1e-5
     )
 
 
-    ########################################################
-    # Gaussian copula transformation
-    ########################################################
+  ##########################################################
+  # GAUSSIAN COPULA SCALE
+  ##########################################################
 
-    U[, j] <- qnorm(
-      u
+  U <-
+    qnorm(
+      U
     )
+
+
+  ##########################################################
+  # TRAINING COPULA FEATURES
+  ##########################################################
+
+  U_train <-
+    matrix(
+      0,
+      nrow = nrow(Z_train),
+      ncol = ncol(Z_train)
+    )
+
+
+  for (
+    j in seq_len(
+      ncol(Z_train)
+    )
+  ) {
+
+    train_sorted <-
+      sort(
+        Z_train[, j]
+      )
+
+
+    n_train <-
+      length(
+        train_sorted
+      )
+
+
+    U_train[, j] <-
+      findInterval(
+        Z_train[, j],
+        train_sorted
+      ) /
+      (
+        n_train + 1
+      )
 
   }
 
 
+  U_train <-
+    pmin(
+      pmax(
+        U_train,
+        1e-5
+      ),
+      1 - 1e-5
+    )
+
+
+  U_train <-
+    qnorm(
+      U_train
+    )
+
+
   ##########################################################
-  # IMPORTANT:
-  # Standardize using TRAINING copula parameters.
-  #
-  # This replaces the problematic code:
-  #
-  # colMeans(qnorm(...))
-  #
-  # which attempted to calculate column means of a vector.
+  # STANDARDIZE COPULA FEATURES
   ##########################################################
 
-  U <- sweep(
-    U,
-    2,
-    fit$U_center,
-    "-"
-  )
+  cop_center <-
+    apply(
+      U_train,
+      2,
+      mean
+    )
 
 
-  U <- sweep(
-    U,
-    2,
-    fit$U_scale,
-    "/"
-  )
+  cop_scale <-
+    apply(
+      U_train,
+      2,
+      sd
+    )
 
 
-  storage.mode(U) <- "double"
+  cop_center[
+    !is.finite(cop_center)
+  ] <- 0
+
+
+  cop_scale[
+    !is.finite(cop_scale) |
+    cop_scale < 1e-8
+  ] <- 1
+
+
+  U <-
+    sweep(
+      U,
+      2,
+      cop_center,
+      "-"
+    )
+
+
+  U <-
+    sweep(
+      U,
+      2,
+      cop_scale,
+      "/"
+    )
+
+
+  storage.mode(
+    U
+  ) <- "double"
 
 
   U
@@ -878,14 +994,7 @@ empirical_copula_transform <- function(
 
 
 ############################################################
-# 11. TENSOR REPRESENTATION
-############################################################
-#
-# Channel 1 = standardized X
-# Channel 2 = Gaussianized empirical copula U
-# Channel 3 = treatment T
-# Channel 4 = treatment x copula U
-#
+# 18. LITERAL CTNN TENSOR
 ############################################################
 
 make_ctnn_tensor <- function(
@@ -894,35 +1003,33 @@ make_ctnn_tensor <- function(
     T
 ) {
 
-  X_std <- as.matrix(
-    X_std
-  )
+  X_std <-
+    as.matrix(
+      X_std
+    )
 
-  U <- as.matrix(
-    U
-  )
+  U <-
+    as.matrix(
+      U
+    )
 
-  T <- as.numeric(
-    T
-  )
-
-
-  n_obs <- nrow(
-    X_std
-  )
-
-  p_cov <- ncol(
-    X_std
-  )
+  T <-
+    as.numeric(
+      T
+    )
 
 
-  ##########################################################
-  # Dimension checks
-  ##########################################################
+  n_obs <-
+    nrow(X_std)
+
+
+  p_cov <-
+    ncol(X_std)
+
 
   if (
-    nrow(U) != n_obs |
-      ncol(U) != p_cov
+    nrow(U) != n_obs ||
+    ncol(U) != p_cov
   ) {
 
     stop(
@@ -937,56 +1044,48 @@ make_ctnn_tensor <- function(
   ) {
 
     stop(
-      "Treatment length does not match observations."
+      "Treatment vector has incorrect length."
     )
 
   }
 
 
   ##########################################################
-  # Create tensor
+  # CREATE 3-D ARRAY
   ##########################################################
 
-  Z <- array(
-    0,
-    dim = c(
-      n_obs,
-      p_cov,
-      4
+  Z <-
+    array(
+      0,
+      dim = c(
+        n_obs,
+        p_cov,
+        4
+      )
     )
-  )
 
 
   ##########################################################
-  # Channel 1
+  # CHANNEL 1
   ##########################################################
 
-  Z[, , 1] <- X_std
-
-
-  ##########################################################
-  # Channel 2
-  ##########################################################
-
-  Z[, , 2] <- U
+  Z[, , 1] <-
+    X_std
 
 
   ##########################################################
-  # Channel 3
+  # CHANNEL 2
   ##########################################################
 
-  Z[, , 3] <- matrix(
-    T,
-    nrow = n_obs,
-    ncol = p_cov
-  )
+  Z[, , 2] <-
+    U
 
 
   ##########################################################
-  # Channel 4
+  # CHANNEL 3
   ##########################################################
 
-  Z[, , 4] <- U *
+  Z[, , 3] <-
     matrix(
       T,
       nrow = n_obs,
@@ -994,7 +1093,63 @@ make_ctnn_tensor <- function(
     )
 
 
-  storage.mode(Z) <- "double"
+  ##########################################################
+  # CHANNEL 4
+  ##########################################################
+
+  Z[, , 4] <-
+    U *
+    matrix(
+      T,
+      nrow = n_obs,
+      ncol = p_cov
+    )
+
+
+  ##########################################################
+  # FORCE DOUBLE
+  ##########################################################
+
+  storage.mode(
+    Z
+  ) <- "double"
+
+
+  ##########################################################
+  # VERIFY
+  ##########################################################
+
+  if (
+    length(dim(Z)) != 3
+  ) {
+
+    stop(
+      "CTNN tensor is not 3-dimensional."
+    )
+
+  }
+
+
+  if (
+    dim(Z)[2] != p_cov
+  ) {
+
+    stop(
+      "Incorrect tensor covariate dimension."
+    )
+
+  }
+
+
+  if (
+    dim(Z)[3] != 4
+  ) {
+
+    stop(
+      "Incorrect tensor channel dimension."
+    )
+
+  }
 
 
   Z
@@ -1003,43 +1158,22 @@ make_ctnn_tensor <- function(
 
 
 ############################################################
-# 12. KERAS PREDICTION HELPER
+# 19. NP-CTNN MODEL
 ############################################################
 #
-# Keras 3 can return objects that should first be converted
-# using as.array() before as.numeric().
+# IMPORTANT:
 #
-############################################################
-
-keras_predict_numeric <- function(
-    model,
-    x
-) {
-
-  pred <- predict(
-    model,
-    x,
-    verbose = 0
-  )
-
-
-  pred <- as.array(
-    pred
-  )
-
-
-  pred <- as.numeric(
-    pred
-  )
-
-
-  pred
-
-}
-
-
-############################################################
-# 13. NP-CTNN ARCHITECTURE
+# No BatchNormalization is used here.
+#
+# This avoids the Keras 3 / reticulate shape incompatibility
+# previously observed:
+#
+#   Received shapes (12,64) and [(None,1,64)]
+#
+# The model receives strictly:
+#
+#   batch x 12 x 4
+#
 ############################################################
 
 make_tensor_nn <- function(
@@ -1049,113 +1183,148 @@ make_tensor_nn <- function(
 ) {
 
   ##########################################################
-  # Input
+  # INPUT
   ##########################################################
 
-  input <- keras_input(
-    shape = c(
-      p,
-      n_channels
-    ),
-    name = "ctnn_tensor_input"
-  )
-
-
-  ##########################################################
-  # Convolution block 1
-  ##########################################################
-
-  x <- input |>
-    layer_conv_1d(
-      filters = CTNN_FILTERS_1,
-      kernel_size = 3,
-      padding = "same",
-      activation = "relu"
-    ) |>
-    layer_batch_normalization()
-
-
-  ##########################################################
-  # Convolution block 2
-  ##########################################################
-
-  x <- x |>
-    layer_conv_1d(
-      filters = CTNN_FILTERS_2,
-      kernel_size = 3,
-      padding = "same",
-      activation = "relu"
-    ) |>
-    layer_batch_normalization()
-
-
-  ##########################################################
-  # Dropout
-  ##########################################################
-
-  x <- x |>
-    layer_dropout(
-      rate = CTNN_DROPOUT
+  input <-
+    keras_input(
+      shape = c(
+        p,
+        n_channels
+      ),
+      name = "ctnn_tensor_input"
     )
 
 
   ##########################################################
-  # Global aggregation
+  # CONVOLUTION 1
   ##########################################################
 
-  x <- x |>
+  x <-
+    input |>
+    layer_conv_1d(
+      filters = 32,
+      kernel_size = 3,
+      padding = "same",
+      activation = "relu"
+    )
+
+
+  ##########################################################
+  # CONVOLUTION 2
+  ##########################################################
+
+  x <-
+    x |>
+    layer_conv_1d(
+      filters = 32,
+      kernel_size = 3,
+      padding = "same",
+      activation = "relu"
+    )
+
+
+  ##########################################################
+  # DROPOUT
+  ##########################################################
+
+  x <-
+    x |>
+    layer_dropout(
+      rate = 0.10
+    )
+
+
+  ##########################################################
+  # GLOBAL POOLING
+  ##########################################################
+
+  x <-
+    x |>
     layer_global_average_pooling_1d()
 
 
   ##########################################################
-  # Dense representation
+  # DENSE 1
   ##########################################################
 
-  x <- x |>
+  x <-
+    x |>
     layer_dense(
-      units = CTNN_DENSE_1,
+      units = 64,
       activation = "relu"
-    ) |>
+    )
+
+
+  ##########################################################
+  # DROPOUT
+  ##########################################################
+
+  x <-
+    x |>
     layer_dropout(
-      rate = CTNN_DROPOUT
-    ) |>
+      rate = 0.10
+    )
+
+
+  ##########################################################
+  # DENSE 2
+  ##########################################################
+
+  x <-
+    x |>
     layer_dense(
-      units = CTNN_DENSE_2,
+      units = 32,
       activation = "relu"
     )
 
 
   ##########################################################
-  # Outcome
+  # DENSE 3
   ##########################################################
 
-  output <- x |>
+  x <-
+    x |>
     layer_dense(
-      units = 1,
-      activation = "sigmoid"
+      units = 16,
+      activation = "relu"
     )
 
 
   ##########################################################
-  # Model
+  # OUTCOME
   ##########################################################
 
-  model <- keras_model(
-    inputs = input,
-    outputs = output
-  )
+  output <-
+    x |>
+    layer_dense(
+      units = 1
+    )
 
 
   ##########################################################
-  # Compile
+  # MODEL
   ##########################################################
 
-  model |> compile(
-    optimizer = optimizer_adam(
-      learning_rate = lr
-    ),
-    loss = "binary_crossentropy"
-  )
+  model <-
+    keras_model(
+      inputs = input,
+      outputs = output
+    )
+
+
+  ##########################################################
+  # COMPILE
+  ##########################################################
+
+  model |>
+    compile(
+      optimizer =
+        optimizer_adam(
+          learning_rate = lr
+        ),
+      loss = "mse"
+    )
 
 
   model
@@ -1164,158 +1333,117 @@ make_tensor_nn <- function(
 
 
 ############################################################
-# 14. NP-CTNN FIT
+# 20. FIT NP-CTNN
 ############################################################
 
 fit_np_ctnn <- function(
     train,
-    valid,
     test,
     p
 ) {
 
   ##########################################################
-  # Extract covariates
+  # EXTRACT X
   ##########################################################
 
-  Xtr <- as.matrix(
-    train[
-      ,
-      covariate_names,
-      with = FALSE
-    ]
-  )
+  Xtr <-
+    as.matrix(
+      train[, X_NAMES, with = FALSE]
+    )
 
-  Xva <- as.matrix(
-    valid[
-      ,
-      covariate_names,
-      with = FALSE
-    ]
-  )
 
-  Xte <- as.matrix(
-    test[
-      ,
-      covariate_names,
-      with = FALSE
-    ]
-  )
+  Xte <-
+    as.matrix(
+      test[, X_NAMES, with = FALSE]
+    )
 
 
   ##########################################################
-  # Training-only imputation
+  # IMPUTATION
   ##########################################################
 
-  imp1 <- impute_train_test(
-    Xtr,
-    Xva
-  )
-
-  Xtr <- imp1$Xtr
-
-  Xva <- imp1$Xte
+  imp <-
+    impute_train_test(
+      Xtr,
+      Xte
+    )
 
 
-  imp2 <- impute_train_test(
-    Xtr,
-    Xte
-  )
+  Xtr <-
+    imp$Xtr
 
-  Xtr <- imp2$Xtr
-
-  Xte <- imp2$Xte
+  Xte <-
+    imp$Xte
 
 
   ##########################################################
-  # Training-only standardization
+  # STANDARDIZATION
   ##########################################################
 
-  std_fit <- fit_standardizer(
-    Xtr
-  )
+  std <-
+    standardize_train_test(
+      Xtr,
+      Xte
+    )
 
 
-  Xtr_s <- apply_standardizer(
-    Xtr,
-    std_fit
-  )
+  Xtr_s <-
+    std$Xtr
 
-
-  Xva_s <- apply_standardizer(
-    Xva,
-    std_fit
-  )
-
-
-  Xte_s <- apply_standardizer(
-    Xte,
-    std_fit
-  )
+  Xte_s <-
+    std$Xte
 
 
   ##########################################################
-  # Training-only empirical copula fit
+  # EMPIRICAL COPULA
   ##########################################################
 
-  ec_fit <- empirical_copula_fit(
-    Xtr
-  )
+  ec_fit <-
+    empirical_copula_fit(
+      Xtr
+    )
 
 
-  ##########################################################
-  # Copula transformation
-  ##########################################################
-
-  Utr <- empirical_copula_transform(
-    Xtr,
-    ec_fit
-  )
+  Utr <-
+    empirical_copula_transform(
+      Xtr,
+      ec_fit
+    )
 
 
-  Uva <- empirical_copula_transform(
-    Xva,
-    ec_fit
-  )
-
-
-  Ute <- empirical_copula_transform(
-    Xte,
-    ec_fit
-  )
+  Ute <-
+    empirical_copula_transform(
+      Xte,
+      ec_fit
+    )
 
 
   ##########################################################
-  # Construct tensors
+  # CREATE TENSORS
   ##########################################################
 
-  Ztr <- make_ctnn_tensor(
-    X_std = Xtr_s,
-    U = Utr,
-    T = train[[treatment_name]]
-  )
+  Ztr <-
+    make_ctnn_tensor(
+      X_std = Xtr_s,
+      U = Utr,
+      T = train$treatment
+    )
 
 
-  Zva <- make_ctnn_tensor(
-    X_std = Xva_s,
-    U = Uva,
-    T = valid[[treatment_name]]
-  )
-
-
-  Zte <- make_ctnn_tensor(
-    X_std = Xte_s,
-    U = Ute,
-    T = test[[treatment_name]]
-  )
+  Zte <-
+    make_ctnn_tensor(
+      X_std = Xte_s,
+      U = Ute,
+      T = test$treatment
+    )
 
 
   ##########################################################
-  # Tensor diagnostics
+  # VERIFY DIMENSIONS
   ##########################################################
 
   cat(
-    "NP-CTNN training tensor:",
+    "      Training tensor:",
     paste(
       dim(Ztr),
       collapse = " x "
@@ -1325,17 +1453,7 @@ fit_np_ctnn <- function(
 
 
   cat(
-    "NP-CTNN validation tensor:",
-    paste(
-      dim(Zva),
-      collapse = " x "
-    ),
-    "\n"
-  )
-
-
-  cat(
-    "NP-CTNN test tensor:",
+    "      Test tensor:",
     paste(
       dim(Zte),
       collapse = " x "
@@ -1344,113 +1462,165 @@ fit_np_ctnn <- function(
   )
 
 
+  if (
+    length(dim(Ztr)) != 3
+  ) {
+
+    stop(
+      "Ztr is not 3-dimensional."
+    )
+
+  }
+
+
+  if (
+    !all(
+      dim(Ztr)[2:3] ==
+      c(p, 4)
+    )
+  ) {
+
+    stop(
+      "Incorrect Ztr shape."
+    )
+
+  }
+
+
   ##########################################################
-  # Build model
+  # BUILD MODEL
   ##########################################################
 
-  model <- make_tensor_nn(
-    p = p,
-    n_channels = 4
-  )
+  model <-
+    make_tensor_nn(
+      p = p,
+      n_channels = 4
+    )
 
 
   ##########################################################
-  # Train with explicit validation set
+  # TRAIN
   ##########################################################
 
-  model |> fit(
-    Ztr,
-    train[[outcome_name]],
-    epochs = NN_EPOCHS,
-    batch_size = NN_BATCH_SIZE,
-    validation_data = list(
-      Zva,
-      valid[[outcome_name]]
-    ),
-    verbose = 0,
-    callbacks = list(
-      callback_early_stopping(
-        monitor = "val_loss",
-        patience = NN_PATIENCE,
-        restore_best_weights = TRUE
+  history <-
+    model |>
+    fit(
+
+      x = Ztr,
+
+      y = as.numeric(
+        train$conversion
+      ),
+
+      epochs =
+        NN_EPOCHS,
+
+      batch_size =
+        NN_BATCH_SIZE,
+
+      validation_split =
+        VALID_PROP,
+
+      verbose = 0,
+
+      callbacks =
+        list(
+
+          callback_early_stopping(
+
+            monitor =
+              "val_loss",
+
+            patience =
+              NN_PATIENCE,
+
+            restore_best_weights =
+              TRUE
+
+          )
+
+        )
+
+    )
+
+
+  ##########################################################
+  # COUNTERFACTUAL T = 1
+  ##########################################################
+
+  Z1 <-
+    Zte
+
+
+  Z1[, , 3] <-
+    1
+
+
+  Z1[, , 4] <-
+    Ute
+
+
+  storage.mode(
+    Z1
+  ) <- "double"
+
+
+  ##########################################################
+  # COUNTERFACTUAL T = 0
+  ##########################################################
+
+  Z0 <-
+    Zte
+
+
+  Z0[, , 3] <-
+    0
+
+
+  Z0[, , 4] <-
+    0
+
+
+  storage.mode(
+    Z0
+  ) <- "double"
+
+
+  ##########################################################
+  # PREDICTIONS
+  ##########################################################
+
+  mu1 <-
+    as.numeric(
+      predict(
+        model,
+        Z1,
+        verbose = 0
       )
     )
-  )
 
 
-  ##########################################################
-  # Counterfactual T = 1
-  ##########################################################
-
-  Z1 <- Zte
-
-  Z1[, , 3] <- 1
-
-  Z1[, , 4] <- Ute
-
-
-  ##########################################################
-  # Counterfactual T = 0
-  ##########################################################
-
-  Z0 <- Zte
-
-  Z0[, , 3] <- 0
-
-  Z0[, , 4] <- 0
-
-
-  ##########################################################
-  # Potential outcome predictions
-  ##########################################################
-
-  mu1 <- keras_predict_numeric(
-    model,
-    Z1
-  )
-
-
-  mu0 <- keras_predict_numeric(
-    model,
-    Z0
-  )
+  mu0 <-
+    as.numeric(
+      predict(
+        model,
+        Z0,
+        verbose = 0
+      )
+    )
 
 
   ##########################################################
   # CATE
   ##########################################################
 
-  cate <- mu1 - mu0
+  cate <-
+    mu1 -
+    mu0
 
 
   ##########################################################
-  # Prediction checks
-  ##########################################################
-
-  if (
-    length(mu1) != nrow(test)
-  ) {
-
-    stop(
-      "Incorrect T=1 prediction length."
-    )
-
-  }
-
-
-  if (
-    length(mu0) != nrow(test)
-  ) {
-
-    stop(
-      "Incorrect T=0 prediction length."
-    )
-
-  }
-
-
-  ##########################################################
-  # Return
+  # RETURN
   ##########################################################
 
   list(
@@ -1461,9 +1631,12 @@ fit_np_ctnn <- function(
 
     mu0 = mu0,
 
+    tensor_dim =
+      dim(Ztr),
+
     model = model,
 
-    tensor_dim = dim(Ztr)
+    history = history
 
   )
 
@@ -1471,7 +1644,7 @@ fit_np_ctnn <- function(
 
 
 ############################################################
-# 15. STANDARD NEURAL S-LEARNER
+# 21. STANDARD NEURAL S-LEARNER
 ############################################################
 
 make_standard_nn <- function(
@@ -1479,44 +1652,66 @@ make_standard_nn <- function(
     lr = NN_LEARNING_RATE
 ) {
 
-  model <- keras_model_sequential() |>
-
-    layer_dense(
-      units = 64,
-      activation = "relu",
-      input_shape = input_dim
-    ) |>
-
-    layer_dropout(
-      rate = 0.10
-    ) |>
-
-    layer_dense(
-      units = 32,
-      activation = "relu"
-    ) |>
-
-    layer_dense(
-      units = 16,
-      activation = "relu"
-    ) |>
-
-    layer_dense(
-      units = 1,
-      activation = "sigmoid"
+  input <-
+    keras_input(
+      shape = input_dim,
+      name = "s_learner_input"
     )
 
 
-  ##########################################################
-  # Compile
-  ##########################################################
+  x <-
+    input |>
+    layer_dense(
+      units = 64,
+      activation = "relu"
+    )
 
-  model |> compile(
-    optimizer = optimizer_adam(
-      learning_rate = lr
-    ),
-    loss = "binary_crossentropy"
-  )
+
+  x <-
+    x |>
+    layer_dropout(
+      rate = 0.10
+    )
+
+
+  x <-
+    x |>
+    layer_dense(
+      units = 32,
+      activation = "relu"
+    )
+
+
+  x <-
+    x |>
+    layer_dense(
+      units = 16,
+      activation = "relu"
+    )
+
+
+  output <-
+    x |>
+    layer_dense(
+      units = 1
+    )
+
+
+  model <-
+    keras_model(
+      inputs = input,
+      outputs = output
+    )
+
+
+  model |>
+    compile(
+      optimizer =
+        optimizer_adam(
+          learning_rate = lr
+        ),
+      loss = "mse"
+    )
 
 
   model
@@ -1525,213 +1720,218 @@ make_standard_nn <- function(
 
 
 ############################################################
-# 16. NEURAL S-LEARNER FIT
+# 22. FIT NEURAL S-LEARNER
 ############################################################
 
 fit_nn <- function(
     train,
-    valid,
     test,
     p
 ) {
 
   ##########################################################
-  # Extract covariates
+  # X
   ##########################################################
 
-  Xtr <- as.matrix(
-    train[
-      ,
-      covariate_names,
-      with = FALSE
-    ]
-  )
+  Xtr <-
+    as.matrix(
+      train[, X_NAMES, with = FALSE]
+    )
 
-  Xva <- as.matrix(
-    valid[
-      ,
-      covariate_names,
-      with = FALSE
-    ]
-  )
 
-  Xte <- as.matrix(
-    test[
-      ,
-      covariate_names,
-      with = FALSE
-    ]
-  )
+  Xte <-
+    as.matrix(
+      test[, X_NAMES, with = FALSE]
+    )
 
 
   ##########################################################
-  # Training-only imputation
+  # IMPUTATION
   ##########################################################
 
-  imp1 <- impute_train_test(
-    Xtr,
-    Xva
-  )
-
-  Xtr <- imp1$Xtr
-
-  Xva <- imp1$Xte
+  imp <-
+    impute_train_test(
+      Xtr,
+      Xte
+    )
 
 
-  imp2 <- impute_train_test(
-    Xtr,
-    Xte
-  )
+  Xtr <-
+    imp$Xtr
 
-  Xtr <- imp2$Xtr
-
-  Xte <- imp2$Xte
+  Xte <-
+    imp$Xte
 
 
   ##########################################################
-  # Training-only standardization
+  # STANDARDIZATION
   ##########################################################
 
-  std_fit <- fit_standardizer(
-    Xtr
-  )
+  std <-
+    standardize_train_test(
+      Xtr,
+      Xte
+    )
 
 
-  Xtr_s <- apply_standardizer(
-    Xtr,
-    std_fit
-  )
+  Xtr_s <-
+    std$Xtr
 
-
-  Xva_s <- apply_standardizer(
-    Xva,
-    std_fit
-  )
-
-
-  Xte_s <- apply_standardizer(
-    Xte,
-    std_fit
-  )
+  Xte_s <-
+    std$Xte
 
 
   ##########################################################
-  # S-learner input
+  # S-LEARNER INPUT
   ##########################################################
 
-  Ztr <- cbind(
-    Xtr_s,
-    T = train[[treatment_name]]
-  )
+  Ztr <-
+    cbind(
+      Xtr_s,
+      treatment =
+        train$treatment
+    )
 
 
-  Zva <- cbind(
-    Xva_s,
-    T = valid[[treatment_name]]
-  )
+  Zte <-
+    cbind(
+      Xte_s,
+      treatment =
+        test$treatment
+    )
 
 
-  Zte <- cbind(
-    Xte_s,
-    T = test[[treatment_name]]
-  )
+  storage.mode(
+    Ztr
+  ) <- "double"
+
+
+  storage.mode(
+    Zte
+  ) <- "double"
 
 
   ##########################################################
-  # Build model
+  # MODEL
   ##########################################################
 
-  model <- make_standard_nn(
-    input_dim = ncol(Ztr)
-  )
+  model <-
+    make_standard_nn(
+      input_dim =
+        ncol(Ztr)
+    )
 
 
   ##########################################################
-  # Explicit validation
+  # TRAIN
   ##########################################################
 
-  model |> fit(
-    Ztr,
-    train[[outcome_name]],
-    epochs = NN_EPOCHS,
-    batch_size = NN_BATCH_SIZE,
-    validation_data = list(
-      Zva,
-      valid[[outcome_name]]
-    ),
-    verbose = 0,
-    callbacks = list(
-      callback_early_stopping(
-        monitor = "val_loss",
-        patience = NN_PATIENCE,
-        restore_best_weights = TRUE
+  model |>
+    fit(
+
+      x = Ztr,
+
+      y =
+        as.numeric(
+          train$conversion
+        ),
+
+      epochs =
+        NN_EPOCHS,
+
+      batch_size =
+        NN_BATCH_SIZE,
+
+      validation_split =
+        VALID_PROP,
+
+      verbose = 0,
+
+      callbacks =
+        list(
+
+          callback_early_stopping(
+
+            monitor =
+              "val_loss",
+
+            patience =
+              NN_PATIENCE,
+
+            restore_best_weights =
+              TRUE
+
+          )
+
+        )
+
+    )
+
+
+  ##########################################################
+  # TREATMENT = 1
+  ##########################################################
+
+  Z1 <-
+    Zte
+
+
+  Z1[, ncol(Z1)] <-
+    1
+
+
+  ##########################################################
+  # TREATMENT = 0
+  ##########################################################
+
+  Z0 <-
+    Zte
+
+
+  Z0[, ncol(Z0)] <-
+    0
+
+
+  ##########################################################
+  # POTENTIAL OUTCOME
+  ##########################################################
+
+  mu1 <-
+    as.numeric(
+      predict(
+        model,
+        Z1,
+        verbose = 0
       )
     )
-  )
 
 
-  ##########################################################
-  # Counterfactual T = 1
-  ##########################################################
-
-  Z1 <- Zte
-
-  Z1[, ncol(Z1)] <- 1
-
-
-  ##########################################################
-  # Counterfactual T = 0
-  ##########################################################
-
-  Z0 <- Zte
-
-  Z0[, ncol(Z0)] <- 0
-
-
-  ##########################################################
-  # Predictions
-  ##########################################################
-
-  mu1 <- keras_predict_numeric(
-    model,
-    Z1
-  )
-
-
-  mu0 <- keras_predict_numeric(
-    model,
-    Z0
-  )
+  mu0 <-
+    as.numeric(
+      predict(
+        model,
+        Z0,
+        verbose = 0
+      )
+    )
 
 
   ##########################################################
   # CATE
   ##########################################################
 
-  cate <- mu1 - mu0
+  cate <-
+    mu1 -
+    mu0
 
 
-  ##########################################################
-  # Return
-  ##########################################################
-
-  list(
-
-    cate = cate,
-
-    mu1 = mu1,
-
-    mu0 = mu0,
-
-    model = model
-
-  )
+  cate
 
 }
 
 
 ############################################################
-# 17. POLICY VALUE
+# 23. POLICY VALUE
 ############################################################
 
 calculate_policy_value <- function(
@@ -1742,401 +1942,602 @@ calculate_policy_value <- function(
 ) {
 
   ##########################################################
-  # Estimated treatment policy
+  # POLICY
   ##########################################################
 
-  policy <- ifelse(
-    cate > 0,
-    1,
-    0
-  )
-
-
-  ##########################################################
-  # Probability of observed action under estimated policy
-  ##########################################################
-
-  action_probability <- ifelse(
-    policy == 1,
-    propensity,
-    1 - propensity
-  )
+  policy <-
+    ifelse(
+      cate > 0,
+      1,
+      0
+    )
 
 
   ##########################################################
-  # Numerical protection
+  # ACTION PROBABILITY
   ##########################################################
 
-  action_probability <- pmax(
-    action_probability,
-    0.05
-  )
+  action_probability <-
+    ifelse(
+      policy == 1,
+      propensity,
+      1 - propensity
+    )
 
 
   ##########################################################
-  # IPW policy value
+  # PROTECTION
   ##########################################################
 
-  mean(
-    Y *
-      (T == policy) /
+  action_probability <-
+    pmax(
       action_probability,
-    na.rm = TRUE
-  )
+      PROPENSITY_FLOOR
+    )
+
+
+  ##########################################################
+  # IPW POLICY VALUE
+  ##########################################################
+
+  value <-
+    mean(
+
+      Y *
+        as.numeric(
+          T == policy
+        ) /
+        action_probability,
+
+      na.rm = TRUE
+
+    )
+
+
+  value
 
 }
 
 
 ############################################################
-# 18. EVALUATION
+# 24. REAL-DATA EVALUATION
+############################################################
+#
+# No true CATE is available.
+#
+# Therefore:
+#
+#   Reference ATE = mean(Causal Forest CATE)
+#
+#   Reference CATE = Causal Forest CATE
+#
 ############################################################
 
-evaluate_cate <- function(
+evaluate_real_data <- function(
     cate_hat,
-    cate_reference,
+    reference_cate,
     Y,
     T,
     propensity
 ) {
 
   ##########################################################
-  # Estimated ATE
+  # ATE
   ##########################################################
 
-  ate_hat <- mean(
-    cate_hat,
-    na.rm = TRUE
-  )
-
-
-  ##########################################################
-  # Benchmark ATE
-  ##########################################################
-
-  ate_reference <- mean(
-    cate_reference,
-    na.rm = TRUE
-  )
-
-
-  ##########################################################
-  # Bias
-  ##########################################################
-
-  bias <- ate_hat -
-    ate_reference
-
-
-  ##########################################################
-  # Absolute bias
-  ##########################################################
-
-  abs_bias <- abs(
-    bias
-  )
-
-
-  ##########################################################
-  # PEHE
-  ##########################################################
-
-  pehe <- sqrt(
+  ate_hat <-
     mean(
-      (
-        cate_hat -
-          cate_reference
-      )^2,
+      cate_hat,
       na.rm = TRUE
     )
-  )
 
 
   ##########################################################
-  # Policy value
+  # REFERENCE ATE
   ##########################################################
 
-  policy_value <- calculate_policy_value(
-    Y = Y,
-    T = T,
-    cate = cate_hat,
-    propensity = propensity
-  )
+  reference_ate <-
+    mean(
+      reference_cate,
+      na.rm = TRUE
+    )
 
 
   ##########################################################
-  # Return metrics
+  # BIAS RELATIVE TO CF BENCHMARK
   ##########################################################
 
-  c(
-
-    ATE = ate_hat,
-
-    True_ATE = ate_reference,
-
-    Bias = bias,
-
-    AbsBias = abs_bias,
-
-    PEHE = pehe,
-
-    PolicyValue = policy_value
-
-  )
-
-}
+  bias <-
+    ate_hat -
+    reference_ate
 
 
-############################################################
-# 19. FULL-SAMPLE GRF BENCHMARK
-############################################################
+  ##########################################################
+  # ABSOLUTE BIAS
+  ##########################################################
 
-cat("\n")
-cat("============================================================\n")
-cat("FITTING FULL-SAMPLE GRF BENCHMARK\n")
-cat("============================================================\n")
-
-
-X_full <- X
+  abs_bias <-
+    abs(
+      bias
+    )
 
 
-############################################################
-# Full-sample imputation
-############################################################
+  ##########################################################
+  # ATE SQUARED ERROR
+  ##########################################################
 
-for (
-  j in seq_len(
-    ncol(X_full)
-  )
-) {
-
-  z <- X_full[, j]
-
-  z[
-    !is.finite(z)
-  ] <- NA
+  squared_error <-
+    bias^2
 
 
-  med_j <- median(
-    z,
-    na.rm = TRUE
-  )
+  ##########################################################
+  # CATE RMSE / PEHE-STYLE METRIC
+  ##########################################################
+
+  cate_rmse <-
+    sqrt(
+
+      mean(
+
+        (
+          cate_hat -
+          reference_cate
+        )^2,
+
+        na.rm = TRUE
+
+      )
+
+    )
+
+
+  ##########################################################
+  # CORRELATION WITH REFERENCE CATE
+  ##########################################################
+
+  cate_cor <-
+    suppressWarnings(
+
+      cor(
+        cate_hat,
+        reference_cate,
+        use = "complete.obs"
+      )
+
+    )
 
 
   if (
-    !is.finite(med_j)
+    !is.finite(cate_cor)
   ) {
 
-    med_j <- 0
+    cate_cor <- NA_real_
 
   }
 
 
-  X_full[
-    is.na(z),
-    j
-  ] <- med_j
+  ##########################################################
+  # POSITIVE CATE RATE
+  ##########################################################
+
+  positive_cate_rate <-
+    mean(
+      cate_hat > 0,
+      na.rm = TRUE
+    )
+
+
+  ##########################################################
+  # MEAN ABSOLUTE CATE
+  ##########################################################
+
+  mean_abs_cate <-
+    mean(
+      abs(cate_hat),
+      na.rm = TRUE
+    )
+
+
+  ##########################################################
+  # SD CATE
+  ##########################################################
+
+  sd_cate <-
+    sd(
+      cate_hat,
+      na.rm = TRUE
+    )
+
+
+  ##########################################################
+  # POLICY VALUE
+  ##########################################################
+
+  policy_value <-
+    calculate_policy_value(
+
+      Y =
+        Y,
+
+      T =
+        T,
+
+      cate =
+        cate_hat,
+
+      propensity =
+        propensity
+
+    )
+
+
+  ##########################################################
+  # TREATMENT RATE UNDER ESTIMATED POLICY
+  ##########################################################
+
+  test_treatment_rate <-
+    positive_cate_rate
+
+
+  ##########################################################
+  # CONVERSION RATE UNDER ESTIMATED POLICY
+  ##########################################################
+
+  policy <-
+    ifelse(
+      cate_hat > 0,
+      1,
+      0
+    )
+
+
+  observed_policy <-
+    T == policy
+
+
+  conversion_rate_observed_policy <-
+    ifelse(
+
+      sum(
+        observed_policy
+      ) > 0,
+
+      mean(
+        Y[
+          observed_policy
+        ],
+        na.rm = TRUE
+      ),
+
+      NA_real_
+
+    )
+
+
+  ##########################################################
+  # RETURN
+  ##########################################################
+
+  c(
+
+    ATE =
+      ate_hat,
+
+    Reference_ATE =
+      reference_ate,
+
+    Bias =
+      bias,
+
+    AbsBias =
+      abs_bias,
+
+    SquaredError =
+      squared_error,
+
+    PEHE =
+      cate_rmse,
+
+    CATE_Correlation =
+      cate_cor,
+
+    Mean_SD_CATE =
+      sd_cate,
+
+    Mean_Abs_CATE =
+      mean_abs_cate,
+
+    Positive_CATE_Rate =
+      positive_cate_rate,
+
+    PolicyValue =
+      policy_value,
+
+    Test_Treatment_Rate =
+      test_treatment_rate,
+
+    Test_Conversion_Rate =
+      conversion_rate_observed_policy
+
+  )
 
 }
 
 
 ############################################################
-# Full-sample standardization
+# 25. RUN ONE REPLICATION
 ############################################################
 
-full_std <- fit_standardizer(
-  X_full
-)
-
-
-X_full_s <- apply_standardizer(
-  X_full,
-  full_std
-)
-
-
-############################################################
-# Full-sample causal forest
-############################################################
-
-grf_full <- causal_forest(
-  X = X_full_s,
-  Y = Y,
-  W = T,
-  num.trees = NUM_TREES,
-  min.node.size = MIN_NODE_SIZE,
-  seed = SEED_BASE
-)
-
-
-############################################################
-# Benchmark CATE
-############################################################
-
-cate_reference <- as.numeric(
-  predict(
-    grf_full,
-    estimate.variance = FALSE
-  )$predictions
-)
-
-
-############################################################
-# Benchmark ATE
-############################################################
-
-reference_ATE <- mean(
-  cate_reference,
-  na.rm = TRUE
-)
-
-
-cat(
-  "Benchmark ATE:",
-  round(
-    reference_ATE,
-    8
-  ),
-  "\n"
-)
-
-
-############################################################
-# 20. REPLICATION STORAGE
-############################################################
-
-results_list <- vector(
-  "list",
-  N_REP
-)
-
-
-cat("\n")
-cat("============================================================\n")
-cat(
-  "STARTING",
-  N_REP,
-  "REPLICATIONS\n"
-)
-cat("============================================================\n")
-
-
-start_time <- Sys.time()
-
-
-############################################################
-# 21. MONTE CARLO LOOP
-############################################################
-
-for (
-  r in seq_len(N_REP)
+run_replication <- function(
+    dat,
+    seed
 ) {
 
   ##########################################################
-  # Replication seed
+  # SEED
   ##########################################################
 
-  current_seed <- SEED_BASE +
-    r
-
-
   set.seed(
-    current_seed
+    seed
   )
 
 
   tf$random$set_seed(
     as.integer(
-      current_seed
+      seed
     )
   )
 
 
   ##########################################################
-  # Random 70/15/15 split
+  # RANDOM SPLIT
   ##########################################################
 
-  idx <- sample(
-    seq_len(n)
-  )
+  n <-
+    nrow(dat)
 
 
-  ntr <- floor(
-    TRAIN_PROP * n
-  )
+  idx <-
+    sample(
+      seq_len(n)
+    )
 
 
-  nva <- floor(
-    VALID_PROP * n
-  )
-
-
-  train_idx <- idx[
-    seq_len(ntr)
-  ]
-
-
-  valid_idx <- idx[
-    (ntr + 1):
-      (ntr + nva)
-  ]
-
-
-  test_idx <- idx[
-    (ntr + nva + 1):
+  ntr <-
+    floor(
+      TRAIN_PROP *
       n
-  ]
+    )
+
+
+  nva <-
+    floor(
+      VALID_PROP *
+      n
+    )
+
+
+  train_idx <-
+    idx[
+      1:ntr
+    ]
+
+
+  valid_idx <-
+    idx[
+      (ntr + 1):
+      (ntr + nva)
+    ]
+
+
+  test_idx <-
+    idx[
+      (ntr + nva + 1):
+      n
+    ]
+
+
+  train <-
+    dat[
+      train_idx
+    ]
+
+
+  valid <-
+    dat[
+      valid_idx
+    ]
+
+
+  test <-
+    dat[
+      test_idx
+    ]
 
 
   ##########################################################
-  # Create datasets
+  # PROPENSITY
   ##########################################################
-
-  train <- analysis_dat[
-    train_idx,
-  ]
-
-
-  valid <- analysis_dat[
-    valid_idx,
-  ]
-
-
-  test <- analysis_dat[
-    test_idx,
-  ]
-
-
-  ##########################################################
-  # Treatment propensity
   #
-  # Criteo is a randomized experiment.
-  # The training treatment rate is used for IPW evaluation.
+  # Criteo is randomized. We estimate the treatment
+  # probability from the training sample.
+  #
   ##########################################################
 
-  propensity <- mean(
-    train[[treatment_name]]
-  )
+  propensity <-
+    mean(
+      train$treatment,
+      na.rm = TRUE
+    )
+
+
+  propensity <-
+    min(
+      max(
+        propensity,
+        PROPENSITY_FLOOR
+      ),
+      1 - PROPENSITY_FLOOR
+    )
 
 
   ##########################################################
   # NP-CTNN
   ##########################################################
 
-  np_fit <- fit_np_ctnn(
-    train = train,
-    valid = valid,
-    test = test,
-    p = p
+  cat(
+    "  Fitting NP-CTNN...\n"
   )
 
 
-  np_res <- evaluate_cate(
-    cate_hat = np_fit$cate,
-    cate_reference =
-      cate_reference[test_idx],
-    Y = test[[outcome_name]],
-    T = test[[treatment_name]],
-    propensity = propensity
+  np_fit <-
+    fit_np_ctnn(
+
+      train =
+        train,
+
+      test =
+        test,
+
+      p =
+        P
+
+    )
+
+
+  np_cate <-
+    as.numeric(
+      np_fit$cate
+    )
+
+
+  ##########################################################
+  # CAUSAL FOREST
+  ##########################################################
+
+  cat(
+    "  Fitting Causal Forest...\n"
+  )
+
+
+  Xtr <-
+    as.matrix(
+      train[
+        ,
+        X_NAMES,
+        with = FALSE
+      ]
+    )
+
+
+  Xte <-
+    as.matrix(
+      test[
+        ,
+        X_NAMES,
+        with = FALSE
+      ]
+    )
+
+
+  ##########################################################
+  # IMPUTATION
+  ##########################################################
+
+  imp <-
+    impute_train_test(
+      Xtr,
+      Xte
+    )
+
+
+  Xtr <-
+    imp$Xtr
+
+  Xte <-
+    imp$Xte
+
+
+  ##########################################################
+  # STANDARDIZATION
+  ##########################################################
+
+  std <-
+    standardize_train_test(
+      Xtr,
+      Xte
+    )
+
+
+  Xtr_s <-
+    std$Xtr
+
+  Xte_s <-
+    std$Xte
+
+
+  ##########################################################
+  # CAUSAL FOREST
+  ##########################################################
+
+  cf <-
+    causal_forest(
+
+      X =
+        Xtr_s,
+
+      Y =
+        train$conversion,
+
+      W =
+        train$treatment,
+
+      num.trees =
+        NUM_TREES,
+
+      min.node.size =
+        MIN_NODE_SIZE,
+
+      seed =
+        seed
+
+    )
+
+
+  ##########################################################
+  # CF CATE
+  ##########################################################
+
+  cf_cate <-
+    as.numeric(
+
+      predict(
+        cf,
+        Xte_s,
+        estimate.variance = FALSE
+      )$predictions
+
+    )
+
+
+  ##########################################################
+  # CF REFERENCE ATE
+  ##########################################################
+
+  reference_ate <-
+    mean(
+      cf_cate,
+      na.rm = TRUE
+    )
+
+
+  cat(
+    "  Causal Forest reference ATE:",
+    round(
+      reference_ate,
+      6
+    ),
+    "\n"
   )
 
 
@@ -2144,184 +2545,367 @@ for (
   # NEURAL S-LEARNER
   ##########################################################
 
-  nn_fit <- fit_nn(
-    train = train,
-    valid = valid,
-    test = test,
-    p = p
+  cat(
+    "  Fitting Neural S-learner...\n"
   )
 
 
-  nn_res <- evaluate_cate(
-    cate_hat = nn_fit$cate,
-    cate_reference =
-      cate_reference[test_idx],
-    Y = test[[outcome_name]],
-    T = test[[treatment_name]],
-    propensity = propensity
-  )
+  nn_cate <-
+    fit_nn(
+
+      train =
+        train,
+
+      test =
+        test,
+
+      p =
+        P
+
+    )
 
 
   ##########################################################
-  # CAUSAL FOREST
+  # EVALUATION: NP-CTNN
   ##########################################################
 
-  Xtr <- as.matrix(
-    train[
-      ,
-      covariate_names,
-      with = FALSE
-    ]
-  )
+  np_res <-
+    evaluate_real_data(
 
+      cate_hat =
+        np_cate,
 
-  Xva <- as.matrix(
-    valid[
-      ,
-      covariate_names,
-      with = FALSE
-    ]
-  )
+      reference_cate =
+        cf_cate,
 
+      Y =
+        test$conversion,
 
-  Xte <- as.matrix(
-    test[
-      ,
-      covariate_names,
-      with = FALSE
-    ]
-  )
+      T =
+        test$treatment,
+
+      propensity =
+        propensity
+
+    )
 
 
   ##########################################################
-  # Training-only imputation
+  # EVALUATION: NEURAL S
   ##########################################################
 
-  imp_cf1 <- impute_train_test(
-    Xtr,
-    Xva
-  )
+  nn_res <-
+    evaluate_real_data(
 
+      cate_hat =
+        nn_cate,
 
-  Xtr <- imp_cf1$Xtr
+      reference_cate =
+        cf_cate,
 
-  Xva <- imp_cf1$Xte
+      Y =
+        test$conversion,
 
+      T =
+        test$treatment,
 
-  imp_cf2 <- impute_train_test(
-    Xtr,
-    Xte
-  )
+      propensity =
+        propensity
 
-
-  Xtr <- imp_cf2$Xtr
-
-  Xte <- imp_cf2$Xte
-
-
-  ##########################################################
-  # Training-only standardization
-  ##########################################################
-
-  cf_std <- fit_standardizer(
-    Xtr
-  )
-
-
-  Xtr_s <- apply_standardizer(
-    Xtr,
-    cf_std
-  )
-
-
-  Xte_s <- apply_standardizer(
-    Xte,
-    cf_std
-  )
+    )
 
 
   ##########################################################
-  # Causal Forest
+  # EVALUATION: CAUSAL FOREST
   ##########################################################
 
-  cf <- causal_forest(
-    X = Xtr_s,
-    Y = train[[outcome_name]],
-    W = train[[treatment_name]],
-    num.trees = NUM_TREES,
-    min.node.size = MIN_NODE_SIZE,
-    seed = current_seed
-  )
+  cf_res <-
+    evaluate_real_data(
 
+      cate_hat =
+        cf_cate,
 
-  ##########################################################
-  # Test CATE
-  ##########################################################
+      reference_cate =
+        cf_cate,
 
-  cf_cate <- as.numeric(
-    predict(
-      cf,
-      Xte_s,
-      estimate.variance = FALSE
-    )$predictions
-  )
+      Y =
+        test$conversion,
+
+      T =
+        test$treatment,
+
+      propensity =
+        propensity
+
+    )
 
 
   ##########################################################
-  # Evaluate Causal Forest
+  # CF SELF-BENCHMARK METRICS
   ##########################################################
 
-  cf_res <- evaluate_cate(
-    cate_hat = cf_cate,
-    cate_reference =
-      cate_reference[test_idx],
-    Y = test[[outcome_name]],
-    T = test[[treatment_name]],
-    propensity = propensity
-  )
+  cf_res[
+    "Bias"
+  ] <- 0
+
+
+  cf_res[
+    "AbsBias"
+  ] <- 0
+
+
+  cf_res[
+    "SquaredError"
+  ] <- 0
+
+
+  cf_res[
+    "PEHE"
+  ] <- 0
+
+
+  cf_res[
+    "CATE_Correlation"
+  ] <- 1
 
 
   ##########################################################
-  # STORE RESULTS
+  # RESULTS
   ##########################################################
 
-  results_list[[r]] <- bind_rows(
+  bind_rows(
 
     data.frame(
-      Method = "NP-CTNN",
-      t(np_res)
+      Method =
+        "NP-CTNN",
+      t(np_res),
+      check.names = FALSE
     ),
 
     data.frame(
-      Method = "Neural-S-learner",
-      t(nn_res)
+      Method =
+        "Neural-S-learner",
+      t(nn_res),
+      check.names = FALSE
     ),
 
     data.frame(
-      Method = "Causal-Forest",
-      t(cf_res)
+      Method =
+        "Causal-Forest",
+      t(cf_res),
+      check.names = FALSE
     )
 
   )
 
+}
 
-  ##########################################################
-  # PROGRESS
-  ##########################################################
 
-  elapsed <- difftime(
-    Sys.time(),
-    start_time,
-    units = "mins"
+############################################################
+# 26. START ANALYSIS
+############################################################
+
+cat("\n")
+cat("============================================================\n")
+cat("STARTING CRITEO NP-CTNN TENSOR ANALYSIS\n")
+cat("============================================================\n")
+
+
+cat(
+  "Observations:",
+  nrow(criteo),
+  "\n"
+)
+
+
+cat(
+  "Covariates:",
+  P,
+  "\n"
+)
+
+
+cat(
+  "Replications:",
+  R,
+  "\n"
+)
+
+
+cat(
+  "Training proportion:",
+  TRAIN_PROP,
+  "\n"
+)
+
+
+cat(
+  "Validation proportion:",
+  VALID_PROP,
+  "\n"
+)
+
+
+cat(
+  "Test proportion:",
+  TEST_PROP,
+  "\n"
+)
+
+
+cat(
+  "Tensor dimension:",
+  paste(
+    P,
+    "x 4"
+  ),
+  "\n"
+)
+
+
+cat(
+  "Causal Forest trees:",
+  NUM_TREES,
+  "\n"
+)
+
+
+cat(
+  "NN epochs:",
+  NN_EPOCHS,
+  "\n"
+)
+
+
+############################################################
+# 27. RUN REPLICATIONS
+############################################################
+
+start_time <-
+  Sys.time()
+
+
+results_list <-
+  vector(
+    "list",
+    R
+  )
+
+
+for (
+  r in seq_len(R)
+) {
+
+  cat("\n")
+  cat("------------------------------------------------------------\n")
+
+
+  cat(
+    "Replication ",
+    r,
+    " of ",
+    R,
+    "\n",
+    sep = ""
+  )
+
+
+  cat("------------------------------------------------------------\n")
+
+
+  current_seed <-
+    SEED_BASE +
+    r
+
+
+  replication_start <-
+    Sys.time()
+
+
+  result_r <-
+    tryCatch(
+
+      {
+
+        run_replication(
+
+          dat =
+            criteo,
+
+          seed =
+            current_seed
+
+        )
+
+      },
+
+      error = function(e) {
+
+        cat(
+          "  ERROR in replication ",
+          r,
+          ":\n",
+          sep = ""
+        )
+
+
+        cat(
+          conditionMessage(e),
+          "\n"
+        )
+
+
+        NULL
+
+      }
+
+    )
+
+
+  results_list[[r]] <-
+    result_r
+
+
+  elapsed_rep <-
+    difftime(
+
+      Sys.time(),
+
+      replication_start,
+
+      units = "mins"
+
+    )
+
+
+  elapsed_total <-
+    difftime(
+
+      Sys.time(),
+
+      start_time,
+
+      units = "mins"
+
+    )
+
+
+  cat(
+    sprintf(
+      "  Replication time: %.2f minutes\n",
+      as.numeric(
+        elapsed_rep
+      )
+    )
   )
 
 
   cat(
     sprintf(
-      "Replication %3d/%3d | Elapsed %.2f min\n",
-      r,
-      N_REP,
-      as.numeric(elapsed)
+      "  Total elapsed time: %.2f minutes\n",
+      as.numeric(
+        elapsed_total
+      )
     )
   )
 
@@ -2329,36 +2913,71 @@ for (
 
 
 ############################################################
-# 22. COMBINE RESULTS
+# 28. REMOVE FAILED REPLICATIONS
 ############################################################
 
-results <- bind_rows(
-  results_list,
-  .id = "Replication"
-)
+results_list <-
+  results_list[
+    !sapply(
+      results_list,
+      is.null
+    )
+  ]
 
 
-results$Replication <- as.integer(
-  results$Replication
-)
+if (
+  length(results_list) == 0
+) {
+
+  stop(
+    "All replications failed."
+  )
+
+}
 
 
 ############################################################
-# 23. SAVE RAW RESULTS
+# 29. COMBINE RESULTS
+############################################################
+
+results <-
+  bind_rows(
+
+    results_list,
+
+    .id =
+      "Replication"
+
+  )
+
+
+results$Replication <-
+  as.integer(
+    results$Replication
+  )
+
+
+############################################################
+# 30. SAVE RAW RESULTS
 ############################################################
 
 write.csv(
+
   results,
-  "criteo_np_ctnn_three_methods_results_100_replications.csv",
+
+  "criteo_np_ctnn_tensor_results_30_replications.csv",
+
   row.names = FALSE
+
 )
 
 
 ############################################################
-# 24. SUMMARY STATISTICS
+# 31. SUMMARY STATISTICS
 ############################################################
 
-summary_statistics <- results %>%
+summary_statistics <-
+  results %>%
 
   group_by(
     Method
@@ -2366,7 +2985,12 @@ summary_statistics <- results %>%
 
   summarise(
 
-    N = n(),
+    N =
+      n(),
+
+    ########################################################
+    # ATE
+    ########################################################
 
     Mean_ATE =
       mean(
@@ -2380,11 +3004,25 @@ summary_statistics <- results %>%
         na.rm = TRUE
       ),
 
-    Mean_True_ATE =
+    ########################################################
+    # REFERENCE ATE
+    ########################################################
+
+    Mean_Reference_ATE =
       mean(
-        True_ATE,
+        Reference_ATE,
         na.rm = TRUE
       ),
+
+    SD_Reference_ATE =
+      sd(
+        Reference_ATE,
+        na.rm = TRUE
+      ),
+
+    ########################################################
+    # BIAS
+    ########################################################
 
     Mean_Bias =
       mean(
@@ -2404,13 +3042,26 @@ summary_statistics <- results %>%
         na.rm = TRUE
       ),
 
+    ########################################################
+    # ATE RMSE
+    ########################################################
+
     RMSE_ATE =
       sqrt(
+
         mean(
-          Bias^2,
+
+          SquaredError,
+
           na.rm = TRUE
+
         )
+
       ),
+
+    ########################################################
+    # CATE
+    ########################################################
 
     Mean_PEHE =
       mean(
@@ -2424,6 +3075,50 @@ summary_statistics <- results %>%
         na.rm = TRUE
       ),
 
+    Mean_CATE_Correlation =
+      mean(
+        CATE_Correlation,
+        na.rm = TRUE
+      ),
+
+    SD_CATE_Correlation =
+      sd(
+        CATE_Correlation,
+        na.rm = TRUE
+      ),
+
+    Mean_SD_CATE =
+      mean(
+        Mean_SD_CATE,
+        na.rm = TRUE
+      ),
+
+    Mean_Abs_CATE =
+      mean(
+        Mean_Abs_CATE,
+        na.rm = TRUE
+      ),
+
+    ########################################################
+    # POSITIVE CATE
+    ########################################################
+
+    Mean_Positive_CATE_Rate =
+      mean(
+        Positive_CATE_Rate,
+        na.rm = TRUE
+      ),
+
+    SD_Positive_CATE_Rate =
+      sd(
+        Positive_CATE_Rate,
+        na.rm = TRUE
+      ),
+
+    ########################################################
+    # POLICY
+    ########################################################
+
     Mean_PolicyValue =
       mean(
         PolicyValue,
@@ -2436,96 +3131,200 @@ summary_statistics <- results %>%
         na.rm = TRUE
       ),
 
-    .groups = "drop"
+    ########################################################
+    # TREATMENT RATE
+    ########################################################
+
+    Mean_Test_Treatment_Rate =
+      mean(
+        Test_Treatment_Rate,
+        na.rm = TRUE
+      ),
+
+    SD_Test_Treatment_Rate =
+      sd(
+        Test_Treatment_Rate,
+        na.rm = TRUE
+      ),
+
+    ########################################################
+    # CONVERSION RATE
+    ########################################################
+
+    Mean_Test_Conversion_Rate =
+      mean(
+        Test_Conversion_Rate,
+        na.rm = TRUE
+      ),
+
+    SD_Test_Conversion_Rate =
+      sd(
+        Test_Conversion_Rate,
+        na.rm = TRUE
+      ),
+
+    .groups =
+      "drop"
 
   )
 
 
 ############################################################
-# 25. PUBLICATION TABLE
+# 32. SAVE SUMMARY
 ############################################################
 
-publication_table <- summary_statistics %>%
+write.csv(
+
+  summary_statistics,
+
+  "criteo_np_ctnn_tensor_summary_30_replications.csv",
+
+  row.names = FALSE
+
+)
+
+
+############################################################
+# 33. PUBLICATION TABLE
+############################################################
+
+publication_table <-
+  summary_statistics %>%
 
   mutate(
 
     Mean_ATE =
       round(
         Mean_ATE,
-        4
+        6
       ),
 
     SD_ATE =
       round(
         SD_ATE,
-        4
+        6
       ),
 
-    Mean_True_ATE =
+    Mean_Reference_ATE =
       round(
-        Mean_True_ATE,
-        4
+        Mean_Reference_ATE,
+        6
+      ),
+
+    SD_Reference_ATE =
+      round(
+        SD_Reference_ATE,
+        6
       ),
 
     Mean_Bias =
       round(
         Mean_Bias,
-        4
+        6
       ),
 
     SD_Bias =
       round(
         SD_Bias,
-        4
+        6
       ),
 
     Mean_AbsBias =
       round(
         Mean_AbsBias,
-        4
+        6
       ),
 
     RMSE_ATE =
       round(
         RMSE_ATE,
-        4
+        6
       ),
 
     Mean_PEHE =
       round(
         Mean_PEHE,
-        4
+        6
       ),
 
     SD_PEHE =
       round(
         SD_PEHE,
-        4
+        6
+      ),
+
+    Mean_CATE_Correlation =
+      round(
+        Mean_CATE_Correlation,
+        6
+      ),
+
+    SD_CATE_Correlation =
+      round(
+        SD_CATE_Correlation,
+        6
+      ),
+
+    Mean_SD_CATE =
+      round(
+        Mean_SD_CATE,
+        6
+      ),
+
+    Mean_Abs_CATE =
+      round(
+        Mean_Abs_CATE,
+        6
+      ),
+
+    Mean_Positive_CATE_Rate =
+      round(
+        Mean_Positive_CATE_Rate,
+        6
+      ),
+
+    SD_Positive_CATE_Rate =
+      round(
+        SD_Positive_CATE_Rate,
+        6
       ),
 
     Mean_PolicyValue =
       round(
         Mean_PolicyValue,
-        4
+        6
       ),
 
     SD_PolicyValue =
       round(
         SD_PolicyValue,
-        4
+        6
+      ),
+
+    Mean_Test_Treatment_Rate =
+      round(
+        Mean_Test_Treatment_Rate,
+        6
+      ),
+
+    Mean_Test_Conversion_Rate =
+      round(
+        Mean_Test_Conversion_Rate,
+        6
       )
 
   )
 
 
 ############################################################
-# 26. PRINT RESULTS
+# 34. PRINT SUMMARY
 ############################################################
 
 cat("\n")
 cat("============================================================\n")
-cat("CRITEO THREE-METHOD SUMMARY\n")
+cat("CRITEO NP-CTNN TENSOR SUMMARY\n")
 cat("============================================================\n")
+
 
 print(
   publication_table
@@ -2533,38 +3332,25 @@ print(
 
 
 ############################################################
-# 27. SAVE SUMMARY
+# 35. FIGURE 1: ATE
 ############################################################
 
-write.csv(
-  publication_table,
-  "criteo_np_ctnn_three_methods_summary_100_replications.csv",
-  row.names = FALSE
-)
+p_ate <-
+  ggplot(
 
+    results,
 
-############################################################
-# 28. FIGURE 1: ATE
-############################################################
+    aes(
+      x = Replication,
+      y = ATE,
+      group = Method,
+      linetype = Method
+    )
 
-p_ate <- ggplot(
-  results,
-  aes(
-    x = Replication,
-    y = ATE,
-    group = Method,
-    linetype = Method
-  )
-) +
+  ) +
 
   geom_line(
     linewidth = 0.7
-  ) +
-
-  geom_hline(
-    yintercept = reference_ATE,
-    linetype = "dashed",
-    linewidth = 0.9
   ) +
 
   facet_wrap(
@@ -2573,17 +3359,19 @@ p_ate <- ggplot(
   ) +
 
   labs(
+
     title =
       "ATE Estimates Across Criteo Replications",
 
     subtitle =
-      "Dashed line: full-sample GRF benchmark",
+      "Causal Forest provides the reference ATE",
 
     x =
       "Replication",
 
     y =
       "Estimated ATE"
+
   ) +
 
   theme_minimal(
@@ -2614,41 +3402,46 @@ p_ate <- ggplot(
   )
 
 
+print(
+  p_ate
+)
+
+
 ############################################################
-# 29. FIGURE 2: ATE BIAS
+# 36. FIGURE 2: CATE RMSE
 ############################################################
 
-p_bias <- ggplot(
-  results,
-  aes(
-    x = Method,
-    y = Bias
-  )
-) +
+p_cate <-
+  ggplot(
+
+    results,
+
+    aes(
+      x = Method,
+      y = PEHE
+    )
+
+  ) +
 
   geom_boxplot(
     width = 0.6,
-    outlier.shape = 16,
     alpha = 0.7
   ) +
 
-  geom_hline(
-    yintercept = 0,
-    linetype = "dashed",
-    linewidth = 0.8
-  ) +
-
   labs(
+
     title =
-      "Distribution of ATE Bias",
+      "CATE RMSE Relative to Causal Forest Benchmark",
 
     subtitle =
-      "Bias relative to the full-sample GRF benchmark",
+      "Lower values indicate closer agreement with the reference CATE",
 
-    x = NULL,
+    x =
+      NULL,
 
     y =
-      "ATE Bias"
+      "CATE RMSE"
+
   ) +
 
   theme_minimal(
@@ -2677,17 +3470,26 @@ p_bias <- ggplot(
   )
 
 
+print(
+  p_cate
+)
+
+
 ############################################################
-# 30. FIGURE 3: PEHE
+# 37. FIGURE 3: POLICY VALUE
 ############################################################
 
-p_pehe <- ggplot(
-  results,
-  aes(
-    x = Method,
-    y = PEHE
-  )
-) +
+p_policy <-
+  ggplot(
+
+    results,
+
+    aes(
+      x = Method,
+      y = PolicyValue
+    )
+
+  ) +
 
   geom_boxplot(
     width = 0.6,
@@ -2695,72 +3497,19 @@ p_pehe <- ggplot(
   ) +
 
   labs(
-    title =
-      "Distribution of CATE Benchmark Error",
 
-    subtitle =
-      "PEHE relative to the full-sample GRF CATE benchmark",
-
-    x = NULL,
-
-    y =
-      "Benchmark PEHE"
-  ) +
-
-  theme_minimal(
-    base_size = 13
-  ) +
-
-  theme(
-
-    plot.title =
-      element_text(
-        face = "bold",
-        hjust = 0.5
-      ),
-
-    plot.subtitle =
-      element_text(
-        hjust = 0.5
-      ),
-
-    axis.text.x =
-      element_text(
-        angle = 15,
-        hjust = 1
-      )
-
-  )
-
-
-############################################################
-# 31. FIGURE 4: POLICY VALUE
-############################################################
-
-p_policy <- ggplot(
-  results,
-  aes(
-    x = Method,
-    y = PolicyValue
-  )
-) +
-
-  geom_boxplot(
-    width = 0.6,
-    alpha = 0.7
-  ) +
-
-  labs(
     title =
       "Distribution of Policy Value",
 
     subtitle =
       "IPW value under the estimated treatment policy",
 
-    x = NULL,
+    x =
+      NULL,
 
     y =
       "Policy Value"
+
   ) +
 
   theme_minimal(
@@ -2789,96 +3538,290 @@ p_policy <- ggplot(
   )
 
 
+print(
+  p_policy
+)
+
+
 ############################################################
-# 32. SAVE FIGURES
+# 38. FIGURE 4: POSITIVE CATE RATE
+############################################################
+
+p_positive <-
+  ggplot(
+
+    results,
+
+    aes(
+      x = Method,
+      y = Positive_CATE_Rate
+    )
+
+  ) +
+
+  geom_boxplot(
+    width = 0.6,
+    alpha = 0.7
+  ) +
+
+  labs(
+
+    title =
+      "Estimated Positive CATE Rate",
+
+    subtitle =
+      "Proportion of users recommended for treatment",
+
+    x =
+      NULL,
+
+    y =
+      "Positive CATE Rate"
+
+  ) +
+
+  theme_minimal(
+    base_size = 13
+  ) +
+
+  theme(
+
+    plot.title =
+      element_text(
+        face = "bold",
+        hjust = 0.5
+      ),
+
+    plot.subtitle =
+      element_text(
+        hjust = 0.5
+      ),
+
+    axis.text.x =
+      element_text(
+        angle = 15,
+        hjust = 1
+      )
+
+  )
+
+
+print(
+  p_positive
+)
+
+
+############################################################
+# 39. FIGURE 5: ATE SD
+############################################################
+
+p_ate_sd <-
+  summary_statistics %>%
+
+  ggplot(
+
+    aes(
+      x = Method,
+      y = SD_ATE
+    )
+
+  ) +
+
+  geom_col(
+    alpha = 0.8
+  ) +
+
+  labs(
+
+    title =
+      "Standard Deviation of ATE Estimates",
+
+    subtitle =
+      "Across Criteo replications",
+
+    x =
+      NULL,
+
+    y =
+      "ATE Standard Deviation"
+
+  ) +
+
+  theme_minimal(
+    base_size = 13
+  ) +
+
+  theme(
+
+    plot.title =
+      element_text(
+        face = "bold",
+        hjust = 0.5
+      ),
+
+    plot.subtitle =
+      element_text(
+        hjust = 0.5
+      ),
+
+    axis.text.x =
+      element_text(
+        angle = 15,
+        hjust = 1
+      )
+
+  )
+
+
+print(
+  p_ate_sd
+)
+
+
+############################################################
+# 40. SAVE FIGURES
 ############################################################
 
 ggsave(
-  "Figure1_Criteo_Three_Methods_ATE.png",
+
+  "Figure1_Criteo_NP_CTNN_Tensor_ATE.png",
+
   p_ate,
+
   width = 8,
+
   height = 10,
+
   dpi = 300
+
 )
 
 
 ggsave(
-  "Figure2_Criteo_Three_Methods_Bias.png",
-  p_bias,
+
+  "Figure2_Criteo_NP_CTNN_Tensor_CATE.png",
+
+  p_cate,
+
   width = 8,
+
   height = 6,
+
   dpi = 300
+
 )
 
 
 ggsave(
-  "Figure3_Criteo_Three_Methods_PEHE.png",
-  p_pehe,
-  width = 8,
-  height = 6,
-  dpi = 300
-)
 
+  "Figure3_Criteo_NP_CTNN_Tensor_PolicyValue.png",
 
-ggsave(
-  "Figure4_Criteo_Three_Methods_PolicyValue.png",
   p_policy,
+
   width = 8,
+
   height = 6,
+
   dpi = 300
+
+)
+
+
+ggsave(
+
+  "Figure4_Criteo_NP_CTNN_Tensor_PositiveCATE.png",
+
+  p_positive,
+
+  width = 8,
+
+  height = 6,
+
+  dpi = 300
+
+)
+
+
+ggsave(
+
+  "Figure5_Criteo_NP_CTNN_Tensor_ATE_SD.png",
+
+  p_ate_sd,
+
+  width = 8,
+
+  height = 6,
+
+  dpi = 300
+
 )
 
 
 ############################################################
-# 33. FINAL REPORT
+# 41. FINAL REPORT
 ############################################################
 
 cat("\n")
 cat("============================================================\n")
-cat("CRITEO THREE-METHOD ANALYSIS COMPLETED\n")
+cat("CRITEO NP-CTNN TENSOR ANALYSIS COMPLETED\n")
 cat("============================================================\n")
 
 
 cat(
   "Observations:",
-  n,
+  nrow(criteo),
   "\n"
 )
 
 
 cat(
   "Covariates:",
-  p,
+  P,
   "\n"
 )
 
 
 cat(
   "Tensor channels:",
-  4,
+  N_CHANNELS,
   "\n"
 )
 
 
 cat(
-  "Tensor dimension:",
+  "Individual tensor dimension:",
   paste(
-    p,
-    "x 4"
+    P,
+    "x",
+    N_CHANNELS
   ),
   "\n"
 )
 
 
 cat(
-  "Replications:",
-  N_REP,
+  "Training tensor approximately:",
+  floor(
+    TRAIN_PROP *
+    nrow(criteo)
+  ),
+  "x",
+  P,
+  "x",
+  N_CHANNELS,
   "\n"
 )
 
 
 cat(
-  "GRF trees:",
+  "Replications:",
+  R,
+  "\n"
+)
+
+
+cat(
+  "Causal Forest trees:",
   NUM_TREES,
   "\n"
 )
@@ -2892,91 +3835,57 @@ cat(
 
 
 cat(
-  "NN batch size:",
-  NN_BATCH_SIZE,
-  "\n"
-)
-
-
-cat(
-  "NN learning rate:",
-  NN_LEARNING_RATE,
-  "\n"
-)
-
-
-cat(
-  "Benchmark ATE:",
-  round(
-    reference_ATE,
-    8
+  "Successful replications:",
+  length(
+    results_list
   ),
   "\n"
 )
 
-
-############################################################
-# OUTPUT FILES
-############################################################
 
 cat("\n")
 cat("Output files:\n")
 
 
 cat(
-  "  criteo_np_ctnn_three_methods_results_100_replications.csv\n"
+  "  criteo_np_ctnn_tensor_results_30_replications.csv\n"
 )
 
 
 cat(
-  "  criteo_np_ctnn_three_methods_summary_100_replications.csv\n"
+  "  criteo_np_ctnn_tensor_summary_30_replications.csv\n"
 )
 
 
 cat(
-  "  Figure1_Criteo_Three_Methods_ATE.png\n"
+  "  Figure1_Criteo_NP_CTNN_Tensor_ATE.png\n"
 )
 
 
 cat(
-  "  Figure2_Criteo_Three_Methods_Bias.png\n"
+  "  Figure2_Criteo_NP_CTNN_Tensor_CATE.png\n"
 )
 
 
 cat(
-  "  Figure3_Criteo_Three_Methods_PEHE.png\n"
+  "  Figure3_Criteo_NP_CTNN_Tensor_PolicyValue.png\n"
 )
 
 
 cat(
-  "  Figure4_Criteo_Three_Methods_PolicyValue.png\n"
-)
-
-
-############################################################
-# METHODS
-############################################################
-
-cat("\n")
-cat("METHODS:\n")
-
-
-cat(
-  "  1. NP-CTNN\n"
+  "  Figure4_Criteo_NP_CTNN_Tensor_PositiveCATE.png\n"
 )
 
 
 cat(
-  "  2. Neural-S-learner\n"
-)
-
-
-cat(
-  "  3. Causal-Forest\n"
+  "  Figure5_Criteo_NP_CTNN_Tensor_ATE_SD.png\n"
 )
 
 
 cat("\n")
+cat("============================================================\n")
+cat("END OF CRITEO NP-CTNN ANALYSIS\n")
+cat("============================================================\n")
 
 
 ################################################################################

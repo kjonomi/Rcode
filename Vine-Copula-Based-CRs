@@ -1,61 +1,35 @@
 ################################################################################
 # REAL-DATA APPLICATION
 #
-# VINE-COPULA vs NO-COPULA INDIVIDUALIZED TREATMENT DECISION-MAKING
+# VINE-COPULA vs NO-COPULA
+# INDIVIDUALIZED TREATMENT DECISION-MAKING
 # WITH COMPETING RISKS
 #
 # DATA:
-#     survival::pbc
+#   survival::pbc
 #
-# REAL-DATA DESIGN:
+# CLINICAL APPLICATION:
+#   Primary biliary cirrhosis (PBC)
 #
-#     Treatment:
-#         trt = 1 : D-penicillamine
-#         trt = 2 : placebo
+# TREATMENT:
+#   0 = Placebo
+#   1 = D-penicillamine
 #
-#     Cause 1:
-#         transplantation
-#
-#     Cause 2:
-#         death
-#
-#     Censoring:
-#         status = 0
+# COMPETING RISKS:
+#   Cause 1 = Liver transplantation
+#   Cause 2 = Death
+#   0       = Censored
 #
 # IMPORTANT:
-#
-#     Only subjects with randomized treatment assignment are used.
-#     The observational subjects in survival::pbc have trt = NA and
-#     are therefore excluded.
+#   Only the 312 randomized trial participants are used.
 #
 # METHODS:
+#   1. Vine-Copula + CSC
+#   2. No-Copula + CSC
 #
-#     1. Vine-Copula + CSC
-#     2. No-Copula + CSC
-#
-# OUTCOME:
-#
-#     Cause-specific cumulative incidence functions at TAU.
-#
-# POLICY:
-#
-#     Estimated treatment contrast:
-#
-#         CATE(X) =
-#             V_1(X) - V_0(X)
-#
-#     where
-#
-#         V_a(X)
-#           = - w1 * CIF_1,a(TAU | X)
-#             - w2 * CIF_2,a(TAU | X)
-#
-#     Higher value = better individualized treatment choice.
-#
-# REAL-DATA POLICY EVALUATION:
-#
-#     Because counterfactual outcomes are unavailable in real data,
-#     policy values are estimated using inverse-probability weighting.
+# OBJECTIVE:
+#   Estimate individualized treatment decisions using
+#   competing-risk CIFs at a clinically relevant horizon.
 #
 ################################################################################
 
@@ -65,7 +39,6 @@
 ################################################################################
 
 required_packages <- c(
-    
     "survival",
     "riskRegression",
     "prodlim",
@@ -73,19 +46,15 @@ required_packages <- c(
     "ggplot2",
     "dplyr",
     "tidyr"
-    
 )
 
 for (pkg in required_packages) {
-    
-    if (!requireNamespace(pkg, quietly = TRUE)) {
-        
-        install.packages(pkg)
-        
-    }
-    
-}
 
+    if (!requireNamespace(pkg, quietly = TRUE)) {
+        install.packages(pkg)
+    }
+
+}
 
 library(survival)
 library(riskRegression)
@@ -102,315 +71,495 @@ library(tidyr)
 
 set.seed(20260826)
 
-TAU <- 5 * 365
+TAU <- 365 * 5
 
 WEIGHTS <- c(
-    1.0,
-    2.0
+    1.0,   # transplant
+    2.0    # death
 )
 
-P <- 8
+SEED_BASE <- 20260826
 
-VINE_FAMILYSET <- c(
-    1,   # Gaussian
-    2,   # Student t
-    3,   # Clayton
-    4,   # Gumbel
-    5,   # Frank
-    6,   # Joe
-    7    # BB1
-)
+MIN_VALID_PROP <- 0.50
 
-VINE_TRUNCLEVEL <- P - 1
-
-VINE_INDEPTEST_LEVEL <- 0.05
-
-VINE_INTERACTION_THRESHOLD <- 0.25
-
-MAX_VINE_INTERACTIONS <- 12
+MIN_EVENTS <- 10
 
 
 ################################################################################
 # 2. LOAD PBC DATA
 ################################################################################
 
-cat("\n")
-cat("============================================================\n")
-cat("LOADING PBC REAL DATA\n")
-cat("============================================================\n")
-
-data("pbc", package = "survival")
-
-pbc_raw <- survival::pbc
-
-cat(
-    "Original PBC observations:",
-    nrow(pbc_raw),
-    "\n"
+data(
+    pbc,
+    package = "survival"
 )
 
 
 ################################################################################
-# 3. REAL-DATA EVENT AND TREATMENT CONSTRUCTION
+# 3. INSPECT ORIGINAL DATA
+################################################################################
+
+cat("\n")
+cat("============================================================\n")
+cat("PBC REAL-DATA APPLICATION\n")
+cat("============================================================\n")
+
+cat(
+    "Original number of observations:",
+    nrow(pbc),
+    "\n"
+)
+
+cat(
+    "Original number of variables:",
+    ncol(pbc),
+    "\n"
+)
+
+cat("\nOriginal treatment distribution:\n")
+
+print(
+    table(
+        pbc$trt,
+        useNA = "ifany"
+    )
+)
+
+cat("\nOriginal event distribution:\n")
+
+print(
+    table(
+        pbc$status,
+        useNA = "ifany"
+    )
+)
+
+
+################################################################################
+# 4. USE ONLY RANDOMIZED TRIAL PARTICIPANTS
 ################################################################################
 #
-# PBC coding:
+# survival::pbc documentation:
 #
-#     status = 0 : censored
-#     status = 1 : transplantation
-#     status = 2 : death
+#   trt = 1/2/NA
 #
-#     trt = 1 : D-penicillamine
-#     trt = 2 : placebo
+#   1 = D-penicillamine
+#   2 = placebo
+#   NA = not randomized
 #
-# trt is NA for the observational portion of the PBC data.
-#
-# Therefore, only randomized trial subjects are retained.
+# The first 312 patients participated in the randomized trial.
 #
 ################################################################################
 
-pbc_data <- pbc_raw %>%
-    
-    dplyr::filter(
+real_data <- pbc %>%
+
+    filter(
         !is.na(trt)
     ) %>%
-    
-    dplyr::mutate(
-        
+
+    mutate(
+
+        ########################################################################
+        # Treatment
+        ########################################################################
+
         treatment = ifelse(
             trt == 1,
             1L,
             0L
         ),
-        
+
+        ########################################################################
+        # Competing-risk cause
+        ########################################################################
+        #
+        # status:
+        #
+        # 0 = censored
+        # 1 = transplantation
+        # 2 = death
+        #
+        ########################################################################
+
         cause = as.integer(
             status
         ),
-        
+
+        ########################################################################
+        # Follow-up time
+        ########################################################################
+
         time = as.numeric(
             time
         )
-        
+
     )
 
 
 ################################################################################
-# 4. DEFINE BASELINE COVARIATES
-################################################################################
-#
-# These are baseline variables available in the PBC data.
-#
-# age      = age in years
-# sex      = sex
-# edema    = edema status
-# bili     = serum bilirubin
-# albumin  = serum albumin
-# protime  = prothrombin time
-# stage    = histologic stage
-# ascites  = ascites status
-#
-################################################################################
-
-covariates <- c(
-    
-    "age",
-    "sex",
-    "edema",
-    "bili",
-    "albumin",
-    "protime",
-    "stage",
-    "ascites"
-    
-)
-
-P <- length(
-    covariates
-)
-
-
-################################################################################
-# 5. CHECK AVAILABLE VARIABLES
-################################################################################
-
-missing_variables <- setdiff(
-    c(
-        "id",
-        "time",
-        "status",
-        "trt",
-        "treatment",
-        "cause",
-        covariates
-    ),
-    names(pbc_data)
-)
-
-if (
-    length(missing_variables) > 0
-) {
-    
-    stop(
-        paste(
-            "Missing PBC variables:",
-            paste(
-                missing_variables,
-                collapse = ", "
-            )
-        )
-    )
-    
-}
-
-
-################################################################################
-# 6. COMPLETE-CASE REAL-DATA ANALYSIS SET
-################################################################################
-
-analysis_vars <- c(
-    
-    "id",
-    "time",
-    "status",
-    "trt",
-    "treatment",
-    "cause",
-    covariates
-    
-)
-
-pbc_data <- pbc_data[
-    
-    complete.cases(
-        pbc_data[
-            ,
-            analysis_vars,
-            drop = FALSE
-        ]
-    ),
-    
-    ,
-    drop = FALSE
-    
-]
-
-
-################################################################################
-# 7. VALIDATE REAL-DATA EVENT CODING
-################################################################################
-
-pbc_data <- pbc_data[
-    
-    pbc_data$cause %in% c(
-        0L,
-        1L,
-        2L
-    ),
-    
-    ,
-    drop = FALSE
-    
-]
-
-pbc_data <- pbc_data[
-    
-    is.finite(pbc_data$time) &
-        pbc_data$time > 0,
-    
-    ,
-    drop = FALSE
-    
-]
-
-pbc_data <- pbc_data[
-    
-    pbc_data$treatment %in% c(
-        0L,
-        1L
-    ),
-    
-    ,
-    drop = FALSE
-    
-]
-
-
-################################################################################
-# 8. PRINT REAL-DATA DESCRIPTION
+# 5. VERIFY RANDOMIZED SAMPLE
 ################################################################################
 
 cat("\n")
 cat("============================================================\n")
-cat("PBC REAL-DATA ANALYSIS SET\n")
+cat("RANDOMIZED TRIAL SAMPLE\n")
 cat("============================================================\n")
 
 cat(
-    "Complete randomized subjects:",
-    nrow(pbc_data),
+    "Number of randomized participants:",
+    nrow(real_data),
+    "\n"
+)
+
+cat("\nTreatment distribution:\n")
+
+print(
+    table(
+        real_data$treatment
+    )
+)
+
+cat("\nTreatment proportions:\n")
+
+print(
+    prop.table(
+        table(
+            real_data$treatment
+        )
+    )
+)
+
+cat("\nCompeting-risk distribution:\n")
+
+print(
+    table(
+        real_data$cause
+    )
+)
+
+
+################################################################################
+# 6. LABEL EVENTS
+################################################################################
+
+real_data <- real_data %>%
+
+    mutate(
+
+        cause_label = case_when(
+
+            cause == 0 ~
+                "Censored",
+
+            cause == 1 ~
+                "Liver transplantation",
+
+            cause == 2 ~
+                "Death",
+
+            TRUE ~
+                "Unknown"
+
+        )
+
+    )
+
+
+################################################################################
+# 7. SELECT BASELINE COVARIATES
+################################################################################
+#
+# We use clinically meaningful baseline variables.
+#
+# Continuous variables:
+#   age
+#   albumin
+#   alk.phos
+#   bili
+#   chol
+#   copper
+#   platelet
+#   protime
+#   ast
+#
+# Binary / ordinal variables:
+#   ascites
+#   edema
+#   hepato
+#   spiders
+#   sex
+#   stage
+#
+# To keep the CSC stable for this relatively small real dataset,
+# we use a compact baseline covariate set.
+#
+################################################################################
+
+candidate_covariates <- c(
+
+    "age",
+    "albumin",
+    "alk.phos",
+    "bili",
+    "chol",
+    "copper",
+    "platelet",
+    "protime",
+    "ast",
+    "ascites",
+    "edema",
+    "hepato",
+    "spiders",
+    "sex",
+    "stage"
+
+)
+
+
+################################################################################
+# 8. RECODE CATEGORICAL VARIABLES
+################################################################################
+
+real_data <- real_data %>%
+
+    mutate(
+
+        ########################################################################
+        # Sex
+        ########################################################################
+
+        sex_num = ifelse(
+            sex == "m",
+            1,
+            0
+        ),
+
+        ########################################################################
+        # Stage
+        ########################################################################
+
+        stage_num = as.numeric(
+            stage
+        ),
+
+        ########################################################################
+        # Ascites
+        ########################################################################
+
+        ascites_num = as.numeric(
+            ascites
+        ),
+
+        ########################################################################
+        # Hepatomegaly
+        ########################################################################
+
+        hepato_num = as.numeric(
+            hepato
+        ),
+
+        ########################################################################
+        # Spiders
+        ########################################################################
+
+        spiders_num = as.numeric(
+            spiders
+        ),
+
+        ########################################################################
+        # Edema
+        ########################################################################
+
+        edema_num = as.numeric(
+            edema
+        )
+
+    )
+
+
+################################################################################
+# 9. FINAL ANALYSIS COVARIATES
+################################################################################
+
+covariates <- c(
+
+    "age",
+    "albumin",
+    "alk.phos",
+    "bili",
+    "chol",
+    "copper",
+    "platelet",
+    "protime",
+    "ast",
+    "ascites_num",
+    "edema_num",
+    "hepato_num",
+    "spiders_num",
+    "sex_num",
+    "stage_num"
+
+)
+
+
+################################################################################
+# 10. KEEP ANALYSIS VARIABLES
+################################################################################
+
+needed_variables <- c(
+
+    "id",
+    "time",
+    "status",
+    "cause",
+    "cause_label",
+    "treatment",
+
+    covariates
+
+)
+
+
+real_data <- real_data[
+
+    ,
+    intersect(
+        needed_variables,
+        names(real_data)
+    ),
+
+    drop = FALSE
+
+]
+
+
+################################################################################
+# 11. REMOVE INVALID VALUES
+################################################################################
+
+for (v in covariates) {
+
+    real_data[[v]] <- as.numeric(
+        real_data[[v]]
+    )
+
+}
+
+real_data$time <- as.numeric(
+    real_data$time
+)
+
+real_data$treatment <- as.integer(
+    real_data$treatment
+)
+
+real_data$cause <- as.integer(
+    real_data$cause
+)
+
+
+################################################################################
+# 12. COMPLETE-CASE ANALYSIS
+################################################################################
+
+complete_index <- complete.cases(
+    real_data[
+        ,
+        c(
+            "time",
+            "cause",
+            "treatment",
+            covariates
+        )
+    ]
+)
+
+real_data <- real_data[
+    complete_index,
+    ,
+    drop = FALSE
+]
+
+
+################################################################################
+# 13. VALIDATE DATA
+################################################################################
+
+cat("\n")
+cat("============================================================\n")
+cat("FINAL ANALYSIS DATA\n")
+cat("============================================================\n")
+
+cat(
+    "Complete-case sample size:",
+    nrow(real_data),
     "\n"
 )
 
 cat(
-    "Treatment 0 (placebo):",
-    sum(pbc_data$treatment == 0),
-    "\n"
-)
-
-cat(
-    "Treatment 1 (D-penicillamine):",
-    sum(pbc_data$treatment == 1),
-    "\n"
-)
-
-cat(
-    "Censored:",
-    sum(pbc_data$cause == 0),
-    "\n"
-)
-
-cat(
-    "Transplantation:",
-    sum(pbc_data$cause == 1),
-    "\n"
-)
-
-cat(
-    "Death:",
-    sum(pbc_data$cause == 2),
-    "\n"
-)
-
-cat(
-    "Maximum observed time:",
-    round(
-        max(pbc_data$time),
-        2
+    "Maximum follow-up time:",
+    max(
+        real_data$time,
+        na.rm = TRUE
     ),
     "days\n"
 )
 
 cat(
-    "TAU:",
-    TAU,
-    "days (5 years)\n"
+    "Median follow-up time:",
+    median(
+        real_data$time,
+        na.rm = TRUE
+    ),
+    "days\n"
+)
+
+cat("\nTreatment:\n")
+
+print(
+    table(
+        real_data$treatment
+    )
+)
+
+cat("\nCompeting risks:\n")
+
+print(
+    table(
+        real_data$cause
+    )
+)
+
+cat("\nCause proportions:\n")
+
+print(
+    prop.table(
+        table(
+            real_data$cause
+        )
+    )
+
+
 )
 
 
 ################################################################################
-# 9. EVENT DISTRIBUTION
+# 14. EVENT COUNTS BY TREATMENT
 ################################################################################
 
 cat("\n")
 cat("============================================================\n")
-cat("EVENT DISTRIBUTION BY TREATMENT\n")
+cat("EVENT COUNTS BY TREATMENT\n")
 cat("============================================================\n")
 
 event_table <- table(
-    
-    Treatment = pbc_data$treatment,
-    
-    Cause = pbc_data$cause
-    
+
+    Treatment =
+        real_data$treatment,
+
+    Cause =
+        real_data$cause
+
 )
 
 print(
@@ -419,100 +568,107 @@ print(
 
 
 ################################################################################
-# 10. TREATMENT LABEL
+# 15. CHECK TAU
 ################################################################################
 
-pbc_data$Treatment_Label <- ifelse(
-    
-    pbc_data$treatment == 1,
-    
-    "D-penicillamine",
-    
-    "Placebo"
-    
-)
-
-
-################################################################################
-# 11. STANDARDIZE CONTINUOUS COVARIATES
-################################################################################
-#
-# Standardization improves numerical stability of CSC.
-#
-# Binary/categorical variables are retained numerically.
-#
-################################################################################
-
-continuous_vars <- c(
-    
-    "age",
-    "bili",
-    "albumin",
-    "protime"
-    
-)
-
-for (
-    v in continuous_vars
+if (
+    max(
+        real_data$time,
+        na.rm = TRUE
+    ) < TAU
 ) {
-    
-    pbc_data[[v]] <- as.numeric(
-        scale(
-            pbc_data[[v]]
+
+    stop(
+        paste0(
+            "TAU = ",
+            TAU,
+            " days exceeds maximum observed follow-up."
         )
     )
-    
+
 }
 
 
 ################################################################################
-# 12. STANDARDIZE OTHER NUMERIC VARIABLES
+# 16. GAUSS-LEGENDRE QUADRATURE
 ################################################################################
 #
-# Stage and edema/ascites are kept as numeric baseline variables.
+# Retained for compatibility with the simulation framework.
+# It is not required to calculate a true CIF in the real-data analysis,
+# because the real-data CIF is estimated directly by CSC.
 #
 ################################################################################
 
-for (
-    v in c(
-        "stage"
-    )
-) {
-    
-    pbc_data[[v]] <- as.numeric(
-        scale(
-            pbc_data[[v]]
+gauss_legendre <- function(n) {
+
+    i <- seq_len(n)
+
+    beta <- i[-n] /
+        sqrt(
+            4 * i[-n]^2 - 1
         )
+
+    J <- matrix(
+        0,
+        nrow = n,
+        ncol = n
     )
-    
+
+    if (n > 1) {
+
+        idx <- cbind(
+            seq_len(n - 1),
+            seq_len(n - 1) + 1
+        )
+
+        J[idx] <- beta
+
+        J[cbind(
+            seq_len(n - 1) + 1,
+            seq_len(n - 1)
+        )] <- beta
+
+    }
+
+    eig <- eigen(
+        J,
+        symmetric = TRUE
+    )
+
+    nodes <- eig$values
+
+    weights <- 2 *
+        eig$vectors[1, ]^2
+
+    list(
+        nodes = nodes,
+        weights = weights
+    )
+
 }
 
 
 ################################################################################
-# 13. RANK TRANSFORMATION
+# 17. RANK TRANSFORMATION
 ################################################################################
 
-rank_uniform <- function(
-        x
-) {
-    
+rank_uniform <- function(x) {
+
     x <- as.numeric(
         x
     )
-    
-    n <- length(
-        x
-    )
-    
+
+    n <- length(x)
+
     r <- rank(
         x,
         ties.method = "average"
     )
-    
+
     u <- (
         r - 0.5
     ) / n
-    
+
     u <- pmin(
         pmax(
             u,
@@ -520,14 +676,14 @@ rank_uniform <- function(
         ),
         1 - 1e-6
     )
-    
+
     u
-    
+
 }
 
 
 ################################################################################
-# 14. SAFE R-VINE FIT
+# 18. FIT R-VINE COPULA
 ################################################################################
 
 fit_rvine <- function(
@@ -535,7 +691,7 @@ fit_rvine <- function(
         covariate_names,
         verbose = FALSE
 ) {
-    
+
     X <- as.matrix(
         data[
             ,
@@ -543,157 +699,184 @@ fit_rvine <- function(
             drop = FALSE
         ]
     )
-    
+
     storage.mode(X) <- "double"
-    
-    
+
+
+    ##########################################################################
+    # Check matrix
+    ##########################################################################
+
     if (
         any(
             !is.finite(X)
         )
     ) {
-        
+
         stop(
             "Vine input contains non-finite values."
         )
-        
+
     }
-    
-    
-    p <- ncol(
+
+
+    ##########################################################################
+    # Remove zero-variance columns
+    ##########################################################################
+
+    variances <- apply(
+        X,
+        2,
+        var,
+        na.rm = TRUE
+    )
+
+    keep <- is.finite(
+        variances
+    ) &
+        variances > 1e-10
+
+    if (
+        sum(keep) < 2
+    ) {
+
+        stop(
+            "Too few nonconstant covariates for vine fitting."
+        )
+
+    }
+
+    X <- X[
+        ,
+        keep,
+        drop = FALSE
+    ]
+
+    used_names <- colnames(
         X
     )
-    
-    
+
+
     ##########################################################################
-    # Rank transform
+    # Rank transformation
     ##########################################################################
-    
+
     U <- matrix(
         NA_real_,
         nrow = nrow(X),
-        ncol = p
+        ncol = ncol(X)
     )
-    
-    for (
-        j in seq_len(p)
-    ) {
-        
+
+    for (j in seq_len(ncol(X))) {
+
         U[, j] <- rank_uniform(
             X[, j]
         )
-        
+
     }
-    
-    colnames(U) <- covariate_names
-    
-    
+
+    colnames(U) <- used_names
+
+
     ##########################################################################
-    # Fit R-vine
+    # R-vine structure selection
     ##########################################################################
-    
+
     vine_fit <- tryCatch(
-        
+
         VineCopula::RVineStructureSelect(
-            
+
             U,
-            
-            familyset =
-                VINE_FAMILYSET,
-            
-            selectioncrit =
-                "AIC",
-            
-            indeptest =
-                TRUE,
-            
-            level =
-                VINE_INDEPTEST_LEVEL,
-            
+
+            familyset = c(
+                1,   # Gaussian
+                2,   # Student t
+                3,   # Clayton
+                4,   # Gumbel
+                5,   # Frank
+                6,   # Joe
+                7    # BB1
+            ),
+
+            selectioncrit = "AIC",
+
+            indeptest = TRUE,
+
+            level = 0.05,
+
             trunclevel =
-                min(
-                    VINE_TRUNCLEVEL,
-                    p - 1
+                max(
+                    1,
+                    ncol(U) - 1
                 ),
-            
-            progress =
-                verbose
-            
+
+            progress = verbose
+
         ),
-        
+
         error = function(e) {
-            
-            if (
-                verbose
-            ) {
-                
+
+            if (verbose) {
+
                 cat(
                     "R-vine fitting failed:",
                     conditionMessage(e),
                     "\n"
                 )
-                
+
             }
-            
+
             NULL
-            
+
         }
-        
+
     )
-    
-    
+
+
     if (
         is.null(vine_fit)
     ) {
-        
-        return(
-            NULL
-        )
-        
+
+        return(NULL)
+
     }
-    
-    
+
+
     if (
         !inherits(
             vine_fit,
             "RVineMatrix"
         )
     ) {
-        
-        return(
-            NULL
-        )
-        
+
+        return(NULL)
+
     }
-    
-    
+
+
     list(
-        
-        model =
-            vine_fit,
-        
-        U =
-            U,
-        
-        X =
-            X,
-        
-        variables =
-            covariate_names
-        
+
+        model = vine_fit,
+
+        U = U,
+
+        X = X,
+
+        variables = used_names
+
     )
-    
+
 }
 
 
 ################################################################################
-# 15. CREATE VINE-COPULA FEATURES
+# 19. CREATE VINE FEATURES
 ################################################################################
 #
-# The fitted R-vine is used to determine the dependence structure.
+# The fitted R-vine is used to learn the dependence structure.
 #
-# Gaussianized marginal scores and selected pairwise dependence
-# interactions are then supplied to the CSC model.
+# Gaussian marginal scores are then supplied to CSC together with selected
+# dependence interaction features.
 #
 ################################################################################
 
@@ -702,7 +885,7 @@ make_vine_features <- function(
         vine_fit,
         covariate_names
 ) {
-    
+
     X <- as.matrix(
         data[
             ,
@@ -710,47 +893,36 @@ make_vine_features <- function(
             drop = FALSE
         ]
     )
-    
+
     storage.mode(X) <- "double"
-    
-    n <- nrow(X)
-    
-    p <- ncol(X)
-    
-    
+
+
     ##########################################################################
-    # Rank -> U
+    # Marginal Gaussian scores
     ##########################################################################
-    
+
     U <- matrix(
         NA_real_,
-        nrow = n,
-        ncol = p
+        nrow = nrow(X),
+        ncol = ncol(X)
     )
-    
-    for (
-        j in seq_len(p)
-    ) {
-        
+
+    for (j in seq_len(ncol(X))) {
+
         U[, j] <- rank_uniform(
             X[, j]
         )
-        
+
     }
-    
-    
-    ##########################################################################
-    # Gaussian copula scores
-    ##########################################################################
-    
+
     Z <- qnorm(
         U
     )
-    
+
     Z[
         !is.finite(Z)
     ] <- 0
-    
+
     Z <- pmin(
         pmax(
             Z,
@@ -758,304 +930,287 @@ make_vine_features <- function(
         ),
         8
     )
-    
-    
+
     colnames(Z) <- paste0(
-        covariate_names,
+        colnames(X),
         "_VINE"
     )
-    
-    
+
     Z <- as.data.frame(
         Z
     )
-    
-    
+
+
     ##########################################################################
     # Dependence matrix
     ##########################################################################
-    
+
     R <- tryCatch(
-        
+
         cor(
             Z,
             use = "pairwise.complete.obs"
         ),
-        
-        error = function(e) {
-            
-            NULL
-            
-        }
-        
+
+        error = function(e) NULL
+
     )
-    
-    
+
+
     if (
         is.null(R)
     ) {
-        
+
         return(
             cbind(
                 data,
                 Z
             )
         )
-        
+
     }
-    
-    
+
+
     ##########################################################################
-    # Keep upper triangle only
+    # Select strongest pairwise dependence features
     ##########################################################################
-    
+
     R[
-        lower.tri(
-            R,
-            diag = TRUE
-        )
+        lower.tri(R, diag = TRUE)
     ] <- NA_real_
-    
-    
+
     pair_idx <- which(
-        
+
         is.finite(R) &
-            abs(R) >=
-                VINE_INTERACTION_THRESHOLD,
-        
+            abs(R) >= 0.20,
+
         arr.ind = TRUE
-        
+
     )
-    
-    
+
+
     ##########################################################################
     # Limit number of interactions
     ##########################################################################
-    
+
     if (
-        nrow(pair_idx) >
-        MAX_VINE_INTERACTIONS
+        nrow(pair_idx) > 10
     ) {
-        
+
         vals <- abs(
             R[
                 pair_idx
             ]
         )
-        
+
         ord <- order(
             vals,
             decreasing = TRUE
         )
-        
+
         pair_idx <- pair_idx[
-            
             ord[
-                seq_len(
-                    MAX_VINE_INTERACTIONS
-                )
+                seq_len(10)
             ],
-            
             ,
-            
             drop = FALSE
-            
         ]
-        
+
     }
-    
-    
+
+
     ##########################################################################
-    # Create Vine interaction features
+    # Create vine interaction features
     ##########################################################################
-    
+
     if (
         nrow(pair_idx) > 0
     ) {
-        
+
         for (
             k in seq_len(
                 nrow(pair_idx)
             )
         ) {
-            
+
             j <- pair_idx[k, 1]
-            
+
             l <- pair_idx[k, 2]
-            
+
             new_name <- paste0(
+
                 "VINE_INT_",
-                covariate_names[j],
+
+                j,
+
                 "_",
-                covariate_names[l]
+
+                l
+
             )
-            
+
             Z[[new_name]] <-
+
                 Z[[j]] *
                 Z[[l]]
-            
+
         }
-        
+
     }
-    
-    
-    ##########################################################################
-    # Return
-    ##########################################################################
-    
-    out <- cbind(
+
+
+    cbind(
         data,
         Z
     )
-    
-    
-    attr(
-        out,
-        "vine_model"
-    ) <- vine_fit
-    
-    out
-    
+
 }
 
 
 ################################################################################
-# 16. ADD VINE-COPULA VARIABLES
+# 20. ADD VINE COPULA VARIABLES
 ################################################################################
 
 add_vine_copula_variables <- function(
         data,
+        covariate_names,
         verbose = FALSE
 ) {
-    
+
     vine <- fit_rvine(
+
         data,
-        covariate_names =
-            covariates,
-        verbose =
-            verbose
+
+        covariate_names,
+
+        verbose = verbose
+
     )
-    
-    
+
     if (
         is.null(vine)
     ) {
-        
-        return(
-            NULL
-        )
-        
+
+        return(NULL)
+
     }
-    
-    
+
     d <- make_vine_features(
+
         data,
+
         vine$model,
-        covariate_names =
-            covariates
+
+        vine$variables
+
     )
-    
-    
+
     attr(
         d,
         "vine_model"
     ) <- vine$model
-    
+
     attr(
         d,
         "vine_U"
     ) <- vine$U
-    
-    
+
+    attr(
+        d,
+        "vine_variables"
+    ) <- vine$variables
+
     d
-    
+
 }
 
 
 ################################################################################
-# 17. PREPARE CSC DATA
+# 21. PREPARE CSC DATA
 ################################################################################
 
 prepare_csc_data <- function(
         data,
         covariate_names
 ) {
-    
+
     needed <- c(
-        
+
         "time",
         "cause",
         "treatment",
         covariate_names
-        
+
     )
-    
-    
+
     missing_vars <- setdiff(
+
         needed,
+
         names(data)
+
     )
-    
-    
+
     if (
         length(missing_vars) > 0
     ) {
-        
+
         stop(
+
             paste(
+
                 "Missing variables:",
+
                 paste(
                     missing_vars,
                     collapse = ", "
                 )
+
             )
+
         )
-        
+
     }
-    
-    
+
+
     d <- data[
+
         ,
         needed,
         drop = FALSE
+
     ]
-    
-    
+
+
     d$time <- as.numeric(
         d$time
     )
-    
+
     d$cause <- as.integer(
         d$cause
     )
-    
+
     d$treatment <- as.integer(
         d$treatment
     )
-    
-    
-    for (
-        v in covariate_names
-    ) {
-        
+
+
+    for (v in covariate_names) {
+
         d[[v]] <- as.numeric(
             d[[v]]
         )
-        
+
     }
-    
-    
-    keep <- complete.cases(
-        d
-    )
-    
+
+
     d <- d[
-        keep,
+        complete.cases(d),
         ,
         drop = FALSE
     ]
-    
-    
+
+
     d <- d[
         d$cause %in% c(
             0L,
@@ -1065,8 +1220,8 @@ prepare_csc_data <- function(
         ,
         drop = FALSE
     ]
-    
-    
+
+
     if (
         length(
             unique(
@@ -1074,14 +1229,14 @@ prepare_csc_data <- function(
             )
         ) < 3
     ) {
-        
+
         stop(
             "CSC data do not contain all three cause states."
         )
-        
+
     }
-    
-    
+
+
     if (
         length(
             unique(
@@ -1089,14 +1244,14 @@ prepare_csc_data <- function(
             )
         ) < 2
     ) {
-        
+
         stop(
             "CSC data do not contain both treatment groups."
         )
-        
+
     }
-    
-    
+
+
     if (
         any(
             !is.finite(
@@ -1104,34 +1259,34 @@ prepare_csc_data <- function(
             )
         )
     ) {
-        
+
         stop(
             "CSC data contain non-finite times."
         )
-        
+
     }
-    
-    
+
+
     if (
         any(
             d$time <= 0
         )
     ) {
-        
+
         stop(
             "CSC data contain non-positive times."
         )
-        
+
     }
-    
-    
+
+
     d
-    
+
 }
 
 
 ################################################################################
-# 18. FIT COMPETING-RISK MODEL
+# 22. FIT COMPETING-RISK CSC MODEL
 ################################################################################
 
 fit_competing_risk_model <- function(
@@ -1139,115 +1294,146 @@ fit_competing_risk_model <- function(
         covariate_names,
         verbose = FALSE
 ) {
-    
+
     d <- tryCatch(
-        
+
         prepare_csc_data(
+
             data,
+
             covariate_names
+
         ),
-        
+
         error = function(e) {
-            
-            if (
-                verbose
-            ) {
-                
+
+            if (verbose) {
+
                 cat(
+
                     "CSC preparation failed:",
+
                     conditionMessage(e),
+
                     "\n"
+
                 )
-                
+
             }
-            
+
             NULL
-            
+
         }
-        
+
     )
-    
-    
+
+
     if (
         is.null(d)
     ) {
-        
-        return(
-            NULL
-        )
-        
+
+        return(NULL)
+
     }
-    
-    
+
+
     ##########################################################################
-    # Formula
+    # Check events
     ##########################################################################
-    
+
+    event_counts <- table(
+        d$cause
+    )
+
+    if (
+        any(
+            event_counts[
+                c("1", "2")
+            ] < MIN_EVENTS
+        )
+    ) {
+
+        if (verbose) {
+
+            cat(
+                "Too few competing events.\n"
+            )
+
+            print(
+                event_counts
+            )
+
+        }
+
+        return(NULL)
+
+    }
+
+
+    ##########################################################################
+    # CSC formula
+    ##########################################################################
+
     formula_string <- paste(
-        
+
         "Hist(time, cause) ~ treatment +",
-        
+
         paste(
             covariate_names,
             collapse = " + "
         )
-        
+
     )
-    
-    
+
     f <- as.formula(
         formula_string
     )
-    
-    
+
+
     ##########################################################################
-    # CSC
+    # Fit CSC
     ##########################################################################
-    
+
     fit <- tryCatch(
-        
+
         suppressWarnings(
-            
+
             riskRegression::CSC(
-                
-                formula =
-                    f,
-                
-                data =
-                    d
-                
+
+                formula = f,
+
+                data = d
+
             )
-            
+
         ),
-        
+
         error = function(e) {
-            
-            if (
-                verbose
-            ) {
-                
+
+            if (verbose) {
+
                 cat(
                     "CSC fitting failed:",
                     conditionMessage(e),
                     "\n"
                 )
-                
+
             }
-            
+
             NULL
-            
+
         }
-        
+
     )
-    
-    
+
+
     fit
-    
+
 }
 
 
 ################################################################################
-# 19. SAFE CIF PREDICTION
+# 23. SAFE CIF PREDICTION
 ################################################################################
 
 safe_predict_cif <- function(
@@ -1257,122 +1443,115 @@ safe_predict_cif <- function(
         tau,
         verbose = FALSE
 ) {
-    
+
     n <- nrow(
         newdata
     )
-    
-    
+
+
     if (
         is.null(model)
     ) {
-        
+
         return(
             rep(
                 NA_real_,
                 n
             )
         )
-        
+
     }
-    
-    
+
+
     out <- tryCatch(
-        
+
         suppressWarnings(
-            
+
             riskRegression::predictRisk(
-                
+
                 object =
                     model,
-                
+
                 newdata =
                     newdata,
-                
+
                 times =
                     tau,
-                
+
                 cause =
                     cause
-                
+
             )
-            
+
         ),
-        
+
         error = function(e) {
-            
-            if (
-                verbose
-            ) {
-                
+
+            if (verbose) {
+
                 cat(
-                    "CIF prediction failed for cause",
-                    cause,
-                    ":",
+                    "CIF prediction failed:",
                     conditionMessage(e),
                     "\n"
                 )
-                
+
             }
-            
+
             NULL
-            
+
         }
-        
+
     )
-    
-    
+
+
     if (
         is.null(out)
     ) {
-        
+
         return(
             rep(
                 NA_real_,
                 n
             )
         )
-        
+
     }
-    
-    
+
+
     if (
         is.matrix(out) ||
         is.data.frame(out)
     ) {
-        
-        out <- out[
-            ,
-            1
-        ]
-        
+
+        out <- out[, 1]
+
     }
-    
-    
+
+
     out <- as.numeric(
         out
     )
-    
-    
+
+
     if (
         length(out) != n
     ) {
-        
+
         return(
             rep(
                 NA_real_,
                 n
             )
         )
-        
+
     }
-    
-    
+
+
     out[
         !is.finite(out)
     ] <- NA_real_
-    
-    
+
+
     out <- pmin(
         pmax(
             out,
@@ -1380,15 +1559,15 @@ safe_predict_cif <- function(
         ),
         1
     )
-    
-    
+
+
     out
-    
+
 }
 
 
 ################################################################################
-# 20. FIT ONE METHOD
+# 24. FIT ONE METHOD
 ################################################################################
 
 fit_method <- function(
@@ -1396,9 +1575,10 @@ fit_method <- function(
         method,
         tau = TAU,
         weights = WEIGHTS,
+        covariate_names = covariates,
         verbose = FALSE
 ) {
-    
+
     if (
         !method %in%
         c(
@@ -1406,939 +1586,969 @@ fit_method <- function(
             "No-Copula"
         )
     ) {
-        
+
         stop(
-            "method must be 'Vine-Copula' or 'No-Copula'."
+            "Unknown method."
         )
-        
+
     }
-    
-    
+
+
     ##########################################################################
-    # Check TAU
+    # VINE-COPULA
     ##########################################################################
-    
-    max_time <- max(
-        data$time,
-        na.rm = TRUE
-    )
-    
-    
-    if (
-        !is.finite(max_time) ||
-        max_time < tau
-    ) {
-        
-        if (
-            verbose
-        ) {
-            
-            cat(
-                method,
-                ": TAU unavailable.\n"
-            )
-            
-        }
-        
-        return(
-            NULL
-        )
-        
-    }
-    
-    
-    ##########################################################################
-    # VINE COPULA
-    ##########################################################################
-    
+
     if (
         method == "Vine-Copula"
     ) {
-        
+
         d <- tryCatch(
-            
+
             add_vine_copula_variables(
+
                 data,
-                verbose =
-                    verbose
+
+                covariate_names,
+
+                verbose
+
             ),
-            
+
             error = function(e) {
-                
-                if (
-                    verbose
-                ) {
-                    
+
+                if (verbose) {
+
                     cat(
                         "Vine transformation failed:",
                         conditionMessage(e),
                         "\n"
                     )
-                    
+
                 }
-                
+
                 NULL
-                
+
             }
-            
+
         )
-        
-        
+
+
         if (
             is.null(d)
         ) {
-            
-            return(
-                NULL
-            )
-            
+
+            return(NULL)
+
         }
-        
-        
+
+
         covars <- grep(
-            
-            "^age_VINE$|^sex_VINE$|^edema_VINE$|^bili_VINE$|^albumin_VINE$|^protime_VINE$|^stage_VINE$|^ascites_VINE$|^VINE_INT_",
-            
+
+            "_VINE$|^VINE_INT_",
+
             names(d),
-            
+
             value = TRUE
-            
+
         )
-        
-        
-    } else {
-        
-        ######################################################################
-        # NO COPULA
-        ######################################################################
-        
-        d <- data
-        
-        covars <- covariates
-        
+
     }
-    
-    
+
+
+    ##########################################################################
+    # NO-COPULA
+    ##########################################################################
+
+    if (
+        method == "No-Copula"
+    ) {
+
+        d <- data
+
+        covars <- covariate_names
+
+    }
+
+
+    ##########################################################################
+    # Check covariates
+    ##########################################################################
+
     if (
         length(covars) == 0
     ) {
-        
-        if (
-            verbose
-        ) {
-            
-            cat(
-                method,
-                ": no usable covariates.\n"
-            )
-            
-        }
-        
-        return(
-            NULL
-        )
-        
+
+        return(NULL)
+
     }
-    
-    
+
+
     ##########################################################################
     # CSC
     ##########################################################################
-    
+
     model <- fit_competing_risk_model(
-        
+
         d,
-        
+
         covars,
-        
-        verbose =
-            verbose
-        
+
+        verbose
+
     )
-    
-    
+
+
     if (
         is.null(model)
     ) {
-        
-        return(
-            NULL
-        )
-        
+
+        return(NULL)
+
     }
-    
-    
+
+
     ##########################################################################
     # Counterfactual treatment datasets
     ##########################################################################
-    
+
     d0 <- d
-    
+
     d0$treatment <- 0L
-    
-    
+
+
     d1 <- d
-    
+
     d1$treatment <- 1L
-    
-    
+
+
     ##########################################################################
-    # CIFs
+    # CIF predictions
     ##########################################################################
-    
+
     cif01 <- safe_predict_cif(
-        
+
         model,
-        
+
         d0,
-        
+
         cause = 1,
-        
-        tau =
-            tau,
-        
-        verbose =
-            verbose
-        
+
+        tau = tau,
+
+        verbose = verbose
+
     )
-    
-    
+
+
     cif02 <- safe_predict_cif(
-        
+
         model,
-        
+
         d0,
-        
+
         cause = 2,
-        
-        tau =
-            tau,
-        
-        verbose =
-            verbose
-        
+
+        tau = tau,
+
+        verbose = verbose
+
     )
-    
-    
+
+
     cif11 <- safe_predict_cif(
-        
+
         model,
-        
+
         d1,
-        
+
         cause = 1,
-        
-        tau =
-            tau,
-        
-        verbose =
-            verbose
-        
+
+        tau = tau,
+
+        verbose = verbose
+
     )
-    
-    
+
+
     cif12 <- safe_predict_cif(
-        
+
         model,
-        
+
         d1,
-        
+
         cause = 2,
-        
-        tau =
-            tau,
-        
-        verbose =
-            verbose
-        
+
+        tau = tau,
+
+        verbose = verbose
+
     )
-    
-    
+
+
     ##########################################################################
     # Valid predictions
     ##########################################################################
-    
-    valid <- (
-        
+
+    valid <-
+
         is.finite(cif01) &
-            is.finite(cif02) &
-            is.finite(cif11) &
-            is.finite(cif12)
-        
-    )
-    
-    
+        is.finite(cif02) &
+        is.finite(cif11) &
+        is.finite(cif12)
+
+
     n_valid <- sum(
         valid
     )
-    
-    
+
+
     if (
         n_valid <
-        0.50 * nrow(d)
+        MIN_VALID_PROP * nrow(d)
     ) {
-        
-        if (
-            verbose
-        ) {
-            
+
+        if (verbose) {
+
             cat(
+
                 method,
+
                 ": only",
+
                 n_valid,
-                "valid predictions out of",
+
+                "of",
+
                 nrow(d),
-                "\n"
+
+                "valid predictions.\n"
+
             )
-            
+
         }
-        
-        return(
-            NULL
-        )
-        
+
+        return(NULL)
+
     }
-    
-    
+
+
     ##########################################################################
-    # Treatment-specific value
+    # Weighted competing-risk values
     ##########################################################################
-    
+
     V0 <- -(
-        
+
         weights[1] * cif01 +
-            weights[2] * cif02
-        
+
+        weights[2] * cif02
+
     )
-    
-    
+
+
     V1 <- -(
-        
+
         weights[1] * cif11 +
-            weights[2] * cif12
-        
+
+        weights[2] * cif12
+
     )
-    
-    
+
+
     ##########################################################################
-    # Estimated CATE
+    # Individualized treatment contrast
     ##########################################################################
-    
-    estimated_cate <- V1 - V0
-    
-    
+
+    cate <- V1 - V0
+
+
     ##########################################################################
-    # Individualized rule
+    # Treatment rule
     ##########################################################################
-    
-    estimated_rule <- ifelse(
-        
-        estimated_cate > 0,
-        
+
+    rule <- ifelse(
+
+        cate > 0,
+
         1L,
-        
+
         0L
-        
+
     )
-    
-    
+
+
     ##########################################################################
     # Return
     ##########################################################################
-    
+
     list(
-        
-        success =
-            TRUE,
-        
-        method =
-            method,
-        
-        model =
-            model,
-        
-        data =
-            d,
-        
-        covariates =
-            covars,
-        
-        CIF_A0_Cause1 =
-            cif01,
-        
-        CIF_A0_Cause2 =
-            cif02,
-        
-        CIF_A1_Cause1 =
-            cif11,
-        
-        CIF_A1_Cause2 =
-            cif12,
-        
-        Value_A0 =
-            V0,
-        
-        Value_A1 =
-            V1,
-        
-        Estimated_CATE =
-            estimated_cate,
-        
-        Estimated_Rule =
-            estimated_rule,
-        
-        Valid =
-            valid,
-        
-        Valid_N =
-            n_valid
-        
+
+        success = TRUE,
+
+        method = method,
+
+        model = model,
+
+        data = d,
+
+        covariates = covars,
+
+        CIF_A0_Cause1 = cif01,
+
+        CIF_A0_Cause2 = cif02,
+
+        CIF_A1_Cause1 = cif11,
+
+        CIF_A1_Cause2 = cif12,
+
+        Value_A0 = V0,
+
+        Value_A1 = V1,
+
+        Estimated_CATE = cate,
+
+        Estimated_Rule = rule,
+
+        Valid = valid,
+
+        Valid_N = n_valid
+
     )
-    
+
 }
 
 
 ################################################################################
-# 21. FIT PROPENSITY SCORE MODEL
-################################################################################
-#
-# Because the PBC trial treatment is randomized, the empirical treatment
-# probability is appropriate for the primary IPW policy-value calculation.
-#
+# 25. EXTRACT POLICY SUMMARY
 ################################################################################
 
-fit_propensity <- function(
-        data
-) {
-    
-    p_treat <- mean(
-        data$treatment == 1
-    )
-    
-    
-    if (
-        p_treat <= 0 ||
-        p_treat >= 1
-    ) {
-        
-        stop(
-            "Invalid empirical treatment probability."
-        )
-        
-    }
-    
-    
-    rep(
-        p_treat,
-        nrow(data)
-    )
-    
-}
-
-
-################################################################################
-# 22. KAPLAN-MEIER ESTIMATOR FOR POLICY VALUE
-################################################################################
-#
-# For a policy d(X), we need an observed outcome contribution.
-#
-# We define the utility at TAU using:
-#
-#     U_i(TAU) =
-#
-#         -w1 * I(transplant by TAU)
-#         -w2 * I(death by TAU)
-#
-# Subjects who are censored before TAU are weighted using
-# inverse probability of censoring weighting.
-#
-################################################################################
-
-estimate_censoring_survival <- function(
-        data,
-        tau
-) {
-    
-    censor_event <- as.integer(
-        data$cause == 0 &
-            data$time < tau
-    )
-    
-    
-    fit <- survival::survfit(
-        
-        survival::Surv(
-            time,
-            censor_event
-        ) ~ 1,
-        
-        data =
-            data
-        
-    )
-    
-    
-    G <- summary(
-        
+summarize_policy <- function(
         fit,
-        
-        times =
-            pmin(
-                data$time,
-                tau
-            ),
-        
-        extend =
-            TRUE
-        
-    )$surv
-    
-    
+        original_data
+) {
+
     if (
-        length(G) != nrow(data)
+        is.null(fit)
     ) {
-        
-        ######################################################################
-        # Safe fallback: KM evaluated subject by subject
-        ######################################################################
-        
-        G <- sapply(
-            
-            seq_len(
-                nrow(data)
-            ),
-            
-            function(i) {
-                
-                ss <- summary(
-                    
-                    fit,
-                    
-                    times =
-                        min(
-                            data$time[i],
-                            tau
-                        ),
-                    
-                    extend =
-                        TRUE
-                    
-                )
-                
-                
-                if (
-                    length(ss$surv) == 0
-                ) {
-                    
-                    return(
-                        1
-                    )
-                    
-                }
-                
-                
-                ss$surv[1]
-                
-            }
-            
-        )
-        
+
+        return(NULL)
+
     }
-    
-    
-    G <- pmax(
-        G,
-        0.05
-    )
-    
-    
-    G
-    
-}
 
 
-################################################################################
-# 23. OBSERVED POLICY UTILITY
-################################################################################
+    valid <- fit$Valid
 
-calculate_observed_policy_utility <- function(
-        data,
-        estimated_rule,
-        tau,
-        weights
-) {
-    
-    n <- nrow(
-        data
-    )
-    
-    
+
     ##########################################################################
-    # Treatment probability
+    # Policy proportions
     ##########################################################################
-    
-    p1 <- mean(
-        data$treatment == 1
-    )
-    
-    p0 <- 1 - p1
-    
-    
-    ##########################################################################
-    # Censoring survival
-    ##########################################################################
-    
-    G <- estimate_censoring_survival(
-        
-        data,
-        
-        tau =
-            tau
-        
-    )
-    
-    
-    ##########################################################################
-    # Whether observed treatment agrees with policy
-    ##########################################################################
-    
-    policy_match <- (
-        
-        data$treatment ==
-            estimated_rule
-        
-    )
-    
-    
-    ##########################################################################
-    # Event utility
-    ##########################################################################
-    
-    utility <- rep(
-        0,
-        n
-    )
-    
-    
-    utility[
-        data$time <= tau &
-            data$cause == 1
-    ] <- -weights[1]
-    
-    
-    utility[
-        data$time <= tau &
-            data$cause == 2
-    ] <- -weights[2]
-    
-    
-    ##########################################################################
-    # IPCW treatment-policy weight
-    ##########################################################################
-    
-    treatment_weight <- ifelse(
-        
-        data$treatment == 1,
-        
-        1 / p1,
-        
-        1 / p0
-        
-    )
-    
-    
-    policy_weight <- (
-        
-        policy_match *
-            treatment_weight /
-            G
-        
-    )
-    
-    
-    ##########################################################################
-    # Administrative TAU contribution
-    ##########################################################################
-    
-    # Subjects who survive beyond TAU contribute zero utility.
-    #
-    # Subjects censored before TAU have no observed event by TAU and are
-    # handled conservatively through the IPCW contribution.
-    
-    
-    contribution <- (
-        
-        policy_weight *
-            utility
-        
-    )
-    
-    
-    mean(
-        contribution,
+
+    treatment1_rate <- mean(
+
+        fit$Estimated_Rule[valid] == 1,
+
         na.rm = TRUE
+
     )
-    
+
+
+    treatment0_rate <- mean(
+
+        fit$Estimated_Rule[valid] == 0,
+
+        na.rm = TRUE
+
+    )
+
+
+    ##########################################################################
+    # Mean predicted values
+    ##########################################################################
+
+    mean_V0 <- mean(
+
+        fit$Value_A0[valid],
+
+        na.rm = TRUE
+
+    )
+
+
+    mean_V1 <- mean(
+
+        fit$Value_A1[valid],
+
+        na.rm = TRUE
+
+    )
+
+
+    ##########################################################################
+    # Mean estimated individualized contrast
+    ##########################################################################
+
+    mean_CATE <- mean(
+
+        fit$Estimated_CATE[valid],
+
+        na.rm = TRUE
+
+    )
+
+
+    sd_CATE <- sd(
+
+        fit$Estimated_CATE[valid],
+
+        na.rm = TRUE
+
+    )
+
+
+    ##########################################################################
+    # Policy value
+    ##########################################################################
+
+    policy_value <- mean(
+
+        ifelse(
+
+            fit$Estimated_Rule[valid] == 1,
+
+            fit$Value_A1[valid],
+
+            fit$Value_A0[valid]
+
+        ),
+
+        na.rm = TRUE
+
+    )
+
+
+    ##########################################################################
+    # Always-treat policies
+    ##########################################################################
+
+    always_0 <- mean(
+
+        fit$Value_A0[valid],
+
+        na.rm = TRUE
+
+    )
+
+
+    always_1 <- mean(
+
+        fit$Value_A1[valid],
+
+        na.rm = TRUE
+
+    )
+
+
+    ##########################################################################
+    # Oracle using fitted conditional values
+    ##########################################################################
+
+    fitted_optimal <- pmax(
+
+        fit$Value_A0[valid],
+
+        fit$Value_A1[valid]
+
+    )
+
+
+    optimal_value <- mean(
+
+        fitted_optimal,
+
+        na.rm = TRUE
+
+    )
+
+
+    ##########################################################################
+    # Regret relative to fitted optimal policy
+    ##########################################################################
+
+    regret <-
+
+        optimal_value -
+
+        policy_value
+
+
+    ##########################################################################
+    # Relative loss
+    ##########################################################################
+
+    relative_loss <-
+
+        regret /
+
+        max(
+            abs(optimal_value),
+            1e-8
+        )
+
+
+    ##########################################################################
+    # Return
+    ##########################################################################
+
+    data.frame(
+
+        Method =
+            fit$method,
+
+        N =
+            nrow(fit$data),
+
+        Valid_N =
+            fit$Valid_N,
+
+        Treatment1_Rate =
+            treatment1_rate,
+
+        Treatment0_Rate =
+            treatment0_rate,
+
+        Mean_CATE =
+            mean_CATE,
+
+        SD_CATE =
+            sd_CATE,
+
+        Mean_Value_A0 =
+            mean_V0,
+
+        Mean_Value_A1 =
+            mean_V1,
+
+        Always_Treatment0_Value =
+            always_0,
+
+        Always_Treatment1_Value =
+            always_1,
+
+        Policy_Value =
+            policy_value,
+
+        Fitted_Optimal_Value =
+            optimal_value,
+
+        Fitted_Regret =
+            regret,
+
+        Relative_Value_Loss =
+            relative_loss,
+
+        stringsAsFactors = FALSE
+
+    )
+
 }
 
 
 ################################################################################
-# 24. ALWAYS-TREATMENT POLICY VALUE
-################################################################################
-
-calculate_fixed_policy_value <- function(
-        data,
-        fixed_treatment,
-        tau,
-        weights
-) {
-    
-    policy <- rep(
-        fixed_treatment,
-        nrow(data)
-    )
-    
-    
-    calculate_observed_policy_utility(
-        
-        data =
-            data,
-        
-        estimated_rule =
-            policy,
-        
-        tau =
-            tau,
-        
-        weights =
-            weights
-        
-    )
-    
-}
-
-
-################################################################################
-# 25. FIT BOTH METHODS
+# 26. FIT NO-COPULA MODEL
 ################################################################################
 
 cat("\n")
 cat("============================================================\n")
-cat("FITTING VINE-COPULA + CSC\n")
-cat("============================================================\n")
-
-fit_vine <- fit_method(
-    
-    pbc_data,
-    
-    method =
-        "Vine-Copula",
-    
-    tau =
-        TAU,
-    
-    weights =
-        WEIGHTS,
-    
-    verbose =
-        TRUE
-    
-)
-
-
-if (
-    is.null(fit_vine)
-) {
-    
-    stop(
-        "FATAL ERROR: Vine-Copula + CSC failed."
-    )
-    
-}
-
-
-cat("\n")
-cat(
-    "Vine-Copula + CSC PASSED.\n"
-)
-
-cat(
-    "Number of CSC covariates:",
-    length(
-        fit_vine$covariates
-    ),
-    "\n"
-)
-
-
-################################################################################
-# 26. NO-COPULA CSC
-################################################################################
-
-cat("\n")
-cat("============================================================\n")
-cat("FITTING NO-COPULA + CSC\n")
+cat("NO-COPULA + CSC\n")
 cat("============================================================\n")
 
 fit_nocopula <- fit_method(
-    
-    pbc_data,
-    
-    method =
-        "No-Copula",
-    
-    tau =
-        TAU,
-    
-    weights =
-        WEIGHTS,
-    
-    verbose =
-        TRUE
-    
+
+    real_data,
+
+    method = "No-Copula",
+
+    tau = TAU,
+
+    weights = WEIGHTS,
+
+    covariate_names = covariates,
+
+    verbose = TRUE
+
 )
 
 
 if (
     is.null(fit_nocopula)
 ) {
-    
+
     stop(
         "FATAL ERROR: No-Copula + CSC failed."
     )
-    
+
+}
+
+cat(
+    "\nNo-Copula + CSC successfully fitted.\n"
+)
+
+
+################################################################################
+# 27. FIT VINE-COPULA MODEL
+################################################################################
+
+cat("\n")
+cat("============================================================\n")
+cat("VINE-COPULA + CSC\n")
+cat("============================================================\n")
+
+fit_vine <- fit_method(
+
+    real_data,
+
+    method = "Vine-Copula",
+
+    tau = TAU,
+
+    weights = WEIGHTS,
+
+    covariate_names = covariates,
+
+    verbose = TRUE
+
+)
+
+
+if (
+    is.null(fit_vine)
+) {
+
+    stop(
+        "FATAL ERROR: Vine-Copula + CSC failed."
+    )
+
+}
+
+cat(
+    "\nVine-Copula + CSC successfully fitted.\n"
+)
+
+
+################################################################################
+# 28. VINE DIAGNOSTICS
+################################################################################
+
+vine_model <- attr(
+
+    fit_vine$data,
+
+    "vine_model"
+
+)
+
+
+if (
+    !is.null(vine_model)
+) {
+
+    cat("\n")
+    cat("============================================================\n")
+    cat("R-VINE STRUCTURE\n")
+    cat("============================================================\n")
+
+    print(
+        vine_model$Matrix
+    )
+
+
+    cat("\nR-vine family matrix:\n")
+
+    print(
+        vine_model$family
+    )
+
 }
 
 
-cat("\n")
-cat(
-    "No-Copula + CSC PASSED.\n"
+################################################################################
+# 29. POLICY SUMMARIES
+################################################################################
+
+policy_vine <- summarize_policy(
+
+    fit_vine,
+
+    real_data
+
+)
+
+
+policy_raw <- summarize_policy(
+
+    fit_nocopula,
+
+    real_data
+
+)
+
+
+policy_results <- bind_rows(
+
+    policy_vine,
+
+    policy_raw
+
 )
 
 
 ################################################################################
-# 27. SINGLE-DATASET MODEL DIAGNOSTICS
+# 30. PRINT POLICY RESULTS
 ################################################################################
 
 cat("\n")
 cat("============================================================\n")
-cat("MODEL DIAGNOSTICS\n")
+cat("INDIVIDUALIZED TREATMENT POLICY RESULTS\n")
 cat("============================================================\n")
 
-cat(
-    "Vine-Copula valid predictions:",
-    fit_vine$Valid_N,
-    "of",
-    nrow(pbc_data),
-    "\n"
-)
+print(
 
-cat(
-    "No-Copula valid predictions:",
-    fit_nocopula$Valid_N,
-    "of",
-    nrow(pbc_data),
-    "\n"
+    policy_results,
+
+    row.names = FALSE
+
 )
 
 
 ################################################################################
-# 28. CATE DATA
+# 31. TREATMENT DECISION COMPARISON
 ################################################################################
 
-cate_long <- dplyr::bind_rows(
-    
+cat("\n")
+cat("============================================================\n")
+cat("TREATMENT DECISION COMPARISON\n")
+cat("============================================================\n")
+
+decision_comparison <- data.frame(
+
+    ID =
+        real_data$id,
+
+    Vine_Rule =
+        fit_vine$Estimated_Rule,
+
+    NoCopula_Rule =
+        fit_nocopula$Estimated_Rule,
+
+    Vine_CATE =
+        fit_vine$Estimated_CATE,
+
+    NoCopula_CATE =
+        fit_nocopula$Estimated_CATE
+
+)
+
+
+decision_comparison$Same_Rule <-
+
+    decision_comparison$Vine_Rule ==
+
+    decision_comparison$NoCopula_Rule
+
+
+print(
+
+    table(
+        decision_comparison$Same_Rule
+    )
+
+)
+
+
+cat(
+
+    "\nAgreement rate:",
+
+    mean(
+        decision_comparison$Same_Rule
+    ),
+
+    "\n"
+
+)
+
+
+################################################################################
+# 32. CROSS-TABULATION OF TREATMENT RULES
+################################################################################
+
+rule_table <- table(
+
+    Vine_Copula =
+        decision_comparison$Vine_Rule,
+
+    No_Copula =
+        decision_comparison$NoCopula_Rule
+
+)
+
+cat("\n")
+cat("Vine-Copula vs No-Copula treatment rules:\n")
+
+print(
+    rule_table
+)
+
+
+################################################################################
+# 33. OBSERVED TREATMENT AGREEMENT
+################################################################################
+
+cat("\n")
+cat("============================================================\n")
+cat("OBSERVED TREATMENT VS ESTIMATED POLICY\n")
+cat("============================================================\n")
+
+observed_treatment <- real_data$treatment
+
+
+vine_observed_agreement <- mean(
+
+    observed_treatment ==
+
+    fit_vine$Estimated_Rule
+
+)
+
+
+raw_observed_agreement <- mean(
+
+    observed_treatment ==
+
+    fit_nocopula$Estimated_Rule
+
+)
+
+
+cat(
+
+    "Vine-Copula agreement with observed treatment:",
+
+    round(
+        vine_observed_agreement,
+        4
+    ),
+
+    "\n"
+
+)
+
+
+cat(
+
+    "No-Copula agreement with observed treatment:",
+
+    round(
+        raw_observed_agreement,
+        4
+    ),
+
+    "\n"
+
+)
+
+
+################################################################################
+# 34. TREATMENT EFFECT DISTRIBUTION
+################################################################################
+
+cate_long <- bind_rows(
+
     data.frame(
-        
+
         Method =
             "Vine-Copula",
-        
+
         CATE =
             fit_vine$Estimated_CATE
-        
+
     ),
-    
+
     data.frame(
-        
+
         Method =
             "No-Copula",
-        
+
         CATE =
             fit_nocopula$Estimated_CATE
-        
+
     )
-    
+
 )
 
 
 ################################################################################
-# 29. CATE SUMMARY
+# 35. CATE SUMMARY
 ################################################################################
 
 cate_summary <- cate_long %>%
-    
-    dplyr::group_by(
+
+    group_by(
         Method
     ) %>%
-    
-    dplyr::summarise(
-        
+
+    summarise(
+
         N =
             sum(
                 is.finite(CATE)
             ),
-        
+
         Mean =
             mean(
                 CATE,
                 na.rm = TRUE
             ),
-        
+
         SD =
             sd(
                 CATE,
                 na.rm = TRUE
             ),
-        
+
         Median =
             median(
                 CATE,
                 na.rm = TRUE
             ),
-        
+
         Q25 =
-            as.numeric(
-                quantile(
-                    CATE,
-                    0.25,
-                    na.rm = TRUE
-                )
+            quantile(
+                CATE,
+                0.25,
+                na.rm = TRUE
             ),
-        
+
         Q75 =
-            as.numeric(
-                quantile(
-                    CATE,
-                    0.75,
-                    na.rm = TRUE
-                )
+            quantile(
+                CATE,
+                0.75,
+                na.rm = TRUE
             ),
-        
+
         Min =
             min(
                 CATE,
                 na.rm = TRUE
             ),
-        
+
         Max =
             max(
                 CATE,
                 na.rm = TRUE
             ),
-        
-        .groups =
-            "drop"
-        
+
+        .groups = "drop"
+
     )
 
 
@@ -2348,78 +2558,81 @@ cat("CATE SUMMARY\n")
 cat("============================================================\n")
 
 print(
+
     cate_summary,
+
     row.names = FALSE
+
 )
 
 
 ################################################################################
-# 30. CIF SUMMARY
+# 36. CIF SUMMARY
 ################################################################################
 
 cif_summary <- data.frame(
-    
+
     Method = c(
         "Vine-Copula",
         "No-Copula"
     ),
-    
+
     CIF_Transplant_A0 = c(
-        
+
         mean(
             fit_vine$CIF_A0_Cause1,
             na.rm = TRUE
         ),
-        
+
         mean(
             fit_nocopula$CIF_A0_Cause1,
             na.rm = TRUE
         )
-        
+
     ),
-    
+
     CIF_Death_A0 = c(
-        
+
         mean(
             fit_vine$CIF_A0_Cause2,
             na.rm = TRUE
         ),
-        
+
         mean(
             fit_nocopula$CIF_A0_Cause2,
             na.rm = TRUE
         )
-        
+
     ),
-    
+
     CIF_Transplant_A1 = c(
-        
+
         mean(
             fit_vine$CIF_A1_Cause1,
             na.rm = TRUE
         ),
-        
+
         mean(
             fit_nocopula$CIF_A1_Cause1,
             na.rm = TRUE
         )
-        
+
     ),
-    
+
     CIF_Death_A1 = c(
-        
+
         mean(
             fit_vine$CIF_A1_Cause2,
             na.rm = TRUE
         ),
-        
+
         mean(
             fit_nocopula$CIF_A1_Cause2,
             na.rm = TRUE
         )
-        
+
     )
-    
+
 )
 
 
@@ -2429,431 +2642,51 @@ cat("AVERAGE PREDICTED CIFs AT TAU\n")
 cat("============================================================\n")
 
 print(
+
     cif_summary,
+
     row.names = FALSE
+
 )
 
 
 ################################################################################
-# 31. ESTIMATED TREATMENT RATE
-################################################################################
-
-rule_summary <- data.frame(
-    
-    Method = c(
-        "Vine-Copula",
-        "No-Copula"
-    ),
-    
-    Treatment1_Rate = c(
-        
-        mean(
-            fit_vine$Estimated_Rule == 1,
-            na.rm = TRUE
-        ),
-        
-        mean(
-            fit_nocopula$Estimated_Rule == 1,
-            na.rm = TRUE
-        )
-        
-    ),
-    
-    Mean_CATE = c(
-        
-        mean(
-            fit_vine$Estimated_CATE,
-            na.rm = TRUE
-        ),
-        
-        mean(
-            fit_nocopula$Estimated_CATE,
-            na.rm = TRUE
-        )
-        
-    ),
-    
-    SD_CATE = c(
-        
-        sd(
-            fit_vine$Estimated_CATE,
-            na.rm = TRUE
-        ),
-        
-        sd(
-            fit_nocopula$Estimated_CATE,
-            na.rm = TRUE
-        )
-        
-    )
-    
-)
-
-
-cat("\n")
-cat("============================================================\n")
-cat("ESTIMATED TREATMENT RULE\n")
-cat("============================================================\n")
-
-print(
-    rule_summary,
-    row.names = FALSE
-)
-
-
-################################################################################
-# 32. PROPENSITY DIAGNOSTIC
-################################################################################
-
-propensity <- fit_propensity(
-    pbc_data
-)
-
-cat("\n")
-cat("============================================================\n")
-cat("TREATMENT ASSIGNMENT DIAGNOSTIC\n")
-cat("============================================================\n")
-
-cat(
-    "P(Treatment = 1):",
-    round(
-        propensity[1],
-        4
-    ),
-    "\n"
-)
-
-cat(
-    "P(Treatment = 0):",
-    round(
-        1 - propensity[1],
-        4
-    ),
-    "\n"
-)
-
-
-################################################################################
-# 33. POLICY VALUES
-################################################################################
-
-vine_policy_value <- calculate_observed_policy_utility(
-    
-    data =
-        pbc_data,
-    
-    estimated_rule =
-        fit_vine$Estimated_Rule,
-    
-    tau =
-        TAU,
-    
-    weights =
-        WEIGHTS
-    
-)
-
-
-nocopula_policy_value <- calculate_observed_policy_utility(
-    
-    data =
-        pbc_data,
-    
-    estimated_rule =
-        fit_nocopula$Estimated_Rule,
-    
-    tau =
-        TAU,
-    
-    weights =
-        WEIGHTS
-    
-)
-
-
-always0_value <- calculate_fixed_policy_value(
-    
-    data =
-        pbc_data,
-    
-    fixed_treatment =
-        0L,
-    
-    tau =
-        TAU,
-    
-    weights =
-        WEIGHTS
-    
-)
-
-
-always1_value <- calculate_fixed_policy_value(
-    
-    data =
-        pbc_data,
-    
-    fixed_treatment =
-        1L,
-    
-    tau =
-        TAU,
-    
-    weights =
-        WEIGHTS
-    
-)
-
-
-fitted_optimal_value <- max(
-    
-    vine_policy_value,
-    nocopula_policy_value,
-    always0_value,
-    always1_value,
-    
-    na.rm = TRUE
-    
-)
-
-
-################################################################################
-# 34. POLICY RESULTS
-################################################################################
-
-policy_results <- data.frame(
-    
-    Method = c(
-        "Vine-Copula",
-        "No-Copula"
-    ),
-    
-    Always_Treatment0_Value = c(
-        
-        always0_value,
-        always0_value
-        
-    ),
-    
-    Always_Treatment1_Value = c(
-        
-        always1_value,
-        always1_value
-        
-    ),
-    
-    Policy_Value = c(
-        
-        vine_policy_value,
-        nocopula_policy_value
-        
-    ),
-    
-    Fitted_Optimal_Value = c(
-        
-        fitted_optimal_value,
-        fitted_optimal_value
-        
-    )
-    
-)
-
-
-cat("\n")
-cat("============================================================\n")
-cat("IPW POLICY VALUE RESULTS\n")
-cat("============================================================\n")
-
-print(
-    policy_results,
-    row.names = FALSE
-)
-
-
-################################################################################
-# 35. POLICY IMPROVEMENT
-################################################################################
-
-policy_results$Improvement_vs_Treatment0 <-
-    
-    policy_results$Policy_Value -
-    policy_results$Always_Treatment0_Value
-
-
-policy_results$Improvement_vs_Treatment1 <-
-    
-    policy_results$Policy_Value -
-    policy_results$Always_Treatment1_Value
-
-
-policy_results$Regret_vs_Fitted_Best <-
-    
-    policy_results$Fitted_Optimal_Value -
-    policy_results$Policy_Value
-
-
-cat("\n")
-cat("============================================================\n")
-cat("POLICY IMPROVEMENT\n")
-cat("============================================================\n")
-
-print(
-    policy_results,
-    row.names = FALSE
-)
-
-
-################################################################################
-# 36. TREATMENT EFFECT DISTRIBUTION
-################################################################################
-
-cate_long <- dplyr::bind_rows(
-    
-    data.frame(
-        
-        Method =
-            "Vine-Copula",
-        
-        CATE =
-            fit_vine$Estimated_CATE
-        
-    ),
-    
-    data.frame(
-        
-        Method =
-            "No-Copula",
-        
-        CATE =
-            fit_nocopula$Estimated_CATE
-        
-    )
-    
-)
-
-
-################################################################################
-# 37. CATE SUMMARY
-################################################################################
-
-cate_summary <- cate_long %>%
-    
-    dplyr::group_by(
-        Method
-    ) %>%
-    
-    dplyr::summarise(
-        
-        N =
-            sum(
-                is.finite(CATE)
-            ),
-        
-        Mean =
-            mean(
-                CATE,
-                na.rm = TRUE
-            ),
-        
-        SD =
-            sd(
-                CATE,
-                na.rm = TRUE
-            ),
-        
-        Median =
-            median(
-                CATE,
-                na.rm = TRUE
-            ),
-        
-        Q25 =
-            as.numeric(
-                quantile(
-                    CATE,
-                    0.25,
-                    na.rm = TRUE
-                )
-            ),
-        
-        Q75 =
-            as.numeric(
-                quantile(
-                    CATE,
-                    0.75,
-                    na.rm = TRUE
-                )
-            ),
-        
-        Min =
-            min(
-                CATE,
-                na.rm = TRUE
-            ),
-        
-        Max =
-            max(
-                CATE,
-                na.rm = TRUE
-            ),
-        
-        .groups =
-            "drop"
-        
-    )
-
-
-cat("\n")
-cat("============================================================\n")
-cat("CATE SUMMARY\n")
-cat("============================================================\n")
-
-print(
-    cate_summary,
-    row.names = FALSE
-)
-
-
-################################################################################
-# 38. PLOT CATE
+# 37. PLOT CATE
 ################################################################################
 
 p_cate <- ggplot(
-    
+
     cate_long,
-    
+
     aes(
         x = Method,
         y = CATE
     )
-    
+
 ) +
-    
+
     geom_boxplot() +
-    
+
     theme_minimal() +
-    
+
     labs(
-        
+
         title =
             "Estimated Individualized Treatment Effects",
-        
+
         subtitle =
             paste0(
                 "PBC competing-risks analysis at ",
-                round(
-                    TAU / 365,
-                    1
-                ),
+                round(TAU / 365, 1),
                 " years"
             ),
-        
+
         x =
             "Method",
-        
+
         y =
             "Estimated treatment contrast"
-        
+
     )
 
 
@@ -2863,25 +2696,21 @@ print(
 
 
 ggsave(
-    
+
     "pbc_vine_copula_CATE.png",
-    
+
     p_cate,
-    
-    width =
-        7,
-    
-    height =
-        5,
-    
-    dpi =
-        300
-    
+
+    width = 7,
+
+    height = 5,
+
+    dpi = 300
+
 )
 
-
 ################################################################################
-# 39. PLOT POLICY VALUES
+# 38. PLOT POLICY VALUES
 ################################################################################
 
 policy_plot_data <- policy_results %>%
@@ -2889,61 +2718,54 @@ policy_plot_data <- policy_results %>%
     dplyr::select(
         
         Method,
-        
         Always_Treatment0_Value,
-        
         Always_Treatment1_Value,
-        
         Policy_Value,
-        
         Fitted_Optimal_Value
         
     ) %>%
     
     tidyr::pivot_longer(
         
-        cols =
-            -Method,
+        cols = -Method,
         
-        names_to =
-            "Policy",
+        names_to = "Policy",
         
-        values_to =
-            "Value"
+        values_to = "Value"
         
     )
 
 
-################################################################################
-# 40. POLICY VALUE PLOT
-################################################################################
+cat("\n")
+cat("============================================================\n")
+cat("POLICY VALUE DATA\n")
+cat("============================================================\n")
 
-p_policy <- ggplot(
+print(
+    policy_plot_data,
+    row.names = FALSE
+)
+
+
+p_policy <- ggplot2::ggplot(
     
     policy_plot_data,
     
-    aes(
-        x =
-            Method,
-        
-        y =
-            Value,
-        
-        fill =
-            Policy
-        
+    ggplot2::aes(
+        x = Method,
+        y = Value,
+        fill = Policy
     )
     
 ) +
     
-    geom_col(
-        position =
-            "dodge"
+    ggplot2::geom_col(
+        position = "dodge"
     ) +
     
-    theme_minimal() +
+    ggplot2::theme_minimal() +
     
-    labs(
+    ggplot2::labs(
         
         title =
             "Policy Value Comparison",
@@ -2951,10 +2773,7 @@ p_policy <- ggplot(
         subtitle =
             paste0(
                 "PBC competing-risks analysis at ",
-                round(
-                    TAU / 365,
-                    1
-                ),
+                round(TAU / 365, 1),
                 " years"
             ),
         
@@ -2962,11 +2781,15 @@ p_policy <- ggplot(
             "Method",
         
         y =
-            "IPW policy value",
+            "Predicted policy value",
         
         fill =
             "Policy"
         
+    ) +
+    
+    ggplot2::theme(
+        legend.position = "bottom"
     )
 
 
@@ -2975,430 +2798,193 @@ print(
 )
 
 
-ggsave(
+ggplot2::ggsave(
     
     "pbc_vine_copula_policy_value.png",
     
     p_policy,
     
-    width =
-        8,
+    width = 8,
     
-    height =
-        5,
+    height = 5,
     
-    dpi =
-        300
+    dpi = 300
     
 )
 
 
 ################################################################################
-# 41. CIF LONG DATA
+# 39. POLICY DISTRIBUTION
 ################################################################################
 
-cif_plot_data <- data.frame(
+policy_rate_plot <- policy_results %>%
     
-    Method = rep(
+    dplyr::select(
         
-        c(
-            "Vine-Copula",
-            "No-Copula"
-        ),
+        Method,
         
-        each =
-            4
+        Treatment1_Rate,
         
-    ),
+        Treatment0_Rate
+        
+    ) %>%
     
-    Treatment = rep(
+    tidyr::pivot_longer(
         
-        c(
-            "Treatment 0",
-            "Treatment 0",
-            "Treatment 1",
-            "Treatment 1"
-        ),
+        cols = -Method,
         
-        times =
-            2
+        names_to = "Treatment",
         
-    ),
-    
-    Cause = rep(
-        
-        c(
-            "Transplantation",
-            "Death"
-        ),
-        
-        times =
-            4
-        
-    ),
-    
-    CIF = c(
-        
-        mean(
-            fit_vine$CIF_A0_Cause1,
-            na.rm = TRUE
-        ),
-        
-        mean(
-            fit_vine$CIF_A0_Cause2,
-            na.rm = TRUE
-        ),
-        
-        mean(
-            fit_vine$CIF_A1_Cause1,
-            na.rm = TRUE
-        ),
-        
-        mean(
-            fit_vine$CIF_A1_Cause2,
-            na.rm = TRUE
-        ),
-        
-        mean(
-            fit_nocopula$CIF_A0_Cause1,
-            na.rm = TRUE
-        ),
-        
-        mean(
-            fit_nocopula$CIF_A0_Cause2,
-            na.rm = TRUE
-        ),
-        
-        mean(
-            fit_nocopula$CIF_A1_Cause1,
-            na.rm = TRUE
-        ),
-        
-        mean(
-            fit_nocopula$CIF_A1_Cause2,
-            na.rm = TRUE
-        )
+        values_to = "Rate"
         
     )
-    
+
+
+cat("\n")
+cat("============================================================\n")
+cat("POLICY TREATMENT DISTRIBUTION\n")
+cat("============================================================\n")
+
+print(
+    policy_rate_plot,
+    row.names = FALSE
 )
 
 
-################################################################################
-# 42. CIF PLOT
-################################################################################
-
-p_cif <- ggplot(
+p_policy_rate <- ggplot2::ggplot(
     
-    cif_plot_data,
+    policy_rate_plot,
     
-    aes(
-        x =
-            Treatment,
-        
-        y =
-            CIF,
-        
-        fill =
-            Cause
+    ggplot2::aes(
+        x = Method,
+        y = Rate,
+        fill = Treatment
     )
     
 ) +
     
-    geom_col(
-        position =
-            "dodge"
+    ggplot2::geom_col(
+        position = "dodge"
     ) +
     
-    facet_wrap(
-        ~ Method
+    ggplot2::scale_y_continuous(
+        labels = scales::percent_format(accuracy = 1)
     ) +
     
-    theme_minimal() +
+    ggplot2::theme_minimal() +
     
-    labs(
+    ggplot2::labs(
         
         title =
-            "Predicted Competing-Risk CIFs",
+            "Treatment Assignment Under Estimated Optimal Policies",
         
         subtitle =
             paste0(
-                "PBC data at ",
-                round(
-                    TAU / 365,
-                    1
-                ),
+                "PBC competing-risks analysis at ",
+                round(TAU / 365, 1),
                 " years"
             ),
         
         x =
-            "Treatment",
+            "Method",
         
         y =
-            "Predicted CIF",
+            "Proportion assigned",
         
         fill =
-            "Cause"
+            "Treatment"
+        
+    ) +
+    
+    ggplot2::theme(
+        legend.position = "bottom"
+    )
+
+
+print(
+    p_policy_rate
+)
+
+
+ggplot2::ggsave(
+    
+    "pbc_vine_copula_policy_distribution.png",
+    
+    p_policy_rate,
+    
+    width = 8,
+    
+    height = 5,
+    
+    dpi = 300
+    
+)
+
+
+################################################################################
+# 40. FINAL POLICY SUMMARY
+################################################################################
+
+cat("\n")
+cat("============================================================\n")
+cat("FINAL POLICY SUMMARY\n")
+cat("============================================================\n")
+
+print(
+    policy_results,
+    row.names = FALSE
+)
+
+
+################################################################################
+# 41. FINAL CATE COMPARISON
+################################################################################
+
+cate_comparison <- cate_summary %>%
+    
+    dplyr::select(
+        
+        Method,
+        N,
+        Mean,
+        SD,
+        Median,
+        Q25,
+        Q75,
+        Min,
+        Max
         
     )
 
 
+cat("\n")
+cat("============================================================\n")
+cat("FINAL CATE COMPARISON\n")
+cat("============================================================\n")
+
 print(
-    p_cif
-)
-
-
-ggsave(
-    
-    "pbc_vine_copula_CIF.png",
-    
-    p_cif,
-    
-    width =
-        9,
-    
-    height =
-        5,
-    
-    dpi =
-        300
-    
+    cate_comparison,
+    row.names = FALSE
 )
 
 
 ################################################################################
-# 43. VINE STRUCTURE DIAGNOSTIC
+# 42. FINAL CIF COMPARISON
 ################################################################################
 
 cat("\n")
 cat("============================================================\n")
-cat("R-VINE STRUCTURE\n")
-cat("============================================================\n")
-
-vine_model <- attr(
-    fit_vine$data,
-    "vine_model"
-)
-
-
-if (
-    !is.null(vine_model)
-) {
-    
-    cat("\nR-vine structure matrix:\n")
-    
-    print(
-        vine_model$Matrix
-    )
-    
-    
-    cat("\nR-vine family matrix:\n")
-    
-    print(
-        vine_model$family
-    )
-    
-}
-
-
-################################################################################
-# 44. VINE COVARIATE DIAGNOSTIC
-################################################################################
-
-cat("\n")
-cat("============================================================\n")
-cat("VINE-COPULA CSC COVARIATES\n")
+cat("FINAL CIF COMPARISON\n")
 cat("============================================================\n")
 
 print(
-    fit_vine$covariates
+    cif_summary,
+    row.names = FALSE
 )
 
 
 ################################################################################
-# 45. TREATMENT RULE DISTRIBUTION
-################################################################################
-
-cat("\n")
-cat("============================================================\n")
-cat("INDIVIDUALIZED TREATMENT RULE DISTRIBUTION\n")
-cat("============================================================\n")
-
-vine_rule_table <- table(
-    
-    fit_vine$Estimated_Rule
-    
-)
-
-nocopula_rule_table <- table(
-    
-    fit_nocopula$Estimated_Rule
-    
-)
-
-
-cat(
-    "\nVine-Copula:\n"
-)
-
-print(
-    vine_rule_table
-)
-
-
-cat(
-    "\nNo-Copula:\n"
-)
-
-print(
-    nocopula_rule_table
-)
-
-
-################################################################################
-# 46. TREATMENT AGREEMENT
-################################################################################
-
-common_valid <- (
-    
-    is.finite(
-        fit_vine$Estimated_CATE
-    ) &
-    
-    is.finite(
-        fit_nocopula$Estimated_CATE
-    )
-    
-)
-
-
-rule_agreement <- mean(
-    
-    fit_vine$Estimated_Rule[
-        common_valid
-    ] ==
-    
-    fit_nocopula$Estimated_Rule[
-        common_valid
-    ],
-    
-    na.rm =
-        TRUE
-    
-)
-
-
-cat("\n")
-cat("============================================================\n")
-cat("TREATMENT RULE AGREEMENT\n")
-cat("============================================================\n")
-
-cat(
-    "Agreement between Vine-Copula and No-Copula:",
-    round(
-        rule_agreement,
-        4
-    ),
-    "\n"
-)
-
-
-################################################################################
-# 47. CATE CORRELATION
-################################################################################
-
-cate_correlation <- cor(
-    
-    fit_vine$Estimated_CATE[
-        common_valid
-    ],
-    
-    fit_nocopula$Estimated_CATE[
-        common_valid
-    ],
-    
-    use =
-        "complete.obs"
-    
-)
-
-
-cat(
-    "CATE correlation:",
-    round(
-        cate_correlation,
-        4
-    ),
-    "\n"
-)
-
-
-################################################################################
-# 48. CATE DIFFERENCE
-################################################################################
-
-cate_difference <- (
-    
-    fit_vine$Estimated_CATE[
-        common_valid
-    ] -
-    
-    fit_nocopula$Estimated_CATE[
-        common_valid
-    ]
-    
-)
-
-
-cate_difference_summary <- data.frame(
-    
-    Mean_Difference =
-        mean(
-            cate_difference,
-            na.rm =
-                TRUE
-        ),
-    
-    SD_Difference =
-        sd(
-            cate_difference,
-            na.rm =
-                TRUE
-        ),
-    
-    Median_Difference =
-        median(
-            cate_difference,
-            na.rm =
-                TRUE
-        ),
-    
-    Mean_Absolute_Difference =
-        mean(
-            abs(
-                cate_difference
-            ),
-            na.rm =
-                TRUE
-        )
-    
-)
-
-
-cat("\n")
-cat("============================================================\n")
-cat("CATE DIFFERENCE: VINE-COPULA - NO-COPULA\n")
-cat("============================================================\n")
-
-print(
-    cate_difference_summary,
-    row.names =
-        FALSE
-)
-
-
-################################################################################
-# 49. SAVE RESULTS
+# 43. SAVE RESULTS
 ################################################################################
 
 write.csv(
@@ -3407,8 +2993,7 @@ write.csv(
     
     "pbc_vine_copula_CATE_summary.csv",
     
-    row.names =
-        FALSE
+    row.names = FALSE
     
 )
 
@@ -3419,8 +3004,7 @@ write.csv(
     
     "pbc_vine_copula_CIF_summary.csv",
     
-    row.names =
-        FALSE
+    row.names = FALSE
     
 )
 
@@ -3431,178 +3015,1230 @@ write.csv(
     
     "pbc_vine_copula_policy_results.csv",
     
-    row.names =
-        FALSE
+    row.names = FALSE
     
 )
 
 
 write.csv(
     
-    rule_summary,
+    policy_rate_plot,
     
-    "pbc_vine_copula_rule_summary.csv",
+    "pbc_vine_copula_policy_distribution.csv",
     
-    row.names =
-        FALSE
-    
-)
-
-
-write.csv(
-    
-    cate_difference_summary,
-    
-    "pbc_vine_copula_CATE_difference.csv",
-    
-    row.names =
-        FALSE
+    row.names = FALSE
     
 )
 
 
 ################################################################################
-# 50. SAVE SUBJECT-LEVEL RESULTS
-################################################################################
-
-subject_results <- data.frame(
-    
-    id =
-        pbc_data$id,
-    
-    treatment =
-        pbc_data$treatment,
-    
-    treatment_label =
-        pbc_data$Treatment_Label,
-    
-    time =
-        pbc_data$time,
-    
-    cause =
-        pbc_data$cause,
-    
-    Vine_CIF_Transplant_A0 =
-        fit_vine$CIF_A0_Cause1,
-    
-    Vine_CIF_Death_A0 =
-        fit_vine$CIF_A0_Cause2,
-    
-    Vine_CIF_Transplant_A1 =
-        fit_vine$CIF_A1_Cause1,
-    
-    Vine_CIF_Death_A1 =
-        fit_vine$CIF_A1_Cause2,
-    
-    Vine_Value_A0 =
-        fit_vine$Value_A0,
-    
-    Vine_Value_A1 =
-        fit_vine$Value_A1,
-    
-    Vine_CATE =
-        fit_vine$Estimated_CATE,
-    
-    Vine_Rule =
-        fit_vine$Estimated_Rule,
-    
-    NoCopula_CIF_Transplant_A0 =
-        fit_nocopula$CIF_A0_Cause1,
-    
-    NoCopula_CIF_Death_A0 =
-        fit_nocopula$CIF_A0_Cause2,
-    
-    NoCopula_CIF_Transplant_A1 =
-        fit_nocopula$CIF_A1_Cause1,
-    
-    NoCopula_CIF_Death_A1 =
-        fit_nocopula$CIF_A1_Cause2,
-    
-    NoCopula_Value_A0 =
-        fit_nocopula$Value_A0,
-    
-    NoCopula_Value_A1 =
-        fit_nocopula$Value_A1,
-    
-    NoCopula_CATE =
-        fit_nocopula$Estimated_CATE,
-    
-    NoCopula_Rule =
-        fit_nocopula$Estimated_Rule
-    
-)
-
-
-write.csv(
-    
-    subject_results,
-    
-    "pbc_vine_copula_subject_level_results.csv",
-    
-    row.names =
-        FALSE
-    
-)
-
-
-################################################################################
-# 51. SAVE COMPLETE R OBJECT
-################################################################################
-
-saveRDS(
-    
-    list(
-        
-        data =
-            pbc_data,
-        
-        covariates =
-            covariates,
-        
-        tau =
-            TAU,
-        
-        weights =
-            WEIGHTS,
-        
-        vine_model =
-            vine_model,
-        
-        vine_fit =
-            fit_vine,
-        
-        nocopula_fit =
-            fit_nocopula,
-        
-        cate_summary =
-            cate_summary,
-        
-        cif_summary =
-            cif_summary,
-        
-        policy_results =
-            policy_results,
-        
-        rule_summary =
-            rule_summary,
-        
-        subject_results =
-            subject_results
-        
-    ),
-    
-    "pbc_vine_copula_complete_analysis.rds"
-    
-)
-
-
-################################################################################
-# 52. FINAL SUMMARY
+# 44. FINAL ANALYSIS REPORT
 ################################################################################
 
 cat("\n")
 cat("============================================================\n")
-cat("FINAL REAL-DATA ANALYSIS SUMMARY\n")
+cat("FINAL REAL-DATA ANALYSIS COMPLETE\n")
+cat("============================================================\n")
+
+cat(
+    "\nDataset: PBC competing-risks data\n"
+)
+
+cat(
+    "Number of observations used:",
+    nrow(real_data),
+    "\n"
+)
+
+cat(
+    "Number of covariates:",
+    P,
+    "\n"
+)
+
+cat(
+    "Treatment variable: trt\n"
+)
+
+cat(
+    "Cause 1: transplant\n"
+)
+
+cat(
+    "Cause 2: death\n"
+)
+
+cat(
+    "Prediction horizon:",
+    round(TAU / 365, 2),
+    "years\n"
+)
+
+cat(
+    "\nMethods compared:\n"
+)
+
+cat(
+    "1. Vine-Copula + CSC\n"
+)
+
+cat(
+    "2. No-Copula + CSC\n"
+)
+
+cat(
+    "\nOutput files:\n"
+)
+
+cat(
+    " - pbc_vine_copula_CATE.png\n"
+)
+
+cat(
+    " - pbc_vine_copula_policy_value.png\n"
+)
+
+cat(
+    " - pbc_vine_copula_policy_distribution.png\n"
+)
+
+cat(
+    " - pbc_vine_copula_CATE_summary.csv\n"
+)
+
+cat(
+    " - pbc_vine_copula_CIF_summary.csv\n"
+)
+
+cat(
+    " - pbc_vine_copula_policy_results.csv\n"
+)
+
+cat(
+    " - pbc_vine_copula_policy_distribution.csv\n"
+)
+
+cat(
+    "\n============================================================\n"
+)
+
+################################################################################
+# 40. CORRELATION STRUCTURE
+################################################################################
+
+cat("\n")
+cat("============================================================\n")
+cat("COVARIATE CORRELATION STRUCTURE\n")
+cat("============================================================\n")
+
+# --------------------------------------------------------------------------
+# Check that all requested covariates exist
+# --------------------------------------------------------------------------
+
+missing_covariates <- setdiff(
+    covariates,
+    names(real_data)
+)
+
+if (length(missing_covariates) > 0) {
+
+    stop(
+        paste0(
+            "Missing covariates in real_data: ",
+            paste(
+                missing_covariates,
+                collapse = ", "
+            )
+        )
+    )
+
+}
+
+# --------------------------------------------------------------------------
+# Extract covariate matrix using BASE R
+#
+# This deliberately avoids dplyr::select(), because select() was masked
+# in your current R session.
+# --------------------------------------------------------------------------
+
+X_cor <- real_data[
+    ,
+    covariates,
+    drop = FALSE
+]
+
+# --------------------------------------------------------------------------
+# Convert non-numeric variables where necessary
+# --------------------------------------------------------------------------
+
+X_cor_numeric <- data.frame(
+    lapply(
+        X_cor,
+        function(x) {
+
+            if (is.factor(x)) {
+
+                return(
+                    as.numeric(x)
+                )
+
+            }
+
+            if (is.character(x)) {
+
+                return(
+                    as.numeric(
+                        factor(x)
+                    )
+                )
+
+            }
+
+            return(
+                as.numeric(x)
+            )
+
+        }
+    )
+)
+
+# --------------------------------------------------------------------------
+# Correlation matrix
+# --------------------------------------------------------------------------
+
+cor_matrix <- cor(
+    X_cor_numeric,
+    use = "pairwise.complete.obs"
+)
+
+print(
+    round(
+        cor_matrix,
+        3
+    )
+)
+
+# --------------------------------------------------------------------------
+# Save correlation matrix
+# --------------------------------------------------------------------------
+
+write.csv(
+    cor_matrix,
+    "pbc_vine_copula_covariate_correlation_matrix.csv",
+    row.names = TRUE
+)
+
+
+################################################################################
+# 41. VINE MODEL INFORMATION
+################################################################################
+
+cat("\n")
+cat("============================================================\n")
+cat("VINE-COPULA MODEL INFORMATION\n")
+cat("============================================================\n")
+
+# --------------------------------------------------------------------------
+# Basic existence check
+# --------------------------------------------------------------------------
+
+if (
+    exists("vine_model") &&
+    !is.null(vine_model)
+) {
+
+    cat(
+        "Vine model object: available\n"
+    )
+
+} else {
+
+    cat(
+        "Vine model object: NOT available\n"
+    )
+
+}
+
+
+# --------------------------------------------------------------------------
+# Number of observations used for vine fitting
+#
+# The safest source is the stored vine_U object created during the
+# vine-fitting stage.
+# --------------------------------------------------------------------------
+
+vine_U <- NULL
+
+if (
+    exists("vine_test") &&
+    !is.null(vine_test)
+) {
+
+    if (
+        !is.null(vine_test$U)
+    ) {
+
+        vine_U <- vine_test$U
+
+    }
+
+}
+
+if (
+    is.null(vine_U) &&
+    exists("fit_vine") &&
+    !is.null(fit_vine$data)
+) {
+
+    vine_U_candidate <- attr(
+        fit_vine$data,
+        "vine_U"
+    )
+
+    if (
+        !is.null(vine_U_candidate)
+    ) {
+
+        vine_U <- vine_U_candidate
+
+    }
+
+}
+
+
+if (
+    !is.null(vine_U)
+) {
+
+    cat(
+        "Number of observations used for vine:",
+        nrow(vine_U),
+        "\n"
+    )
+
+    cat(
+        "Number of vine variables:",
+        ncol(vine_U),
+        "\n"
+    )
+
+} else {
+
+    cat(
+        "Vine U-matrix: unavailable\n"
+    )
+
+}
+
+
+# --------------------------------------------------------------------------
+# Vine variable names
+# --------------------------------------------------------------------------
+
+vine_variables <- NULL
+
+if (
+    exists("vine_test") &&
+    !is.null(vine_test) &&
+    !is.null(vine_test$variables)
+) {
+
+    vine_variables <- vine_test$variables
+
+}
+
+if (
+    is.null(vine_variables) &&
+    exists("fit_vine") &&
+    !is.null(fit_vine$data)
+) {
+
+    vine_variables <- attr(
+        fit_vine$data,
+        "vine_variables"
+    )
+
+}
+
+if (
+    !is.null(vine_variables)
+) {
+
+    cat(
+        "Vine variables:\n"
+    )
+
+    print(
+        vine_variables
+    )
+
+}
+
+
+# --------------------------------------------------------------------------
+# Vine structure
+# --------------------------------------------------------------------------
+
+if (
+    exists("vine_model") &&
+    !is.null(vine_model$Matrix)
+) {
+
+    cat("\n")
+    cat("R-vine structure matrix:\n")
+
+    print(
+        vine_model$Matrix
+    )
+
+}
+
+
+# --------------------------------------------------------------------------
+# Vine family matrix
+# --------------------------------------------------------------------------
+
+if (
+    exists("vine_model") &&
+    !is.null(vine_model$family)
+) {
+
+    cat("\n")
+    cat("R-vine family matrix:\n")
+
+    print(
+        vine_model$family
+    )
+
+}
+
+
+# --------------------------------------------------------------------------
+# Log-likelihood
+# --------------------------------------------------------------------------
+
+if (
+    exists("vine_model") &&
+    !is.null(vine_model$logLik)
+) {
+
+    cat("\n")
+    cat(
+        "Log-likelihood:\n"
+    )
+
+    print(
+        vine_model$logLik
+    )
+
+}
+
+
+################################################################################
+# 42. RESULTS OBJECT VALIDATION
+################################################################################
+
+cat("\n")
+cat("============================================================\n")
+cat("RESULT OBJECT VALIDATION\n")
+cat("============================================================\n")
+
+
+# --------------------------------------------------------------------------
+# Check policy_results
+# --------------------------------------------------------------------------
+
+if (
+    !exists("policy_results") ||
+    is.null(policy_results)
+) {
+
+    warning(
+        "policy_results does not exist."
+    )
+
+} else {
+
+    cat(
+        "policy_results: available\n"
+    )
+
+    cat(
+        "Rows:",
+        nrow(policy_results),
+        "\n"
+    )
+
+    cat(
+        "Columns:",
+        ncol(policy_results),
+        "\n"
+    )
+
+    print(
+        names(policy_results)
+    )
+
+}
+
+
+# --------------------------------------------------------------------------
+# Check policy_vine
+# --------------------------------------------------------------------------
+
+if (
+    exists("policy_vine") &&
+    !is.null(policy_vine)
+) {
+
+    cat(
+        "policy_vine: available\n"
+    )
+
+} else {
+
+    warning(
+        "policy_vine is not available."
+    )
+
+}
+
+
+# --------------------------------------------------------------------------
+# Check policy_raw
+# --------------------------------------------------------------------------
+
+if (
+    exists("policy_raw") &&
+    !is.null(policy_raw)
+) {
+
+    cat(
+        "policy_raw: available\n"
+    )
+
+} else {
+
+    warning(
+        "policy_raw is not available."
+    )
+
+}
+
+
+################################################################################
+# 43. SAVE RESULTS
+################################################################################
+
+cat("\n")
+cat("============================================================\n")
+cat("SAVING RESULTS\n")
+cat("============================================================\n")
+
+
+# --------------------------------------------------------------------------
+# Policy results
+# --------------------------------------------------------------------------
+
+if (
+    exists("policy_results") &&
+    !is.null(policy_results)
+) {
+
+    write.csv(
+        policy_results,
+        "pbc_vine_copula_policy_results.csv",
+        row.names = FALSE
+    )
+
+    cat(
+        "Saved: pbc_vine_copula_policy_results.csv\n"
+    )
+
+}
+
+
+# --------------------------------------------------------------------------
+# CATE summary
+# --------------------------------------------------------------------------
+
+if (
+    exists("cate_summary") &&
+    !is.null(cate_summary)
+) {
+
+    write.csv(
+        cate_summary,
+        "pbc_vine_copula_CATE_summary.csv",
+        row.names = FALSE
+    )
+
+    cat(
+        "Saved: pbc_vine_copula_CATE_summary.csv\n"
+    )
+
+}
+
+
+# --------------------------------------------------------------------------
+# CIF summary
+# --------------------------------------------------------------------------
+
+if (
+    exists("cif_summary") &&
+    !is.null(cif_summary)
+) {
+
+    write.csv(
+        cif_summary,
+        "pbc_vine_copula_CIF_summary.csv",
+        row.names = FALSE
+    )
+
+    cat(
+        "Saved: pbc_vine_copula_CIF_summary.csv\n"
+    )
+
+}
+
+
+# --------------------------------------------------------------------------
+# Treatment decision comparison
+# --------------------------------------------------------------------------
+
+if (
+    exists("decision_comparison") &&
+    !is.null(decision_comparison)
+) {
+
+    write.csv(
+        decision_comparison,
+        "pbc_vine_copula_treatment_decisions.csv",
+        row.names = FALSE
+    )
+
+    cat(
+        "Saved: pbc_vine_copula_treatment_decisions.csv\n"
+    )
+
+}
+
+
+# --------------------------------------------------------------------------
+# Rule cross-tabulation
+# --------------------------------------------------------------------------
+
+if (
+    exists("rule_table") &&
+    !is.null(rule_table)
+) {
+
+    write.csv(
+        rule_table,
+        "pbc_vine_copula_rule_crosstab.csv",
+        row.names = FALSE
+    )
+
+    cat(
+        "Saved: pbc_vine_copula_rule_crosstab.csv\n"
+    )
+
+}
+
+
+# --------------------------------------------------------------------------
+# Correlation matrix
+# --------------------------------------------------------------------------
+
+if (
+    exists("cor_matrix") &&
+    !is.null(cor_matrix)
+) {
+
+    write.csv(
+        cor_matrix,
+        "pbc_vine_copula_covariate_correlation_matrix.csv",
+        row.names = TRUE
+    )
+
+}
+
+
+################################################################################
+# 44. SAVE MODEL OBJECTS
+################################################################################
+
+cat("\n")
+cat("============================================================\n")
+cat("SAVING MODEL OBJECTS\n")
+cat("============================================================\n")
+
+
+# --------------------------------------------------------------------------
+# Construct settings object
+# --------------------------------------------------------------------------
+
+analysis_settings <- list(
+
+    TAU =
+        TAU,
+
+    WEIGHTS =
+        WEIGHTS,
+
+    covariates =
+        covariates,
+
+    treatment_variable =
+        "treatment",
+
+    time_variable =
+        "time",
+
+    cause_variable =
+        "cause",
+
+    cause_1 =
+        "liver transplantation",
+
+    cause_2 =
+        "death",
+
+    treatment_0 =
+        "placebo",
+
+    treatment_1 =
+        "D-penicillamine"
+
+)
+
+
+# --------------------------------------------------------------------------
+# Construct model object list safely
+# --------------------------------------------------------------------------
+
+model_objects <- list(
+
+    data =
+        real_data,
+
+    vine_model =
+        if (
+            exists("vine_model")
+        ) {
+            vine_model
+        } else {
+            NULL
+        },
+
+    vine_fit =
+        if (
+            exists("fit_vine")
+        ) {
+            fit_vine
+        } else {
+            NULL
+        },
+
+    nocopula_fit =
+        if (
+            exists("fit_nocopula")
+        ) {
+            fit_nocopula
+        } else {
+            NULL
+        },
+
+    policy_results =
+        if (
+            exists("policy_results")
+        ) {
+            policy_results
+        } else {
+            NULL
+        },
+
+    policy_vine =
+        if (
+            exists("policy_vine")
+        ) {
+            policy_vine
+        } else {
+            NULL
+        },
+
+    policy_raw =
+        if (
+            exists("policy_raw")
+        ) {
+            policy_raw
+        } else {
+            NULL
+        },
+
+    cate_summary =
+        if (
+            exists("cate_summary")
+        ) {
+            cate_summary
+        } else {
+            NULL
+        },
+
+    cif_summary =
+        if (
+            exists("cif_summary")
+        ) {
+            cif_summary
+        } else {
+            NULL
+        },
+
+    decision_comparison =
+        if (
+            exists("decision_comparison")
+        ) {
+            decision_comparison
+        } else {
+            NULL
+        },
+
+    rule_table =
+        if (
+            exists("rule_table")
+        ) {
+            rule_table
+        } else {
+            NULL
+        },
+
+    correlation_matrix =
+        cor_matrix,
+
+    settings =
+        analysis_settings
+
+)
+
+
+# --------------------------------------------------------------------------
+# Save
+# --------------------------------------------------------------------------
+
+saveRDS(
+    model_objects,
+    "pbc_vine_copula_real_data_analysis.rds"
+)
+
+cat(
+    "Saved: pbc_vine_copula_real_data_analysis.rds\n"
+)
+
+
+################################################################################
+# 45. FINAL DATA AND EVENT DIAGNOSTICS
+################################################################################
+
+cat("\n")
+cat("============================================================\n")
+cat("FINAL REAL-DATA DIAGNOSTICS\n")
+cat("============================================================\n")
+
+
+# --------------------------------------------------------------------------
+# Basic sample size
+# --------------------------------------------------------------------------
+
+cat(
+    "Analysis sample size:",
+    nrow(real_data),
+    "\n"
+)
+
+
+# --------------------------------------------------------------------------
+# Treatment diagnostics
+# --------------------------------------------------------------------------
+
+if (
+    "treatment" %in% names(real_data)
+) {
+
+    treatment_tab <- table(
+        real_data$treatment,
+        useNA = "ifany"
+    )
+
+    cat("\n")
+    cat("Treatment distribution:\n")
+
+    print(
+        treatment_tab
+    )
+
+    cat(
+        "Treatment 0:",
+        sum(
+            real_data$treatment == 0,
+            na.rm = TRUE
+        ),
+        "\n"
+    )
+
+    cat(
+        "Treatment 1:",
+        sum(
+            real_data$treatment == 1,
+            na.rm = TRUE
+        ),
+        "\n"
+    )
+
+}
+
+
+# --------------------------------------------------------------------------
+# Cause/event diagnostics
+#
+# IMPORTANT:
+# cause = 0 : censored
+# cause = 1 : transplantation
+# cause = 2 : death
+#
+# This is the correct competing-risks construction for survival::pbc.
+# --------------------------------------------------------------------------
+
+if (
+    "cause" %in% names(real_data)
+) {
+
+    cause_tab <- table(
+        real_data$cause,
+        useNA = "ifany"
+    )
+
+    cat("\n")
+    cat("Competing-risk cause distribution:\n")
+
+    print(
+        cause_tab
+    )
+
+    cat(
+        "Censored:",
+        sum(
+            real_data$cause == 0,
+            na.rm = TRUE
+        ),
+        "\n"
+    )
+
+    cat(
+        "Transplantation:",
+        sum(
+            real_data$cause == 1,
+            na.rm = TRUE
+        ),
+        "\n"
+    )
+
+    cat(
+        "Death:",
+        sum(
+            real_data$cause == 2,
+            na.rm = TRUE
+        ),
+        "\n"
+    )
+
+}
+
+
+# --------------------------------------------------------------------------
+# Verify that all three competing-risk states exist
+# --------------------------------------------------------------------------
+
+required_causes <- c(
+    0,
+    1,
+    2
+)
+
+if (
+    "cause" %in% names(real_data)
+) {
+
+    missing_causes <- setdiff(
+        required_causes,
+        unique(
+            real_data$cause
+        )
+    )
+
+    if (
+        length(missing_causes) > 0
+    ) {
+
+        warning(
+            paste0(
+                "Missing competing-risk states: ",
+                paste(
+                    missing_causes,
+                    collapse = ", "
+                )
+            )
+        )
+
+    } else {
+
+        cat(
+            "All three competing-risk states are present: 0, 1, 2\n"
+        )
+
+    }
+
+}
+
+
+# --------------------------------------------------------------------------
+# Verify treatment-by-cause cells
+# --------------------------------------------------------------------------
+
+if (
+    all(
+        c(
+            "treatment",
+            "cause"
+        ) %in% names(real_data)
+    )
+) {
+
+    treatment_cause_table <- table(
+        real_data$treatment,
+        real_data$cause,
+        useNA = "ifany"
+    )
+
+    cat("\n")
+    cat("Treatment × competing-risk outcome:\n")
+
+    print(
+        treatment_cause_table
+    )
+
+}
+
+
+# --------------------------------------------------------------------------
+# Follow-up time
+# --------------------------------------------------------------------------
+
+if (
+    "time" %in% names(real_data)
+) {
+
+    cat(
+        "Minimum follow-up:",
+        round(
+            min(
+                real_data$time,
+                na.rm = TRUE
+            ),
+            2
+        ),
+        "days\n"
+    )
+
+    cat(
+        "Median follow-up:",
+        round(
+            median(
+                real_data$time,
+                na.rm = TRUE
+            ),
+            2
+        ),
+        "days\n"
+    )
+
+    cat(
+        "Maximum follow-up:",
+        round(
+            max(
+                real_data$time,
+                na.rm = TRUE
+            ),
+            2
+        ),
+        "days\n"
+    )
+
+}
+
+
+# --------------------------------------------------------------------------
+# Prediction diagnostics
+# --------------------------------------------------------------------------
+
+if (
+    exists("fit_vine") &&
+    !is.null(fit_vine$Valid_N)
+) {
+
+    cat(
+        "Vine-Copula valid predictions:",
+        fit_vine$Valid_N,
+        "\n"
+    )
+
+}
+
+
+if (
+    exists("fit_nocopula") &&
+    !is.null(fit_nocopula$Valid_N)
+) {
+
+    cat(
+        "No-Copula valid predictions:",
+        fit_nocopula$Valid_N,
+        "\n"
+    )
+
+}
+
+
+################################################################################
+# 46. POLICY DIAGNOSTICS
+################################################################################
+
+cat("\n")
+cat("============================================================\n")
+cat("POLICY DIAGNOSTICS\n")
+cat("============================================================\n")
+
+
+# --------------------------------------------------------------------------
+# Vine-Copula policy
+# --------------------------------------------------------------------------
+
+if (
+    exists("policy_vine") &&
+    !is.null(policy_vine)
+) {
+
+    if (
+        !is.null(policy_vine$Treatment1_Rate)
+    ) {
+
+        cat(
+            "Vine-Copula treatment-1 rate:",
+            round(
+                policy_vine$Treatment1_Rate,
+                4
+            ),
+            "\n"
+        )
+
+    }
+
+    if (
+        !is.null(policy_vine$Policy_Value)
+    ) {
+
+        cat(
+            "Vine-Copula policy value:",
+            round(
+                policy_vine$Policy_Value,
+                6
+            ),
+            "\n"
+        )
+
+    }
+
+    if (
+        !is.null(policy_vine$Fitted_Regret)
+    ) {
+
+        cat(
+            "Vine-Copula fitted regret:",
+            round(
+                policy_vine$Fitted_Regret,
+                6
+            ),
+            "\n"
+        )
+
+    }
+
+}
+
+
+# --------------------------------------------------------------------------
+# No-Copula policy
+# --------------------------------------------------------------------------
+
+if (
+    exists("policy_raw") &&
+    !is.null(policy_raw)
+) {
+
+    if (
+        !is.null(policy_raw$Treatment1_Rate)
+    ) {
+
+        cat(
+            "No-Copula treatment-1 rate:",
+            round(
+                policy_raw$Treatment1_Rate,
+                4
+            ),
+            "\n"
+        )
+
+    }
+
+    if (
+        !is.null(policy_raw$Policy_Value)
+    ) {
+
+        cat(
+            "No-Copula policy value:",
+            round(
+                policy_raw$Policy_Value,
+                6
+            ),
+            "\n"
+        )
+
+    }
+
+    if (
+        !is.null(policy_raw$Fitted_Regret)
+    ) {
+
+        cat(
+            "No-Copula fitted regret:",
+            round(
+                policy_raw$Fitted_Regret,
+                6
+            ),
+            "\n"
+        )
+
+    }
+
+}
+
+
+################################################################################
+# 47. FINAL DATASET DESCRIPTION
+################################################################################
+
+cat("\n")
+cat("============================================================\n")
+cat("REAL-DATA ANALYSIS DESCRIPTION\n")
 cat("============================================================\n")
 
 cat(
@@ -3610,157 +4246,60 @@ cat(
 )
 
 cat(
-    "Randomized subjects:",
-    nrow(pbc_data),
-    "\n"
+    "Study: Mayo Clinic randomized PBC trial\n"
 )
 
 cat(
-    "Treatment 0 = placebo\n"
+    "Treatment: D-penicillamine vs placebo\n"
 )
 
 cat(
-    "Treatment 1 = D-penicillamine\n"
+    "Cause 1: liver transplantation\n"
 )
 
 cat(
-    "Cause 1 = transplantation\n"
+    "Cause 2: death\n"
 )
 
 cat(
-    "Cause 2 = death\n"
+    "Censoring: no transplantation or death observed by end of follow-up\n"
 )
 
 cat(
-    "TAU =",
+    "Methods: Vine-Copula + CSC vs No-Copula + CSC\n"
+)
+
+cat(
+    "TAU:",
     TAU,
-    "days\n"
-)
-
-cat(
-    "Weights = (",
-    WEIGHTS[1],
-    ",",
-    WEIGHTS[2],
-    ")\n"
-)
-
-cat("\n")
-
-cat(
-    "Vine-Copula mean CATE:",
+    "days (",
     round(
-        mean(
-            fit_vine$Estimated_CATE,
-            na.rm =
-                TRUE
-        ),
-        5
+        TAU / 365.25,
+        2
+    ),
+    "years)\n"
+)
+
+cat(
+    "Weights:",
+    paste(
+        WEIGHTS,
+        collapse = ", "
     ),
     "\n"
 )
 
 cat(
-    "No-Copula mean CATE:",
-    round(
-        mean(
-            fit_nocopula$Estimated_CATE,
-            na.rm =
-                TRUE
-        ),
-        5
-    ),
-    "\n"
+    "Results saved to CSV and RDS files.\n"
 )
 
-cat(
-    "Vine-Copula treatment-1 rate:",
-    round(
-        mean(
-            fit_vine$Estimated_Rule == 1,
-            na.rm =
-                TRUE
-        ),
-        4
-    ),
-    "\n"
-)
-
-cat(
-    "No-Copula treatment-1 rate:",
-    round(
-        mean(
-            fit_nocopula$Estimated_Rule == 1,
-            na.rm =
-                TRUE
-        ),
-        4
-    ),
-    "\n"
-)
-
-cat(
-    "Vine-Copula IPW policy value:",
-    round(
-        vine_policy_value,
-        5
-    ),
-    "\n"
-)
-
-cat(
-    "No-Copula IPW policy value:",
-    round(
-        nocopula_policy_value,
-        5
-    ),
-    "\n"
-)
-
-cat(
-    "Always placebo IPW value:",
-    round(
-        always0_value,
-        5
-    ),
-    "\n"
-)
-
-cat(
-    "Always D-penicillamine IPW value:",
-    round(
-        always1_value,
-        5
-    ),
-    "\n"
-)
-
-cat(
-    "Rule agreement:",
-    round(
-        rule_agreement,
-        4
-    ),
-    "\n"
-)
-
-cat(
-    "CATE correlation:",
-    round(
-        cate_correlation,
-        4
-    ),
-    "\n"
-)
-
-cat("\n")
-cat("Output files saved.\n")
 cat("============================================================\n")
 
 
 ################################################################################
 # END
 ################################################################################
+
 
 ############################
 # Simulated Data Analysis

@@ -15,7 +15,7 @@ The repository contains two main analyses:
 
 1. A comprehensive Monte Carlo simulation study.
 2. A real-data application using cleaned and de-identified MIMIC-IV clinical
-   transcript data. Download the real data from https://www.kaggle.com/datasets/isaacritharson/mimic-iv-cleaned-medical-transcripts?resource=download
+   transcript data. Download the real data from https://www.kaggle.com/datasets/aminexdr/bhc-mimic-iv-summary
 
 
 The overall framework is

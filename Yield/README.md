@@ -1,4 +1,4 @@
-# Deep Sequential Learning for Macro-Financial Yield Curve Prediction
+# An Affine Transformer--CNN--BiLSTM Framework with Adaptive Experience Replay for No-Arbitrage Macro-Financial Yield Curve Forecasting
 
 ## Overview
 

@@ -2273,6 +2273,664 @@ write.csv(
 )
 
 ###############################################################################
+# 59. INVESTMENT SUMMARY
+###############################################################################
+
+investment_summary <- data.frame(
+
+    Metric = c(
+
+        "Policy Investment Rate",
+
+        "Policy Accuracy",
+
+        "True Policy Value",
+
+        "Optimal Policy Value",
+
+        "Policy Regret",
+
+        "IPW Value",
+
+        "Doubly Robust Value",
+
+        "Policy Total Return",
+
+        "Buy-Hold Total Return",
+
+        "Policy Sharpe",
+
+        "Buy-Hold Sharpe",
+
+        "Policy Maximum Drawdown",
+
+        "Buy-Hold Maximum Drawdown"
+    ),
+
+    Value = c(
+
+        POLICY_RATE,
+
+        POLICY_ACCURACY,
+
+        TRUE_POLICY_VALUE,
+
+        TRUE_OPTIMAL_VALUE,
+
+        POLICY_REGRET,
+
+        IPW_VALUE,
+
+        DR_VALUE,
+
+        POLICY_TOTAL_RETURN,
+
+        BUY_HOLD_TOTAL_RETURN,
+
+        POLICY_SHARPE,
+
+        BUY_HOLD_SHARPE,
+
+        POLICY_MDD,
+
+        BUY_HOLD_MDD
+    )
+)
+
+print(
+
+    investment_summary
+)
+
+write.csv(
+
+    investment_summary,
+
+    "causal_investment_performance.csv",
+
+    row.names = FALSE
+)
+
+###############################################################################
+# 60. CUMULATIVE RETURN PLOT
+###############################################################################
+
+return_plot_data <- data.frame(
+
+    Time = seq_along(
+        CUM_POLICY
+    ),
+
+    CausalPolicy =
+        CUM_POLICY,
+
+    BuyHold =
+        CUM_BUY_HOLD
+)
+
+p1 <- ggplot(
+
+    return_plot_data,
+
+    aes(
+        x = Time
+    )
+
+) +
+
+    geom_line(
+
+        aes(
+            y = CausalPolicy,
+            linetype = "Causal Policy"
+        ),
+
+        linewidth = 1
+    ) +
+
+    geom_line(
+
+        aes(
+            y = BuyHold,
+            linetype = "Buy-and-Hold"
+        ),
+
+        linewidth = 1
+    ) +
+
+    labs(
+
+        title =
+            "Causal Investment Policy vs. Buy-and-Hold",
+
+        x =
+            "Test Period",
+
+        y =
+            "Cumulative Wealth",
+
+        linetype =
+            "Strategy"
+    ) +
+
+    theme_minimal()
+
+print(
+    p1
+)
+
+ggsave(
+
+    "causal_investment_cumulative_return.png",
+
+    p1,
+
+    width = 8,
+
+    height = 5,
+
+    dpi = 300
+)
+
+###############################################################################
+# 61. TRUE VS ESTIMATED CATE
+###############################################################################
+
+cate_plot_data <- data.frame(
+
+    True_CATE =
+        TAU_test,
+
+    Estimated_CATE =
+        TAU_HAT
+)
+
+p2 <- ggplot(
+
+    cate_plot_data,
+
+    aes(
+
+        x = True_CATE,
+
+        y = Estimated_CATE
+    )
+
+) +
+
+    geom_point(
+
+        alpha = 0.40
+    ) +
+
+    geom_abline(
+
+        slope = 1,
+
+        intercept = 0,
+
+        linetype = "dashed"
+    ) +
+
+    labs(
+
+        title =
+            "True vs. Estimated CATE",
+
+        x =
+            "True CATE",
+
+        y =
+            "Estimated CATE"
+    ) +
+
+    theme_minimal()
+
+print(
+    p2
+)
+
+ggsave(
+
+    "causal_investment_cate.png",
+
+    p2,
+
+    width = 7,
+
+    height = 6,
+
+    dpi = 300
+)
+
+###############################################################################
+# 62. CATE DISTRIBUTION
+###############################################################################
+
+cate_distribution <- data.frame(
+
+    CATE =
+        TAU_HAT
+)
+
+p3 <- ggplot(
+
+    cate_distribution,
+
+    aes(
+        x = CATE
+    )
+
+) +
+
+    geom_histogram(
+
+        bins = 40
+    ) +
+
+    labs(
+
+        title =
+            "Distribution of Estimated Causal Investment Effects",
+
+        x =
+            "Estimated CATE",
+
+        y =
+            "Frequency"
+    ) +
+
+    theme_minimal()
+
+print(
+    p3
+)
+
+ggsave(
+
+    "causal_investment_cate_distribution.png",
+
+    p3,
+
+    width = 7,
+
+    height = 5,
+
+    dpi = 300
+)
+
+###############################################################################
+# 63. POLICY CLASSIFICATION PLOT
+###############################################################################
+
+policy_plot_data <- data.frame(
+
+    True_CATE =
+        TAU_test,
+
+    Estimated_CATE =
+        TAU_HAT,
+
+    Policy =
+        factor(
+            POLICY,
+            levels = c(0, 1),
+            labels = c(
+                "Do Not Invest",
+                "Invest"
+            )
+        )
+)
+
+p4 <- ggplot(
+
+    policy_plot_data,
+
+    aes(
+
+        x = True_CATE,
+
+        y = Estimated_CATE
+    )
+
+) +
+
+    geom_point(
+
+        aes(
+            shape = Policy
+        ),
+
+        alpha = 0.50
+    ) +
+
+    geom_hline(
+
+        yintercept =
+            POLICY_THRESHOLD,
+
+        linetype =
+            "dashed"
+    ) +
+
+    geom_vline(
+
+        xintercept =
+            0,
+
+        linetype =
+            "dashed"
+    ) +
+
+    labs(
+
+        title =
+            "Causal Investment Policy Based on Estimated CATE",
+
+        x =
+            "True CATE",
+
+        y =
+            "Estimated CATE",
+
+        shape =
+            "Policy"
+    ) +
+
+    theme_minimal()
+
+print(
+    p4
+)
+
+ggsave(
+
+    "causal_investment_policy.png",
+
+    p4,
+
+    width = 8,
+
+    height = 6,
+
+    dpi = 300
+)
+
+###############################################################################
+# 64. POTENTIAL OUTCOME PREDICTION PLOT
+###############################################################################
+
+potential_outcome_data <- data.frame(
+
+    Y0_True =
+        Y0_test_true,
+
+    Y0_Hat =
+        Y0_HAT,
+
+    Y1_True =
+        Y1_test_true,
+
+    Y1_Hat =
+        Y1_HAT
+)
+
+p5 <- ggplot(
+
+    potential_outcome_data,
+
+    aes(
+        x = Y0_True,
+        y = Y0_Hat
+    )
+
+) +
+
+    geom_point(
+
+        alpha = 0.35
+    ) +
+
+    geom_abline(
+
+        slope = 1,
+
+        intercept = 0,
+
+        linetype = "dashed"
+    ) +
+
+    labs(
+
+        title =
+            "True vs. Estimated Y(0)",
+
+        x =
+            "True Y(0)",
+
+        y =
+            "Estimated Y(0)"
+    ) +
+
+    theme_minimal()
+
+print(
+    p5
+)
+
+ggsave(
+
+    "causal_investment_Y0.png",
+
+    p5,
+
+    width = 7,
+
+    height = 6,
+
+    dpi = 300
+)
+
+###############################################################################
+# 65. TRAINING HISTORY
+###############################################################################
+#
+# history_py is a Python Keras History object.
+#
+# We extract the available loss history without using R keras callbacks.
+#
+###############################################################################
+
+history_dict <- py_to_r(
+    history_py$history
+)
+
+###############################################################################
+# SAVE TRAINING HISTORY
+###############################################################################
+
+if (!is.null(history_dict)) {
+
+    history_df <- as.data.frame(
+        history_dict
+    )
+
+    history_df$Epoch <-
+        seq_len(
+            nrow(history_df)
+        )
+
+    write.csv(
+
+        history_df,
+
+        "causal_investment_training_history.csv",
+
+        row.names = FALSE
+    )
+}
+
+###############################################################################
+# 66. FINAL SUMMARY
+###############################################################################
+
+cat("\n")
+cat("============================================================\n")
+cat("FINAL ANALYSIS SUMMARY\n")
+cat("============================================================\n")
+
+cat(
+
+    "ATE Bias:        ",
+
+    round(
+        ATE_BIAS,
+        5
+    ),
+
+    "\n"
+)
+
+cat(
+
+    "CATE RMSE:       ",
+
+    round(
+        PEHE,
+        5
+    ),
+
+    "\n"
+)
+
+cat(
+
+    "Y0 RMSE:         ",
+
+    round(
+        Y0_RMSE,
+        5
+    ),
+
+    "\n"
+)
+
+cat(
+
+    "Y1 RMSE:         ",
+
+    round(
+        Y1_RMSE,
+        5
+    ),
+
+    "\n"
+)
+
+cat(
+
+    "Policy rate:     ",
+
+    round(
+        POLICY_RATE,
+        5
+    ),
+
+    "\n"
+)
+
+cat(
+
+    "Policy accuracy: ",
+
+    round(
+        POLICY_ACCURACY,
+        5
+    ),
+
+    "\n"
+)
+
+cat(
+
+    "Policy value:    ",
+
+    round(
+        TRUE_POLICY_VALUE,
+        5
+    ),
+
+    "\n"
+)
+
+cat(
+
+    "Policy regret:   ",
+
+    round(
+        POLICY_REGRET,
+        5
+    ),
+
+    "\n"
+)
+
+cat(
+
+    "IPW value:       ",
+
+    round(
+        IPW_VALUE,
+        5
+    ),
+
+    "\n"
+)
+
+cat(
+
+    "DR value:        ",
+
+    round(
+        DR_VALUE,
+        5
+    ),
+
+    "\n"
+)
+
+cat(
+
+    "Policy Sharpe:   ",
+
+    round(
+        POLICY_SHARPE,
+        5
+    ),
+
+    "\n"
+)
+
+cat(
+
+    "Policy MDD:      ",
+
+    round(
+        POLICY_MDD,
+        5
+    ),
+
+    "\n"
+)
+
+cat("\n")
+cat("Analysis completed successfully.\n")
+cat("============================================================\n")
+
+###############################################################################
+# END
+###############################################################################
+###############################################################################
 # 59. COMPREHENSIVE SUMMARY RESULTS TABLE
 ###############################################################################
 

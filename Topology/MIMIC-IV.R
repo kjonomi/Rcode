@@ -1,59 +1,51 @@
 ###############################################################################
 # 02_MIMIC_IV_Topology_Causal_Analysis.R
 #
-# TOPOLOGY-AWARE CAUSAL INFERENCE USING BHC MIMIC-IV
+# TOPOLOGY-AWARE CAUSAL ANALYSIS OF MIMIC-IV BHC SUMMARIZATION DATA
 #
 # Dataset:
 #   BHC_MIMIC-IV.csv
 #
-# Main variables:
-#   note_id
-#   subject_id
-#   hadm_id
-#   note_type
-#   note_seq
-#   charttime
-#   storetime
-#   input
-#   target
-#   input_length
-#
-# Objective:
-#   Construct a functional representation of clinical BHC information,
-#   obtain FPCA and topology-aware representations, and estimate
-#   treatment effects.
+# Main objectives:
+#   1. Construct patient-level analytic data
+#   2. Define treatment from clinically meaningful text exposure
+#   3. Define mortality/outcome from available BHC information
+#   4. Construct functional representations from clinical text
+#   5. Estimate FPCA representations
+#   6. Construct topology-aware representations
+#   7. Estimate causal effects using:
+#        - Classical adjustment
+#        - FPCA
+#        - Topology-DR
+#        - Topology-IPW
+#        - Topology-OR
+#   8. Produce tables and figures
 #
 # IMPORTANT:
-#   Treatment is NOT defined from arbitrary drug mentions in BHC text.
-#   The default treatment is a reproducible text-derived clinical exposure:
-#
-#       A = 1 if the BHC target contains evidence of mechanical ventilation
-#       A = 0 otherwise
-#
-#   This is intended as a methodological demonstration.
-#   For a definitive clinical causal study, treatment should preferably
-#   be linked to MIMIC-IV structured treatment tables.
+#   The BHC dataset does not contain a conventional treatment variable or
+#   physiological time series. Therefore, treatment and functional features
+#   are explicitly derived from available text fields and must be interpreted
+#   as observational research variables rather than randomized exposures.
 ###############################################################################
 
 rm(list = ls())
 
-options(stringsAsFactors = FALSE)
-
-set.seed(20260828)
-
 ###############################################################################
-# 1. PACKAGES
+# 0. PACKAGES
 ###############################################################################
 
 required_packages <- c(
     "data.table",
     "dplyr",
-    "stringr",
     "tidyr",
+    "stringr",
     "ggplot2",
     "purrr",
     "tibble",
-    "splines"
+    "MASS",
+    "splines",
+    "mgcv",
+    "Matrix"
 )
 
 for (pkg in required_packages) {
@@ -62,22 +54,17 @@ for (pkg in required_packages) {
         install.packages(pkg)
     }
 
+    library(
+        pkg,
+        character.only = TRUE
+    )
 }
 
-library(data.table)
-library(dplyr)
-library(stringr)
-library(tidyr)
-library(ggplot2)
-library(purrr)
-library(tibble)
-library(splines)
-
 ###############################################################################
-# 2. DIRECTORIES
+# 1. DIRECTORIES
 ###############################################################################
 
-DATA_FILE <- "BHC_MIMIC-IV.csv"
+DATA_DIR <- "data"
 
 RESULT_DIR <- "results/MIMIC_IV"
 
@@ -91,8 +78,13 @@ FIGURE_DIR <- file.path(
     "figures"
 )
 
-dir.create(
+MODEL_DIR <- file.path(
     RESULT_DIR,
+    "models"
+)
+
+dir.create(
+    DATA_DIR,
     recursive = TRUE,
     showWarnings = FALSE
 )
@@ -109,30 +101,43 @@ dir.create(
     showWarnings = FALSE
 )
 
+dir.create(
+    MODEL_DIR,
+    recursive = TRUE,
+    showWarnings = FALSE
+)
+
+###############################################################################
+# 2. DATA LOCATION
+###############################################################################
+
+DATA_FILE <- file.path(
+    DATA_DIR,
+    "BHC_MIMIC-IV.csv"
+)
+
+if (!file.exists(DATA_FILE)) {
+
+    stop(
+        paste0(
+            "\nCannot find:\n",
+            DATA_FILE,
+            "\n\n",
+            "Place BHC_MIMIC-IV.csv in the data/ directory.\n"
+        )
+    )
+
+}
+
 ###############################################################################
 # 3. READ DATA
 ###############################################################################
 
 cat("\n============================================================\n")
 cat("READING BHC MIMIC-IV DATA\n")
-cat("============================================================\n\n")
+cat("============================================================\n")
 
-if (!file.exists(DATA_FILE)) {
-
-    stop(
-        paste0(
-            "Cannot find: ",
-            DATA_FILE,
-            "\n\n",
-            "Place BHC_MIMIC-IV.csv in the working directory."
-        )
-    )
-
-}
-
-cat("Reading CSV...\n")
-
-bhc <- fread(
+bhc <- data.table::fread(
     DATA_FILE,
     encoding = "UTF-8",
     showProgress = TRUE
@@ -158,7 +163,11 @@ names(bhc) <- tolower(
     names(bhc)
 )
 
-required_columns <- c(
+###############################################################################
+# 5. REQUIRED VARIABLES
+###############################################################################
+
+required_variables <- c(
     "note_id",
     "subject_id",
     "hadm_id",
@@ -167,22 +176,21 @@ required_columns <- c(
     "charttime",
     "storetime",
     "input",
-    "target",
-    "input_length"
+    "target"
 )
 
-missing_columns <- setdiff(
-    required_columns,
+missing_variables <- setdiff(
+    required_variables,
     names(bhc)
 )
 
-if (length(missing_columns) > 0) {
+if (length(missing_variables) > 0) {
 
     stop(
         paste0(
-            "Missing required columns:\n",
+            "\nMissing required variables:\n",
             paste(
-                missing_columns,
+                missing_variables,
                 collapse = ", "
             )
         )
@@ -191,7 +199,7 @@ if (length(missing_columns) > 0) {
 }
 
 ###############################################################################
-# 5. BASIC DATA STRUCTURE
+# 6. DATA STRUCTURE
 ###############################################################################
 
 cat("\n============================================================\n")
@@ -200,15 +208,15 @@ cat("============================================================\n")
 
 N_ROWS <- nrow(bhc)
 
-N_PATIENTS <- uniqueN(
+N_PATIENTS <- data.table::uniqueN(
     bhc$subject_id
 )
 
-N_ADMISSIONS <- uniqueN(
+N_ADMISSIONS <- data.table::uniqueN(
     bhc$hadm_id
 )
 
-N_NOTES <- uniqueN(
+N_NOTES <- data.table::uniqueN(
     bhc$note_id
 )
 
@@ -237,29 +245,29 @@ cat(
 )
 
 ###############################################################################
-# 6. IDENTIFIER SUMMARY
+# 7. IDENTIFIER SUMMARY
 ###############################################################################
 
 identifier_summary <- tibble(
-
+    
     Variable = c(
         "subject_id",
         "hadm_id",
         "note_id"
     ),
-
+    
     Unique_Values = c(
-        uniqueN(bhc$subject_id),
-        uniqueN(bhc$hadm_id),
-        uniqueN(bhc$note_id)
+        data.table::uniqueN(bhc$subject_id),
+        data.table::uniqueN(bhc$hadm_id),
+        data.table::uniqueN(bhc$note_id)
     ),
-
+    
     NonMissing = c(
         sum(!is.na(bhc$subject_id)),
         sum(!is.na(bhc$hadm_id)),
         sum(!is.na(bhc$note_id))
     )
-
+    
 )
 
 print(
@@ -276,24 +284,60 @@ write.csv(
 )
 
 ###############################################################################
-# 7. NOTE TYPE
+# 8. SAFE FREQUENCY TABLE FUNCTION
 ###############################################################################
 
-cat("\nNote type distribution:\n")
+make_frequency_table <- function(x,
+                                 value_name = "Category",
+                                 frequency_name = "Frequency") {
 
-note_type_table <- as.data.frame(
-    sort(
-        table(
-            bhc$note_type,
-            useNA = "ifany"
-        ),
-        decreasing = TRUE
+    x <- as.character(x)
+
+    x[is.na(x)] <- "<NA>"
+
+    tab <- table(
+        x,
+        useNA = "no"
     )
+
+    out <- data.frame(
+        Category = names(tab),
+        Frequency = as.integer(tab),
+        stringsAsFactors = FALSE
+    )
+
+    names(out) <- c(
+        value_name,
+        frequency_name
+    )
+
+    out <- out[
+        order(
+            out[[frequency_name]],
+            decreasing = TRUE
+        ),
+        ,
+        drop = FALSE
+    ]
+
+    rownames(out) <- NULL
+
+    out
+
+}
+
+###############################################################################
+# 9. NOTE TYPE
+###############################################################################
+
+cat(
+    "\nNote type distribution:\n"
 )
 
-names(note_type_table) <- c(
-    "Note_Type",
-    "Frequency"
+note_type_table <- make_frequency_table(
+    bhc$note_type,
+    value_name = "Note_Type",
+    frequency_name = "Frequency"
 )
 
 print(
@@ -310,790 +354,782 @@ write.csv(
 )
 
 ###############################################################################
-# 8. NOTE-LEVEL TEXT PREPARATION
+# 10. BASIC VARIABLE SUMMARY
+###############################################################################
+
+variable_summary <- tibble(
+    
+    Variable = names(bhc),
+    
+    Class = sapply(
+        bhc,
+        function(x) class(x)[1]
+    ),
+    
+    NonMissing = sapply(
+        bhc,
+        function(x) sum(!is.na(x))
+    ),
+    
+    Missing = sapply(
+        bhc,
+        function(x) sum(is.na(x))
+    ),
+    
+    Unique = sapply(
+        bhc,
+        function(x) data.table::uniqueN(x)
+    )
+    
+)
+
+write.csv(
+    variable_summary,
+    file.path(
+        TABLE_DIR,
+        "variable_summary.csv"
+    ),
+    row.names = FALSE
+)
+
+###############################################################################
+# 11. TEXT LENGTH DISTRIBUTIONS
 ###############################################################################
 
 bhc <- bhc %>%
-
+    
     mutate(
-
-        input = ifelse(
-            is.na(input),
-            "",
-            as.character(input)
+        
+        input_length_calc = stringr::str_length(
+            coalesce(
+                as.character(input),
+                ""
+            )
         ),
-
-        target = ifelse(
-            is.na(target),
-            "",
-            as.character(target)
-        ),
-
-        clinical_text = paste(
-            input,
-            target,
-            sep = " "
-        ),
-
-        clinical_text = str_squish(
-            clinical_text
+        
+        target_length_calc = stringr::str_length(
+            coalesce(
+                as.character(target),
+                ""
+            )
         )
-
+        
     )
 
-###############################################################################
-# 9. TEXT LENGTH
-###############################################################################
-
-bhc <- bhc %>%
-
-    mutate(
-
-        text_chars = nchar(
-            clinical_text
-        ),
-
-        text_words = str_count(
-            clinical_text,
-            "\\S+"
-        )
-
-    )
-
-text_summary <- bhc %>%
-
+length_summary <- bhc %>%
+    
     summarise(
-
+        
         N = n(),
-
-        Mean_Words =
+        
+        Mean_Input_Length =
             mean(
-                text_words,
+                input_length_calc,
                 na.rm = TRUE
             ),
-
-        SD_Words =
+        
+        SD_Input_Length =
             sd(
-                text_words,
+                input_length_calc,
                 na.rm = TRUE
             ),
-
-        Median_Words =
+        
+        Median_Input_Length =
             median(
-                text_words,
+                input_length_calc,
                 na.rm = TRUE
             ),
-
-        Mean_Characters =
+        
+        Mean_Target_Length =
             mean(
-                text_chars,
+                target_length_calc,
+                na.rm = TRUE
+            ),
+        
+        SD_Target_Length =
+            sd(
+                target_length_calc,
+                na.rm = TRUE
+            ),
+        
+        Median_Target_Length =
+            median(
+                target_length_calc,
                 na.rm = TRUE
             )
-
+        
     )
 
 print(
-    text_summary
+    length_summary
 )
 
 write.csv(
-    text_summary,
+    length_summary,
     file.path(
         TABLE_DIR,
-        "text_summary.csv"
+        "text_length_summary.csv"
     ),
     row.names = FALSE
 )
 
 ###############################################################################
-# 10. TEXT LENGTH FIGURE
+# 12. PATIENT-LEVEL NOTE COUNT
 ###############################################################################
 
-p_text_length <- ggplot(
-    bhc,
-    aes(
-        x = text_words
-    )
-) +
-
-    geom_histogram(
-        bins = 50
-    ) +
-
-    coord_cartesian(
-        xlim = c(
-            0,
-            quantile(
-                bhc$text_words,
-                0.99,
-                na.rm = TRUE
-            )
-        )
-    ) +
-
-    labs(
-        title = "Distribution of BHC Note Length",
-        x = "Number of Words",
-        y = "Frequency"
-    ) +
-
-    theme_minimal()
-
-ggsave(
-    file.path(
-        FIGURE_DIR,
-        "BHC_note_length_distribution.png"
-    ),
-    p_text_length,
-    width = 8,
-    height = 5,
-    dpi = 300
-)
-
-###############################################################################
-# 11. HOSPITALIZATION-LEVEL DATA
-###############################################################################
-
-###############################################################################
-# IMPORTANT:
-#
-# BHC notes are hospitalization documents.
-#
-# We therefore construct one observation per hospitalization.
-###############################################################################
-
-hospital <- bhc %>%
-
+patient_note_count <- bhc %>%
+    
     group_by(
-        subject_id,
-        hadm_id
+        subject_id
     ) %>%
-
+    
     summarise(
-
-        n_notes = n(),
-
-        total_words =
-            sum(
-                text_words,
-                na.rm = TRUE
-            ),
-
-        mean_words =
+        
+        N_Notes = n(),
+        
+        N_Admissions = n_distinct(
+            hadm_id
+        ),
+        
+        Mean_Input_Length =
             mean(
-                text_words,
+                input_length_calc,
                 na.rm = TRUE
             ),
-
-        max_words =
-            max(
-                text_words,
+        
+        Mean_Target_Length =
+            mean(
+                target_length_calc,
                 na.rm = TRUE
             ),
-
-        first_charttime =
-            suppressWarnings(
-                min(
-                    as.POSIXct(
-                        charttime
-                    ),
-                    na.rm = TRUE
-                )
-            ),
-
-        last_charttime =
-            suppressWarnings(
-                max(
-                    as.POSIXct(
-                        charttime
-                    ),
-                    na.rm = TRUE
-                )
-            ),
-
-        clinical_text =
-            paste(
-                clinical_text,
-                collapse = " "
-            ),
-
+        
         .groups = "drop"
-
+        
     )
-
-###############################################################################
-# 12. REMOVE INVALID TIME VALUES
-###############################################################################
-
-hospital <- hospital %>%
-
-    mutate(
-
-        first_charttime =
-            ifelse(
-                is.infinite(
-                    as.numeric(first_charttime)
-                ),
-                NA,
-                first_charttime
-            ),
-
-        last_charttime =
-            ifelse(
-                is.infinite(
-                    as.numeric(last_charttime)
-                ),
-                NA,
-                last_charttime
-            )
-
-    )
-
-###############################################################################
-# 13. DEFINE TEXT-DERIVED TREATMENT
-###############################################################################
-
-###############################################################################
-# DEFAULT EXPOSURE:
-#
-# Mechanical ventilation / ventilatory support.
-#
-# This is a text-derived exposure and should be interpreted as
-# an observational methodological demonstration.
-#
-# A = 1:
-#     evidence of mechanical ventilation / intubation
-#
-# A = 0:
-#     no evidence detected
-###############################################################################
-
-VENTILATION_PATTERN <- paste(
-    c(
-        "mechanical ventilation",
-        "mechanically ventilated",
-        "ventilator",
-        "intubated",
-        "intubation",
-        "endotracheal tube",
-        "ett",
-        "extubated"
-    ),
-    collapse = "|"
-)
-
-hospital <- hospital %>%
-
-    mutate(
-
-        A = as.integer(
-            str_detect(
-                str_to_lower(
-                    clinical_text
-                ),
-                VENTILATION_PATTERN
-            )
-        )
-
-    )
-
-###############################################################################
-# 14. TREATMENT DISTRIBUTION
-###############################################################################
-
-cat(
-    "\nTreatment distribution:\n"
-)
-
-treatment_table <- as.data.frame(
-    table(
-        hospital$A,
-        useNA = "ifany"
-    )
-)
-
-names(treatment_table) <- c(
-    "Treatment",
-    "Frequency"
-)
-
-print(
-    treatment_table
-)
 
 write.csv(
-    treatment_table,
+    patient_note_count,
     file.path(
         TABLE_DIR,
-        "treatment_distribution.csv"
+        "patient_note_summary.csv"
     ),
     row.names = FALSE
 )
 
 ###############################################################################
-# 15. TREATMENT RATE
+# 13. CREATE COMBINED CLINICAL TEXT
 ###############################################################################
 
-treatment_rate <- mean(
-    hospital$A,
-    na.rm = TRUE
+bhc <- bhc %>%
+    
+    mutate(
+        
+        input_text =
+            coalesce(
+                as.character(input),
+                ""
+            ),
+        
+        target_text =
+            coalesce(
+                as.character(target),
+                ""
+            ),
+        
+        clinical_text = paste(
+            input_text,
+            target_text
+        )
+        
+    )
+
+###############################################################################
+# 14. TEXT-BASED CLINICAL EXPOSURE
+#
+# IMPORTANT:
+# The BHC dataset does not provide a conventional treatment variable.
+#
+# We therefore create a prespecified exposure based on whether the
+# hospitalization text contains an explicit medication/intervention signal.
+#
+# Users should replace this definition with a clinically validated treatment
+# extracted from the underlying MIMIC-IV tables for a definitive study.
+###############################################################################
+
+###############################################################################
+# 15. DEFINE TREATMENT CANDIDATES
+###############################################################################
+
+treatment_patterns <- c(
+    
+    "heparin",
+    "warfarin",
+    "aspirin",
+    "clopidogrel",
+    "metoprolol",
+    "labetalol",
+    "hydralazine",
+    "insulin",
+    "vancomycin",
+    "ceftriaxone",
+    "piperacillin",
+    "acetaminophen"
+    
 )
 
-cat(
-    "\nTreatment prevalence:",
-    round(
-        treatment_rate,
-        4
+treatment_screening <- lapply(
+    
+    treatment_patterns,
+    
+    function(pattern) {
+        
+        detected <- stringr::str_detect(
+            stringr::str_to_lower(
+                bhc$clinical_text
+            ),
+            fixed(
+                pattern
+            )
+        )
+        
+        tibble(
+            
+            Treatment = pattern,
+            
+            Treated_Notes =
+                sum(
+                    detected,
+                    na.rm = TRUE
+                ),
+            
+            Treated_Patients =
+                data.table::uniqueN(
+                    bhc$subject_id[
+                        detected
+                    ]
+                )
+            
+        )
+        
+    }
+    
+) %>%
+    
+    bind_rows() %>%
+    
+    arrange(
+        desc(Treated_Patients)
+    )
+
+print(
+    treatment_screening
+)
+
+write.csv(
+    treatment_screening,
+    file.path(
+        TABLE_DIR,
+        "text_treatment_screening.csv"
     ),
+    row.names = FALSE
+)
+
+###############################################################################
+# 16. SELECT TREATMENT
+###############################################################################
+
+#
+# Select a treatment with adequate patient-level frequency.
+#
+# For this demonstration we use the most frequently detected candidate
+# among the prespecified treatment patterns.
+#
+
+MIN_TREATED <- 500
+MIN_CONTROL <- 500
+
+eligible_treatments <- treatment_screening %>%
+    
+    filter(
+        Treated_Patients >= MIN_TREATED
+    )
+
+if (nrow(eligible_treatments) == 0) {
+    
+    stop(
+        paste0(
+            "\nNo text-derived treatment has at least ",
+            MIN_TREATED,
+            " treated patients.\n",
+            "Inspect text_treatment_screening.csv.\n"
+        )
+    )
+    
+}
+
+TARGET_TREATMENT <-
+    eligible_treatments$Treatment[1]
+
+cat(
+    "\nSelected treatment:",
+    TARGET_TREATMENT,
     "\n"
 )
 
 ###############################################################################
-# 16. OUTCOME
+# 17. PATIENT-LEVEL TREATMENT
 ###############################################################################
 
+target_pattern <- TARGET_TREATMENT
+
+bhc <- bhc %>%
+    
+    mutate(
+        
+        A_note =
+            as.integer(
+                stringr::str_detect(
+                    stringr::str_to_lower(
+                        clinical_text
+                    ),
+                    fixed(
+                        target_pattern
+                    )
+                )
+            )
+        
+    )
+
+treatment_patient <- bhc %>%
+    
+    group_by(
+        subject_id
+    ) %>%
+    
+    summarise(
+        
+        A =
+            as.integer(
+                any(
+                    A_note == 1,
+                    na.rm = TRUE
+                )
+            ),
+        
+        .groups = "drop"
+        
+    )
+
+treatment_distribution <- treatment_patient %>%
+    
+    count(
+        A,
+        name = "Patients"
+    )
+
+print(
+    treatment_distribution
+)
+
+write.csv(
+    treatment_distribution,
+    file.path(
+        TABLE_DIR,
+        "patient_treatment_distribution.csv"
+    ),
+    row.names = FALSE
+)
+
 ###############################################################################
-# IMPORTANT:
-#
-# BHC_MIMIC-IV.csv itself does not provide a reliable structured mortality
-# variable in the columns listed by the dataset description.
-#
-# Therefore we construct a clearly labeled TEXT-DERIVED DISCHARGE OUTCOME.
-#
-# Y = 1 if the BHC target contains explicit death/expired language.
-# Y = 0 otherwise.
-#
-# For a definitive mortality analysis, link hadm_id to MIMIC-IV admissions.
+# 18. REQUIRE TREATMENT OVERLAP
 ###############################################################################
 
-MORTALITY_PATTERN <- paste(
+N_TREATED <- sum(
+    treatment_patient$A == 1
+)
+
+N_CONTROL <- sum(
+    treatment_patient$A == 0
+)
+
+cat(
+    "\nTreated patients:",
+    N_TREATED,
+    "\n"
+)
+
+cat(
+    "Control patients:",
+    N_CONTROL,
+    "\n"
+)
+
+if (
+    N_TREATED < MIN_TREATED ||
+    N_CONTROL < MIN_CONTROL
+) {
+    
+    stop(
+        paste0(
+            "\nInsufficient patient-level treatment overlap.\n\n",
+            "Treated = ",
+            N_TREATED,
+            "\n",
+            "Control = ",
+            N_CONTROL,
+            "\n\n",
+            "Use a clinically meaningful exposure extracted from ",
+            "the underlying MIMIC-IV structured data if stronger ",
+            "causal identification is required."
+        )
+    )
+    
+}
+
+###############################################################################
+# 19. OUTCOME CONSTRUCTION
+###############################################################################
+
+#
+# BHC_MIMIC-IV does not provide a clean binary mortality variable.
+#
+# We therefore search the target BHC summary for explicit mortality terms.
+#
+###############################################################################
+
+mortality_pattern <- paste(
     c(
-        "expired",
-        "died",
         "death",
+        "died",
         "deceased",
-        "passed away",
-        "pronounced dead"
+        "expired",
+        "mortality",
+        "passed away"
     ),
     collapse = "|"
 )
 
-hospital <- hospital %>%
-
+bhc <- bhc %>%
+    
     mutate(
-
-        Y = as.integer(
-            str_detect(
-                str_to_lower(
-                    clinical_text
-                ),
-                MORTALITY_PATTERN
+        
+        Y_note =
+            as.integer(
+                stringr::str_detect(
+                    stringr::str_to_lower(
+                        target_text
+                    ),
+                    mortality_pattern
+                )
             )
-        )
-
+        
     )
 
 ###############################################################################
-# 17. OUTCOME DISTRIBUTION
+# 20. PATIENT-LEVEL OUTCOME
 ###############################################################################
 
-outcome_table <- as.data.frame(
-    table(
-        hospital$Y,
-        useNA = "ifany"
+outcome_patient <- bhc %>%
+    
+    group_by(
+        subject_id
+    ) %>%
+    
+    summarise(
+        
+        Y =
+            as.integer(
+                any(
+                    Y_note == 1,
+                    na.rm = TRUE
+                )
+            ),
+        
+        .groups = "drop"
+        
     )
-)
 
-names(outcome_table) <- c(
-    "Outcome",
-    "Frequency"
-)
+outcome_distribution <- outcome_patient %>%
+    
+    count(
+        Y,
+        name = "Patients"
+    )
 
 print(
-    outcome_table
+    outcome_distribution
 )
 
 write.csv(
-    outcome_table,
+    outcome_distribution,
     file.path(
         TABLE_DIR,
-        "outcome_distribution.csv"
+        "patient_outcome_distribution.csv"
     ),
     row.names = FALSE
 )
 
 ###############################################################################
-# 18. CLINICAL TEXT FUNCTIONAL REPRESENTATION
+# 21. BASELINE TEXT-STRUCTURE COVARIATES
 ###############################################################################
 
-###############################################################################
-# IDEA:
-#
-# Instead of treating the clinical document as a single scalar,
-# divide the clinical course into ordered sections/windows.
-#
-# For each hospitalization, calculate the prevalence/intensity of
-# clinically relevant concepts across ordered windows.
-#
-# These ordered measurements form a functional trajectory.
-###############################################################################
-
-clinical_patterns <- list(
-
-    cardiovascular = paste(
-        c(
-            "cardiac",
-            "heart",
-            "arrhythmia",
-            "atrial fibrillation",
-            "hypotension",
-            "hypertension"
-        ),
-        collapse = "|"
-    ),
-
-    respiratory = paste(
-        c(
-            "respiratory",
-            "oxygen",
-            "pneumonia",
-            "ventilator",
-            "intubation",
-            "hypoxia"
-        ),
-        collapse = "|"
-    ),
-
-    renal = paste(
-        c(
-            "renal",
-            "kidney",
-            "creatinine",
-            "dialysis",
-            "acute kidney"
-        ),
-        collapse = "|"
-    ),
-
-    infection = paste(
-        c(
-            "infection",
-            "sepsis",
-            "antibiotic",
-            "bacteremia",
-            "fever"
-        ),
-        collapse = "|"
-    ),
-
-    neurologic = paste(
-        c(
-            "neurolog",
-            "stroke",
-            "seizure",
-            "confusion",
-            "encephalopathy"
-        ),
-        collapse = "|"
-    )
-
-)
-
-###############################################################################
-# 19. FUNCTIONAL BASIS
-###############################################################################
-
-N_GRID <- 20
-
-time_grid <- seq(
-    0,
-    1,
-    length.out = N_GRID
-)
-
-###############################################################################
-# 20. CREATE FUNCTIONAL FEATURES
-###############################################################################
-
-make_functional_vector <- function(
-    text,
-    patterns,
-    grid
-) {
-
-    text <- str_to_lower(
-        text
-    )
-
-    total_words <- max(
-        str_count(
-            text,
-            "\\S+"
-        ),
-        1
-    )
-
-    words <- unlist(
-        str_split(
-            text,
-            "\\s+"
-        )
-    )
-
-    n <- length(
-        words
-    )
-
-    if (n < 2) {
-
-        return(
-            rep(
+patient_text_features <- bhc %>%
+    
+    group_by(
+        subject_id
+    ) %>%
+    
+    summarise(
+        
+        Mean_Input_Length =
+            mean(
+                input_length_calc,
+                na.rm = TRUE
+            ),
+        
+        SD_Input_Length =
+            sd(
+                input_length_calc,
+                na.rm = TRUE
+            ),
+        
+        Mean_Target_Length =
+            mean(
+                target_length_calc,
+                na.rm = TRUE
+            ),
+        
+        SD_Target_Length =
+            sd(
+                target_length_calc,
+                na.rm = TRUE
+            ),
+        
+        N_Notes =
+            n(),
+        
+        N_Admissions =
+            n_distinct(
+                hadm_id
+            ),
+        
+        .groups = "drop"
+        
+    ) %>%
+    
+    mutate(
+        
+        across(
+            everything(),
+            ~ ifelse(
+                is.na(.x),
                 0,
-                length(grid)
+                .x
             )
         )
-
-    }
-
-    positions <- seq(
-        0,
-        1,
-        length.out = n
+        
     )
 
-    indicator <- as.numeric(
-        str_detect(
-            words,
-            patterns
+###############################################################################
+# 22. FUNCTIONAL REPRESENTATION
+#
+# We convert each patient's collection of BHC records into a functional
+# trajectory indexed by note order.
+#
+# The trajectory contains standardized text-complexity information.
+###############################################################################
+
+bhc_functional <- bhc %>%
+    
+    group_by(
+        subject_id
+    ) %>%
+    
+    arrange(
+        note_seq,
+        .by_group = TRUE
+    ) %>%
+    
+    mutate(
+        
+        time_index =
+            row_number(),
+        
+        time_scaled =
+            ifelse(
+                n() == 1,
+                0,
+                (time_index - 1) /
+                    (n() - 1)
+            )
+        
+    ) %>%
+    
+    ungroup()
+
+###############################################################################
+# 23. FUNCTIONAL FEATURES
+###############################################################################
+
+bhc_functional <- bhc_functional %>%
+    
+    mutate(
+        
+        complexity =
+            log1p(
+                input_length_calc +
+                    target_length_calc
+            ),
+        
+        information_ratio =
+            target_length_calc /
+            pmax(
+                input_length_calc,
+                1
+            )
+        
+    )
+
+###############################################################################
+# 24. PATIENT-LEVEL FUNCTIONAL SUMMARY
+###############################################################################
+
+functional_patient <- bhc_functional %>%
+    
+    group_by(
+        subject_id
+    ) %>%
+    
+    summarise(
+        
+        Functional_Mean =
+            mean(
+                complexity,
+                na.rm = TRUE
+            ),
+        
+        Functional_SD =
+            sd(
+                complexity,
+                na.rm = TRUE
+            ),
+        
+        Functional_Max =
+            max(
+                complexity,
+                na.rm = TRUE
+            ),
+        
+        Functional_Min =
+            min(
+                complexity,
+                na.rm = TRUE
+            ),
+        
+        Functional_Slope = {
+            
+            if (
+                n() >= 2 &&
+                length(
+                    unique(time_scaled)
+                ) >= 2
+            ) {
+                
+                coef(
+                    lm(
+                        complexity ~ time_scaled
+                    )
+                )[2]
+                
+            } else {
+                
+                0
+                
+            }
+            
+        },
+        
+        .groups = "drop"
+        
+    ) %>%
+    
+    mutate(
+        
+        across(
+            everything(),
+            ~ ifelse(
+                is.na(.x) |
+                    is.infinite(.x),
+                0,
+                .x
+            )
+            
         )
+        
     )
 
-    smooth <- approx(
-        x = positions,
-        y = indicator,
-        xout = grid,
-        method = "linear",
-        rule = 2
-    )$y
-
-    smooth
-
-}
-
 ###############################################################################
-# 21. CONSTRUCT FUNCTIONAL TRAJECTORIES
+# 25. FUNCTIONAL FEATURE TABLE
 ###############################################################################
-
-cat(
-    "\nConstructing functional clinical representations...\n"
-)
-
-functional_list <- vector(
-    "list",
-    length(clinical_patterns)
-)
-
-for (j in seq_along(clinical_patterns)) {
-
-    domain_name <-
-        names(clinical_patterns)[j]
-
-    pattern <-
-        clinical_patterns[[j]]
-
-    matrix_j <- t(
-        sapply(
-            hospital$clinical_text,
-            make_functional_vector,
-            patterns = pattern,
-            grid = time_grid
-        )
-    )
-
-    colnames(matrix_j) <-
-        paste0(
-            domain_name,
-            "_t",
-            seq_len(N_GRID)
-        )
-
-    functional_list[[j]] <-
-        matrix_j
-
-}
-
-functional_matrix <- do.call(
-    cbind,
-    functional_list
-)
-
-###############################################################################
-# 22. SAVE FUNCTIONAL MATRIX
-###############################################################################
-
-functional_df <- cbind(
-    hospital %>%
-        select(
-            subject_id,
-            hadm_id,
-            A,
-            Y
-        ),
-    as.data.frame(
-        functional_matrix
-    )
-)
 
 write.csv(
-    functional_df,
+    functional_patient,
     file.path(
         TABLE_DIR,
-        "functional_clinical_representation.csv"
+        "functional_patient_features.csv"
     ),
     row.names = FALSE
 )
 
 ###############################################################################
-# 23. FPCA-LIKE REPRESENTATION
+# 26. FPCA-STYLE DIMENSION REDUCTION
 ###############################################################################
 
-###############################################################################
-# R base implementation:
-#
-# PCA is applied to the discretized functional trajectories.
-#
-# The resulting scores provide a functional principal-component
-# representation.
-###############################################################################
+fpca_variables <- c(
+    
+    "Functional_Mean",
+    "Functional_SD",
+    "Functional_Max",
+    "Functional_Min",
+    "Functional_Slope"
+    
+)
 
-functional_only <- functional_matrix
+fpca_matrix <- functional_patient %>%
+    
+    select(
+        all_of(fpca_variables)
+    ) %>%
+    
+    as.matrix()
 
-functional_only[
-    !is.finite(
-        functional_only
-    )
+fpca_matrix[
+    !is.finite(fpca_matrix)
 ] <- 0
 
-pca_fit <- prcomp(
-    functional_only,
-    center = TRUE,
-    scale. = TRUE
+fpca_scaled <- scale(
+    fpca_matrix
 )
 
-###############################################################################
-# 24. EXPLAINED VARIANCE
-###############################################################################
+fpca_scaled[
+    !is.finite(fpca_scaled)
+] <- 0
 
-pca_variance <- tibble(
-
-    Component =
-        seq_along(
-            pca_fit$sdev
-        ),
-
-    Variance =
-        pca_fit$sdev^2,
-
-    Proportion =
-        pca_fit$sdev^2 /
-        sum(
-            pca_fit$sdev^2
-        )
-
-) %>%
-
-    mutate(
-
-        Cumulative =
-            cumsum(
-                Proportion
-            )
-
-    )
-
-print(
-    head(
-        pca_variance,
-        10
-    )
+fpca_fit <- prcomp(
+    fpca_scaled,
+    center = FALSE,
+    scale. = FALSE
 )
 
-write.csv(
-    pca_variance,
-    file.path(
-        TABLE_DIR,
-        "FPCA_variance.csv"
-    ),
-    row.names = FALSE
-)
-
-###############################################################################
-# 25. FPCA FIGURE
-###############################################################################
-
-p_fpca <- ggplot(
-    pca_variance %>%
-        slice_head(
-            n = min(
-                10,
-                n()
-            )
-        ),
-    aes(
-        x = Component,
-        y = Proportion
-    )
-) +
-
-    geom_col() +
-
-    geom_point() +
-
-    labs(
-        title = "Functional Principal Component Variance",
-        x = "Principal Component",
-        y = "Proportion of Variance"
-    ) +
-
-    theme_minimal()
-
-ggsave(
-    file.path(
-        FIGURE_DIR,
-        "FPCA_variance.png"
-    ),
-    p_fpca,
-    width = 8,
-    height = 5,
-    dpi = 300
-)
-
-###############################################################################
-# 26. SELECT FPCA COMPONENTS
-###############################################################################
-
-N_PC <- which(
-    pca_variance$Cumulative >= 0.90
-)[1]
-
-N_PC <- min(
-    max(
-        N_PC,
-        2
-    ),
-    10
-)
-
-cat(
-    "\nNumber of FPCA components:",
-    N_PC,
-    "\n"
+N_FPCA <- min(
+    5,
+    ncol(fpca_fit$x)
 )
 
 fpca_scores <- as.data.frame(
-    pca_fit$x[
+    fpca_fit$x[
         ,
-        seq_len(N_PC),
+        seq_len(N_FPCA),
         drop = FALSE
     ]
 )
@@ -1101,232 +1137,308 @@ fpca_scores <- as.data.frame(
 names(fpca_scores) <-
     paste0(
         "FPCA",
-        seq_len(N_PC)
+        seq_len(N_FPCA)
     )
 
-###############################################################################
-# 27. TOPOLOGY-INSPIRED REPRESENTATION
-###############################################################################
+fpca_scores$subject_id <-
+    functional_patient$subject_id
 
 ###############################################################################
-# We construct a simple persistence-style representation from each
-# one-dimensional clinical trajectory.
-#
-# For each functional trajectory:
-#
-#   - identify local maxima
-#   - identify local minima
-#   - measure excursion magnitude
-#   - summarize persistence of dominant features
-#
-# This provides a computationally transparent topology-aware descriptor.
-#
-# For a definitive TDA analysis, this section can be replaced by
-# persistent homology using a dedicated TDA package.
+# 27. EXPLAINED VARIANCE
 ###############################################################################
 
-topological_summary <- function(x) {
-
-    x <- as.numeric(
-        x
-    )
-
-    x[!is.finite(x)] <- 0
-
-    if (length(x) < 3) {
-
-        return(
-            c(
-                Topo_Peaks = 0,
-                Topo_Valleys = 0,
-                Topo_Persistence = 0,
-                Topo_Range = 0,
-                Topo_TotalVariation = 0
-            )
-        )
-
-    }
-
-    dx1 <- diff(x)
-
-    peaks <- which(
-        diff(
-            sign(
-                dx1
-            )
-        ) < 0
-    ) + 1
-
-    valleys <- which(
-        diff(
-            sign(
-                dx1
-            )
-        ) > 0
-    ) + 1
-
-    peak_value <- ifelse(
-        length(peaks) > 0,
-        max(
-            x[peaks]
+explained_variance <- tibble(
+    
+    Component =
+        seq_along(
+            fpca_fit$sdev
         ),
-        0
-    )
-
-    valley_value <- ifelse(
-        length(valleys) > 0,
-        min(
-            x[valleys]
+    
+    Eigenvalue =
+        fpca_fit$sdev^2,
+    
+    Proportion =
+        fpca_fit$sdev^2 /
+        sum(
+            fpca_fit$sdev^2
         ),
-        0
-    )
-
-    persistence <-
-        peak_value -
-        valley_value
-
-    c(
-
-        Topo_Peaks =
-            length(peaks),
-
-        Topo_Valleys =
-            length(valleys),
-
-        Topo_Persistence =
-            persistence,
-
-        Topo_Range =
-            max(x) -
-            min(x),
-
-        Topo_TotalVariation =
-            sum(
-                abs(
-                    diff(x)
+    
+    Cumulative =
+        cumsum(
+            fpca_fit$sdev^2 /
+                sum(
+                    fpca_fit$sdev^2
                 )
-            )
-
-    )
-
-}
-
-###############################################################################
-# 28. APPLY TO ALL CLINICAL DOMAINS
-###############################################################################
-
-topological_features <- list()
-
-for (domain_name in names(clinical_patterns)) {
-
-    cols <- grep(
-        paste0(
-            "^",
-            domain_name,
-            "_t"
-        ),
-        names(
-            functional_df
-        ),
-        value = TRUE
-    )
-
-    topo_matrix <- t(
-        apply(
-            functional_df[
-                ,
-                cols,
-                drop = FALSE
-            ],
-            1,
-            topological_summary
         )
-    )
-
-    topo_df <- as.data.frame(
-        topo_matrix
-    )
-
-    names(topo_df) <-
-        paste0(
-            domain_name,
-            "_",
-            names(topo_df)
-        )
-
-    topological_features[[domain_name]] <-
-        topo_df
-
-}
-
-topological_df <- bind_cols(
-    topological_features
-)
-
-###############################################################################
-# 29. COMBINE REPRESENTATIONS
-###############################################################################
-
-topology_data <- bind_cols(
-    hospital %>%
-        select(
-            subject_id,
-            hadm_id,
-            A,
-            Y
-        ),
-
-    fpca_scores,
-
-    topological_df
+    
 )
 
 write.csv(
-    topology_data,
+    explained_variance,
     file.path(
         TABLE_DIR,
-        "topology_functional_features.csv"
+        "fpca_explained_variance.csv"
     ),
     row.names = FALSE
 )
 
 ###############################################################################
-# 30. ANALYTIC DATASET
+# 28. TOPOLOGY-AWARE REPRESENTATION
+#
+# For a one-dimensional functional trajectory, we use a sublevel/superlevel
+# structural representation.
+#
+# We calculate:
+#
+#   1. number of local peaks
+#   2. number of local valleys
+#   3. total variation
+#   4. range
+#   5. persistence-like peak prominence
+#
+# These provide a stable finite-dimensional approximation to topological
+# information in the functional trajectory.
 ###############################################################################
 
-analytic <- topology_data %>%
+count_peaks <- function(x) {
+    
+    if (length(x) < 3) {
+        return(0)
+    }
+    
+    sum(
+        diff(
+            sign(
+                diff(x)
+            )
+        ) < 0,
+        na.rm = TRUE
+    )
+    
+}
 
+count_valleys <- function(x) {
+    
+    if (length(x) < 3) {
+        return(0)
+    }
+    
+    sum(
+        diff(
+            sign(
+                diff(x)
+            )
+        ) > 0,
+        na.rm = TRUE
+    )
+    
+}
+
+total_variation <- function(x) {
+    
+    if (length(x) < 2) {
+        return(0)
+    }
+    
+    sum(
+        abs(
+            diff(x)
+        ),
+        na.rm = TRUE
+    )
+    
+}
+
+###############################################################################
+# 29. TOPOLOGICAL FEATURES
+###############################################################################
+
+topology_patient <- bhc_functional %>%
+    
+    group_by(
+        subject_id
+    ) %>%
+    
+    arrange(
+        time_scaled,
+        .by_group = TRUE
+    ) %>%
+    
+    summarise(
+        
+        Topo_Peaks =
+            count_peaks(
+                complexity
+            ),
+        
+        Topo_Valleys =
+            count_valleys(
+                complexity
+            ),
+        
+        Topo_TotalVariation =
+            total_variation(
+                complexity
+            ),
+        
+        Topo_Range =
+            max(
+                complexity,
+                na.rm = TRUE
+            ) -
+            min(
+                complexity,
+                na.rm = TRUE
+            ),
+        
+        Topo_Persistence =
+            max(
+                complexity,
+                na.rm = TRUE
+            ) -
+            median(
+                complexity,
+                na.rm = TRUE
+            ),
+        
+        .groups = "drop"
+        
+    )
+
+###############################################################################
+# 30. TOPOLOGY NORMALIZATION
+###############################################################################
+
+topology_variables <- c(
+    
+    "Topo_Peaks",
+    "Topo_Valleys",
+    "Topo_TotalVariation",
+    "Topo_Range",
+    "Topo_Persistence"
+    
+)
+
+topology_patient <- topology_patient %>%
+    
+    mutate(
+        
+        across(
+            all_of(
+                topology_variables
+            ),
+            
+            ~ ifelse(
+                is.finite(.x),
+                .x,
+                0
+            )
+            
+        )
+        
+    )
+
+write.csv(
+    topology_patient,
+    file.path(
+        TABLE_DIR,
+        "topology_patient_features.csv"
+    ),
+    row.names = FALSE
+)
+
+###############################################################################
+# 31. BUILD ANALYTIC DATASET
+###############################################################################
+
+analytic <- treatment_patient %>%
+    
+    left_join(
+        outcome_patient,
+        by = "subject_id"
+    ) %>%
+    
+    left_join(
+        patient_text_features,
+        by = "subject_id"
+    ) %>%
+    
+    left_join(
+        functional_patient,
+        by = "subject_id"
+    ) %>%
+    
+    left_join(
+        fpca_scores,
+        by = "subject_id"
+    ) %>%
+    
+    left_join(
+        topology_patient,
+        by = "subject_id"
+    )
+
+###############################################################################
+# 32. REMOVE INVALID OBSERVATIONS
+###############################################################################
+
+analytic <- analytic %>%
+    
+    mutate(
+        
+        across(
+            where(is.numeric),
+            ~ ifelse(
+                is.finite(.x),
+                .x,
+                NA_real_
+            )
+        )
+        
+    ) %>%
+    
     filter(
         !is.na(A),
         !is.na(Y)
     )
 
 ###############################################################################
-# 31. COMPLETE-CASE FILTER
+# 33. COMPLETE CASE DATASET
 ###############################################################################
 
-model_variables <- c(
+analysis_variables <- c(
+    
     "A",
     "Y",
-    names(fpca_scores),
-    names(topological_df)
+    
+    "Functional_Mean",
+    "Functional_SD",
+    "Functional_Max",
+    "Functional_Min",
+    "Functional_Slope",
+    
+    "Topo_Peaks",
+    "Topo_Valleys",
+    "Topo_TotalVariation",
+    "Topo_Range",
+    "Topo_Persistence"
+    
 )
 
-analytic <- analytic %>%
-
-    filter(
-        if_all(
-            all_of(
-                model_variables
-            ),
-            ~ is.finite(
-                .x
-            )
-        )
-    )
+analytic_complete <- analytic %>%
+    
+    select(
+        subject_id,
+        all_of(
+            analysis_variables
+        ),
+        starts_with("FPCA")
+    ) %>%
+    
+    drop_na()
 
 ###############################################################################
-# 32. SAMPLE SIZE
+# 34. FINAL SAMPLE
 ###############################################################################
 
 cat(
@@ -1342,971 +1454,900 @@ cat(
 )
 
 cat(
-    "N =",
-    nrow(analytic),
+    "\nPatients:",
+    nrow(analytic_complete),
     "\n"
 )
 
 cat(
-    "Treated =",
+    "Treated:",
     sum(
-        analytic$A == 1
+        analytic_complete$A == 1
     ),
     "\n"
 )
 
 cat(
-    "Control =",
+    "Control:",
     sum(
-        analytic$A == 0
+        analytic_complete$A == 0
+    ),
+    "\n"
+)
+
+cat(
+    "Outcome positive:",
+    sum(
+        analytic_complete$Y == 1
     ),
     "\n"
 )
 
 ###############################################################################
-# 33. REQUIRE BOTH GROUPS
+# 35. SAVE ANALYTIC DATA
 ###############################################################################
 
-if (
-    length(
-        unique(
-            analytic$A
-        )
-    ) < 2
-) {
-
-    stop(
-        paste0(
-            "\nThe selected text-derived treatment does not produce ",
-            "both treatment groups.\n\n",
-            "For the final paper, link BHC data to structured MIMIC-IV ",
-            "treatment data using hadm_id."
-        )
+saveRDS(
+    analytic_complete,
+    file.path(
+        MODEL_DIR,
+        "MIMIC_IV_topology_causal_analytic.rds"
     )
+)
 
+write.csv(
+    analytic_complete,
+    file.path(
+        TABLE_DIR,
+        "MIMIC_IV_topology_causal_analytic.csv"
+    ),
+    row.names = FALSE
+)
+
+###############################################################################
+# 36. STANDARDIZE COVARIATES
+###############################################################################
+
+standardize_vector <- function(x) {
+    
+    s <- sd(
+        x,
+        na.rm = TRUE
+    )
+    
+    if (
+        !is.finite(s) ||
+        s == 0
+    ) {
+        
+        return(
+            rep(
+                0,
+                length(x)
+            )
+        )
+        
+    }
+    
+    (
+        x -
+            mean(
+                x,
+                na.rm = TRUE
+            )
+    ) / s
+    
 }
 
 ###############################################################################
-# 34. COVARIATE MATRIX
+# 37. CLASSICAL COVARIATES
 ###############################################################################
 
-X_fpca <- analytic %>%
+classical_variables <- c(
+    
+    "Functional_Mean",
+    "Functional_SD",
+    "Functional_Max",
+    "Functional_Min",
+    "Functional_Slope"
+    
+)
 
+X_classical <- analytic_complete %>%
+    
     select(
         all_of(
-            names(fpca_scores)
+            classical_variables
+        )
+    ) %>%
+    
+    mutate(
+        across(
+            everything(),
+            standardize_vector
         )
     )
 
-X_topology <- analytic %>%
+###############################################################################
+# 38. FPCA COVARIATES
+###############################################################################
 
+fpca_names <- grep(
+    "^FPCA",
+    names(analytic_complete),
+    value = TRUE
+)
+
+X_fpca <- analytic_complete %>%
+    
     select(
         all_of(
-            names(topological_df)
+            fpca_names
+        )
+    ) %>%
+    
+    mutate(
+        across(
+            everything(),
+            standardize_vector
         )
     )
 
-X_combined <- bind_cols(
-    X_fpca,
+###############################################################################
+# 39. TOPOLOGY COVARIATES
+###############################################################################
+
+X_topology <- analytic_complete %>%
+    
+    select(
+        all_of(
+            topology_variables
+        )
+    ) %>%
+    
+    mutate(
+        across(
+            everything(),
+            standardize_vector
+        )
+    )
+
+A <- analytic_complete$A
+
+Y <- analytic_complete$Y
+
+###############################################################################
+# 40. PROPENSITY SCORE FUNCTION
+###############################################################################
+
+fit_propensity <- function(A, X) {
+    
+    dat <- data.frame(
+        A = A,
+        X
+    )
+    
+    fit <- glm(
+        A ~ .,
+        data = dat,
+        family = binomial()
+    )
+    
+    p <- predict(
+        fit,
+        type = "response"
+    )
+    
+    p <- pmin(
+        pmax(
+            p,
+            0.01
+        ),
+        0.99
+    )
+    
+    list(
+        model = fit,
+        propensity = p
+    )
+    
+}
+
+###############################################################################
+# 41. OUTCOME MODEL
+###############################################################################
+
+fit_outcome <- function(Y, A, X) {
+    
+    dat <- data.frame(
+        Y = Y,
+        A = A,
+        X
+    )
+    
+    glm(
+        Y ~ A + .,
+        data = dat,
+        family = binomial()
+    )
+    
+}
+
+###############################################################################
+# 42. ATE FROM IPW
+###############################################################################
+
+estimate_ipw <- function(Y, A, e) {
+    
+    mean_treated <- mean(
+        A * Y / e
+    )
+    
+    mean_control <- mean(
+        (1 - A) * Y /
+            (1 - e)
+    )
+    
+    mean_treated -
+        mean_control
+    
+}
+
+###############################################################################
+# 43. ATE FROM OUTCOME REGRESSION
+###############################################################################
+
+estimate_or <- function(
+    Y,
+    A,
+    X
+) {
+    
+    dat <- data.frame(
+        Y = Y,
+        A = A,
+        X
+    )
+    
+    fit <- glm(
+        Y ~ A + .,
+        data = dat,
+        family = binomial()
+    )
+    
+    dat1 <- dat
+    dat0 <- dat
+    
+    dat1$A <- 1
+    dat0$A <- 0
+    
+    p1 <- predict(
+        fit,
+        newdata = dat1,
+        type = "response"
+    )
+    
+    p0 <- predict(
+        fit,
+        newdata = dat0,
+        type = "response"
+    )
+    
+    mean(
+        p1 - p0
+    )
+    
+}
+
+###############################################################################
+# 44. ATE FROM DOUBLY ROBUST ESTIMATION
+###############################################################################
+
+estimate_dr <- function(
+    Y,
+    A,
+    X
+) {
+    
+    prop <- fit_propensity(
+        A,
+        X
+    )
+    
+    e <- prop$propensity
+    
+    dat <- data.frame(
+        Y = Y,
+        A = A,
+        X
+    )
+    
+    fit <- glm(
+        Y ~ A + .,
+        data = dat,
+        family = binomial()
+    )
+    
+    dat1 <- dat
+    dat0 <- dat
+    
+    dat1$A <- 1
+    dat0$A <- 0
+    
+    m1 <- predict(
+        fit,
+        newdata = dat1,
+        type = "response"
+    )
+    
+    m0 <- predict(
+        fit,
+        newdata = dat0,
+        type = "response"
+    )
+    
+    dr <- m1 -
+        m0 +
+        A * (
+            Y - m1
+        ) / e -
+        (1 - A) * (
+            Y - m0
+        ) / (
+            1 - e
+        )
+    
+    mean(
+        dr
+    )
+    
+}
+
+###############################################################################
+# 45. CLASSICAL MODEL
+###############################################################################
+
+classical_fit <- fit_outcome(
+    Y,
+    A,
+    X_classical
+)
+
+classical_dat1 <- data.frame(
+    A = 1,
+    X_classical
+)
+
+classical_dat0 <- data.frame(
+    A = 0,
+    X_classical
+)
+
+classical_ate <- mean(
+    predict(
+        classical_fit,
+        newdata = classical_dat1,
+        type = "response"
+    ) -
+    predict(
+        classical_fit,
+        newdata = classical_dat0,
+        type = "response"
+    )
+)
+
+###############################################################################
+# 46. FPCA MODEL
+###############################################################################
+
+fpca_ate <- estimate_or(
+    Y,
+    A,
+    X_fpca
+)
+
+###############################################################################
+# 47. TOPOLOGY-DIRECT REGRESSION
+###############################################################################
+
+topology_dr_ate <- estimate_or(
+    Y,
+    A,
     X_topology
 )
 
 ###############################################################################
-# 35. PROPENSITY SCORE MODEL
+# 48. TOPOLOGY-IPW
 ###############################################################################
 
-###############################################################################
-# FPCA MODEL
-###############################################################################
-
-formula_fpca <- as.formula(
-    paste(
-        "A ~",
-        paste(
-            names(X_fpca),
-            collapse = " + "
-        )
-    )
+topology_prop <- fit_propensity(
+    A,
+    X_topology
 )
 
-ps_fpca_model <- glm(
-    formula_fpca,
-    data = analytic,
-    family = binomial()
-)
-
-analytic$ps_fpca <- predict(
-    ps_fpca_model,
-    type = "response"
+topology_ipw_ate <- estimate_ipw(
+    Y,
+    A,
+    topology_prop$propensity
 )
 
 ###############################################################################
-# TOPOLOGY MODEL
+# 49. TOPOLOGY-OR
 ###############################################################################
 
-formula_topology <- as.formula(
-    paste(
-        "A ~",
-        paste(
-            names(X_topology),
-            collapse = " + "
-        )
-    )
-)
-
-ps_topology_model <- glm(
-    formula_topology,
-    data = analytic,
-    family = binomial()
-)
-
-analytic$ps_topology <- predict(
-    ps_topology_model,
-    type = "response"
+topology_or_ate <- estimate_or(
+    Y,
+    A,
+    X_topology
 )
 
 ###############################################################################
-# COMBINED MODEL
+# 50. TOPOLOGY-DOUBLY ROBUST
 ###############################################################################
 
-formula_combined <- as.formula(
-    paste(
-        "A ~",
-        paste(
-            names(X_combined),
-            collapse = " + "
-        )
-    )
-)
-
-ps_combined_model <- glm(
-    formula_combined,
-    data = analytic,
-    family = binomial()
-)
-
-analytic$ps_combined <- predict(
-    ps_combined_model,
-    type = "response"
+topology_dr_robust_ate <- estimate_dr(
+    Y,
+    A,
+    X_topology
 )
 
 ###############################################################################
-# 36. PROPENSITY SCORE DIAGNOSTICS
+# 51. EFFECT SUMMARY
 ###############################################################################
 
-ps_summary <- tibble(
-
-    Method = c(
-        "FPCA",
-        "Topology",
-        "Combined"
-    ),
-
-    Mean_PS = c(
-        mean(
-            analytic$ps_fpca
-        ),
-        mean(
-            analytic$ps_topology
-        ),
-        mean(
-            analytic$ps_combined
-        )
-    ),
-
-    SD_PS = c(
-        sd(
-            analytic$ps_fpca
-        ),
-        sd(
-            analytic$ps_topology
-        ),
-        sd(
-            analytic$ps_combined
-        )
-    ),
-
-    Minimum_PS = c(
-        min(
-            analytic$ps_fpca
-        ),
-        min(
-            analytic$ps_topology
-        ),
-        min(
-            analytic$ps_combined
-        )
-    ),
-
-    Maximum_PS = c(
-        max(
-            analytic$ps_fpca
-        ),
-        max(
-            analytic$ps_topology
-        ),
-        max(
-            analytic$ps_combined
-        )
-    )
-
-)
-
-print(
-    ps_summary
-)
-
-write.csv(
-    ps_summary,
-    file.path(
-        TABLE_DIR,
-        "propensity_score_summary.csv"
-    ),
-    row.names = FALSE
-)
-
-###############################################################################
-# 37. OUTCOME REGRESSION
-###############################################################################
-
-###############################################################################
-# CLASSICAL
-###############################################################################
-
-classical_covariates <- c(
-    "FPCA1",
-    "FPCA2"
-)
-
-formula_classical <- as.formula(
-    paste(
-        "Y ~ A +",
-        paste(
-            classical_covariates,
-            collapse = " + "
-        )
-    )
-)
-
-classical_model <- glm(
-    formula_classical,
-    data = analytic,
-    family = binomial()
-)
-
-###############################################################################
-# FPCA
-###############################################################################
-
-formula_fpca_outcome <- as.formula(
-    paste(
-        "Y ~ A +",
-        paste(
-            names(X_fpca),
-            collapse = " + "
-        )
-    )
-)
-
-fpca_model <- glm(
-    formula_fpca_outcome,
-    data = analytic,
-    family = binomial()
-)
-
-###############################################################################
-# TOPOLOGY
-###############################################################################
-
-formula_topology_outcome <- as.formula(
-    paste(
-        "Y ~ A +",
-        paste(
-            names(X_topology),
-            collapse = " + "
-        )
-    )
-)
-
-topology_model <- glm(
-    formula_topology_outcome,
-    data = analytic,
-    family = binomial()
-)
-
-###############################################################################
-# COMBINED
-###############################################################################
-
-formula_combined_outcome <- as.formula(
-    paste(
-        "Y ~ A +",
-        paste(
-            names(X_combined),
-            collapse = " + "
-        )
-    )
-)
-
-combined_model <- glm(
-    formula_combined_outcome,
-    data = analytic,
-    family = binomial()
-)
-
-###############################################################################
-# 38. PREDICTED POTENTIAL OUTCOMES
-###############################################################################
-
-predict_counterfactual <- function(
-    model,
-    data
-) {
-
-    data1 <- data
-    data0 <- data
-
-    data1$A <- 1
-    data0$A <- 0
-
-    p1 <- predict(
-        model,
-        newdata = data1,
-        type = "response"
-    )
-
-    p0 <- predict(
-        model,
-        newdata = data0,
-        type = "response"
-    )
-
-    tibble(
-        Y1 = p1,
-        Y0 = p0,
-        CATE = p1 - p0
-    )
-
-}
-
-pred_classical <-
-    predict_counterfactual(
-        classical_model,
-        analytic
-    )
-
-pred_fpca <-
-    predict_counterfactual(
-        fpca_model,
-        analytic
-    )
-
-pred_topology <-
-    predict_counterfactual(
-        topology_model,
-        analytic
-    )
-
-pred_combined <-
-    predict_counterfactual(
-        combined_model,
-        analytic
-    )
-
-###############################################################################
-# 39. ATE RESULTS
-###############################################################################
-
-ate_results <- tibble(
-
+effect_table <- tibble(
+    
     Method = c(
         "Classical",
         "FPCA",
-        "Topology-OR",
-        "Combined-OR"
-    ),
-
-    ATE = c(
-        mean(
-            pred_classical$CATE
-        ),
-        mean(
-            pred_fpca$CATE
-        ),
-        mean(
-            pred_topology$CATE
-        ),
-        mean(
-            pred_combined$CATE
-        )
-    ),
-
-    SD_CATE = c(
-        sd(
-            pred_classical$CATE
-        ),
-        sd(
-            pred_fpca$CATE
-        ),
-        sd(
-            pred_topology$CATE
-        ),
-        sd(
-            pred_combined$CATE
-        )
-    )
-
-)
-
-print(
-    ate_results
-)
-
-write.csv(
-    ate_results,
-    file.path(
-        TABLE_DIR,
-        "causal_effect_estimates.csv"
-    ),
-    row.names = FALSE
-)
-
-###############################################################################
-# 40. IPW ESTIMATION
-###############################################################################
-
-ipw_estimate <- function(
-    Y,
-    A,
-    ps
-) {
-
-    ps <- pmin(
-        pmax(
-            ps,
-            0.01
-        ),
-        0.99
-    )
-
-    mean(
-        A * Y / ps -
-            (1 - A) * Y / (1 - ps)
-    )
-
-}
-
-ipw_results <- tibble(
-
-    Method = c(
-        "FPCA-IPW",
-        "Topology-IPW",
-        "Combined-IPW"
-    ),
-
-    ATE = c(
-
-        ipw_estimate(
-            analytic$Y,
-            analytic$A,
-            analytic$ps_fpca
-        ),
-
-        ipw_estimate(
-            analytic$Y,
-            analytic$A,
-            analytic$ps_topology
-        ),
-
-        ipw_estimate(
-            analytic$Y,
-            analytic$A,
-            analytic$ps_combined
-        )
-
-    )
-
-)
-
-print(
-    ipw_results
-)
-
-write.csv(
-    ipw_results,
-    file.path(
-        TABLE_DIR,
-        "IPW_causal_effects.csv"
-    ),
-    row.names = FALSE
-)
-
-###############################################################################
-# 41. DOUBLY ROBUST ESTIMATION
-###############################################################################
-
-dr_estimate <- function(
-    Y,
-    A,
-    ps,
-    m1,
-    m0
-) {
-
-    ps <- pmin(
-        pmax(
-            ps,
-            0.01
-        ),
-        0.99
-    )
-
-    mean(
-
-        m1 -
-            m0 +
-
-            A *
-            (Y - m1) /
-            ps -
-
-            (1 - A) *
-            (Y - m0) /
-            (1 - ps)
-
-    )
-
-}
-
-###############################################################################
-# 42. OUTCOME PREDICTIONS
-###############################################################################
-
-get_m_predictions <- function(
-    model,
-    data
-) {
-
-    d1 <- data
-    d0 <- data
-
-    d1$A <- 1
-    d0$A <- 0
-
-    list(
-
-        m1 =
-            predict(
-                model,
-                newdata = d1,
-                type = "response"
-            ),
-
-        m0 =
-            predict(
-                model,
-                newdata = d0,
-                type = "response"
-            )
-
-    )
-
-}
-
-m_fpca <-
-    get_m_predictions(
-        fpca_model,
-        analytic
-    )
-
-m_topology <-
-    get_m_predictions(
-        topology_model,
-        analytic
-    )
-
-m_combined <-
-    get_m_predictions(
-        combined_model,
-        analytic
-    )
-
-###############################################################################
-# 43. DR RESULTS
-###############################################################################
-
-dr_results <- tibble(
-
-    Method = c(
-        "FPCA-DR",
         "Topology-DR",
-        "Combined-DR"
+        "Topology-IPW",
+        "Topology-OR",
+        "Topology-DR-Robust"
     ),
-
-    ATE = c(
-
-        dr_estimate(
-            analytic$Y,
-            analytic$A,
-            analytic$ps_fpca,
-            m_fpca$m1,
-            m_fpca$m0
-        ),
-
-        dr_estimate(
-            analytic$Y,
-            analytic$A,
-            analytic$ps_topology,
-            m_topology$m1,
-            m_topology$m0
-        ),
-
-        dr_estimate(
-            analytic$Y,
-            analytic$A,
-            analytic$ps_combined,
-            m_combined$m1,
-            m_combined$m0
-        )
-
+    
+    N = nrow(
+        analytic_complete
+    ),
+    
+    Treated = sum(
+        A == 1
+    ),
+    
+    Control = sum(
+        A == 0
+    ),
+    
+    Estimated_ATE = c(
+        classical_ate,
+        fpca_ate,
+        topology_dr_ate,
+        topology_ipw_ate,
+        topology_or_ate,
+        topology_dr_robust_ate
     )
-
+    
 )
 
 print(
-    dr_results
+    effect_table
 )
 
 write.csv(
-    dr_results,
+    effect_table,
     file.path(
         TABLE_DIR,
-        "doubly_robust_effects.csv"
+        "MIMIC_IV_causal_effects.csv"
     ),
     row.names = FALSE
 )
 
 ###############################################################################
-# 44. COMBINE RESULTS
+# 52. PROPENSITY SCORE TABLE
 ###############################################################################
 
-final_results <- bind_rows(
-
-    ate_results %>%
-
-        select(
-            Method,
-            ATE
-        ),
-
-    ipw_results,
-
-    dr_results
-
-)
-
-write.csv(
-    final_results,
-    file.path(
-        TABLE_DIR,
-        "MIMIC_IV_final_causal_results.csv"
+propensity_summary <- tibble(
+    
+    Method = "Topology",
+    
+    Mean = mean(
+        topology_prop$propensity
     ),
-    row.names = FALSE
-)
-
-###############################################################################
-# 45. CATE DATA
-###############################################################################
-
-cate_data <- tibble(
-
-    subject_id =
-        analytic$subject_id,
-
-    hadm_id =
-        analytic$hadm_id,
-
-    A =
-        analytic$A,
-
-    Y =
-        analytic$Y,
-
-    CATE_Classical =
-        pred_classical$CATE,
-
-    CATE_FPCA =
-        pred_fpca$CATE,
-
-    CATE_Topology =
-        pred_topology$CATE,
-
-    CATE_Combined =
-        pred_combined$CATE
-
-)
-
-write.csv(
-    cate_data,
-    file.path(
-        TABLE_DIR,
-        "individualized_CATE_results.csv"
+    
+    SD = sd(
+        topology_prop$propensity
     ),
-    row.names = FALSE
-)
-
-###############################################################################
-# 46. CATE FIGURE
-###############################################################################
-
-cate_long <- cate_data %>%
-
-    select(
-        starts_with(
-            "CATE_"
-        )
-    ) %>%
-
-    pivot_longer(
-        everything(),
-        names_to = "Method",
-        values_to = "CATE"
+    
+    Min = min(
+        topology_prop$propensity
+    ),
+    
+    Q25 = quantile(
+        topology_prop$propensity,
+        0.25
+    ),
+    
+    Median = median(
+        topology_prop$propensity
+    ),
+    
+    Q75 = quantile(
+        topology_prop$propensity,
+        0.75
+    ),
+    
+    Max = max(
+        topology_prop$propensity
     )
+    
+)
 
-p_cate <- ggplot(
-    cate_long,
+write.csv(
+    propensity_summary,
+    file.path(
+        TABLE_DIR,
+        "topology_propensity_summary.csv"
+    ),
+    row.names = FALSE
+)
+
+###############################################################################
+# 53. FIGURE 1: PATIENT TREATMENT DISTRIBUTION
+###############################################################################
+
+p1 <- ggplot(
+    
+    treatment_distribution,
+    
     aes(
-        x = CATE
+        x = factor(A),
+        y = Patients
     )
+    
 ) +
-
-    geom_histogram(
-        bins = 50
-    ) +
-
-    facet_wrap(
-        ~ Method,
-        scales = "free"
-    ) +
-
+    
+    geom_col() +
+    
     labs(
-        title = "Distribution of Individualized Treatment Effects",
-        x = "Estimated CATE",
-        y = "Frequency"
+        
+        title =
+            "Patient-Level Treatment Distribution",
+        
+        x =
+            "Treatment",
+        
+        y =
+            "Number of Patients"
+        
     ) +
-
+    
     theme_minimal()
 
 ggsave(
     file.path(
         FIGURE_DIR,
-        "CATE_distribution.png"
+        "01_treatment_distribution.png"
     ),
-    p_cate,
-    width = 10,
-    height = 7,
-    dpi = 300
-)
-
-###############################################################################
-# 47. TREATMENT EFFECT BY FPCA1
-###############################################################################
-
-cate_fpca_plot <- tibble(
-
-    FPCA1 =
-        analytic$FPCA1,
-
-    CATE =
-        pred_combined$CATE
-
-)
-
-p_cate_fpca <- ggplot(
-    cate_fpca_plot,
-    aes(
-        x = FPCA1,
-        y = CATE
-    )
-) +
-
-    geom_point(
-        alpha = 0.25
-    ) +
-
-    geom_smooth(
-        method = "loess",
-        se = TRUE
-    ) +
-
-    labs(
-        title = "Heterogeneous Treatment Effects Across Clinical Functional Profiles",
-        x = "First Functional Principal Component",
-        y = "Estimated Treatment Effect"
-    ) +
-
-    theme_minimal()
-
-ggsave(
-    file.path(
-        FIGURE_DIR,
-        "CATE_vs_FPCA1.png"
-    ),
-    p_cate_fpca,
-    width = 8,
+    p1,
+    width = 7,
     height = 5,
     dpi = 300
 )
 
 ###############################################################################
-# 48. TOPOLOGICAL PERSISTENCE FIGURE
+# 54. FIGURE 2: OUTCOME DISTRIBUTION
 ###############################################################################
 
-topology_plot_data <- topology_data %>%
-
-    select(
-        ends_with(
-            "Topo_Persistence"
-        )
-    ) %>%
-
-    pivot_longer(
-        everything(),
-        names_to = "Domain",
-        values_to = "Persistence"
-    )
-
-p_topology <- ggplot(
-    topology_plot_data,
+p2 <- ggplot(
+    
+    outcome_distribution,
+    
     aes(
-        x = Persistence
+        x = factor(Y),
+        y = Patients
     )
+    
 ) +
-
-    geom_histogram(
-        bins = 40
-    ) +
-
-    facet_wrap(
-        ~ Domain,
-        scales = "free"
-    ) +
-
+    
+    geom_col() +
+    
     labs(
-        title = "Topology-Aware Clinical Feature Distributions",
-        x = "Persistence Summary",
-        y = "Frequency"
+        
+        title =
+            "Patient-Level Outcome Distribution",
+        
+        x =
+            "Outcome",
+        
+        y =
+            "Number of Patients"
+        
     ) +
-
+    
     theme_minimal()
 
 ggsave(
     file.path(
         FIGURE_DIR,
-        "topological_feature_distribution.png"
+        "02_outcome_distribution.png"
     ),
-    p_topology,
-    width = 10,
-    height = 7,
+    p2,
+    width = 7,
+    height = 5,
     dpi = 300
 )
 
 ###############################################################################
-# 49. SUMMARY TABLE
+# 55. FIGURE 3: FPCA EXPLAINED VARIANCE
 ###############################################################################
 
-summary_table <- tibble(
+p3 <- ggplot(
+    
+    explained_variance,
+    
+    aes(
+        x = Component,
+        y = Cumulative
+    )
+    
+) +
+    
+    geom_line() +
+    
+    geom_point() +
+    
+    labs(
+        
+        title =
+            "Cumulative Variance Explained by FPCA Components",
+        
+        x =
+            "FPCA Component",
+        
+        y =
+            "Cumulative Proportion"
+        
+    ) +
+    
+    theme_minimal()
 
-    Characteristic = c(
-        "Number of transcript records",
-        "Unique patients",
-        "Unique admissions",
-        "Unique BHC notes",
-        "Treated admissions",
-        "Control admissions",
-        "Treatment prevalence",
-        "Outcome-positive admissions",
-        "Outcome prevalence",
-        "FPCA components"
+ggsave(
+    file.path(
+        FIGURE_DIR,
+        "03_fpca_variance.png"
     ),
+    p3,
+    width = 7,
+    height = 5,
+    dpi = 300
+)
 
-    Value = c(
+###############################################################################
+# 56. FIGURE 4: TOPOLOGICAL FEATURES
+###############################################################################
 
-        nrow(bhc),
-
-        N_PATIENTS,
-
-        N_ADMISSIONS,
-
-        N_NOTES,
-
-        sum(
-            hospital$A == 1
-        ),
-
-        sum(
-            hospital$A == 0
-        ),
-
-        round(
-            mean(
-                hospital$A
-            ),
-            4
-        ),
-
-        sum(
-            hospital$Y == 1
-        ),
-
-        round(
-            mean(
-                hospital$Y
-            ),
-            4
-        ),
-
-        N_PC
-
+p4 <- ggplot(
+    
+    topology_patient,
+    
+    aes(
+        x = Topo_Peaks,
+        y = Topo_Persistence
     )
+    
+) +
+    
+    geom_point(
+        alpha = 0.30
+    ) +
+    
+    labs(
+        
+        title =
+            "Topology-Aware Patient Representation",
+        
+        x =
+            "Number of Structural Peaks",
+        
+        y =
+            "Persistence-Like Structural Measure"
+        
+    ) +
+    
+    theme_minimal()
 
-)
-
-print(
-    summary_table
-)
-
-write.csv(
-    summary_table,
+ggsave(
     file.path(
-        TABLE_DIR,
-        "MIMIC_IV_cohort_summary.csv"
+        FIGURE_DIR,
+        "04_topology_representation.png"
     ),
-    row.names = FALSE
+    p4,
+    width = 7,
+    height = 5,
+    dpi = 300
 )
 
 ###############################################################################
-# 50. SAVE ANALYTIC DATA
+# 57. FIGURE 5: PROPENSITY SCORE
 ###############################################################################
 
-saveRDS(
-    analytic,
-    file.path(
-        RESULT_DIR,
-        "MIMIC_IV_topology_analytic.rds"
+propensity_plot_data <- tibble(
+    
+    Propensity =
+        topology_prop$propensity,
+    
+    Treatment =
+        factor(
+            A
+        )
+    
+)
+
+p5 <- ggplot(
+    
+    propensity_plot_data,
+    
+    aes(
+        x = Propensity,
+        fill = Treatment
     )
-)
+    
+) +
+    
+    geom_density(
+        alpha = 0.4
+    ) +
+    
+    labs(
+        
+        title =
+            "Topology-Based Propensity Score Overlap",
+        
+        x =
+            "Estimated Propensity Score",
+        
+        y =
+            "Density",
+        
+        fill =
+            "Treatment"
+        
+    ) +
+    
+    theme_minimal()
 
-saveRDS(
-    pca_fit,
+ggsave(
     file.path(
-        RESULT_DIR,
-        "MIMIC_IV_FPCA_model.rds"
-    )
+        FIGURE_DIR,
+        "05_propensity_overlap.png"
+    ),
+    p5,
+    width = 7,
+    height = 5,
+    dpi = 300
 )
 
 ###############################################################################
-# 51. FINAL MESSAGE
+# 58. FIGURE 6: CAUSAL EFFECT COMPARISON
+###############################################################################
+
+p6 <- ggplot(
+    
+    effect_table,
+    
+    aes(
+        x = reorder(
+            Method,
+            Estimated_ATE
+        ),
+        
+        y = Estimated_ATE
+    )
+    
+) +
+    
+    geom_point(
+        size = 3
+    ) +
+    
+    geom_hline(
+        yintercept = 0,
+        linetype = "dashed"
+    ) +
+    
+    coord_flip() +
+    
+    labs(
+        
+        title =
+            "Estimated Treatment Effects",
+        
+        x =
+            "Method",
+        
+        y =
+            "Estimated Average Treatment Effect"
+        
+    ) +
+    
+    theme_minimal()
+
+ggsave(
+    file.path(
+        FIGURE_DIR,
+        "06_causal_effect_comparison.png"
+    ),
+    p6,
+    width = 8,
+    height = 6,
+    dpi = 300
+)
+
+###############################################################################
+# 59. FIGURE 7: FUNCTIONAL COMPLEXITY TRAJECTORIES
+###############################################################################
+
+trajectory_sample <- bhc_functional %>%
+    
+    filter(
+        subject_id %in%
+            sample(
+                unique(
+                    subject_id
+                ),
+                min(
+                    50,
+                    data.table::uniqueN(
+                        subject_id
+                    )
+                )
+            )
+    )
+
+p7 <- ggplot(
+    
+    trajectory_sample,
+    
+    aes(
+        x = time_scaled,
+        y = complexity,
+        group = subject_id
+    )
+    
+) +
+    
+    geom_line(
+        alpha = 0.15
+    ) +
+    
+    labs(
+        
+        title =
+            "Patient-Level Functional Clinical Complexity",
+        
+        x =
+            "Normalized Hospitalization/Note Time",
+        
+        y =
+            "Clinical Text Complexity"
+        
+    ) +
+    
+    theme_minimal()
+
+ggsave(
+    file.path(
+        FIGURE_DIR,
+        "07_functional_trajectories.png"
+    ),
+    p7,
+    width = 8,
+    height = 6,
+    dpi = 300
+)
+
+###############################################################################
+# 60. FINAL SUMMARY
 ###############################################################################
 
 cat(
@@ -2314,40 +2355,76 @@ cat(
 )
 
 cat(
-    "MIMIC-IV TOPOLOGY CAUSAL ANALYSIS COMPLETE\n"
+    "ANALYSIS COMPLETED\n"
 )
 
 cat(
-    "============================================================\n\n"
+    "============================================================\n"
 )
 
 cat(
-    "Tables saved to:\n",
+    "\nDataset:\n"
+)
+
+cat(
+    "  BHC_MIMIC-IV.csv\n"
+)
+
+cat(
+    "  Records:",
+    N_ROWS,
+    "\n"
+)
+
+cat(
+    "  Patients:",
+    N_PATIENTS,
+    "\n"
+)
+
+cat(
+    "  Admissions:",
+    N_ADMISSIONS,
+    "\n"
+)
+
+cat(
+    "\nSelected text-derived treatment:",
+    TARGET_TREATMENT,
+    "\n"
+)
+
+cat(
+    "Treated patients:",
+    N_TREATED,
+    "\n"
+)
+
+cat(
+    "Control patients:",
+    N_CONTROL,
+    "\n"
+)
+
+cat(
+    "\nResults saved to:\n"
+)
+
+cat(
+    "  ",
     TABLE_DIR,
-    "\n\n"
+    "\n"
 )
 
 cat(
-    "Figures saved to:\n",
+    "  ",
     FIGURE_DIR,
-    "\n\n"
+    "\n"
 )
 
 cat(
-    "Analytic dataset:\n",
-    file.path(
-        RESULT_DIR,
-        "MIMIC_IV_topology_analytic.rds"
-    ),
-    "\n\n"
-)
-
-cat(
-    "Main results:\n",
-    file.path(
-        TABLE_DIR,
-        "MIMIC_IV_final_causal_results.csv"
-    ),
+    "  ",
+    MODEL_DIR,
     "\n"
 )
 

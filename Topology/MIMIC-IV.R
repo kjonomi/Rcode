@@ -43,39 +43,6 @@
 
 rm(list = ls())
 
-gc()
-
-options(
-    stringsAsFactors = FALSE,
-    scipen = 999
-)
-
-
-###############################################################################
-# 1. PACKAGES
-###############################################################################
-
-required_packages <- c(
-    "data.table",
-    "dplyr",
-    "tidyr",
-    "stringr",
-    "ggplot2",
-    "purrr",
-    "tibble",
-    "TDA"
-)
-
-for (pkg in required_packages) {
-
-    if (!requireNamespace(pkg, quietly = TRUE)) {
-
-        install.packages(pkg)
-
-    }
-
-}
-
 library(data.table)
 library(dplyr)
 library(tidyr)

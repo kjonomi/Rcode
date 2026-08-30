@@ -3440,82 +3440,682 @@ cat(
     "\n"
 )
 
+###############################################################################
+# 51. PUBLICATION-QUALITY FIGURES FROM SAVED CSV FILES
+###############################################################################
+
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
 
 ###############################################################################
-# 51. FINAL MESSAGE
+# 51.1 OUTPUT DIRECTORY
 ###############################################################################
 
-cat(
-  "\n============================================================\n"
-)
+OUTPUT_DIR <- "graph_causal_results"
 
-cat(
-  "SIMULATION COMPLETED\n"
-)
+if (!dir.exists(OUTPUT_DIR)) {
+    dir.create(
+        OUTPUT_DIR,
+        recursive = TRUE
+    )
+}
 
-cat(
-  "============================================================\n\n"
-)
 
-cat(
-  "Successful replications: ",
-  n_success,
-  " / ",
-  n_expected,
-  "\n\n",
-  sep = ""
-)
+###############################################################################
+# 51.2 FIGURE DIRECTORY
+###############################################################################
 
-cat(
-  "Models compared:\n",
-  "  1. CNN-LSTM\n",
-  "  2. GF-CNN-LSTM\n",
-  "  3. GCN-CNN-LSTM\n\n"
-)
-
-cat(
-  "Scenarios:\n",
-  "  1. No graph dependence\n",
-  "  2. Graph-frequency causal signal\n",
-  "  3. Local graph causal signal\n",
-  "  4. Mixed graph signal\n",
-  "  5. Graph misspecification\n\n"
-)
-
-cat(
-  "Raw results:\n",
-  file.path(
+FIGURE_DIR <- file.path(
     OUTPUT_DIR,
-    "graph_causal_three_model_raw_results.csv"
-  ),
-  "\n\n"
+    "figures"
 )
 
-cat(
-  "Summary results:\n",
-  file.path(
+if (!dir.exists(FIGURE_DIR)) {
+    dir.create(
+        FIGURE_DIR,
+        recursive = TRUE
+    )
+}
+
+
+###############################################################################
+# 51.3 CSV FILES
+###############################################################################
+
+SUMMARY_FILE <- file.path(
     OUTPUT_DIR,
     "graph_causal_three_model_summary.csv"
-  ),
-  "\n\n"
 )
 
-cat(
-  "Model winners:\n",
-  file.path(
+RAW_FILE <- file.path(
+    OUTPUT_DIR,
+    "graph_causal_three_model_raw_results.csv"
+)
+
+WIN_FILE <- file.path(
     OUTPUT_DIR,
     "graph_causal_model_wins.csv"
-  ),
-  "\n\n"
+)
+
+
+###############################################################################
+# 51.4 CHECK FILES
+###############################################################################
+
+if (!file.exists(SUMMARY_FILE)) {
+    
+    stop(
+        paste0(
+            "\nERROR: Summary results file not found:\n",
+            SUMMARY_FILE,
+            "\n\nRun the simulation first.\n"
+        )
+    )
+}
+
+
+if (!file.exists(RAW_FILE)) {
+    
+    stop(
+        paste0(
+            "\nERROR: Raw results file not found:\n",
+            RAW_FILE,
+            "\n\nRun the simulation first.\n"
+        )
+    )
+}
+
+
+###############################################################################
+# 51.5 READ CSV FILES
+###############################################################################
+
+final_summary <- read.csv(
+    SUMMARY_FILE,
+    stringsAsFactors = FALSE,
+    check.names = FALSE
+)
+
+
+raw_results <- read.csv(
+    RAW_FILE,
+    stringsAsFactors = FALSE,
+    check.names = FALSE
+)
+
+
+if (file.exists(WIN_FILE)) {
+    
+    model_wins <- read.csv(
+        WIN_FILE,
+        stringsAsFactors = FALSE,
+        check.names = FALSE
+    )
+    
+}
+
+
+###############################################################################
+# 51.6 VERIFY REQUIRED VARIABLES
+###############################################################################
+
+required_summary_columns <- c(
+    "simulation_scenario",
+    "scenario_label",
+    "model",
+    "ate",
+    "bias",
+    "Absolute_Bias",
+    "ATE_RMSE",
+    "pehe",
+    "cate_cor",
+    "policy_value",
+    "optimal_policy_value",
+    "policy_regret",
+    "Policy_Regret_RMSE",
+    "treatment_rate"
+)
+
+
+missing_columns <- setdiff(
+    required_summary_columns,
+    names(final_summary)
+)
+
+
+if (length(missing_columns) > 0) {
+    
+    stop(
+        paste0(
+            "\nERROR: The summary CSV is missing the following columns:\n",
+            paste(
+                missing_columns,
+                collapse = ", "
+            ),
+            "\n"
+        )
+    )
+}
+
+
+###############################################################################
+# 51.7 SCENARIO LABELS
+###############################################################################
+
+scenario_levels <- c(
+    "No graph dependence",
+    "Graph-frequency causal signal",
+    "Local graph causal signal",
+    "Mixed graph signal",
+    "Graph misspecification"
+)
+
+
+scenario_short_levels <- c(
+    "No Graph",
+    "Graph-Frequency",
+    "Local Graph",
+    "Mixed Graph",
+    "Graph Misspecification"
+)
+
+
+###############################################################################
+# 51.8 MODEL LABELS
+###############################################################################
+
+model_levels <- c(
+    "CNN-LSTM",
+    "GF-CNN-LSTM",
+    "GCN-CNN-LSTM"
+)
+
+
+###############################################################################
+# 51.9 FACTOR ORDER
+###############################################################################
+
+final_summary$scenario_label <- factor(
+    final_summary$scenario_label,
+    levels = scenario_levels
+)
+
+
+final_summary$scenario_short <- factor(
+    final_summary$scenario_label,
+    levels = scenario_levels,
+    labels = scenario_short_levels
+)
+
+
+final_summary$model <- factor(
+    final_summary$model,
+    levels = model_levels
+)
+
+
+###############################################################################
+# 51.10 PUBLICATION THEME
+###############################################################################
+
+publication_theme <- theme_bw(
+    base_size = 12
+) +
+    theme(
+        plot.title = element_text(
+            face = "bold",
+            hjust = 0.5,
+            size = 14
+        ),
+        axis.title = element_text(
+            face = "bold"
+        ),
+        axis.text.x = element_text(
+            size = 10
+        ),
+        legend.position = "bottom",
+        legend.title = element_text(
+            face = "bold"
+        ),
+        strip.text = element_text(
+            face = "bold",
+            size = 11
+        ),
+        panel.grid.minor = element_blank()
+    )
+
+
+###############################################################################
+# 52. FIGURE 1: ATE RMSE
+###############################################################################
+
+p_ate_rmse <- ggplot(
+    final_summary,
+    aes(
+        x = model,
+        y = ATE_RMSE
+    )
+) +
+    geom_point(
+        size = 3
+    ) +
+    facet_wrap(
+        ~ scenario_short,
+        nrow = 1
+    ) +
+    labs(
+        title = "ATE Estimation Performance",
+        x = NULL,
+        y = "ATE RMSE"
+    ) +
+    publication_theme
+
+
+ggsave(
+    file.path(
+        FIGURE_DIR,
+        "Figure_1_ATE_RMSE.png"
+    ),
+    p_ate_rmse,
+    width = 12,
+    height = 5.5,
+    dpi = 300
+)
+
+
+ggsave(
+    file.path(
+        FIGURE_DIR,
+        "Figure_1_ATE_RMSE.pdf"
+    ),
+    p_ate_rmse,
+    width = 12,
+    height = 5.5
+)
+
+
+###############################################################################
+# 53. FIGURE 2: PEHE
+###############################################################################
+
+p_pehe <- ggplot(
+    final_summary,
+    aes(
+        x = model,
+        y = pehe
+    )
+) +
+    geom_point(
+        size = 3
+    ) +
+    facet_wrap(
+        ~ scenario_short,
+        nrow = 1,
+        scales = "free_y"
+    ) +
+    labs(
+        title = "Heterogeneous Treatment-Effect Estimation",
+        x = NULL,
+        y = "PEHE"
+    ) +
+    publication_theme
+
+
+ggsave(
+    file.path(
+        FIGURE_DIR,
+        "Figure_2_PEHE.png"
+    ),
+    p_pehe,
+    width = 12,
+    height = 5.5,
+    dpi = 300
+)
+
+
+ggsave(
+    file.path(
+        FIGURE_DIR,
+        "Figure_2_PEHE.pdf"
+    ),
+    p_pehe,
+    width = 12,
+    height = 5.5
+)
+
+
+###############################################################################
+# 54. FIGURE 3: CATE CORRELATION
+###############################################################################
+
+p_cate_cor <- ggplot(
+    final_summary,
+    aes(
+        x = model,
+        y = cate_cor
+    )
+) +
+    geom_point(
+        size = 3
+    ) +
+    facet_wrap(
+        ~ scenario_short,
+        nrow = 1,
+        scales = "free_y"
+    ) +
+    labs(
+        title = "Heterogeneous Treatment-Effect Recovery",
+        x = NULL,
+        y = "CATE Correlation"
+    ) +
+    publication_theme
+
+
+ggsave(
+    file.path(
+        FIGURE_DIR,
+        "Figure_3_CATE_Correlation.png"
+    ),
+    p_cate_cor,
+    width = 12,
+    height = 5.5,
+    dpi = 300
+)
+
+
+ggsave(
+    file.path(
+        FIGURE_DIR,
+        "Figure_3_CATE_Correlation.pdf"
+    ),
+    p_cate_cor,
+    width = 12,
+    height = 5.5
+)
+
+
+###############################################################################
+# 55. FIGURE 4: ABSOLUTE BIAS
+###############################################################################
+
+p_abs_bias <- ggplot(
+    final_summary,
+    aes(
+        x = model,
+        y = Absolute_Bias
+    )
+) +
+    geom_point(
+        size = 3
+    ) +
+    facet_wrap(
+        ~ scenario_short,
+        nrow = 1,
+        scales = "free_y"
+    ) +
+    labs(
+        title = "Absolute ATE Bias",
+        x = NULL,
+        y = "Absolute Bias"
+    ) +
+    publication_theme
+
+
+ggsave(
+    file.path(
+        FIGURE_DIR,
+        "Figure_4_Absolute_Bias.png"
+    ),
+    p_abs_bias,
+    width = 12,
+    height = 5.5,
+    dpi = 300
+)
+
+
+ggsave(
+    file.path(
+        FIGURE_DIR,
+        "Figure_4_Absolute_Bias.pdf"
+    ),
+    p_abs_bias,
+    width = 12,
+    height = 5.5
+)
+
+
+###############################################################################
+# 56. FIGURE 5: POLICY VALUE
+###############################################################################
+
+p_policy <- ggplot(
+    final_summary,
+    aes(
+        x = model,
+        y = policy_value
+    )
+) +
+    geom_point(
+        size = 3
+    ) +
+    geom_point(
+        aes(
+            y = optimal_policy_value
+        ),
+        shape = 4,
+        size = 3,
+        stroke = 1
+    ) +
+    facet_wrap(
+        ~ scenario_short,
+        nrow = 1,
+        scales = "free_y"
+    ) +
+    labs(
+        title = "Policy Value Across Simulation Scenarios",
+        x = NULL,
+        y = "Policy Value"
+    ) +
+    publication_theme
+
+
+ggsave(
+    file.path(
+        FIGURE_DIR,
+        "Figure_5_Policy_Value.png"
+    ),
+    p_policy,
+    width = 12,
+    height = 5.5,
+    dpi = 300
+)
+
+
+ggsave(
+    file.path(
+        FIGURE_DIR,
+        "Figure_5_Policy_Value.pdf"
+    ),
+    p_policy,
+    width = 12,
+    height = 5.5
+)
+
+
+###############################################################################
+# 57. FIGURE 6: POLICY REGRET RMSE
+###############################################################################
+
+p_policy_regret <- ggplot(
+    final_summary,
+    aes(
+        x = model,
+        y = Policy_Regret_RMSE
+    )
+) +
+    geom_point(
+        size = 3
+    ) +
+    facet_wrap(
+        ~ scenario_short,
+        nrow = 1,
+        scales = "free_y"
+    ) +
+    labs(
+        title = "Policy Regret RMSE",
+        x = NULL,
+        y = "Policy Regret RMSE"
+    ) +
+    publication_theme
+
+
+ggsave(
+    file.path(
+        FIGURE_DIR,
+        "Figure_6_Policy_Regret_RMSE.png"
+    ),
+    p_policy_regret,
+    width = 12,
+    height = 5.5,
+    dpi = 300
+)
+
+
+ggsave(
+    file.path(
+        FIGURE_DIR,
+        "Figure_6_Policy_Regret_RMSE.pdf"
+    ),
+    p_policy_regret,
+    width = 12,
+    height = 5.5
+)
+
+
+###############################################################################
+# 58. FIGURE 7: TREATMENT RATE
+###############################################################################
+
+p_treatment_rate <- ggplot(
+    final_summary,
+    aes(
+        x = model,
+        y = treatment_rate
+    )
+) +
+    geom_point(
+        size = 3
+    ) +
+    facet_wrap(
+        ~ scenario_short,
+        nrow = 1,
+        scales = "free_y"
+    ) +
+    labs(
+        title = "Estimated Treatment Rate",
+        x = NULL,
+        y = "Treatment Rate"
+    ) +
+    publication_theme
+
+
+ggsave(
+    file.path(
+        FIGURE_DIR,
+        "Figure_7_Treatment_Rate.png"
+    ),
+    p_treatment_rate,
+    width = 12,
+    height = 5.5,
+    dpi = 300
+)
+
+
+ggsave(
+    file.path(
+        FIGURE_DIR,
+        "Figure_7_Treatment_Rate.pdf"
+    ),
+    p_treatment_rate,
+    width = 12,
+    height = 5.5
+)
+
+
+###############################################################################
+# 59. SAVE DATA USED FOR FIGURES
+###############################################################################
+
+figure_data <- final_summary[
+    ,
+    required_summary_columns
+]
+
+
+write.csv(
+    figure_data,
+    file.path(
+        FIGURE_DIR,
+        "figure_data.csv"
+    ),
+    row.names = FALSE
+)
+
+
+###############################################################################
+# 60. PRINT FIGURE INFORMATION
+###############################################################################
+
+cat(
+    "\n============================================================\n"
 )
 
 cat(
-  "Frequency diagnostic:\n",
-  file.path(
+    "PUBLICATION-QUALITY FIGURES CREATED\n"
+)
+
+cat(
+    "============================================================\n\n"
+)
+
+cat(
+    "Output directory:\n",
     OUTPUT_DIR,
-    "graph_frequency_energy_diagnostic.csv"
-  ),
-  "\n"
+    "\n\n"
+)
+
+cat(
+    "Figure directory:\n",
+    FIGURE_DIR,
+    "\n\n"
+)
+
+cat(
+    "Figures created:\n\n",
+    "  Figure 1: ATE RMSE\n",
+    "  Figure 2: PEHE\n",
+    "  Figure 3: CATE Correlation\n",
+    "  Figure 4: Absolute Bias\n",
+    "  Figure 5: Policy Value\n",
+    "  Figure 6: Policy Regret RMSE\n",
+    "  Figure 7: Treatment Rate\n\n"
+)
+
+cat(
+    "Formats:\n",
+    "  PNG: 300 dpi\n",
+    "  PDF: publication/vector format\n\n"
+)
+
+cat(
+    "Figure data saved to:\n",
+    file.path(
+        FIGURE_DIR,
+        "figure_data.csv"
+    ),
+    "\n"
 )
 
 ###############################################################################

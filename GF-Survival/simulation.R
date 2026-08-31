@@ -17,16 +17,40 @@
 #   Delta   = event indicator
 #   RMST    = restricted mean survival time
 #
-# IMPORTANT IMPLEMENTATION FIXES
+# CAUSAL FRAMEWORK
+#   Propensity score
+#   Neural representation
+#   Outcome regression
+#   Doubly robust estimation
+#   Individual CATE
+#   PEHE
+#   ATE bias
+#   Policy value
+#
+# GRAPH STRUCTURES
+#   Chain
+#   Lattice
+#   Hub
+#   Random
+#
+# SCENARIOS
+#   1. No graph dependence
+#   2. Graph-frequency causal signal
+#   3. Local graph causal signal
+#   4. Mixed graph signal
+#   5. Graph misspecification
+#
+# IMPORTANT FIXES
 #   1. NO ranger formula interface.
 #   2. ranger(x = ..., y = ...) used throughout.
-#   3. Safe feature names are enforced.
-#   4. Correct R list indexing: [[...]]
-#   5. Propensity model trained on training data only.
-#   6. Propensity predictions generated on test data.
-#   7. Neural representations used in outcome models.
-#   8. Measurement error affects observed X only.
-#   9. True CATE generated from latent X.
+#   3. Safe column names for all ranger matrices.
+#   4. Propensity trained on training data only.
+#   5. Propensity predicted on test data.
+#   6. Neural representations used in outcome models.
+#   7. Measurement error affects observed covariates only.
+#   8. True CATE generated from latent covariates.
+#   9. append() used instead of problematic list[[...]] syntax.
+#  10. Partial results saved after each ME/scenario.
 ###############################################################################
 
 rm(list = ls())
@@ -62,33 +86,88 @@ library(Matrix)
 
 SEED_BASE <- 20260831
 
+###############################################################################
+# SAMPLE SIZE
+###############################################################################
+
 N <- 1000
+
+###############################################################################
+# NUMBER OF FUNCTIONAL VARIABLES
+###############################################################################
+
 P <- 20
+
+###############################################################################
+# NUMBER OF TEMPORAL OBSERVATIONS
+###############################################################################
+
 NT <- 30
 
+###############################################################################
+# NUMBER OF REPLICATIONS
+###############################################################################
+
 N_REP <- 30
+
+###############################################################################
+# DATA SPLIT
+###############################################################################
 
 TRAIN_PROP <- 0.70
 VALID_PROP <- 0.15
 TEST_PROP  <- 0.15
 
+###############################################################################
+# CROSS-FITTING
+###############################################################################
+
 N_FOLDS <- 3
+
+###############################################################################
+# NEURAL NETWORK
+###############################################################################
 
 EPOCHS <- 40
 BATCH_SIZE <- 32
 LEARNING_RATE <- 0.001
 LATENT_DIM <- 32
 
+###############################################################################
+# TEMPORAL DEPENDENCE
+###############################################################################
+
 RHO_TIME <- 0.70
+
+###############################################################################
+# GRAPH STRENGTH
+###############################################################################
+
 GRAPH_STRENGTH <- 0.50
+
+###############################################################################
+# SURVIVAL PARAMETERS
+###############################################################################
 
 BASELINE_HAZARD <- 0.12
 CENSOR_RATE <- 0.30
 
+###############################################################################
+# RMST HORIZON
+###############################################################################
+
 TAU <- 5
+
+###############################################################################
+# PROPENSITY SCORE TRIMMING
+###############################################################################
 
 PS_LOWER <- 0.05
 PS_UPPER <- 0.95
+
+###############################################################################
+# MEASUREMENT ERROR LEVELS
+###############################################################################
 
 ME_LEVELS <- c(
     0.00,
@@ -97,6 +176,10 @@ ME_LEVELS <- c(
     0.50,
     1.00
 )
+
+###############################################################################
+# OUTPUT DIRECTORY
+###############################################################################
 
 OUTPUT_DIR <- "graph_survival_ME_results"
 
@@ -287,6 +370,12 @@ make_random_graph <- function(
     prob = 0.15
 ) {
 
+    A <- matrix(
+        0,
+        P,
+        P
+    )
+
     upper <- matrix(
         rbinom(
             P * P,
@@ -297,7 +386,9 @@ make_random_graph <- function(
         P
     )
 
-    upper[lower.tri(upper)] <- 0
+    upper[
+        lower.tri(upper)
+    ] <- 0
 
     A <- upper + t(upper)
 
@@ -448,7 +539,7 @@ standardize_array <- function(X) {
 }
 
 ###############################################################################
-# 9. FUNCTIONAL TEMPORAL DATA
+# 9. FUNCTIONAL TEMPORAL DATA GENERATION
 ###############################################################################
 
 generate_functional_data <- function(
@@ -479,7 +570,9 @@ generate_functional_data <- function(
         for (k in seq_len(P)) {
 
             Sigma[j, k] <-
-                rho_cross^abs(j - k)
+                rho_cross^abs(
+                    j - k
+                )
         }
     }
 
@@ -490,7 +583,9 @@ generate_functional_data <- function(
     for (i in seq_len(N)) {
 
         base <- matrix(
-            rnorm(NT * P),
+            rnorm(
+                NT * P
+            ),
             NT,
             P
         )
@@ -507,7 +602,8 @@ generate_functional_data <- function(
                     rho_time *
                     base[t - 1, ] +
                     sqrt(
-                        1 - rho_time^2
+                        1 -
+                            rho_time^2
                     ) *
                     base[t, ]
             }
@@ -543,7 +639,9 @@ add_measurement_error <- function(
             mean = 0,
             sd = ME
         ),
-        dim = dim(X_latent)
+        dim = dim(
+            X_latent
+        )
     )
 
     X_obs <-
@@ -555,7 +653,7 @@ add_measurement_error <- function(
 }
 
 ###############################################################################
-# 11. FUNCTIONAL FEATURES
+# 11. FUNCTIONAL SUMMARY FEATURES
 ###############################################################################
 
 functional_features <- function(X) {
@@ -636,7 +734,7 @@ true_cate <- function(
     )
 
     ###########################################################################
-    # Scenario 1: No graph dependence
+    # SCENARIO 1
     ###########################################################################
 
     if (scenario == 1) {
@@ -649,7 +747,7 @@ true_cate <- function(
     }
 
     ###########################################################################
-    # Scenario 2: Graph-frequency signal
+    # SCENARIO 2: GRAPH-FREQUENCY SIGNAL
     ###########################################################################
 
     else if (scenario == 2) {
@@ -668,7 +766,7 @@ true_cate <- function(
     }
 
     ###########################################################################
-    # Scenario 3: Local graph signal
+    # SCENARIO 3: LOCAL GRAPH SIGNAL
     ###########################################################################
 
     else if (scenario == 3) {
@@ -683,7 +781,7 @@ true_cate <- function(
     }
 
     ###########################################################################
-    # Scenario 4: Mixed graph signal
+    # SCENARIO 4: MIXED SIGNAL
     ###########################################################################
 
     else if (scenario == 4) {
@@ -705,7 +803,7 @@ true_cate <- function(
     }
 
     ###########################################################################
-    # Scenario 5: Graph misspecification
+    # SCENARIO 5: GRAPH MISSPECIFICATION
     ###########################################################################
 
     else if (scenario == 5) {
@@ -738,7 +836,7 @@ true_cate <- function(
 }
 
 ###############################################################################
-# 13. TREATMENT
+# 13. TREATMENT ASSIGNMENT
 ###############################################################################
 
 generate_treatment <- function(
@@ -791,7 +889,7 @@ generate_treatment <- function(
 }
 
 ###############################################################################
-# 14. SURVIVAL
+# 14. SURVIVAL GENERATION
 ###############################################################################
 
 generate_survival <- function(
@@ -801,6 +899,10 @@ generate_survival <- function(
 
     N_local <- length(A)
 
+    ###########################################################################
+    # Positive CATE = better survival
+    ###########################################################################
+
     log_hazard <-
         log(BASELINE_HAZARD) -
         0.30 * tau_cate * A
@@ -808,15 +910,27 @@ generate_survival <- function(
     hazard <-
         exp(log_hazard)
 
+    ###########################################################################
+    # Event time
+    ###########################################################################
+
     T_event <- rexp(
         N_local,
         rate = hazard
     )
 
+    ###########################################################################
+    # Censoring time
+    ###########################################################################
+
     C <- rexp(
         N_local,
         rate = CENSOR_RATE
     )
+
+    ###########################################################################
+    # Observed time
+    ###########################################################################
 
     time <-
         pmin(
@@ -824,6 +938,10 @@ generate_survival <- function(
             C,
             TAU
         )
+
+    ###########################################################################
+    # Event indicator
+    ###########################################################################
 
     status <-
         as.integer(
@@ -838,7 +956,7 @@ generate_survival <- function(
 }
 
 ###############################################################################
-# 15. RMST
+# 15. RMST OUTCOME
 ###############################################################################
 
 rmst_individual <- function(
@@ -846,6 +964,14 @@ rmst_individual <- function(
     status,
     tau = TAU
 ) {
+
+    ###########################################################################
+    # Observed restricted survival contribution.
+    #
+    # This is a simplified individual-level outcome used for the simulation.
+    # For a full censored-data RMST analysis, an IPCW/Kaplan-Meier
+    # pseudo-outcome can be substituted.
+    ###########################################################################
 
     pmin(
         time,
@@ -1025,7 +1151,7 @@ build_gcn_cnn_lstm <- function(
 }
 
 ###############################################################################
-# 19. TRAIN REPRESENTATION
+# 19. TRAIN REPRESENTATION MODEL
 ###############################################################################
 
 train_representation_model <- function(
@@ -1107,7 +1233,7 @@ train_representation_model <- function(
 }
 
 ###############################################################################
-# 20. EXTRACT REPRESENTATION
+# 20. EXTRACT NEURAL REPRESENTATION
 ###############################################################################
 
 extract_representation <- function(
@@ -1121,16 +1247,20 @@ extract_representation <- function(
         verbose = 0
     )
 
-    z <- as.matrix(z)
+    z <- as.matrix(
+        z
+    )
 
-    safe_matrix(z)
+    safe_matrix(
+        z
+    )
 }
 
 ###############################################################################
 # 21. RANGER PROPENSITY MODEL
 #
 # CRITICAL:
-# x/y interface avoids ranger formula column-name restrictions.
+# NO FORMULA INTERFACE.
 ###############################################################################
 
 fit_propensity_matrix <- function(
@@ -1143,9 +1273,26 @@ fit_propensity_matrix <- function(
         X_train
     )
 
-    A_train <- as.factor(
+    A_train <- as.integer(
         A_train
     )
+
+    ###########################################################################
+    # Check treatment variation
+    ###########################################################################
+
+    if (
+        length(unique(A_train)) < 2
+    ) {
+
+        stop(
+            "Propensity model requires both treatment classes."
+        )
+    }
+
+    ###########################################################################
+    # ranger MATRIX INTERFACE
+    ###########################################################################
 
     fit <- ranger(
 
@@ -1161,8 +1308,7 @@ fit_propensity_matrix <- function(
 
         seed = seed,
 
-        respect.unordered.factors =
-            "order"
+        respect.unordered.factors = "order"
     )
 
     fit
@@ -1186,9 +1332,16 @@ predict_propensity_matrix <- function(
         data = X_test
     )$predictions
 
+    ###########################################################################
+    # Handle ranger probability output
+    ###########################################################################
+
     if (is.matrix(pred)) {
 
-        if ("1" %in% colnames(pred)) {
+        if (
+            "1" %in%
+            colnames(pred)
+        ) {
 
             ps <- pred[, "1"]
 
@@ -1212,11 +1365,16 @@ predict_propensity_matrix <- function(
         PS_UPPER
     )
 
-    as.numeric(ps)
+    as.numeric(
+        ps
+    )
 }
 
 ###############################################################################
-# 23. OUTCOME MODEL
+# 23. RANGER OUTCOME MODEL
+#
+# CRITICAL:
+# NO FORMULA INTERFACE.
 ###############################################################################
 
 fit_outcome_matrix <- function(
@@ -1232,6 +1390,37 @@ fit_outcome_matrix <- function(
     Y_train <- as.numeric(
         Y_train
     )
+
+    ###########################################################################
+    # Remove invalid observations
+    ###########################################################################
+
+    keep <- is.finite(
+        Y_train
+    )
+
+    X_train <- X_train[
+        keep,
+        ,
+        drop = FALSE
+    ]
+
+    Y_train <- Y_train[
+        keep
+    ]
+
+    if (
+        nrow(X_train) < 20
+    ) {
+
+        stop(
+            "Too few observations for outcome model."
+        )
+    }
+
+    ###########################################################################
+    # ranger MATRIX INTERFACE
+    ###########################################################################
 
     fit <- ranger(
 
@@ -1267,11 +1456,13 @@ predict_outcome_matrix <- function(
         data = X_test
     )$predictions
 
-    as.numeric(pred)
+    as.numeric(
+        pred
+    )
 }
 
 ###############################################################################
-# 25. DR CATE
+# 25. DOUBLY ROBUST CATE
 ###############################################################################
 
 dr_cate <- function(
@@ -1291,20 +1482,29 @@ dr_cate <- function(
     )
 
     cate <-
+
         mu1 -
         mu0 +
+
         A *
-        (Y - mu1) /
+        (
+            Y - mu1
+        ) /
         ps -
+
         (1 - A) *
-        (Y - mu0) /
+        (
+            Y - mu0
+        ) /
         (1 - ps)
 
-    as.numeric(cate)
+    as.numeric(
+        cate
+    )
 }
 
 ###############################################################################
-# 26. DR ATE
+# 26. DOUBLY ROBUST ATE
 ###############################################################################
 
 dr_ate <- function(
@@ -1374,11 +1574,13 @@ calculate_policy_value <- function(
         )
 
     score <-
+
         Y *
         (
             A *
             (policy == 1) /
             ps +
+
             (1 - A) *
             (policy == 0) /
             (1 - ps)
@@ -1394,7 +1596,9 @@ calculate_policy_value <- function(
 # 29. DATA SPLIT
 ###############################################################################
 
-split_data <- function(N) {
+split_data <- function(
+    N
+) {
 
     idx <- sample(
         seq_len(N),
@@ -1473,12 +1677,11 @@ run_model_analysis <- function(
 ) {
 
     ###########################################################################
-    # MODEL
+    # MODEL CONSTRUCTION
     ###########################################################################
 
     if (
-        model_name ==
-        "CNN-LSTM"
+        model_name == "CNN-LSTM"
     ) {
 
         base_model <-
@@ -1492,8 +1695,7 @@ run_model_analysis <- function(
             )
 
     } else if (
-        model_name ==
-        "GF-CNN-LSTM"
+        model_name == "GF-CNN-LSTM"
     ) {
 
         base_model <-
@@ -1502,15 +1704,13 @@ run_model_analysis <- function(
                     dim(X_train)[2],
                 P =
                     dim(X_train)[3],
-                U =
-                    U,
+                U = U,
                 latent_dim =
                     LATENT_DIM
             )
 
     } else if (
-        model_name ==
-        "GCN-CNN-LSTM"
+        model_name == "GCN-CNN-LSTM"
     ) {
 
         base_model <-
@@ -1570,19 +1770,31 @@ run_model_analysis <- function(
         )
 
     ###########################################################################
-    # SAFETY CHECK
+    # CHECK REPRESENTATIONS
     ###########################################################################
 
-    Z_train <- safe_matrix(
-        Z_train
-    )
+    if (
+        nrow(Z_train) !=
+        length(Y_train)
+    ) {
 
-    Z_test <- safe_matrix(
-        Z_test
-    )
+        stop(
+            "Training representation has incorrect number of rows."
+        )
+    }
+
+    if (
+        nrow(Z_test) !=
+        length(Y_test)
+    ) {
+
+        stop(
+            "Test representation has incorrect number of rows."
+        )
+    }
 
     ###########################################################################
-    # TREATMENT GROUPS
+    # TREATMENT-SPECIFIC TRAINING INDICES
     ###########################################################################
 
     tr0 <- which(
@@ -1599,12 +1811,18 @@ run_model_analysis <- function(
     ) {
 
         stop(
-            "Insufficient observations in one treatment group."
+            paste(
+                "Insufficient observations in treatment groups:",
+                length(tr0),
+                "control and",
+                length(tr1),
+                "treated."
+            )
         )
     }
 
     ###########################################################################
-    # OUTCOME MODEL: A = 0
+    # OUTCOME MODEL FOR A = 0
     ###########################################################################
 
     outcome0 <-
@@ -1627,7 +1845,7 @@ run_model_analysis <- function(
         )
 
     ###########################################################################
-    # OUTCOME MODEL: A = 1
+    # OUTCOME MODEL FOR A = 1
     ###########################################################################
 
     outcome1 <-
@@ -1672,20 +1890,15 @@ run_model_analysis <- function(
     cate_hat <-
         dr_cate(
 
-            Y =
-                Y_test,
+            Y = Y_test,
 
-            A =
-                A_test,
+            A = A_test,
 
-            ps =
-                ps_test,
+            ps = ps_test,
 
-            mu0 =
-                mu0,
+            mu0 = mu0,
 
-            mu1 =
-                mu1
+            mu1 = mu1
         )
 
     ###########################################################################
@@ -1693,10 +1906,27 @@ run_model_analysis <- function(
     ###########################################################################
 
     valid <-
+
         is.finite(cate_hat) &
+
         is.finite(cate_true_test) &
+
         is.finite(Y_test) &
-        is.finite(ps_test)
+
+        is.finite(ps_test) &
+
+        is.finite(mu0) &
+
+        is.finite(mu1)
+
+    if (
+        sum(valid) < 20
+    ) {
+
+        stop(
+            "Too few valid test observations."
+        )
+    }
 
     cate_hat <-
         cate_hat[
@@ -1731,6 +1961,10 @@ run_model_analysis <- function(
         mean(
             cate_hat
         )
+
+    ###########################################################################
+    # ATE SE
+    ###########################################################################
 
     ate_se <-
         sd(
@@ -1805,16 +2039,14 @@ run_model_analysis <- function(
     ###########################################################################
 
     policy_value <-
+
         calculate_policy_value(
 
-            Y =
-                Y_use,
+            Y = Y_use,
 
-            A =
-                A_use,
+            A = A_use,
 
-            ps =
-                ps_use,
+            ps = ps_use,
 
             cate_hat =
                 cate_hat
@@ -1830,11 +2062,13 @@ run_model_analysis <- function(
         )
 
     oracle_score <-
+
         Y_use *
         (
             A_use *
             (oracle_policy == 1) /
             ps_use +
+
             (1 - A_use) *
             (oracle_policy == 0) /
             (1 - ps_use)
@@ -1866,7 +2100,7 @@ run_model_analysis <- function(
     gc()
 
     ###########################################################################
-    # RETURN RESULT
+    # RETURN
     ###########################################################################
 
     data.frame(
@@ -1927,9 +2161,15 @@ run_single_replication <- function(
 ) {
 
     seed <-
+
         SEED_BASE +
+
         rep_id * 10000 +
-        round(ME * 1000) +
+
+        round(
+            ME * 1000
+        ) +
+
         scenario * 100
 
     set.seed(
@@ -1984,20 +2224,17 @@ run_single_replication <- function(
     U <- gf$U
 
     ###########################################################################
-    # LATENT DATA
+    # LATENT FUNCTIONAL DATA
     ###########################################################################
 
     X_latent <-
         generate_functional_data(
 
-            N =
-                N,
+            N = N,
 
-            P =
-                P,
+            P = P,
 
-            NT =
-                NT,
+            NT = NT,
 
             rho_time =
                 RHO_TIME,
@@ -2049,11 +2286,11 @@ run_single_replication <- function(
             tau_cate =
                 cate_true,
 
-            A =
-                A
+            A = A
         )
 
     time <- surv$time
+
     status <- surv$status
 
     ###########################################################################
@@ -2071,7 +2308,7 @@ run_single_replication <- function(
         )
 
     ###########################################################################
-    # RMST
+    # RMST OUTCOME
     ###########################################################################
 
     Y <-
@@ -2088,7 +2325,7 @@ run_single_replication <- function(
         )
 
     ###########################################################################
-    # SPLIT
+    # DATA SPLIT
     ###########################################################################
 
     splits <-
@@ -2128,12 +2365,24 @@ run_single_replication <- function(
             drop = FALSE
         ]
 
+    ###########################################################################
+    # OUTCOMES
+    ###########################################################################
+
     Y_train <- Y[tr]
     Y_valid <- Y[va]
     Y_test <- Y[te]
 
+    ###########################################################################
+    # TREATMENT
+    ###########################################################################
+
     A_train <- A[tr]
     A_test <- A[te]
+
+    ###########################################################################
+    # TRUE TEST CATE
+    ###########################################################################
 
     cate_true_test <-
         cate_true[
@@ -2159,6 +2408,7 @@ run_single_replication <- function(
     ###########################################################################
 
     ps_fit <-
+
         fit_propensity_matrix(
 
             X_train =
@@ -2176,6 +2426,7 @@ run_single_replication <- function(
     ###########################################################################
 
     ps_test <-
+
         predict_propensity_matrix(
 
             fit =
@@ -2184,6 +2435,20 @@ run_single_replication <- function(
             X_test =
                 F_test
         )
+
+    ###########################################################################
+    # CHECK PROPENSITY
+    ###########################################################################
+
+    if (
+        length(ps_test) !=
+        length(A_test)
+    ) {
+
+        stop(
+            "Propensity prediction length does not match test sample size."
+        )
+    }
 
     ###########################################################################
     # MODELS
@@ -2199,13 +2464,13 @@ run_single_replication <- function(
     )
 
     ###########################################################################
-    # CORRECT LIST INITIALIZATION
+    # MODEL RESULTS
     ###########################################################################
 
     model_results <- list()
 
     ###########################################################################
-    # MODEL LOOP
+    # LOOP OVER MODELS
     ###########################################################################
 
     for (
@@ -2218,7 +2483,8 @@ run_single_replication <- function(
             "\n"
         )
 
-        result <-
+        model_result <-
+
             tryCatch(
 
                 {
@@ -2272,7 +2538,7 @@ run_single_replication <- function(
                 error = function(e) {
 
                     cat(
-                        "ERROR in",
+                        "  ERROR in",
                         model_name,
                         ":",
                         conditionMessage(e),
@@ -2292,7 +2558,8 @@ run_single_replication <- function(
 
                         True_ATE =
                             mean(
-                                cate_true_test
+                                cate_true_test,
+                                na.rm = TRUE
                             ),
 
                         ATE_Bias =
@@ -2326,10 +2593,13 @@ run_single_replication <- function(
             )
 
         #######################################################################
-        # CORRECT R LIST ASSIGNMENT
+        # SAFE APPEND
         #######################################################################
 
-        model_results[[model_name]] <- result
+        model_results <- append(
+            model_results,
+            list(model_result)
+        )
 
         gc()
     }
@@ -2345,6 +2615,10 @@ run_single_replication <- function(
         )
 
     rownames(result) <- NULL
+
+    ###########################################################################
+    # ADD IDENTIFIERS
+    ###########################################################################
 
     result$Replication <-
         rep_id
@@ -2364,23 +2638,27 @@ run_single_replication <- function(
     result$Scenario <-
         scenario
 
+    ###########################################################################
+    # RETURN
+    ###########################################################################
+
     result
 }
 
 ###############################################################################
-# 32. MAIN SIMULATION INITIALIZATION
+# 32. INITIALIZE MAIN SIMULATION
 ###############################################################################
 
 all_results <- list()
 
-counter <- 1
+run_counter <- 0
 
 total_runs <-
-    length(ME_LEVELS) *
+    length(
+        ME_LEVELS
+    ) *
     5 *
     N_REP
-
-run_counter <- 0
 
 cat("\n\n")
 
@@ -2499,6 +2777,7 @@ for (
             ###################################################################
 
             res <-
+
                 tryCatch(
 
                     {
@@ -2539,56 +2818,78 @@ for (
                 )
 
             ###################################################################
-            # CORRECT LIST APPEND
+            # SAFE APPEND
             #
-            # THIS IS THE CRITICAL FIX:
+            # IMPORTANT:
             #
-            # WRONG:
+            # DO NOT use:
+            #
             # scenario_results[
             #     [length(scenario_results) + 1]
             # ] <- res
             #
-            # CORRECT:
-            # scenario_results[[length(scenario_results) + 1]] <- res
+            # Use append().
             ###################################################################
 
             if (
                 !is.null(res)
             ) {
 
-                scenario_results[
-                    [length(scenario_results) + 1]
-                ] <- res
+                scenario_results <-
+                    append(
+                        scenario_results,
+                        list(res)
+                    )
+
+                cat(
+                    "  SUCCESS: replication",
+                    rep_id,
+                    "\n"
+                )
             }
 
             gc()
         }
 
         #######################################################################
-        # SAVE SCENARIO RESULTS
+        # COMBINE SCENARIO RESULTS
         #######################################################################
 
         if (
-            length(scenario_results) > 0
+            length(
+                scenario_results
+            ) > 0
         ) {
 
             scenario_results <-
+
                 do.call(
                     rbind,
                     scenario_results
                 )
 
-            ###################################################################
-            # CORRECT LIST APPEND
-            ###################################################################
-
-            all_results[[counter]] <-
+            rownames(
                 scenario_results
+            ) <- NULL
 
-            counter <-
-                counter + 1
+            ###################################################################
+            # APPEND TO GLOBAL RESULTS
+            ###################################################################
+
+            all_results <-
+                append(
+                    all_results,
+                    list(
+                        scenario_results
+                    )
+                )
+
+            ###################################################################
+            # SAVE PARTIAL RESULTS
+            ###################################################################
 
             partial_file <-
+
                 file.path(
 
                     OUTPUT_DIR,
@@ -2620,15 +2921,31 @@ for (
             )
 
             cat(
-                "Saved:",
+                "\nSaved:",
                 partial_file,
+                "\n"
+            )
+
+            ###################################################################
+            # SUCCESS COUNT
+            ###################################################################
+
+            cat(
+                "Successful replications:",
+                length(
+                    scenario_results$Replication[
+                        !is.na(
+                            scenario_results$Replication
+                        )
+                    ]
+                ),
                 "\n"
             )
 
         } else {
 
             cat(
-                "WARNING: no successful replications for ME =",
+                "\nWARNING: no successful replications for ME =",
                 ME,
                 "Scenario =",
                 scenario,
@@ -2645,7 +2962,9 @@ for (
 ###############################################################################
 
 if (
-    length(all_results) == 0
+    length(
+        all_results
+    ) == 0
 ) {
 
     stop(
@@ -2658,12 +2977,15 @@ if (
 ###############################################################################
 
 results <-
+
     do.call(
         rbind,
         all_results
     )
 
-rownames(results) <- NULL
+rownames(
+    results
+) <- NULL
 
 ###############################################################################
 # 36. SAVE RAW RESULTS
@@ -2700,7 +3022,9 @@ safe_mean <- function(x) {
         )
     }
 
-    mean(x)
+    mean(
+        x
+    )
 }
 
 ###############################################################################
@@ -2720,7 +3044,9 @@ safe_sd <- function(x) {
         )
     }
 
-    sd(x)
+    sd(
+        x
+    )
 }
 
 ###############################################################################
@@ -2728,6 +3054,7 @@ safe_sd <- function(x) {
 ###############################################################################
 
 summary_ME_model <-
+
     aggregate(
 
         cbind(
@@ -2762,11 +3089,9 @@ summary_ME_model <-
 
         Model,
 
-        data =
-            results,
+        data = results,
 
-        FUN =
-            safe_mean
+        FUN = safe_mean
     )
 
 ###############################################################################
@@ -2774,6 +3099,7 @@ summary_ME_model <-
 ###############################################################################
 
 sd_ME_model <-
+
     aggregate(
 
         cbind(
@@ -2800,11 +3126,9 @@ sd_ME_model <-
 
         Model,
 
-        data =
-            results,
+        data = results,
 
-        FUN =
-            safe_sd
+        FUN = safe_sd
     )
 
 ###############################################################################
@@ -2824,22 +3148,28 @@ sd_names <- c(
     "Policy_Regret"
 )
 
-names(sd_ME_model)[
+names(
+    sd_ME_model
+)[
     match(
         sd_names,
-        names(sd_ME_model)
+        names(
+            sd_ME_model
+        )
     )
 ] <-
+
     paste0(
         sd_names,
         "_SD"
     )
 
 ###############################################################################
-# 40. MERGE
+# 40. MERGE SUMMARY
 ###############################################################################
 
 summary_ME_model <-
+
     merge(
 
         summary_ME_model,
@@ -2876,6 +3206,7 @@ write.csv(
 ###############################################################################
 
 summary_scenario <-
+
     aggregate(
 
         cbind(
@@ -2906,11 +3237,9 @@ summary_scenario <-
 
         Model,
 
-        data =
-            results,
+        data = results,
 
-        FUN =
-            safe_mean
+        FUN = safe_mean
     )
 
 ###############################################################################
@@ -2935,8 +3264,11 @@ ranking <-
     summary_scenario
 
 ###############################################################################
+# PEHE RANK
+###############################################################################
 
 ranking$PEHE_Rank <-
+
     ave(
 
         ranking$PEHE,
@@ -2948,9 +3280,12 @@ ranking$PEHE_Rank <-
         FUN = function(x) {
 
             rank(
+
                 x,
+
                 ties.method =
                     "average",
+
                 na.last =
                     "keep"
             )
@@ -2958,8 +3293,11 @@ ranking$PEHE_Rank <-
     )
 
 ###############################################################################
+# POLICY RANK
+###############################################################################
 
 ranking$Policy_Rank <-
+
     ave(
 
         -ranking$Policy_Value,
@@ -2971,9 +3309,12 @@ ranking$Policy_Rank <-
         FUN = function(x) {
 
             rank(
+
                 x,
+
                 ties.method =
                     "average",
+
                 na.last =
                     "keep"
             )
@@ -2981,8 +3322,11 @@ ranking$Policy_Rank <-
     )
 
 ###############################################################################
+# ATE BIAS RANK
+###############################################################################
 
 ranking$ATE_Bias_Rank <-
+
     ave(
 
         abs(
@@ -2996,9 +3340,12 @@ ranking$ATE_Bias_Rank <-
         FUN = function(x) {
 
             rank(
+
                 x,
+
                 ties.method =
                     "average",
+
                 na.last =
                     "keep"
             )
@@ -3024,6 +3371,7 @@ write.csv(
 ###############################################################################
 
 ME_PEHE <-
+
     aggregate(
 
         PEHE ~
@@ -3032,11 +3380,9 @@ ME_PEHE <-
 
         Model,
 
-        data =
-            results,
+        data = results,
 
-        FUN =
-            safe_mean
+        FUN = safe_mean
     )
 
 write.csv(
@@ -3056,6 +3402,7 @@ write.csv(
 ###############################################################################
 
 ME_ATE_Bias <-
+
     aggregate(
 
         ATE_Bias ~
@@ -3064,8 +3411,7 @@ ME_ATE_Bias <-
 
         Model,
 
-        data =
-            results,
+        data = results,
 
         FUN = function(x) {
 
@@ -3082,6 +3428,7 @@ names(
         ME_ATE_Bias
     ) == "ATE_Bias"
 ] <-
+
     "Absolute_ATE_Bias"
 
 write.csv(
@@ -3101,6 +3448,7 @@ write.csv(
 ###############################################################################
 
 ME_policy <-
+
     aggregate(
 
         Policy_Regret ~
@@ -3109,11 +3457,9 @@ ME_policy <-
 
         Model,
 
-        data =
-            results,
+        data = results,
 
-        FUN =
-            safe_mean
+        FUN = safe_mean
     )
 
 write.csv(
@@ -3129,7 +3475,54 @@ write.csv(
 )
 
 ###############################################################################
-# 47. PRINT MAIN RESULTS
+# 47. OVERALL MODEL SUMMARY
+###############################################################################
+
+overall_model_summary <-
+
+    aggregate(
+
+        cbind(
+
+            ATE,
+
+            ATE_Bias,
+
+            PEHE,
+
+            CATE_Correlation,
+
+            Policy_Value,
+
+            Policy_Regret,
+
+            Treatment_Rate
+
+        )
+
+        ~
+
+        Model,
+
+        data = results,
+
+        FUN = safe_mean
+    )
+
+write.csv(
+
+    overall_model_summary,
+
+    file.path(
+        OUTPUT_DIR,
+        "overall_model_summary.csv"
+    ),
+
+    row.names = FALSE
+)
+
+###############################################################################
+# 48. PRINT MAIN RESULTS
 ###############################################################################
 
 cat("\n\n")
@@ -3159,7 +3552,7 @@ print(
 )
 
 ###############################################################################
-# 48. PRINT SCENARIO RESULTS
+# 49. PRINT SCENARIO RESULTS
 ###############################################################################
 
 cat("\n\n")
@@ -3182,7 +3575,7 @@ print(
 )
 
 ###############################################################################
-# 49. BEST MODEL BY PEHE
+# 50. BEST MODEL BY PEHE
 ###############################################################################
 
 cat("\n\n")
@@ -3208,13 +3601,18 @@ for (
     ) {
 
         tmp <-
+
             subset(
 
                 summary_scenario,
 
                 ME == me &
+
                 Scenario == sc &
-                is.finite(PEHE)
+
+                is.finite(
+                    PEHE
+                )
             )
 
         if (
@@ -3259,7 +3657,7 @@ for (
 }
 
 ###############################################################################
-# 50. BEST MODEL BY POLICY VALUE
+# 51. BEST MODEL BY POLICY VALUE
 ###############################################################################
 
 cat("\n\n")
@@ -3285,13 +3683,18 @@ for (
     ) {
 
         tmp <-
+
             subset(
 
                 summary_scenario,
 
                 ME == me &
+
                 Scenario == sc &
-                is.finite(Policy_Value)
+
+                is.finite(
+                    Policy_Value
+                )
             )
 
         if (
@@ -3299,6 +3702,7 @@ for (
         ) {
 
             tmp <-
+
                 tmp[
                     order(
                         -tmp$Policy_Value
@@ -3336,7 +3740,115 @@ for (
 }
 
 ###############################################################################
-# 51. SAVE LAST GRAPH
+# 52. BEST MODEL BY ABSOLUTE ATE BIAS
+###############################################################################
+
+cat("\n\n")
+
+cat(
+    "====================================================================\n"
+)
+
+cat(
+    "BEST MODEL BY ABSOLUTE ATE BIAS\n"
+)
+
+cat(
+    "====================================================================\n\n"
+)
+
+for (
+    me in ME_LEVELS
+) {
+
+    for (
+        sc in 1:5
+    ) {
+
+        tmp <-
+
+            subset(
+
+                summary_scenario,
+
+                ME == me &
+
+                Scenario == sc &
+
+                is.finite(
+                    ATE_Bias
+                )
+            )
+
+        if (
+            nrow(tmp) > 0
+        ) {
+
+            tmp$AbsBias <-
+                abs(
+                    tmp$ATE_Bias
+                )
+
+            tmp <-
+
+                tmp[
+                    order(
+                        tmp$AbsBias
+                    ),
+                ]
+
+            cat(
+
+                "ME =",
+
+                sprintf(
+                    "%.2f",
+                    me
+                ),
+
+                "| Scenario =",
+
+                sc,
+
+                "| Best =",
+
+                tmp$Model[1],
+
+                "| Absolute ATE Bias =",
+
+                round(
+                    tmp$AbsBias[1],
+                    5
+                ),
+
+                "\n"
+            )
+        }
+    }
+}
+
+###############################################################################
+# 53. SAVE LAST GRAPH
+###############################################################################
+
+A_graph <-
+    get_graph(
+        type = "chain",
+        P = P
+    )
+
+L <-
+    graph_laplacian(
+        A_graph
+    )
+
+gf <-
+    graph_fourier_basis(
+        L
+    )
+
+U <- gf$U
+
 ###############################################################################
 
 write.csv(
@@ -3345,11 +3857,13 @@ write.csv(
 
     file.path(
         OUTPUT_DIR,
-        "graph_adjacency_last_replication.csv"
+        "graph_adjacency_chain.csv"
     ),
 
     row.names = TRUE
 )
+
+###############################################################################
 
 write.csv(
 
@@ -3357,11 +3871,13 @@ write.csv(
 
     file.path(
         OUTPUT_DIR,
-        "graph_laplacian_last_replication.csv"
+        "graph_laplacian_chain.csv"
     ),
 
     row.names = TRUE
 )
+
+###############################################################################
 
 write.csv(
 
@@ -3369,14 +3885,160 @@ write.csv(
 
     file.path(
         OUTPUT_DIR,
-        "graph_fourier_basis_last_replication.csv"
+        "graph_fourier_basis_chain.csv"
     ),
 
     row.names = TRUE
 )
 
 ###############################################################################
-# 52. SESSION INFORMATION
+# 54. SAVE SIMULATION SETTINGS
+###############################################################################
+
+settings <- data.frame(
+
+    Parameter = c(
+
+        "SEED_BASE",
+
+        "N",
+
+        "P",
+
+        "NT",
+
+        "N_REP",
+
+        "TRAIN_PROP",
+
+        "VALID_PROP",
+
+        "TEST_PROP",
+
+        "EPOCHS",
+
+        "BATCH_SIZE",
+
+        "LEARNING_RATE",
+
+        "LATENT_DIM",
+
+        "RHO_TIME",
+
+        "GRAPH_STRENGTH",
+
+        "BASELINE_HAZARD",
+
+        "CENSOR_RATE",
+
+        "TAU",
+
+        "PS_LOWER",
+
+        "PS_UPPER"
+
+    ),
+
+    Value = c(
+
+        SEED_BASE,
+
+        N,
+
+        P,
+
+        NT,
+
+        N_REP,
+
+        TRAIN_PROP,
+
+        VALID_PROP,
+
+        TEST_PROP,
+
+        EPOCHS,
+
+        BATCH_SIZE,
+
+        LEARNING_RATE,
+
+        LATENT_DIM,
+
+        RHO_TIME,
+
+        GRAPH_STRENGTH,
+
+        BASELINE_HAZARD,
+
+        CENSOR_RATE,
+
+        TAU,
+
+        PS_LOWER,
+
+        PS_UPPER
+
+    ),
+
+    stringsAsFactors = FALSE
+)
+
+write.csv(
+
+    settings,
+
+    file.path(
+        OUTPUT_DIR,
+        "simulation_settings.csv"
+    ),
+
+    row.names = FALSE
+)
+
+###############################################################################
+# 55. RESULT COUNTS
+###############################################################################
+
+result_counts <-
+
+    aggregate(
+
+        Model ~
+
+        ME +
+
+        Scenario,
+
+        data = results,
+
+        FUN = length
+    )
+
+names(
+    result_counts
+)[
+    names(
+        result_counts
+    ) == "Model"
+] <-
+
+    "Result_Rows"
+
+write.csv(
+
+    result_counts,
+
+    file.path(
+        OUTPUT_DIR,
+        "result_counts.csv"
+    ),
+
+    row.names = FALSE
+)
+
+###############################################################################
+# 56. SESSION INFORMATION
 ###############################################################################
 
 sink(
@@ -3394,7 +4056,7 @@ print(
 sink()
 
 ###############################################################################
-# 53. FINAL MESSAGE
+# 57. FINAL MESSAGE
 ###############################################################################
 
 cat("\n\n")
@@ -3424,7 +4086,7 @@ cat(
 )
 
 cat(
-    "Expected maximum rows:",
+    "Maximum possible rows:",
     total_runs * 3,
     "\n"
 )
@@ -3479,6 +4141,42 @@ cat(
 
 cat(
     "  5 = Graph misspecification\n"
+)
+
+cat(
+    "\nOutput files include:\n"
+)
+
+cat(
+    "  all_results.csv\n"
+)
+
+cat(
+    "  summary_ME_by_model.csv\n"
+)
+
+cat(
+    "  summary_ME_scenario_model.csv\n"
+)
+
+cat(
+    "  model_ranking.csv\n"
+)
+
+cat(
+    "  ME_effect_PEHE.csv\n"
+)
+
+cat(
+    "  ME_effect_ATE_bias.csv\n"
+)
+
+cat(
+    "  ME_effect_policy_regret.csv\n"
+)
+
+cat(
+    "  overall_model_summary.csv\n"
 )
 
 cat(

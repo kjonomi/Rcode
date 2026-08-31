@@ -42,12 +42,15 @@
 #
 # IMPORTANT FIXES
 #   1. No ranger formula interface.
-#   2. ranger(x=..., y=...) is used throughout.
-#   3. All feature matrices receive safe column names.
-#   4. Propensity scores are trained on training data and predicted on test data.
-#   5. Neural representations are used directly in the causal outcome models.
-#   6. Measurement error affects observed covariates only.
-#   7. The true CATE is generated from latent covariates.
+#   2. ranger(x = ..., y = ...) is used throughout.
+#   3. Propensity response is explicitly converted to factor.
+#   4. All feature matrices receive safe column names.
+#   5. All list assignments use [[...]] correctly.
+#   6. Propensity scores are trained on training data only.
+#   7. Propensity scores are predicted on test data.
+#   8. Neural representations are used in outcome models.
+#   9. Measurement error affects observed covariates only.
+#  10. True CATE is generated from latent covariates.
 ###############################################################################
 
 rm(list = ls())
@@ -67,7 +70,6 @@ required_packages <- c(
 for (pkg in required_packages) {
 
   if (!requireNamespace(pkg, quietly = TRUE)) {
-
     install.packages(pkg)
   }
 }
@@ -83,88 +85,33 @@ library(Matrix)
 
 SEED_BASE <- 20260831
 
-###############################################################################
-# Sample size
-###############################################################################
-
 N <- 1000
-
-###############################################################################
-# Number of functional variables
-###############################################################################
-
 P <- 20
-
-###############################################################################
-# Number of temporal observations
-###############################################################################
-
 NT <- 30
 
-###############################################################################
-# Replications
-###############################################################################
-
 N_REP <- 30
-
-###############################################################################
-# Data split
-###############################################################################
 
 TRAIN_PROP <- 0.70
 VALID_PROP <- 0.15
 TEST_PROP  <- 0.15
 
-###############################################################################
-# Cross-fitting
-###############################################################################
-
 N_FOLDS <- 3
-
-###############################################################################
-# Neural network
-###############################################################################
 
 EPOCHS <- 40
 BATCH_SIZE <- 32
 LEARNING_RATE <- 0.001
 LATENT_DIM <- 32
 
-###############################################################################
-# Temporal dependence
-###############################################################################
-
 RHO_TIME <- 0.70
-
-###############################################################################
-# Graph strength
-###############################################################################
-
 GRAPH_STRENGTH <- 0.50
-
-###############################################################################
-# Survival parameters
-###############################################################################
 
 BASELINE_HAZARD <- 0.12
 CENSOR_RATE <- 0.30
 
-###############################################################################
-# RMST horizon
-###############################################################################
-
 TAU <- 5
-
-###############################################################################
-# Propensity-score trimming
-###############################################################################
 
 PS_LOWER <- 0.05
 PS_UPPER <- 0.95
-
-###############################################################################
-# Measurement-error levels
-###############################################################################
 
 ME_LEVELS <- c(
   0.00,
@@ -173,10 +120,6 @@ ME_LEVELS <- c(
   0.50,
   1.00
 )
-
-###############################################################################
-# Output directory
-###############################################################################
 
 OUTPUT_DIR <- "graph_survival_ME_results"
 
@@ -653,7 +596,6 @@ add_measurement_error <- function(
 functional_features <- function(X) {
 
   N_local <- dim(X)[1]
-  NT_local <- dim(X)[2]
   P_local <- dim(X)[3]
 
   F <- matrix(
@@ -701,9 +643,7 @@ functional_features <- function(X) {
     col_id <- col_id + 1
   }
 
-  F <- safe_matrix(F)
-
-  F
+  safe_matrix(F)
 }
 
 ###############################################################################
@@ -731,7 +671,7 @@ true_cate <- function(
   )
 
   ###########################################################################
-  # Scenario 1
+  # Scenario 1: No graph dependence
   ###########################################################################
 
   if (scenario == 1) {
@@ -748,7 +688,7 @@ true_cate <- function(
   }
 
   ###########################################################################
-  # Scenario 2
+  # Scenario 2: Graph-frequency causal signal
   ###########################################################################
 
   else if (scenario == 2) {
@@ -771,7 +711,7 @@ true_cate <- function(
   }
 
   ###########################################################################
-  # Scenario 3
+  # Scenario 3: Local graph causal signal
   ###########################################################################
 
   else if (scenario == 3) {
@@ -791,7 +731,7 @@ true_cate <- function(
   }
 
   ###########################################################################
-  # Scenario 4
+  # Scenario 4: Mixed graph signal
   ###########################################################################
 
   else if (scenario == 4) {
@@ -817,7 +757,7 @@ true_cate <- function(
   }
 
   ###########################################################################
-  # Scenario 5
+  # Scenario 5: Graph misspecification
   ###########################################################################
 
   else if (scenario == 5) {
@@ -947,7 +887,7 @@ generate_survival <- function(
   )
 
   ###########################################################################
-  # Censoring
+  # Censoring time
   ###########################################################################
 
   C <- rexp(
@@ -986,11 +926,13 @@ rmst_individual <- function(
     tau = TAU
 ) {
 
-  ###########################################################################
-  # Simple observed RMST contribution.
+  # Observed RMST contribution.
   #
-  # A more formal RMST estimator can be substituted here if desired.
-  ###########################################################################
+  # This is a simple individual-level proxy:
+  # Y_i = min(T_i, tau).
+  #
+  # A formal IPCW/Kaplan-Meier RMST estimator can be substituted
+  # for a more formal censored-outcome analysis.
 
   pmin(
     time,
@@ -1198,10 +1140,6 @@ train_representation_model <- function(
     Y_valid
 ) {
 
-  ###########################################################################
-  # Temporary supervised prediction head
-  ###########################################################################
-
   representation_input <-
     model$input
 
@@ -1268,10 +1206,6 @@ train_representation_model <- function(
     callbacks = callbacks
   )
 
-  ###########################################################################
-  # Return representation model
-  ###########################################################################
-
   list(
     representation = model,
     prediction = training_model
@@ -1308,7 +1242,10 @@ extract_representation <- function(
 # 21. RANGER PROPENSITY MODEL
 #
 # IMPORTANT:
-# No formula interface.
+#   - No formula interface.
+#   - x = matrix/data frame.
+#   - y = factor for probability forest.
+#   - Safe column names.
 ###############################################################################
 
 fit_propensity_matrix <- function(
@@ -1321,9 +1258,36 @@ fit_propensity_matrix <- function(
     X_train
   )
 
-  A_train <- as.numeric(
-    A_train
+  A_train <- factor(
+    as.integer(A_train),
+    levels = c(0, 1)
   )
+
+  ###########################################################################
+  # Explicit data checks
+  ###########################################################################
+
+  if (
+    nrow(X_train) != length(A_train)
+  ) {
+
+    stop(
+      "Propensity training dimension mismatch."
+    )
+  }
+
+  if (
+    anyNA(X_train)
+  ) {
+
+    stop(
+      "NA values found in propensity training matrix."
+    )
+  }
+
+  ###########################################################################
+  # ranger x/y interface
+  ###########################################################################
 
   fit <- ranger(
 
@@ -1339,8 +1303,7 @@ fit_propensity_matrix <- function(
 
     seed = seed,
 
-    respect.unordered.factors =
-      "order"
+    respect.unordered.factors = "order"
   )
 
   fit
@@ -1365,19 +1328,33 @@ predict_propensity_matrix <- function(
   )$predictions
 
   ###########################################################################
-  # ranger can return either two columns or, depending on version,
-  # a matrix with class labels.
+  # Probability forest returns a matrix.
   ###########################################################################
 
-  if (is.matrix(pred)) {
+  if (
+    is.matrix(pred)
+  ) {
 
-    if ("1" %in% colnames(pred)) {
+    cn <- colnames(
+      pred
+    )
+
+    if (
+      !is.null(cn) &&
+      "1" %in% cn
+    ) {
 
       ps <- pred[, "1"]
 
+    } else if (
+      ncol(pred) >= 2
+    ) {
+
+      ps <- pred[, 2]
+
     } else {
 
-      ps <- pred[, ncol(pred)]
+      ps <- pred[, 1]
     }
 
   } else {
@@ -1389,7 +1366,7 @@ predict_propensity_matrix <- function(
 
   ps <- pmin(
     pmax(
-      ps,
+      as.numeric(ps),
       PS_LOWER
     ),
     PS_UPPER
@@ -1403,7 +1380,8 @@ predict_propensity_matrix <- function(
 ###############################################################################
 # 23. OUTCOME MODEL
 #
-# Again, NO formula interface.
+# Continuous RMST outcome.
+# ranger uses regression because Y is numeric.
 ###############################################################################
 
 fit_outcome_matrix <- function(
@@ -1419,6 +1397,33 @@ fit_outcome_matrix <- function(
   Y_train <- as.numeric(
     Y_train
   )
+
+  ###########################################################################
+  # Dimension check
+  ###########################################################################
+
+  if (
+    nrow(X_train) != length(Y_train)
+  ) {
+
+    stop(
+      "Outcome training dimension mismatch."
+    )
+  }
+
+  if (
+    anyNA(X_train) ||
+    anyNA(Y_train)
+  ) {
+
+    stop(
+      "NA values found in outcome training data."
+    )
+  }
+
+  ###########################################################################
+  # ranger regression using x/y interface
+  ###########################################################################
 
   fit <- ranger(
 
@@ -1616,14 +1621,12 @@ split_data <- function(
     ]
 
   valid <-
-
     idx[
       (n_train + 1):
       (n_train + n_valid)
     ]
 
   test <-
-
     idx[
       (n_train + n_valid + 1):
       N
@@ -1645,19 +1648,14 @@ run_model_analysis <- function(
     model_name,
 
     X_train,
-
     X_valid,
-
     X_test,
 
     Y_train,
-
     Y_valid,
-
     Y_test,
 
     A_train,
-
     A_test,
 
     ps_test,
@@ -1665,7 +1663,6 @@ run_model_analysis <- function(
     cate_true_test,
 
     A_graph,
-
     U,
 
     seed
@@ -1677,51 +1674,38 @@ run_model_analysis <- function(
   ###########################################################################
 
   if (
-    model_name ==
-    "CNN-LSTM"
+    model_name == "CNN-LSTM"
   ) {
 
     base_model <-
       build_cnn_lstm(
-        NT =
-          dim(X_train)[2],
-        P =
-          dim(X_train)[3],
-        latent_dim =
-          LATENT_DIM
+        NT = dim(X_train)[2],
+        P = dim(X_train)[3],
+        latent_dim = LATENT_DIM
       )
 
   } else if (
-    model_name ==
-    "GF-CNN-LSTM"
+    model_name == "GF-CNN-LSTM"
   ) {
 
     base_model <-
       build_gf_cnn_lstm(
-        NT =
-          dim(X_train)[2],
-        P =
-          dim(X_train)[3],
+        NT = dim(X_train)[2],
+        P = dim(X_train)[3],
         U = U,
-        latent_dim =
-          LATENT_DIM
+        latent_dim = LATENT_DIM
       )
 
   } else if (
-    model_name ==
-    "GCN-CNN-LSTM"
+    model_name == "GCN-CNN-LSTM"
   ) {
 
     base_model <-
       build_gcn_cnn_lstm(
-        NT =
-          dim(X_train)[2],
-        P =
-          dim(X_train)[3],
-        A_graph =
-          A_graph,
-        latent_dim =
-          LATENT_DIM
+        NT = dim(X_train)[2],
+        P = dim(X_train)[3],
+        A_graph = A_graph,
+        latent_dim = LATENT_DIM
       )
 
   } else {
@@ -1732,7 +1716,7 @@ run_model_analysis <- function(
   }
 
   ###########################################################################
-  # Train representation
+  # TRAIN REPRESENTATION
   ###########################################################################
 
   trained <- train_representation_model(
@@ -1752,7 +1736,7 @@ run_model_analysis <- function(
     trained$representation
 
   ###########################################################################
-  # Extract latent representations
+  # EXTRACT REPRESENTATIONS
   ###########################################################################
 
   Z_train <-
@@ -1768,58 +1752,19 @@ run_model_analysis <- function(
     )
 
   ###########################################################################
-  # Add treatment to representation
+  # ENSURE SAFE MATRICES
   ###########################################################################
 
-  Z0_train <-
-    cbind(
-      Z_train,
-      A = 0
-    )
+  Z_train <- safe_matrix(
+    Z_train
+  )
 
-  Z1_train <-
-    cbind(
-      Z_train,
-      A = 1
-    )
-
-  Z0_test <-
-    cbind(
-      Z_test,
-      A = 0
-    )
-
-  Z1_test <-
-    cbind(
-      Z_test,
-      A = 1
-    )
-
-  Z0_train <-
-    safe_matrix(
-      Z0_train
-    )
-
-  Z1_train <-
-    safe_matrix(
-      Z1_train
-    )
-
-  Z0_test <-
-    safe_matrix(
-      Z0_test
-    )
-
-  Z1_test <-
-    safe_matrix(
-      Z1_test
-    )
+  Z_test <- safe_matrix(
+    Z_test
+  )
 
   ###########################################################################
-  # Treatment-specific outcome models
-  #
-  # Separate models are fitted to avoid using treatment as a predictor
-  # of its own potential outcome.
+  # TREATMENT GROUPS
   ###########################################################################
 
   tr0 <- which(
@@ -1836,36 +1781,62 @@ run_model_analysis <- function(
   ) {
 
     stop(
-      "Insufficient observations in one treatment group."
+      paste0(
+        "Insufficient observations in one treatment group: ",
+        "n0 = ",
+        length(tr0),
+        ", n1 = ",
+        length(tr1)
+      )
     )
   }
+
+  ###########################################################################
+  # OUTCOME MODEL A = 0
+  ###########################################################################
 
   outcome0 <- fit_outcome_matrix(
 
     X_train =
-      Z_train[tr0, , drop = FALSE],
+      Z_train[
+        tr0,
+        ,
+        drop = FALSE
+      ],
 
     Y_train =
-      Y_train[tr0],
+      Y_train[
+        tr0
+      ],
 
     seed =
       seed + 101
   )
 
+  ###########################################################################
+  # OUTCOME MODEL A = 1
+  ###########################################################################
+
   outcome1 <- fit_outcome_matrix(
 
     X_train =
-      Z_train[tr1, , drop = FALSE],
+      Z_train[
+        tr1,
+        ,
+        drop = FALSE
+      ],
 
     Y_train =
-      Y_train[tr1],
+      Y_train[
+        tr1
+      ],
 
     seed =
       seed + 102
   )
 
   ###########################################################################
-  # Potential outcomes
+  # POTENTIAL OUTCOMES
   ###########################################################################
 
   mu0 <-
@@ -1898,30 +1869,63 @@ run_model_analysis <- function(
   )
 
   ###########################################################################
-  # Remove numerical problems
+  # VALID OBSERVATIONS
   ###########################################################################
 
-  valid <- is.finite(
-    cate_hat
-  ) &
-    is.finite(
-      cate_true_test
-    )
+  valid <-
+    is.finite(cate_hat) &
+    is.finite(cate_true_test) &
+    is.finite(Y_test) &
+    is.finite(A_test) &
+    is.finite(ps_test)
 
-  cate_hat <- cate_hat[valid]
+  cate_hat <-
+    cate_hat[
+      valid
+    ]
 
   cate_true_use <-
-    cate_true_test[valid]
+    cate_true_test[
+      valid
+    ]
 
-  Y_use <- Y_test[valid]
+  Y_use <-
+    Y_test[
+      valid
+    ]
 
-  A_use <- A_test[valid]
+  A_use <-
+    A_test[
+      valid
+    ]
 
-  ps_use <- ps_test[valid]
+  ps_use <-
+    ps_test[
+      valid
+    ]
 
-  mu0_use <- mu0[valid]
+  mu0_use <-
+    mu0[
+      valid
+    ]
 
-  mu1_use <- mu1[valid]
+  mu1_use <-
+    mu1[
+      valid
+    ]
+
+  ###########################################################################
+  # CHECK EFFECTIVE SAMPLE SIZE
+  ###########################################################################
+
+  if (
+    length(cate_hat) < 10
+  ) {
+
+    stop(
+      "Too few valid test observations after filtering."
+    )
+  }
 
   ###########################################################################
   # ATE
@@ -1941,7 +1945,7 @@ run_model_analysis <- function(
     )
 
   ###########################################################################
-  # True ATE
+  # TRUE ATE
   ###########################################################################
 
   true_ate <-
@@ -1950,7 +1954,7 @@ run_model_analysis <- function(
     )
 
   ###########################################################################
-  # ATE bias
+  # ATE BIAS
   ###########################################################################
 
   ate_bias <-
@@ -1968,7 +1972,7 @@ run_model_analysis <- function(
     )
 
   ###########################################################################
-  # CATE correlation
+  # CATE CORRELATION
   ###########################################################################
 
   cate_cor <-
@@ -1987,7 +1991,7 @@ run_model_analysis <- function(
   }
 
   ###########################################################################
-  # Policy
+  # POLICY
   ###########################################################################
 
   policy <-
@@ -2001,7 +2005,7 @@ run_model_analysis <- function(
     )
 
   ###########################################################################
-  # Policy value
+  # POLICY VALUE
   ###########################################################################
 
   policy_value <-
@@ -2014,12 +2018,11 @@ run_model_analysis <- function(
 
       ps = ps_use,
 
-      cate_hat =
-        cate_hat
+      cate_hat = cate_hat
     )
 
   ###########################################################################
-  # Oracle policy
+  # ORACLE POLICY
   ###########################################################################
 
   oracle_policy <-
@@ -2047,7 +2050,7 @@ run_model_analysis <- function(
     )
 
   ###########################################################################
-  # Policy regret
+  # POLICY REGRET
   ###########################################################################
 
   policy_regret <-
@@ -2055,7 +2058,7 @@ run_model_analysis <- function(
     policy_value
 
   ###########################################################################
-  # Clean up
+  # CLEAN KERAS
   ###########################################################################
 
   try(
@@ -2066,7 +2069,7 @@ run_model_analysis <- function(
   gc()
 
   ###########################################################################
-  # Return
+  # RETURN
   ###########################################################################
 
   data.frame(
@@ -2256,12 +2259,15 @@ run_single_replication <- function(
       tau_cate =
         cate_true,
 
-      A = A
+      A =
+        A
     )
 
-  time <- surv$time
+  time <-
+    surv$time
 
-  status <- surv$status
+  status <-
+    surv$status
 
   ###########################################################################
   # MEASUREMENT ERROR
@@ -2279,7 +2285,7 @@ run_single_replication <- function(
     )
 
   ###########################################################################
-  # RMST outcome
+  # RMST OUTCOME
   ###########################################################################
 
   Y <-
@@ -2297,7 +2303,7 @@ run_single_replication <- function(
     )
 
   ###########################################################################
-  # SPLIT
+  # DATA SPLIT
   ###########################################################################
 
   splits <-
@@ -2345,12 +2351,15 @@ run_single_replication <- function(
   A_test <- A[te]
 
   cate_true_test <-
-    cate_true[te]
+    cate_true[
+      te
+    ]
 
   ###########################################################################
   # PROPENSITY MODEL
   #
-  # Use observed noisy covariates.
+  # IMPORTANT:
+  # Observed noisy covariates are used.
   ###########################################################################
 
   F_train <-
@@ -2362,6 +2371,14 @@ run_single_replication <- function(
     functional_features(
       X_test
     )
+
+  F_train <- safe_matrix(
+    F_train
+  )
+
+  F_test <- safe_matrix(
+    F_test
+  )
 
   ps_fit <-
 
@@ -2387,6 +2404,19 @@ run_single_replication <- function(
       X_test =
         F_test
     )
+
+  ###########################################################################
+  # PROPENSITY DIAGNOSTIC
+  ###########################################################################
+
+  if (
+    length(ps_test) != length(A_test)
+  ) {
+
+    stop(
+      "Propensity prediction length does not match test sample size."
+    )
+  }
 
   ###########################################################################
   # MODELS
@@ -2492,7 +2522,8 @@ run_single_replication <- function(
 
             True_ATE =
               mean(
-                cate_true_test
+                cate_true_test,
+                na.rm = TRUE
               ),
 
             ATE_Bias =
@@ -2529,9 +2560,7 @@ run_single_replication <- function(
     # CORRECT LIST ASSIGNMENT
     #########################################################################
 
-    model_results[
-      [model_name]
-    ] <- result
+    model_results[[model_name]] <- result
 
     gc()
   }
@@ -2540,6 +2569,15 @@ run_single_replication <- function(
   # COMBINE MODELS
   ###########################################################################
 
+  if (
+    length(model_results) == 0
+  ) {
+
+    stop(
+      "No model results were generated."
+    )
+  }
+
   result <-
     do.call(
       rbind,
@@ -2547,6 +2585,10 @@ run_single_replication <- function(
     )
 
   rownames(result) <- NULL
+
+  ###########################################################################
+  # ADD SIMULATION IDENTIFIERS
+  ###########################################################################
 
   result$Replication <-
     rep_id
@@ -2676,8 +2718,7 @@ for (
     scenario in 1:5
   ) {
 
-    scenario_results <-
-      list()
+    scenario_results <- list()
 
     for (
       rep_id in 1:N_REP
@@ -2735,6 +2776,10 @@ for (
           }
         )
 
+      #######################################################################
+      # CORRECT LIST APPEND
+      #######################################################################
+
       if (
         !is.null(res)
       ) {
@@ -2766,9 +2811,11 @@ for (
           scenario_results
         )
 
-      all_results[
-        [counter]
-      ] <-
+      #######################################################################
+      # CORRECT LIST ASSIGNMENT
+      #######################################################################
+
+      all_results[[counter]] <-
         scenario_results
 
       counter <-
@@ -3143,7 +3190,8 @@ ranking$PEHE_Rank <-
         x,
         ties.method =
           "average",
-        na.last = "keep"
+        na.last =
+          "keep"
       )
     }
   )
@@ -3166,7 +3214,8 @@ ranking$Policy_Rank <-
         x,
         ties.method =
           "average",
-        na.last = "keep"
+        na.last =
+          "keep"
       )
     }
   )
@@ -3191,7 +3240,8 @@ ranking$ATE_Bias_Rank <-
         x,
         ties.method =
           "average",
-        na.last = "keep"
+        na.last =
+          "keep"
       )
     }
   )
@@ -3404,8 +3454,12 @@ for (
         summary_scenario,
 
         ME == me &
+
         Scenario == sc &
-        is.finite(PEHE)
+
+        is.finite(
+          PEHE
+        )
       )
 
     if (
@@ -3482,8 +3536,12 @@ for (
         summary_scenario,
 
         ME == me &
+
         Scenario == sc &
-        is.finite(Policy_Value)
+
+        is.finite(
+          Policy_Value
+        )
       )
 
     if (

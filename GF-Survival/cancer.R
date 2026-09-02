@@ -2510,3 +2510,299 @@ cat(
 ###############################################################################
 # END
 ###############################################################################
+
+#===============================================================================
+# Cancer Real-Data Figures
+# Graph-Frequency vs Graph-Convolution Representation Learning
+#===============================================================================
+
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+#-------------------------------------------------------------------------------
+# Results
+#-------------------------------------------------------------------------------
+
+results <- data.frame(
+  Model = c(
+    "CNN-LSTM", "GF-CNN-LSTM", "GCN-CNN-LSTM",
+    "CNN-LSTM", "GF-CNN-LSTM", "GCN-CNN-LSTM",
+    "CNN-LSTM", "GF-CNN-LSTM", "GCN-CNN-LSTM",
+    "CNN-LSTM", "GF-CNN-LSTM", "GCN-CNN-LSTM",
+    "CNN-LSTM", "GF-CNN-LSTM", "GCN-CNN-LSTM"
+  ),
+
+  N = rep(51, 15),
+
+  ATE_DR = c(
+    105.9048421, -10.22482523, 27.93260364,
+    68.98375602, 62.19489205, 72.0726401,
+    38.89450519, 46.49353758, 19.79362375,
+    35.22514289, 59.19836488, 48.04870915,
+    33.39341275, 37.38419452, 44.91276103
+  ),
+
+  Bootstrap_SE = c(
+    56.87266076, 44.86357929, 51.84728044,
+    51.20588621, 42.71519674, 39.4950008,
+    39.60580692, 36.61995279, 39.32076604,
+    33.70200007, 30.58230568, 33.77471996,
+    29.24194823, 31.11292948, 29.91056139
+  ),
+
+  Regression_ATE = c(
+    -5.72086962, 37.62262882, 65.7200756,
+    16.60295599, 52.37485425, 36.45607584,
+    26.61032925, 18.85982497, 26.97018287,
+    35.62836764, 17.34086566, 19.5301871,
+    9.809367916, 13.55968161, 8.468088171
+  ),
+
+  Policy_Value = c(
+    410.5031018, 413.5166915, 347.5401513,
+    427.2156494, 391.5652627, 384.3307017,
+    356.2394875, 385.0686199, 321.3296451,
+    298.7474019, 298.3935709, 300.9075706,
+    324.1741712, 326.2580337, 342.7244853
+  ),
+
+  Treatment_Rate = c(
+    0.588235294, 0.568627451, 0.666666667,
+    0.549019608, 0.568627451, 0.62745098,
+    0.509803922, 0.607843137, 0.549019608,
+    0.568627451, 0.588235294, 0.568627451,
+    0.549019608, 0.549019608, 0.529411765
+  ),
+
+  ME = rep(c(0, 0.10, 0.25, 0.50, 1.00), each = 3)
+)
+
+results$Model <- factor(
+  results$Model,
+  levels = c(
+    "CNN-LSTM",
+    "GF-CNN-LSTM",
+    "GCN-CNN-LSTM"
+  )
+)
+
+results$ME_Label <- factor(
+  results$ME,
+  levels = c(0, 0.10, 0.25, 0.50, 1.00),
+  labels = c("0.00", "0.10", "0.25", "0.50", "1.00")
+)
+
+#===============================================================================
+# Figure 1: ATE across measurement-error levels
+#===============================================================================
+
+p_ate <- ggplot(
+  results,
+  aes(
+    x = ME,
+    y = ATE_DR,
+    group = Model,
+    linetype = Model,
+    shape = Model
+  )
+) +
+  geom_hline(
+    yintercept = 0,
+    linewidth = 0.5
+  ) +
+  geom_errorbar(
+    aes(
+      ymin = ATE_DR - 1.96 * Bootstrap_SE,
+      ymax = ATE_DR + 1.96 * Bootstrap_SE
+    ),
+    width = 0.025,
+    linewidth = 0.5
+  ) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2.8) +
+  scale_x_continuous(
+    breaks = c(0, 0.10, 0.25, 0.50, 1.00)
+  ) +
+  labs(
+    x = "Measurement-error magnitude",
+    y = "Doubly robust ATE",
+    linetype = "Model",
+    shape = "Model"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    legend.position = "bottom",
+    panel.grid.minor = element_blank()
+  )
+
+print(p_ate)
+
+ggsave(
+  "cancer_ME_ATE.png",
+  p_ate,
+  width = 8,
+  height = 5.5,
+  dpi = 300
+)
+
+#===============================================================================
+# Figure 2: Policy Value
+#===============================================================================
+
+p_policy <- ggplot(
+  results,
+  aes(
+    x = ME,
+    y = Policy_Value,
+    group = Model,
+    linetype = Model,
+    shape = Model
+  )
+) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2.8) +
+  scale_x_continuous(
+    breaks = c(0, 0.10, 0.25, 0.50, 1.00)
+  ) +
+  labs(
+    x = "Measurement-error magnitude",
+    y = "Policy value",
+    linetype = "Model",
+    shape = "Model"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    legend.position = "bottom",
+    panel.grid.minor = element_blank()
+  )
+
+print(p_policy)
+
+ggsave(
+  "cancer_ME_policy_value.png",
+  p_policy,
+  width = 8,
+  height = 5.5,
+  dpi = 300
+)
+
+#===============================================================================
+# Figure 3: Treatment Rate
+#===============================================================================
+
+p_treatment <- ggplot(
+  results,
+  aes(
+    x = ME,
+    y = Treatment_Rate,
+    group = Model,
+    linetype = Model,
+    shape = Model
+  )
+) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2.8) +
+  scale_x_continuous(
+    breaks = c(0, 0.10, 0.25, 0.50, 1.00)
+  ) +
+  scale_y_continuous(
+    limits = c(0, 1),
+    labels = scales::percent_format(accuracy = 1)
+  ) +
+  labs(
+    x = "Measurement-error magnitude",
+    y = "Treatment rate",
+    linetype = "Model",
+    shape = "Model"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    legend.position = "bottom",
+    panel.grid.minor = element_blank()
+  )
+
+print(p_treatment)
+
+ggsave(
+  "cancer_ME_treatment_rate.png",
+  p_treatment,
+  width = 8,
+  height = 5.5,
+  dpi = 300
+)
+
+#===============================================================================
+# Figure 4: ATE versus Regression ATE
+#===============================================================================
+
+ate_long <- results %>%
+  select(Model, ME, ATE_DR, Regression_ATE) %>%
+  pivot_longer(
+    cols = c(ATE_DR, Regression_ATE),
+    names_to = "Estimator",
+    values_to = "ATE"
+  )
+
+ate_long$Estimator <- factor(
+  ate_long$Estimator,
+  levels = c("ATE_DR", "Regression_ATE"),
+  labels = c("Doubly robust", "Regression")
+)
+
+p_ate_compare <- ggplot(
+  ate_long,
+  aes(
+    x = ME,
+    y = ATE,
+    group = interaction(Model, Estimator),
+    linetype = interaction(Model, Estimator),
+    shape = Estimator
+  )
+) +
+  geom_hline(
+    yintercept = 0,
+    linewidth = 0.5
+  ) +
+  geom_line(linewidth = 0.7) +
+  geom_point(size = 2.5) +
+  scale_x_continuous(
+    breaks = c(0, 0.10, 0.25, 0.50, 1.00)
+  ) +
+  labs(
+    x = "Measurement-error magnitude",
+    y = "Estimated treatment effect",
+    linetype = "Model",
+    shape = "Estimator"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    legend.position = "bottom",
+    panel.grid.minor = element_blank()
+  )
+
+print(p_ate_compare)
+
+ggsave(
+  "cancer_ME_ATE_comparison.png",
+  p_ate_compare,
+  width = 8,
+  height = 5.5,
+  dpi = 300
+)
+
+#===============================================================================
+# Summary
+#===============================================================================
+
+print(
+  results %>%
+    group_by(Model) %>%
+    summarise(
+      Mean_ATE = mean(ATE_DR),
+      Mean_SE = mean(Bootstrap_SE),
+      Mean_Policy_Value = mean(Policy_Value),
+      Mean_Treatment_Rate = mean(Treatment_Rate),
+      .groups = "drop"
+    )
+)

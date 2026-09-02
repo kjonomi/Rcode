@@ -2978,111 +2978,140 @@ write.csv(
   row.names = FALSE
 )
 
-
 # ==============================================================================
 # 26. RELATIVE PERFORMANCE VERSUS UNIFORM MLP
 # ==============================================================================
 
 uniform_mlp <-
-  results_df %>%
-  filter(
-    model == "MLP",
-    replay == "Uniform"
-  ) %>%
-  select(
-    replication,
-    uniform_policy_value =
-      policy_value,
-    uniform_regret =
-      regret
-  )
-
+    results_df %>%
+    dplyr::filter(
+        model == "MLP",
+        replay == "Uniform"
+    ) %>%
+    dplyr::select(
+        replication,
+        uniform_policy_value = policy_value,
+        uniform_regret = regret
+    )
 
 relative_results <-
-  results_df %>%
-  left_join(
-    uniform_mlp,
-    by = "replication"
-  ) %>%
-  mutate(
+    results_df %>%
+    dplyr::filter(
+        !(model == "MLP" & replay == "Uniform")
+    ) %>%
+    dplyr::select(
+        replication,
+        model,
+        replay,
+        policy_value,
+        regret
+    ) %>%
+    dplyr::left_join(
+        uniform_mlp,
+        by = "replication"
+    ) %>%
+    dplyr::mutate(
+        policy_value_difference =
+            policy_value - uniform_policy_value,
 
-    policy_value_difference =
-      policy_value -
-      uniform_policy_value,
+        regret_difference =
+            regret - uniform_regret,
 
-    regret_difference =
-      regret -
-      uniform_regret
-  )
+        relative_policy_value =
+            (policy_value - uniform_policy_value) /
+            abs(uniform_policy_value),
 
+        relative_regret =
+            (regret - uniform_regret) /
+            abs(uniform_regret)
+    )
 
 write.csv(
-  relative_results,
-  file = file.path(
-    OUTPUT_DIR,
-    "relative_results.csv"
-  ),
-  row.names = FALSE
+    relative_results,
+    file = file.path(
+        OUTPUT_DIR,
+        "relative_results.csv"
+    ),
+    row.names = FALSE
 )
-
-
 # ==============================================================================
 # 27. PAIRED STATISTICAL TESTS
+#
+# All inferential comparisons are conducted at the Monte Carlo replication
+# level. Each prioritized method is compared with Uniform MLP using the same
+# replication-specific simulated data and data partition.
 # ==============================================================================
 
 paired_test <- function(
     df,
     method_name,
-    metric = "policy_value") {
+    metric = "policy_value"
+) {
 
+  # ---------------------------------------------------------------------------
+  # Extract the method being compared
+  # ---------------------------------------------------------------------------
 
   method_df <-
     df %>%
-    filter(
+    dplyr::filter(
       model == "MLP",
       replay == method_name
     )
 
+  # ---------------------------------------------------------------------------
+  # Construct paired comparison
+  # ---------------------------------------------------------------------------
 
-  if (
-    metric == "policy_value"
-  ) {
+  if (metric == "policy_value") {
 
     comparison <-
       method_df %>%
-      select(
+      dplyr::select(
         replication,
         value = policy_value
       ) %>%
-      inner_join(
+      dplyr::inner_join(
         uniform_mlp %>%
-          select(
+          dplyr::select(
             replication,
-            uniform_value =
-              uniform_policy_value
+            uniform_value = uniform_policy_value
+          ),
+        by = "replication"
+      )
+
+  } else if (metric == "regret") {
+
+    comparison <-
+      method_df %>%
+      dplyr::select(
+        replication,
+        value = regret
+      ) %>%
+      dplyr::inner_join(
+        uniform_mlp %>%
+          dplyr::select(
+            replication,
+            uniform_value = uniform_regret
           ),
         by = "replication"
       )
 
   } else {
 
-    comparison <-
-      method_df %>%
-      select(
-        replication,
-        value = regret
-      ) %>%
-      inner_join(
-        uniform_mlp %>%
-          select(
-            replication,
-            uniform_value =
-              uniform_regret
-          ),
-        by = "replication"
-      )
+    stop(
+      "Unknown metric: ",
+      metric,
+      ". Use 'policy_value' or 'regret'."
+    )
   }
 
+  # ---------------------------------------------------------------------------
+  # Paired differences
+  #
+  # Positive difference is favorable for policy value.
+  # Negative difference is favorable for regret.
+  # ---------------------------------------------------------------------------
 
   difference <-
     comparison$value -
@@ -3093,13 +3122,14 @@ paired_test <- function(
       is.finite(difference)
     ]
 
+  # ---------------------------------------------------------------------------
+  # Insufficient observations
+  # ---------------------------------------------------------------------------
 
-  if (
-    length(difference) < 2
-  ) {
+  if (length(difference) < 2) {
 
     return(
-      tibble(
+      tibble::tibble(
         method = method_name,
         metric = metric,
         n = length(difference),
@@ -3111,36 +3141,65 @@ paired_test <- function(
     )
   }
 
+  # ---------------------------------------------------------------------------
+  # Paired t-test
+  #
+  # Since the paired comparison has already been reduced to differences,
+  # a one-sample t-test of the differences is equivalent to a paired t-test.
+  # ---------------------------------------------------------------------------
 
   t_result <-
-    t.test(
+    stats::t.test(
       difference,
       mu = 0
     )
 
+  # ---------------------------------------------------------------------------
+  # Wilcoxon signed-rank test
+  # ---------------------------------------------------------------------------
+
   w_result <-
-    wilcox.test(
-      difference,
-      mu = 0,
-      exact = FALSE
+    suppressWarnings(
+      stats::wilcox.test(
+        difference,
+        mu = 0,
+        exact = FALSE
+      )
     )
 
+  # ---------------------------------------------------------------------------
+  # Return results
+  # ---------------------------------------------------------------------------
 
-  tibble(
+  tibble::tibble(
     method = method_name,
     metric = metric,
     n = length(difference),
+
     mean_difference =
-      mean(difference),
+      mean(
+        difference,
+        na.rm = TRUE
+      ),
+
     sd_difference =
-      sd(difference),
+      stats::sd(
+        difference,
+        na.rm = TRUE
+      ),
+
     paired_t_p =
       t_result$p.value,
+
     wilcoxon_p =
       w_result$p.value
   )
 }
 
+
+# ------------------------------------------------------------------------------
+# Methods compared with Uniform MLP
+# ------------------------------------------------------------------------------
 
 methods_to_compare <-
   c(
@@ -3150,13 +3209,17 @@ methods_to_compare <-
   )
 
 
+# ------------------------------------------------------------------------------
+# Run paired tests for policy value and regret
+# ------------------------------------------------------------------------------
+
 test_results <-
-  bind_rows(
+  dplyr::bind_rows(
     lapply(
       methods_to_compare,
       function(m) {
 
-        bind_rows(
+        dplyr::bind_rows(
 
           paired_test(
             results_df,
@@ -3175,6 +3238,10 @@ test_results <-
   )
 
 
+# ------------------------------------------------------------------------------
+# Save results
+# ------------------------------------------------------------------------------
+
 write.csv(
   test_results,
   file = file.path(
@@ -3187,26 +3254,33 @@ write.csv(
 
 # ==============================================================================
 # 28. BOOTSTRAP CONFIDENCE INTERVAL
+#
+# Bootstrap inference is performed on replication-level paired differences.
+# This preserves the Monte Carlo replication as the inferential unit.
 # ==============================================================================
 
 bootstrap_paired_difference <- function(
     differences,
     R = 2000,
-    seed = 1) {
+    seed = 1
+) {
 
-  set.seed(
-    seed
-  )
+  set.seed(seed)
+
+  # ---------------------------------------------------------------------------
+  # Retain only finite differences
+  # ---------------------------------------------------------------------------
 
   differences <-
     differences[
       is.finite(differences)
     ]
 
+  # ---------------------------------------------------------------------------
+  # Insufficient observations
+  # ---------------------------------------------------------------------------
 
-  if (
-    length(differences) < 2
-  ) {
+  if (length(differences) < 2) {
 
     return(
       c(
@@ -3217,18 +3291,24 @@ bootstrap_paired_difference <- function(
     )
   }
 
+  # ---------------------------------------------------------------------------
+  # Bootstrap statistic: mean paired difference
+  # ---------------------------------------------------------------------------
 
   boot_stat <- function(
       data,
-      indices) {
+      indices
+  ) {
 
     mean(
-      data[
-        indices
-      ]
+      data[indices],
+      na.rm = TRUE
     )
   }
 
+  # ---------------------------------------------------------------------------
+  # Bootstrap resampling
+  # ---------------------------------------------------------------------------
 
   boot_object <-
     boot::boot(
@@ -3237,14 +3317,36 @@ bootstrap_paired_difference <- function(
       R = R
     )
 
+  # ---------------------------------------------------------------------------
+  # Percentile confidence interval
+  # ---------------------------------------------------------------------------
 
   ci <-
     tryCatch(
 
-      boot::boot.ci(
-        boot_object,
-        type = "perc"
-      )$percent[4:5],
+      {
+
+        ci_object <-
+          boot::boot.ci(
+            boot_object,
+            type = "perc"
+          )
+
+        if (
+          is.null(ci_object$percent) ||
+          length(ci_object$percent) < 5
+        ) {
+
+          c(
+            NA_real_,
+            NA_real_
+          )
+
+        } else {
+
+          ci_object$percent[4:5]
+        }
+      },
 
       error = function(e) {
 
@@ -3255,17 +3357,29 @@ bootstrap_paired_difference <- function(
       }
     )
 
+  # ---------------------------------------------------------------------------
+  # Return estimate and confidence limits
+  # ---------------------------------------------------------------------------
 
   c(
     estimate =
-      mean(differences),
+      mean(
+        differences,
+        na.rm = TRUE
+      ),
+
     lower =
       ci[1],
+
     upper =
       ci[2]
   )
 }
 
+
+# ------------------------------------------------------------------------------
+# Bootstrap results
+# ------------------------------------------------------------------------------
 
 bootstrap_results <-
   list()
@@ -3277,24 +3391,22 @@ for (
 
   method_df <-
     results_df %>%
-    filter(
+    dplyr::filter(
       model == "MLP",
       replay == m
     ) %>%
-    select(
+    dplyr::select(
       replication,
       policy_value,
       regret
     )
 
-
   comparison <-
     method_df %>%
-    inner_join(
+    dplyr::inner_join(
       uniform_mlp,
       by = "replication"
     )
-
 
   # ---------------------------------------------------------------------------
   # Policy value
@@ -3304,29 +3416,26 @@ for (
     comparison$policy_value -
     comparison$uniform_policy_value
 
-
   pv_ci <-
     bootstrap_paired_difference(
-      pv_diff,
+      differences = pv_diff,
       R = 2000,
-      seed = 70000
+      seed = 70000 + match(
+        m,
+        methods_to_compare
+      )
     )
-
 
   bootstrap_results[[
     length(bootstrap_results) + 1
   ]] <-
-    tibble(
+    tibble::tibble(
       method = m,
       metric = "policy_value",
-      estimate =
-        pv_ci["estimate"],
-      lower =
-        pv_ci["lower"],
-      upper =
-        pv_ci["upper"]
+      estimate = as.numeric(pv_ci["estimate"]),
+      lower = as.numeric(pv_ci["lower"]),
+      upper = as.numeric(pv_ci["upper"])
     )
-
 
   # ---------------------------------------------------------------------------
   # Regret
@@ -3336,36 +3445,41 @@ for (
     comparison$regret -
     comparison$uniform_regret
 
-
   regret_ci <-
     bootstrap_paired_difference(
-      regret_diff,
-      R = 2000,
-      seed = 71000
+      differences = regret_diff,
+      R = 71000 + match(
+        m,
+        methods_to_compare
+      ),
+      seed = 71000 + match(
+        m,
+        methods_to_compare
+      )
     )
-
 
   bootstrap_results[[
     length(bootstrap_results) + 1
   ]] <-
-    tibble(
+    tibble::tibble(
       method = m,
       metric = "regret",
-      estimate =
-        regret_ci["estimate"],
-      lower =
-        regret_ci["lower"],
-      upper =
-        regret_ci["upper"]
+      estimate = as.numeric(regret_ci["estimate"]),
+      lower = as.numeric(regret_ci["lower"]),
+      upper = as.numeric(regret_ci["upper"])
     )
 }
 
 
 bootstrap_results_df <-
-  bind_rows(
+  dplyr::bind_rows(
     bootstrap_results
   )
 
+
+# ------------------------------------------------------------------------------
+# Save bootstrap results
+# ------------------------------------------------------------------------------
 
 write.csv(
   bootstrap_results_df,
@@ -3381,7 +3495,16 @@ write.csv(
 # 29. ALPHA SENSITIVITY ANALYSIS
 #
 # This is a separate diagnostic sensitivity analysis.
-# It does NOT replace validation-based alpha selection.
+#
+# IMPORTANT:
+# The main analysis selects alpha using the validation set.
+# This section does NOT perform alpha selection.
+#
+# Instead, the prespecified alpha grid is evaluated directly on the held-out
+# test set to characterize the sensitivity of policy performance to the
+# prioritization strength.
+#
+# To control computational cost, this diagnostic uses at most 10 replications.
 # ==============================================================================
 
 cat(
@@ -3418,6 +3541,9 @@ for (
     "\n"
   )
 
+  # ---------------------------------------------------------------------------
+  # Generate independent semisynthetic data
+  # ---------------------------------------------------------------------------
 
   data_alpha <-
     generate_boston_data(
@@ -3426,6 +3552,9 @@ for (
       seed = 80000 + r
     )
 
+  # ---------------------------------------------------------------------------
+  # Create train/validation/test partition
+  # ---------------------------------------------------------------------------
 
   split_alpha <-
     make_data_split(
@@ -3434,7 +3563,6 @@ for (
       valid_prop = VALID_PROP,
       seed = 90000 + r
     )
-
 
   train_alpha <-
     subset_data(
@@ -3448,6 +3576,9 @@ for (
       split_alpha$test
     )
 
+  # ---------------------------------------------------------------------------
+  # Evaluate each prespecified alpha value
+  # ---------------------------------------------------------------------------
 
   for (
     alpha_j in ALPHA_GRID
@@ -3460,7 +3591,6 @@ for (
       )
     )
 
-
     fit_alpha <-
       fit_and_evaluate(
         train_data = train_alpha,
@@ -3471,11 +3601,10 @@ for (
         seed = 100000 + r
       )
 
-
     alpha_results_all[[
       length(alpha_results_all) + 1
     ]] <-
-      tibble(
+      tibble::tibble(
         replication = r,
         alpha = alpha_j,
 
@@ -3493,10 +3622,14 @@ for (
 
 
 alpha_results_df <-
-  bind_rows(
+  dplyr::bind_rows(
     alpha_results_all
   )
 
+
+# ------------------------------------------------------------------------------
+# Save alpha sensitivity results
+# ------------------------------------------------------------------------------
 
 write.csv(
   alpha_results_df,
@@ -3510,6 +3643,12 @@ write.csv(
 
 # ==============================================================================
 # 30. ARCHITECTURE ABLATION
+#
+# The MLP is the primary architecture for the static tabular benchmark.
+# CNN-LSTM is evaluated as an architectural ablation using the same noisy
+# short-sequence representation constructed by generate_boston_data().
+#
+# This analysis uses at most 10 independent replications.
 # ==============================================================================
 
 cat(
@@ -3540,6 +3679,16 @@ for (
   r in seq_len(N_ARCH_RUNS)
 ) {
 
+  cat(
+    "\nArchitecture ablation replication:",
+    r,
+    "\n"
+  )
+
+  # ---------------------------------------------------------------------------
+  # Generate independent semisynthetic data
+  # ---------------------------------------------------------------------------
+
   data_arch <-
     generate_boston_data(
       n = N,
@@ -3547,6 +3696,9 @@ for (
       seed = 120000 + r
     )
 
+  # ---------------------------------------------------------------------------
+  # Create common train/validation/test partition
+  # ---------------------------------------------------------------------------
 
   split_arch <-
     make_data_split(
@@ -3555,7 +3707,6 @@ for (
       valid_prop = VALID_PROP,
       seed = 130000 + r
     )
-
 
   train_arch <-
     subset_data(
@@ -3569,14 +3720,22 @@ for (
       split_arch$test
     )
 
+  # ---------------------------------------------------------------------------
+  # Same replication and data partition across architectures
+  # ---------------------------------------------------------------------------
 
-  # Same seed across architectures for paired comparison.
   for (
     architecture in c(
       "MLP",
       "CNN-LSTM"
     )
   ) {
+
+    cat(
+      "  Architecture:",
+      architecture,
+      "\n"
+    )
 
     fit_arch <-
       fit_and_evaluate(
@@ -3588,13 +3747,12 @@ for (
         seed = 140000 + r
       )
 
-
     architecture_results_all[[
       length(
         architecture_results_all
       ) + 1
     ]] <-
-      tibble(
+      tibble::tibble(
         replication = r,
         architecture = architecture,
         alpha = 0.5,
@@ -3613,10 +3771,14 @@ for (
 
 
 architecture_results_df <-
-  bind_rows(
+  dplyr::bind_rows(
     architecture_results_all
   )
 
+
+# ------------------------------------------------------------------------------
+# Save architecture ablation results
+# ------------------------------------------------------------------------------
 
 write.csv(
   architecture_results_df,
@@ -3630,6 +3792,11 @@ write.csv(
 
 # ==============================================================================
 # 31. LEARNING CURVES
+#
+# Learning curves are descriptive diagnostics from one representative
+# semisynthetic training dataset. They are NOT replication-level inferential
+# results and should not be interpreted as averages over the full Monte Carlo
+# experiment.
 # ==============================================================================
 
 cat(
@@ -3644,6 +3811,10 @@ cat(
   "============================================================\n"
 )
 
+
+# ------------------------------------------------------------------------------
+# Representative dataset
+# ------------------------------------------------------------------------------
 
 representative_data <-
   generate_boston_data(
@@ -3669,6 +3840,10 @@ representative_train <-
   )
 
 
+# ------------------------------------------------------------------------------
+# Replay methods
+# ------------------------------------------------------------------------------
+
 learning_methods <-
   c(
     "Uniform",
@@ -3682,22 +3857,22 @@ learning_curve_list <-
   list()
 
 
+# ------------------------------------------------------------------------------
+# Train each method
+# ------------------------------------------------------------------------------
+
 for (
-  j in seq_along(
-    learning_methods
-  )
+  j in seq_along(learning_methods)
 ) {
 
   method_j <-
     learning_methods[j]
-
 
   cat(
     "Training learning curve:",
     method_j,
     "\n"
   )
-
 
   fit_learning <-
     train_contextual_bandit(
@@ -3728,15 +3903,16 @@ for (
         180000 + j
     )
 
-
   learning_curve_list[[j]] <-
-    tibble(
+    tibble::tibble(
+
       episode =
         seq_along(
           fit_learning$episode_reward
         ),
 
-      method = method_j,
+      method =
+        method_j,
 
       observed_reward =
         fit_learning$episode_reward,
@@ -3751,10 +3927,14 @@ for (
 
 
 learning_curves_df <-
-  bind_rows(
+  dplyr::bind_rows(
     learning_curve_list
   )
 
+
+# ------------------------------------------------------------------------------
+# Save learning curves
+# ------------------------------------------------------------------------------
 
 write.csv(
   learning_curves_df,
@@ -3770,9 +3950,17 @@ write.csv(
 # 32. PAPER SUMMARY TABLE
 # ==============================================================================
 
+# ------------------------------------------------------------------------------
+# Make the summary table publication-ready.
+#
+# The summary_results object should already contain replication-level means
+# and standard deviations. Rounding is applied only to the exported paper
+# table; the original summary_results object remains unchanged.
+# ------------------------------------------------------------------------------
+
 paper_table <-
   summary_results %>%
-  mutate(
+  dplyr::mutate(
 
     mean_reward =
       round(
@@ -3835,6 +4023,10 @@ paper_table <-
       )
   )
 
+
+# ------------------------------------------------------------------------------
+# Save paper summary table
+# ------------------------------------------------------------------------------
 
 write.csv(
   paper_table,

@@ -4186,3 +4186,124 @@ cat(
 ###############################################################################
 # END
 ###############################################################################
+
+# ============================================================
+# Simulation Figures: Measurement Error Results
+# Graph-Frequency versus Graph-Convolution Representation Learning
+# ============================================================
+
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+# ------------------------------------------------------------
+# Input data
+# ------------------------------------------------------------
+dat <- data.frame(
+  ME = rep(c(0, 0.10, 0.25, 0.50, 1.00), 3),
+  Model = rep(c("CNN-LSTM", "GCN-CNN-LSTM", "GF-CNN-LSTM"), each = 5),
+  Absolute_ATE_Bias = c(
+    0.463653280, 0.500344527, 0.505010168, 0.534755940, 0.547001007,
+    0.465849863, 0.493486946, 0.499443166, 0.541806870, 0.533116740,
+    0.451873677, 0.499484190, 0.509608918, 0.540547994, 0.527470899
+  ),
+  PEHE = c(
+    3.521693668, 3.537197269, 3.523511596, 3.529365369, 3.544704582,
+    3.509048460, 3.503644779, 3.518597307, 3.526142844, 3.527144480,
+    3.517906215, 3.552457205, 3.520632828, 3.540893484, 3.532270122
+  ),
+  Policy_Gap = c(
+    1.002070084, 1.033866816, 1.052175716, 1.097514078, 0.996839646,
+    0.992433535, 1.038563939, 1.054486974, 1.092108480, 0.998400131,
+    0.991213852, 1.034734269, 1.048789423, 1.062389560, 1.001287331
+  )
+)
+
+dat$ME_factor <- factor(
+  dat$ME,
+  levels = c(0, 0.10, 0.25, 0.50, 1.00),
+  labels = c("0.00", "0.10", "0.25", "0.50", "1.00")
+)
+
+# Consistent publication theme
+pub_theme <- theme_classic(base_size = 12) +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    axis.title = element_text(face = "bold"),
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    panel.grid = element_blank()
+  )
+
+# ------------------------------------------------------------
+# Figure 1: Absolute ATE Bias
+# ------------------------------------------------------------
+p1 <- ggplot(dat, aes(x = ME, y = Absolute_ATE_Bias,
+                      group = Model, linetype = Model, shape = Model)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2.7) +
+  scale_x_continuous(breaks = c(0, .10, .25, .50, 1.00)) +
+  labs(
+    x = "Measurement Error Level",
+    y = "Absolute ATE Bias"
+  ) +
+  pub_theme
+
+ggsave(
+  "ME_effect_ATE_bias.png", p1,
+  width = 7, height = 5, units = "in", dpi = 600
+)
+
+# ------------------------------------------------------------
+# Figure 2: PEHE
+# ------------------------------------------------------------
+p2 <- ggplot(dat, aes(x = ME, y = PEHE,
+                      group = Model, linetype = Model, shape = Model)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2.7) +
+  scale_x_continuous(breaks = c(0, .10, .25, .50, 1.00)) +
+  labs(
+    x = "Measurement Error Level",
+    y = "PEHE"
+  ) +
+  pub_theme
+
+ggsave(
+  "ME_effect_PEHE.png", p2,
+  width = 7, height = 5, units = "in", dpi = 600
+)
+
+# ------------------------------------------------------------
+# Figure 3: Policy Gap
+# ------------------------------------------------------------
+p3 <- ggplot(dat, aes(x = ME, y = Policy_Gap,
+                      group = Model, linetype = Model, shape = Model)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2.7) +
+  scale_x_continuous(breaks = c(0, .10, .25, .50, 1.00)) +
+  labs(
+    x = "Measurement Error Level",
+    y = "Absolute Policy Gap"
+  ) +
+  pub_theme
+
+ggsave(
+  "ME_effect_policy_regret.png", p3,
+  width = 7, height = 5, units = "in", dpi = 600
+)
+
+# ------------------------------------------------------------
+# Optional: combined PDF with all three figures
+# ------------------------------------------------------------
+pdf("simulation_figures_all.pdf", width = 7, height = 5)
+print(p1)
+print(p2)
+print(p3)
+dev.off()
+
+cat("Figures saved:\n")
+cat("  ME_effect_ATE_bias.png\n")
+cat("  ME_effect_PEHE.png\n")
+cat("  ME_effect_policy_regret.png\n")
+cat("  simulation_figures_all.pdf\n")
+

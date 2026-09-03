@@ -4207,3 +4207,1541 @@ cat(
 cat(
   "\n============================================================\n"
 )
+
+# ==============================================================================
+# 36. PUBLICATION-QUALITY FIGURES
+#
+# Figures are generated from the CSV files produced by the simulation.
+#
+# Primary figures:
+#   Figure 1: Policy value by replay strategy
+#   Figure 2: Policy regret by replay strategy
+#
+# Diagnostic figures:
+#   Figure 3: Action-selection rates
+#   Figure 4: Alpha sensitivity
+#   Figure 5: Learning curves
+#   Figure 6: Paired policy-value differences versus Uniform MLP
+#
+# All figures are saved as high-resolution PNG and PDF files.
+# ==============================================================================
+
+
+# ==============================================================================
+# 36.1 FIGURE SETTINGS
+# ==============================================================================
+
+FIG_DIR <- file.path(
+  OUTPUT_DIR,
+  "figures"
+)
+
+dir.create(
+  FIG_DIR,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+
+# ------------------------------------------------------------------------------
+# Publication theme
+# ------------------------------------------------------------------------------
+
+theme_paper <- function(base_size = 12) {
+
+  ggplot2::theme_bw(
+    base_size = base_size
+  ) +
+
+    ggplot2::theme(
+
+      plot.title =
+        ggplot2::element_text(
+          face = "bold",
+          size = 13,
+          hjust = 0.5
+        ),
+
+      plot.subtitle =
+        ggplot2::element_text(
+          size = 10,
+          hjust = 0.5
+        ),
+
+      axis.title =
+        ggplot2::element_text(
+          face = "bold"
+        ),
+
+      axis.text =
+        ggplot2::element_text(
+          color = "black"
+        ),
+
+      legend.title =
+        ggplot2::element_text(
+          face = "bold"
+        ),
+
+      legend.position =
+        "bottom",
+
+      panel.grid.minor =
+        ggplot2::element_blank(),
+
+      panel.grid.major.x =
+        ggplot2::element_blank(),
+
+      strip.text =
+        ggplot2::element_text(
+          face = "bold"
+        )
+    )
+}
+
+
+# ------------------------------------------------------------------------------
+# Consistent replay-method ordering
+# ------------------------------------------------------------------------------
+
+replay_levels <- c(
+  "Uniform",
+  "Entropy",
+  "Residual-PER",
+  "Quantum-Uncertainty"
+)
+
+
+replay_labels <- c(
+  "Uniform",
+  "Entropy",
+  "Residual-PER",
+  "Quantum-Uncertainty"
+)
+
+
+# ==============================================================================
+# 36.2 LOAD RESULTS
+# ==============================================================================
+
+summary_fig <- read.csv(
+  file.path(
+    OUTPUT_DIR,
+    "summary_results.csv"
+  ),
+  stringsAsFactors = FALSE
+)
+
+
+results_fig <- read.csv(
+  file.path(
+    OUTPUT_DIR,
+    "results_all.csv"
+  ),
+  stringsAsFactors = FALSE
+)
+
+
+alpha_fig <- read.csv(
+  file.path(
+    OUTPUT_DIR,
+    "alpha_sensitivity.csv"
+  ),
+  stringsAsFactors = FALSE
+)
+
+
+learning_fig <- read.csv(
+  file.path(
+    OUTPUT_DIR,
+    "learning_curves.csv"
+  ),
+  stringsAsFactors = FALSE
+)
+
+
+# ------------------------------------------------------------------------------
+# Factor ordering
+# ------------------------------------------------------------------------------
+
+summary_fig$replay <-
+  factor(
+    summary_fig$replay,
+    levels = replay_levels
+  )
+
+
+results_fig$replay <-
+  factor(
+    results_fig$replay,
+    levels = replay_levels
+  )
+
+
+# ==============================================================================
+# 36.3 FIGURE 1 -- POLICY VALUE
+#
+# Primary performance figure.
+# MLP replay strategies are shown together, with CNN-LSTM comparisons
+# shown separately.
+# ==============================================================================
+
+policy_plot_data <-
+  summary_fig %>%
+  dplyr::mutate(
+
+    model_replay =
+      paste(
+        model,
+        replay,
+        sep = ": "
+      ),
+
+    lower =
+      mean_policy_value -
+      sd_policy_value,
+
+    upper =
+      mean_policy_value +
+      sd_policy_value
+  )
+
+
+fig_policy_value <-
+  ggplot2::ggplot(
+    policy_plot_data,
+    ggplot2::aes(
+      x = replay,
+      y = mean_policy_value,
+      group = model,
+      shape = model
+    )
+  ) +
+
+  ggplot2::geom_point(
+    size = 3
+  ) +
+
+  ggplot2::geom_errorbar(
+    ggplot2::aes(
+      ymin = lower,
+      ymax = upper
+    ),
+    width = 0.15,
+    linewidth = 0.6
+  ) +
+
+  ggplot2::facet_wrap(
+    ~ model,
+    scales = "free_x"
+  ) +
+
+  ggplot2::labs(
+
+    title =
+      "Held-Out Policy Value by Replay Strategy",
+
+    subtitle =
+      "Mean across 30 Monte Carlo replications; error bars denote replication-level SD",
+
+    x =
+      "Replay strategy",
+
+    y =
+      "Mean policy value",
+
+    shape =
+      "Architecture"
+  ) +
+
+  theme_paper() +
+
+  ggplot2::theme(
+
+    axis.text.x =
+      ggplot2::element_text(
+        angle = 25,
+        hjust = 1
+      ),
+
+    legend.position =
+      "none"
+  )
+
+
+print(
+  fig_policy_value
+)
+
+
+# ------------------------------------------------------------------------------
+# Save PNG
+# ------------------------------------------------------------------------------
+
+ggplot2::ggsave(
+  filename =
+    file.path(
+      FIG_DIR,
+      "fig1_policy_value.png"
+    ),
+
+  plot =
+    fig_policy_value,
+
+  width =
+    8,
+
+  height =
+    5.5,
+
+  units =
+    "in",
+
+  dpi =
+    600
+)
+
+
+# ------------------------------------------------------------------------------
+# Save PDF
+# ------------------------------------------------------------------------------
+
+ggplot2::ggsave(
+  filename =
+    file.path(
+      FIG_DIR,
+      "fig1_policy_value.pdf"
+    ),
+
+  plot =
+    fig_policy_value,
+
+  width =
+    8,
+
+  height =
+    5.5,
+
+  units =
+    "in"
+)
+
+
+# ==============================================================================
+# 36.4 FIGURE 2 -- POLICY REGRET
+#
+# Lower is better.
+# ==============================================================================
+
+regret_plot_data <-
+  summary_fig %>%
+  dplyr::mutate(
+
+    lower =
+      pmax(
+        0,
+        mean_regret -
+          sd_regret
+      ),
+
+    upper =
+      mean_regret +
+      sd_regret
+  )
+
+
+fig_regret <-
+  ggplot2::ggplot(
+    regret_plot_data,
+    ggplot2::aes(
+      x = replay,
+      y = mean_regret,
+      group = model,
+      shape = model
+    )
+  ) +
+
+  ggplot2::geom_point(
+    size = 3
+  ) +
+
+  ggplot2::geom_errorbar(
+    ggplot2::aes(
+      ymin = lower,
+      ymax = upper
+    ),
+    width = 0.15,
+    linewidth = 0.6
+  ) +
+
+  ggplot2::facet_wrap(
+    ~ model,
+    scales = "free_x"
+  ) +
+
+  ggplot2::labs(
+
+    title =
+      "Oracle-Based Policy Regret by Replay Strategy",
+
+    subtitle =
+      "Mean across 30 Monte Carlo replications; lower values indicate better policy performance",
+
+    x =
+      "Replay strategy",
+
+    y =
+      "Mean policy regret"
+  ) +
+
+  theme_paper() +
+
+  ggplot2::theme(
+
+    axis.text.x =
+      ggplot2::element_text(
+        angle = 25,
+        hjust = 1
+      ),
+
+    legend.position =
+      "none"
+  )
+
+
+print(
+  fig_regret
+)
+
+
+ggplot2::ggsave(
+  filename =
+    file.path(
+      FIG_DIR,
+      "fig2_policy_regret.png"
+    ),
+
+  plot =
+    fig_regret,
+
+  width =
+    8,
+
+  height =
+    5.5,
+
+  units =
+    "in",
+
+  dpi =
+    600
+)
+
+
+ggplot2::ggsave(
+  filename =
+    file.path(
+      FIG_DIR,
+      "fig2_policy_regret.pdf"
+    ),
+
+  plot =
+    fig_regret,
+
+  width =
+    8,
+
+  height =
+    5.5,
+
+  units =
+    "in"
+)
+
+
+# ==============================================================================
+# 36.5 FIGURE 3 -- ACTION-SELECTION RATES
+#
+# Shows how the learned policy allocates observations among Actions 0, 1, 2.
+# ==============================================================================
+
+
+action_plot_data <-
+  summary_fig %>%
+
+  dplyr::select(
+    model,
+    replay,
+    mean_action_rate_0,
+    mean_action_rate_1,
+    mean_action_rate_2
+  ) %>%
+
+  tidyr::pivot_longer(
+
+    cols =
+      c(
+        mean_action_rate_0,
+        mean_action_rate_1,
+        mean_action_rate_2
+      ),
+
+    names_to =
+      "action",
+
+    values_to =
+      "rate"
+  ) %>%
+
+  dplyr::mutate(
+
+    action =
+      dplyr::recode(
+        action,
+
+        mean_action_rate_0 = "Action 0",
+
+        mean_action_rate_1 = "Action 1",
+
+        mean_action_rate_2 = "Action 2"
+      ),
+
+    action =
+      factor(
+        action,
+        levels =
+          c(
+            "Action 0",
+            "Action 1",
+            "Action 2"
+          )
+      )
+  )
+
+
+fig_action_rates <-
+  ggplot2::ggplot(
+    action_plot_data,
+    ggplot2::aes(
+      x = replay,
+      y = rate,
+      shape = action,
+      group = action
+    )
+  ) +
+
+  ggplot2::geom_point(
+    size = 3
+  ) +
+
+  ggplot2::geom_line(
+    linewidth = 0.7
+  ) +
+
+  ggplot2::facet_wrap(
+    ~ model,
+    scales = "free_x"
+  ) +
+
+  ggplot2::scale_y_continuous(
+    limits =
+      c(
+        0,
+        1
+      ),
+
+    labels =
+      scales::percent_format(
+        accuracy = 1
+      )
+  ) +
+
+  ggplot2::labs(
+
+    title =
+      "Action-Selection Behavior",
+
+    subtitle =
+      "Mean proportion of test observations assigned to each action",
+
+    x =
+      "Replay strategy",
+
+    y =
+      "Action-selection rate",
+
+    shape =
+      "Action"
+  ) +
+
+  theme_paper() +
+
+  ggplot2::theme(
+
+    axis.text.x =
+      ggplot2::element_text(
+        angle = 25,
+        hjust = 1
+      )
+  )
+
+
+print(
+  fig_action_rates
+)
+
+
+ggplot2::ggsave(
+  filename =
+    file.path(
+      FIG_DIR,
+      "fig3_action_selection_rates.png"
+    ),
+
+  plot =
+    fig_action_rates,
+
+  width =
+    8,
+
+  height =
+    5.5,
+
+  units =
+    "in",
+
+  dpi =
+    600
+)
+
+
+ggplot2::ggsave(
+  filename =
+    file.path(
+      FIG_DIR,
+      "fig3_action_selection_rates.pdf"
+    ),
+
+  plot =
+    fig_action_rates,
+
+  width =
+    8,
+
+  height =
+    5.5,
+
+  units =
+    "in"
+)
+
+
+# ==============================================================================
+# 36.6 FIGURE 4 -- ALPHA SENSITIVITY
+#
+# This figure uses the separate prespecified-alpha diagnostic.
+# It must NOT be interpreted as validation-based alpha selection.
+# ==============================================================================
+
+
+alpha_summary_fig <-
+  alpha_fig %>%
+
+  dplyr::group_by(
+    alpha
+  ) %>%
+
+  dplyr::summarise(
+
+    mean_policy_value =
+      mean(
+        policy_value,
+        na.rm = TRUE
+      ),
+
+    sd_policy_value =
+      sd(
+        policy_value,
+        na.rm = TRUE
+      ),
+
+    mean_regret =
+      mean(
+        regret,
+        na.rm = TRUE
+      ),
+
+    sd_regret =
+      sd(
+        regret,
+        na.rm = TRUE
+      ),
+
+    .groups =
+      "drop"
+  )
+
+
+# ------------------------------------------------------------------------------
+# Policy value
+# ------------------------------------------------------------------------------
+
+fig_alpha_policy <-
+  ggplot2::ggplot(
+    alpha_summary_fig,
+    ggplot2::aes(
+      x = alpha,
+      y = mean_policy_value
+    )
+  ) +
+
+  ggplot2::geom_line(
+    linewidth = 0.8
+  ) +
+
+  ggplot2::geom_point(
+    size = 3
+  ) +
+
+  ggplot2::geom_errorbar(
+    ggplot2::aes(
+      ymin =
+        mean_policy_value -
+        sd_policy_value,
+
+      ymax =
+        mean_policy_value +
+        sd_policy_value
+    ),
+
+    width = 0.04,
+
+    linewidth = 0.6
+  ) +
+
+  ggplot2::scale_x_continuous(
+    breaks =
+      ALPHA_GRID
+  ) +
+
+  ggplot2::labs(
+
+    title =
+      "Sensitivity of Policy Value to Replay-Prioritization Strength",
+
+    subtitle =
+      "Separate prespecified-alpha diagnostic; error bars denote replication-level SD",
+
+    x =
+      expression(
+        alpha
+      ),
+
+    y =
+      "Mean policy value"
+  ) +
+
+  theme_paper()
+
+
+print(
+  fig_alpha_policy
+)
+
+
+ggplot2::ggsave(
+  filename =
+    file.path(
+      FIG_DIR,
+      "fig4_alpha_policy_value.png"
+    ),
+
+  plot =
+    fig_alpha_policy,
+
+  width =
+    7,
+
+  height =
+    5.2,
+
+  units =
+    "in",
+
+  dpi =
+    600
+)
+
+
+ggplot2::ggsave(
+  filename =
+    file.path(
+      FIG_DIR,
+      "fig4_alpha_policy_value.pdf"
+    ),
+
+  plot =
+    fig_alpha_policy,
+
+  width =
+    7,
+
+  height =
+    5.2,
+
+  units =
+    "in"
+)
+
+
+# ------------------------------------------------------------------------------
+# Regret
+# ------------------------------------------------------------------------------
+
+fig_alpha_regret <-
+  ggplot2::ggplot(
+    alpha_summary_fig,
+    ggplot2::aes(
+      x = alpha,
+      y = mean_regret
+    )
+  ) +
+
+  ggplot2::geom_line(
+    linewidth = 0.8
+  ) +
+
+  ggplot2::geom_point(
+    size = 3
+  ) +
+
+  ggplot2::geom_errorbar(
+    ggplot2::aes(
+      ymin =
+        pmax(
+          0,
+          mean_regret -
+            sd_regret
+        ),
+
+      ymax =
+        mean_regret +
+        sd_regret
+    ),
+
+    width = 0.04,
+
+    linewidth = 0.6
+  ) +
+
+  ggplot2::scale_x_continuous(
+    breaks =
+      ALPHA_GRID
+  ) +
+
+  ggplot2::labs(
+
+    title =
+      "Sensitivity of Policy Regret to Replay-Prioritization Strength",
+
+    subtitle =
+      "Separate prespecified-alpha diagnostic; lower values are better",
+
+    x =
+      expression(
+        alpha
+      ),
+
+    y =
+      "Mean policy regret"
+  ) +
+
+  theme_paper()
+
+
+print(
+  fig_alpha_regret
+)
+
+
+ggplot2::ggsave(
+  filename =
+    file.path(
+      FIG_DIR,
+      "fig4_alpha_regret.png"
+    ),
+
+  plot =
+    fig_alpha_regret,
+
+  width =
+    7,
+
+  height =
+    5.2,
+
+  units =
+    "in",
+
+  dpi =
+    600
+)
+
+
+ggplot2::ggsave(
+  filename =
+    file.path(
+      FIG_DIR,
+      "fig4_alpha_regret.pdf"
+    ),
+
+  plot =
+    fig_alpha_regret,
+
+  width =
+    7,
+
+  height =
+    5.2,
+
+  units =
+    "in"
+)
+
+
+# ==============================================================================
+# 36.7 FIGURE 5 -- LEARNING CURVES
+#
+# Representative single-dataset diagnostic.
+#
+# IMPORTANT:
+# These are NOT Monte Carlo averages.
+# ==============================================================================
+
+
+learning_long <-
+  learning_fig %>%
+
+  dplyr::select(
+    episode,
+    method,
+    observed_reward,
+    greedy_policy_reward
+  ) %>%
+
+  tidyr::pivot_longer(
+
+    cols =
+      c(
+        observed_reward,
+        greedy_policy_reward
+      ),
+
+    names_to =
+      "curve",
+
+    values_to =
+      "reward"
+  ) %>%
+
+  dplyr::mutate(
+
+    curve =
+      dplyr::recode(
+        curve,
+
+        observed_reward =
+          "Observed reward",
+
+        greedy_policy_reward =
+          "Greedy policy reward"
+      )
+  )
+
+
+fig_learning <-
+  ggplot2::ggplot(
+    learning_long,
+    ggplot2::aes(
+      x = episode,
+      y = reward,
+      linetype = curve
+    )
+  ) +
+
+  ggplot2::geom_line(
+    linewidth = 0.8
+  ) +
+
+  ggplot2::facet_wrap(
+    ~ method,
+    ncol = 2
+  ) +
+
+  ggplot2::labs(
+
+    title =
+      "Representative Learning Dynamics",
+
+    subtitle =
+      "MLP trained on one semisynthetic Boston Housing dataset",
+
+    x =
+      "Episode",
+
+    y =
+      "Mean reward",
+
+    linetype =
+      "Training quantity"
+  ) +
+
+  theme_paper()
+
+
+print(
+  fig_learning
+)
+
+
+ggplot2::ggsave(
+  filename =
+    file.path(
+      FIG_DIR,
+      "fig5_learning_curves.png"
+    ),
+
+  plot =
+    fig_learning,
+
+  width =
+    9,
+
+  height =
+    7,
+
+  units =
+    "in",
+
+  dpi =
+    600
+)
+
+
+ggplot2::ggsave(
+  filename =
+    file.path(
+      FIG_DIR,
+      "fig5_learning_curves.pdf"
+    ),
+
+  plot =
+    fig_learning,
+
+  width =
+    9,
+
+  height =
+    7,
+
+  units =
+    "in"
+)
+
+
+# ==============================================================================
+# 36.8 FIGURE 6 -- PAIRED POLICY-VALUE DIFFERENCES
+#
+# Each point represents one Monte Carlo replication.
+#
+# Difference:
+#
+#       Method policy value - Uniform MLP policy value
+#
+# Positive values favor the compared method.
+#
+# This is particularly useful because the simulation uses the same data
+# and partition within each replication.
+# ==============================================================================
+
+
+paired_plot_data <-
+  results_fig %>%
+
+  dplyr::filter(
+    model == "MLP",
+    replay != "Uniform"
+  ) %>%
+
+  dplyr::select(
+    replication,
+    replay,
+    policy_value
+  ) %>%
+
+  dplyr::left_join(
+
+    results_fig %>%
+
+      dplyr::filter(
+        model == "MLP",
+        replay == "Uniform"
+      ) %>%
+
+      dplyr::select(
+        replication,
+        uniform_policy_value =
+          policy_value
+      ),
+
+    by =
+      "replication"
+  ) %>%
+
+  dplyr::mutate(
+
+    difference =
+      policy_value -
+      uniform_policy_value
+  )
+
+
+fig_paired_difference <-
+  ggplot2::ggplot(
+    paired_plot_data,
+    ggplot2::aes(
+      x = replay,
+      y = difference
+    )
+  ) +
+
+  ggplot2::geom_hline(
+    yintercept = 0,
+    linetype = "dashed",
+    linewidth = 0.6
+  ) +
+
+  ggplot2::geom_jitter(
+    width = 0.08,
+    height = 0,
+    size = 2,
+    alpha = 0.75
+  ) +
+
+  ggplot2::stat_summary(
+    fun = mean,
+    geom = "point",
+    size = 4
+  ) +
+
+  ggplot2::labs(
+
+    title =
+      "Replication-Level Policy-Value Differences",
+
+    subtitle =
+      "Difference relative to Uniform MLP; positive values favor the compared method",
+
+    x =
+      "Replay strategy",
+
+    y =
+      "Policy-value difference from Uniform MLP"
+  ) +
+
+  theme_paper() +
+
+  ggplot2::theme(
+
+    axis.text.x =
+      ggplot2::element_text(
+        angle = 25,
+        hjust = 1
+      )
+  )
+
+
+print(
+  fig_paired_difference
+)
+
+
+ggplot2::ggsave(
+  filename =
+    file.path(
+      FIG_DIR,
+      "fig6_paired_policy_value_difference.png"
+    ),
+
+  plot =
+    fig_paired_difference,
+
+  width =
+    8,
+
+  height =
+    5.5,
+
+  units =
+    "in",
+
+  dpi =
+    600
+)
+
+
+ggplot2::ggsave(
+  filename =
+    file.path(
+      FIG_DIR,
+      "fig6_paired_policy_value_difference.pdf"
+    ),
+
+  plot =
+    fig_paired_difference,
+
+  width =
+    8,
+
+  height =
+    5.5,
+
+  units =
+    "in"
+)
+
+
+# ==============================================================================
+# 36.9 OPTIONAL FIGURE -- PAIRED REGRET DIFFERENCES
+#
+# Negative values favor the compared method because lower regret is better.
+# ==============================================================================
+
+
+paired_regret_data <-
+  results_fig %>%
+
+  dplyr::filter(
+    model == "MLP",
+    replay != "Uniform"
+  ) %>%
+
+  dplyr::select(
+    replication,
+    replay,
+    regret
+  ) %>%
+
+  dplyr::left_join(
+
+    results_fig %>%
+
+      dplyr::filter(
+        model == "MLP",
+        replay == "Uniform"
+      ) %>%
+
+      dplyr::select(
+        replication,
+        uniform_regret =
+          regret
+      ),
+
+    by =
+      "replication"
+  ) %>%
+
+  dplyr::mutate(
+
+    difference =
+      regret -
+      uniform_regret
+  )
+
+
+fig_paired_regret <-
+  ggplot2::ggplot(
+    paired_regret_data,
+    ggplot2::aes(
+      x = replay,
+      y = difference
+    )
+  ) +
+
+  ggplot2::geom_hline(
+    yintercept = 0,
+    linetype = "dashed",
+    linewidth = 0.6
+  ) +
+
+  ggplot2::geom_jitter(
+    width = 0.08,
+    height = 0,
+    size = 2,
+    alpha = 0.75
+  ) +
+
+  ggplot2::stat_summary(
+    fun = mean,
+    geom = "point",
+    size = 4
+  ) +
+
+  ggplot2::labs(
+
+    title =
+      "Replication-Level Policy-Regret Differences",
+
+    subtitle =
+      "Difference relative to Uniform MLP; negative values favor the compared method",
+
+    x =
+      "Replay strategy",
+
+    y =
+      "Regret difference from Uniform MLP"
+  ) +
+
+  theme_paper() +
+
+  ggplot2::theme(
+
+    axis.text.x =
+      ggplot2::element_text(
+        angle = 25,
+        hjust = 1
+      )
+  )
+
+
+print(
+  fig_paired_regret
+)
+
+
+ggplot2::ggsave(
+  filename =
+    file.path(
+      FIG_DIR,
+      "fig7_paired_regret_difference.png"
+    ),
+
+  plot =
+    fig_paired_regret,
+
+  width =
+    8,
+
+  height =
+    5.5,
+
+  units =
+    "in",
+
+  dpi =
+    600
+)
+
+
+ggplot2::ggsave(
+  filename =
+    file.path(
+      FIG_DIR,
+      "fig7_paired_regret_difference.pdf"
+    ),
+
+  plot =
+    fig_paired_regret,
+
+  width =
+    8,
+
+  height =
+    5.5,
+
+  units =
+    "in"
+)
+
+
+# ==============================================================================
+# 36.10 SAVE FIGURE DATA
+#
+# Save the processed data used to create the figures for reproducibility.
+# ==============================================================================
+
+write.csv(
+  policy_plot_data,
+  file =
+    file.path(
+      FIG_DIR,
+      "figure1_policy_value_data.csv"
+    ),
+  row.names = FALSE
+)
+
+
+write.csv(
+  regret_plot_data,
+  file =
+    file.path(
+      FIG_DIR,
+      "figure2_policy_regret_data.csv"
+    ),
+  row.names = FALSE
+)
+
+
+write.csv(
+  action_plot_data,
+  file =
+    file.path(
+      FIG_DIR,
+      "figure3_action_selection_data.csv"
+    ),
+  row.names = FALSE
+)
+
+
+write.csv(
+  alpha_summary_fig,
+  file =
+    file.path(
+      FIG_DIR,
+      "figure4_alpha_sensitivity_data.csv"
+    ),
+  row.names = FALSE
+)
+
+
+write.csv(
+  learning_long,
+  file =
+    file.path(
+      FIG_DIR,
+      "figure5_learning_curve_data.csv"
+    ),
+  row.names = FALSE
+)
+
+
+write.csv(
+  paired_plot_data,
+  file =
+    file.path(
+      FIG_DIR,
+      "figure6_paired_policy_value_data.csv"
+    ),
+  row.names = FALSE
+)
+
+
+write.csv(
+  paired_regret_data,
+  file =
+    file.path(
+      FIG_DIR,
+      "figure7_paired_regret_data.csv"
+    ),
+  row.names = FALSE
+)
+
+
+# ==============================================================================
+# 36.11 FIGURE SUMMARY
+# ==============================================================================
+
+cat(
+  "\n============================================================\n"
+)
+
+cat(
+  "FIGURE GENERATION COMPLETE\n"
+)
+
+cat(
+  "============================================================\n\n"
+)
+
+cat(
+  "Figure directory:\n"
+)
+
+cat(
+  normalizePath(
+    FIG_DIR
+  ),
+  "\n\n"
+)
+
+cat(
+  "Generated figures:\n"
+)
+
+cat(
+  "  fig1_policy_value.png\n"
+)
+
+cat(
+  "  fig1_policy_value.pdf\n"
+)
+
+cat(
+  "  fig2_policy_regret.png\n"
+)
+
+cat(
+  "  fig2_policy_regret.pdf\n"
+)
+
+cat(
+  "  fig3_action_selection_rates.png\n"
+)
+
+cat(
+  "  fig3_action_selection_rates.pdf\n"
+)
+
+cat(
+  "  fig4_alpha_policy_value.png\n"
+)
+
+cat(
+  "  fig4_alpha_policy_value.pdf\n"
+)
+
+cat(
+  "  fig4_alpha_regret.png\n"
+)
+
+cat(
+  "  fig4_alpha_regret.pdf\n"
+)
+
+cat(
+  "  fig5_learning_curves.png\n"
+)
+
+cat(
+  "  fig5_learning_curves.pdf\n"
+)
+
+cat(
+  "  fig6_paired_policy_value_difference.png\n"
+)
+
+cat(
+  "  fig6_paired_policy_value_difference.pdf\n"
+)
+
+cat(
+  "  fig7_paired_regret_difference.png\n"
+)
+
+cat(
+  "  fig7_paired_regret_difference.pdf\n"
+)
+
+cat(
+  "\n============================================================\n"
+)

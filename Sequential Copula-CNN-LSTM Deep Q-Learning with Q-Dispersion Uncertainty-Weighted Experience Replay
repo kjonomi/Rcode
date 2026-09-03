@@ -1,0 +1,3156 @@
+# =============================================================================
+# SEQUENTIAL COPULA-CNN-LSTM DQN WITH UNCERTAINTY-WEIGHTED EXPERIENCE REPLAY
+# =============================================================================
+#
+# Controlled pseudo-temporal sequential decision-making benchmark
+#
+# Datasets:
+#   1. Boston Housing
+#   2. Wine Quality Red
+#
+# Methods:
+#   1. Uniform Experience Replay
+#   2. Q-Dispersion Uncertainty-Weighted Replay
+#
+# Core sequential structure:
+#
+#       S_t  -->  A_t  -->  R_t
+#          \             \
+#           \             --> S_{t+1}
+#
+# Bellman target:
+#
+#       y_t = r_t +
+#             gamma * (1-d_t) * max_a Q_target(S_{t+1},a)
+#
+# Important:
+# The Boston and Wine covariates are transformed into controlled
+# pseudo-temporal state trajectories. This is therefore a benchmark
+# environment, not naturally observed longitudinal data.
+#
+# =============================================================================
+
+
+# =============================================================================
+# 1. PACKAGES
+# =============================================================================
+
+required_packages <- c(
+    "MASS",
+    "R6",
+    "keras3",
+    "tensorflow",
+    "ggplot2",
+    "dplyr",
+    "tidyr",
+    "tibble"
+)
+
+for (pkg in required_packages) {
+
+    if (!requireNamespace(pkg, quietly = TRUE)) {
+        install.packages(pkg)
+    }
+
+    suppressPackageStartupMessages(
+        library(
+            pkg,
+            character.only = TRUE
+        )
+    )
+}
+
+
+# =============================================================================
+# 2. COMPUTATIONAL SETTINGS
+# =============================================================================
+
+Sys.setenv(
+    CUDA_VISIBLE_DEVICES = "-1"
+)
+
+SEED_BASE <- 20260903
+
+set.seed(
+    SEED_BASE
+)
+
+try(
+    tensorflow::tf$random$set_seed(
+        SEED_BASE
+    ),
+    silent = TRUE
+)
+
+
+# =============================================================================
+# 3. EXPERIMENTAL SETTINGS
+# =============================================================================
+
+N <- 1000
+
+T_STEPS <- 5
+
+TRAIN_PROP <- 0.70
+VALID_PROP <- 0.15
+TEST_PROP <- 0.15
+
+N_ACTIONS <- 3
+
+N_REWARD_DIM <- 3
+
+CORRELATIONS <- c(
+    0.50,
+    -0.50
+)
+
+GAMMA <- 0.90
+
+LEARNING_RATE <- 0.001
+
+EPOCHS <- 30
+
+BATCH_SIZE <- 32
+
+TARGET_UPDATE_FREQ <- 5
+
+REPLAY_CAPACITY <- 5000
+
+MIN_REPLAY_SIZE <- 64
+
+EPSILON_START <- 1.00
+
+EPSILON_END <- 0.05
+
+EPSILON_DECAY <- 0.95
+
+ALPHA_UNCERTAINTY <- 1.00
+
+BETA_IS <- 0.40
+
+REWARD_WEIGHTS <- c(
+    1 / 3,
+    1 / 3,
+    1 / 3
+)
+
+# Number of trajectories sampled from the training subjects
+# during each online collection epoch.
+EPISODES_PER_EPOCH <- 150
+
+OUTPUT_DIR <- "copula_cnn_lstm_dqn_results"
+
+if (!dir.exists(OUTPUT_DIR)) {
+    dir.create(
+        OUTPUT_DIR,
+        recursive = TRUE
+    )
+}
+
+
+# =============================================================================
+# 4. DATA LOADING
+# =============================================================================
+
+load_boston_data <- function() {
+
+    data(
+        Boston,
+        package = "MASS"
+    )
+
+    X <- as.matrix(
+        Boston[, setdiff(
+            names(Boston),
+            "medv"
+        )]
+    )
+
+    X <- X[
+        apply(
+            X,
+            1,
+            function(z) all(is.finite(z))
+        ),
+        ,
+        drop = FALSE
+    ]
+
+    X
+}
+
+
+load_wine_data <- function() {
+
+    local_file <- "winequality-red.csv"
+
+    if (file.exists(local_file)) {
+
+        wine <- read.csv(
+            local_file,
+            sep = ";",
+            header = TRUE
+        )
+
+    } else {
+
+        wine_url <- paste0(
+            "https://archive.ics.uci.edu/ml/",
+            "machine-learning-databases/wine-quality/",
+            "winequality-red.csv"
+        )
+
+        wine <- read.csv(
+            wine_url,
+            sep = ";",
+            header = TRUE
+        )
+    }
+
+    X <- as.matrix(
+        wine[, setdiff(
+            names(wine),
+            "quality"
+        )]
+    )
+
+    X <- X[
+        apply(
+            X,
+            1,
+            function(z) all(is.finite(z))
+        ),
+        ,
+        drop = FALSE
+    ]
+
+    X
+}
+
+
+dataset_objects <- list(
+    Boston = load_boston_data(),
+    Wine = load_wine_data()
+)
+
+
+# =============================================================================
+# 5. STANDARDIZATION
+# =============================================================================
+
+fit_standardizer <- function(X) {
+
+    X <- as.matrix(X)
+
+    center <- colMeans(
+        X,
+        na.rm = TRUE
+    )
+
+    scale_value <- apply(
+        X,
+        2,
+        sd,
+        na.rm = TRUE
+    )
+
+    scale_value[
+        !is.finite(scale_value) |
+        scale_value < 1e-8
+    ] <- 1
+
+    list(
+        center = center,
+        scale = scale_value
+    )
+}
+
+
+apply_standardizer <- function(
+    X,
+    standardizer
+) {
+
+    X <- as.matrix(X)
+
+    sweep(
+        sweep(
+            X,
+            2,
+            standardizer$center,
+            FUN = "-"
+        ),
+        2,
+        standardizer$scale,
+        FUN = "/"
+    )
+}
+
+
+# =============================================================================
+# 6. EMPIRICAL COPULA TRANSFORMATION
+# =============================================================================
+
+fit_copula <- function(X) {
+
+    X <- as.matrix(X)
+
+    sorted_columns <- vector(
+        "list",
+        ncol(X)
+    )
+
+    for (j in seq_len(ncol(X))) {
+
+        sorted_columns[[j]] <- sort(
+            X[, j]
+        )
+    }
+
+    list(
+        sorted_columns = sorted_columns,
+        n = nrow(X)
+    )
+}
+
+
+apply_copula <- function(
+    X,
+    copula_fit
+) {
+
+    X <- as.matrix(X)
+
+    n <- nrow(X)
+
+    p <- ncol(X)
+
+    U <- matrix(
+        0,
+        nrow = n,
+        ncol = p
+    )
+
+    for (j in seq_len(p)) {
+
+        ref <- copula_fit$sorted_columns[[j]]
+
+        ranks <- findInterval(
+            X[, j],
+            ref
+        )
+
+        ranks <- pmin(
+            pmax(
+                ranks,
+                0
+            ),
+            length(ref)
+        )
+
+        U[, j] <- (
+            ranks + 0.5
+        ) / (
+            length(ref) + 1
+        )
+    }
+
+    Z <- qnorm(
+        pmin(
+            pmax(
+                U,
+                1e-6
+            ),
+            1 - 1e-6
+        )
+    )
+
+    Z[
+        !is.finite(Z)
+    ] <- 0
+
+    Z
+}
+
+
+# =============================================================================
+# 7. PSEUDO-TEMPORAL INITIAL REPRESENTATION
+# =============================================================================
+
+create_initial_states <- function(
+    X,
+    standardizer
+) {
+
+    apply_standardizer(
+        X,
+        standardizer
+    )
+}
+
+
+create_pseudo_temporal_covariates <- function(
+    X0,
+    T_steps = T_STEPS
+) {
+
+    X0 <- as.matrix(
+        X0
+    )
+
+    n <- nrow(X0)
+
+    p <- ncol(X0)
+
+    X_temporal <- array(
+        0,
+        dim = c(
+            n,
+            T_steps,
+            p
+        )
+    )
+
+    for (t in seq_len(T_steps)) {
+
+        temporal_factor <- 1 +
+            0.05 * (t - 1)
+
+        temporal_shift <- 0.05 *
+            sin(
+                2 * pi * t / T_steps
+            )
+
+        X_temporal[, t, ] <-
+            sweep(
+                X0,
+                2,
+                temporal_factor,
+                FUN = "*"
+            ) +
+            temporal_shift
+    }
+
+    X_temporal
+}
+
+
+# =============================================================================
+# 8. EQUICORRELATED ERRORS
+# =============================================================================
+
+make_correlation_matrix <- function(
+    K,
+    rho
+) {
+
+    Sigma <- matrix(
+        rho,
+        nrow = K,
+        ncol = K
+    )
+
+    diag(
+        Sigma
+    ) <- 1
+
+    Sigma
+}
+
+
+generate_correlated_errors <- function(
+    n,
+    rho,
+    sd = 0.50
+) {
+
+    Sigma <- make_correlation_matrix(
+        N_REWARD_DIM,
+        rho
+    )
+
+    Sigma <- Sigma * sd^2
+
+    # Numerical stabilization.
+    Sigma <- Sigma +
+        diag(
+            1e-8,
+            N_REWARD_DIM
+        )
+
+    L <- chol(
+        Sigma
+    )
+
+    Z <- matrix(
+        rnorm(
+            n * N_REWARD_DIM
+        ),
+        nrow = n,
+        ncol = N_REWARD_DIM
+    )
+
+    Z %*% L
+}
+
+
+# =============================================================================
+# 9. ACTION-DEPENDENT REWARD MEANS
+# =============================================================================
+#
+# Action coding:
+#
+#   1 = baseline
+#   2 = treatment 1
+#   3 = treatment 2
+#
+# The reward is a 3-dimensional correlated outcome.
+#
+# =============================================================================
+
+calculate_reward_means <- function(
+    X_state,
+    action
+) {
+
+    X_state <- as.matrix(
+        X_state
+    )
+
+    n <- nrow(
+        X_state
+    )
+
+    p <- ncol(
+        X_state
+    )
+
+    # Ensure at least five coordinates.
+    x1 <- X_state[, 1]
+
+    x2 <- if (p >= 2) {
+        X_state[, 2]
+    } else {
+        0
+    }
+
+    x3 <- if (p >= 3) {
+        X_state[, 3]
+    } else {
+        0
+    }
+
+    x4 <- if (p >= 4) {
+        X_state[, 4]
+    } else {
+        0
+    }
+
+    x5 <- if (p >= 5) {
+        X_state[, 5]
+    } else {
+        0
+    }
+
+    baseline <-
+        1.00 +
+        0.20 * x1 -
+        0.15 * x2 +
+        0.10 * x3^2 +
+        0.10 * sin(x4)
+
+    tau1 <-
+        0.40 +
+        0.20 * sin(x1) +
+        0.10 * x2 * x3
+
+    tau2 <-
+        0.25 +
+        0.15 * x2 -
+        0.10 * x4
+
+    effect <- rep(
+        0,
+        n
+    )
+
+    if (action == 2) {
+
+        effect <- tau1
+
+    } else if (action == 3) {
+
+        effect <- tau2
+    }
+
+    mu <- matrix(
+        0,
+        nrow = n,
+        ncol = N_REWARD_DIM
+    )
+
+    mu[, 1] <- baseline + effect
+
+    mu[, 2] <- baseline + 0.80 * effect
+
+    mu[, 3] <- baseline + 1.20 * effect
+
+    mu
+}
+
+
+generate_reward <- function(
+    X_state,
+    action,
+    rho,
+    reward_sd = 0.50
+) {
+
+    mu <- calculate_reward_means(
+        X_state,
+        action
+    )
+
+    errors <- generate_correlated_errors(
+        nrow(X_state),
+        rho,
+        sd = reward_sd
+    )
+
+    mu + errors
+}
+
+
+# =============================================================================
+# 10. ACTION-DEPENDENT STATE TRANSITION
+# =============================================================================
+#
+# S_{t+1} = phi S_t + B(A_t) + time drift + eta_t
+#
+# Thus the selected action changes the future state.
+#
+# =============================================================================
+
+get_action_shift <- function(
+    p,
+    action
+) {
+
+    shift <- rep(
+        0,
+        p
+    )
+
+    if (action == 2) {
+
+        shift[1] <- 0.08
+
+        if (p >= 2) {
+            shift[2] <- -0.05
+        }
+
+        if (p >= 3) {
+            shift[3] <- 0.03
+        }
+
+    } else if (action == 3) {
+
+        shift[1] <- -0.06
+
+        if (p >= 2) {
+            shift[2] <- 0.04
+        }
+
+        if (p >= 3) {
+            shift[3] <- 0.08
+        }
+    }
+
+    shift
+}
+
+
+transition_state <- function(
+    X_state,
+    action,
+    t,
+    phi = 0.92,
+    transition_sd = 0.08
+) {
+
+    X_state <- as.matrix(
+        X_state
+    )
+
+    n <- nrow(
+        X_state
+    )
+
+    p <- ncol(
+        X_state
+    )
+
+    shift <- get_action_shift(
+        p,
+        action
+    )
+
+    time_drift <- 0.03 *
+        sin(
+            2 * pi * t / T_STEPS
+        )
+
+    noise <- matrix(
+        rnorm(
+            n * p,
+            sd = transition_sd
+        ),
+        nrow = n,
+        ncol = p
+    )
+
+    X_next <- phi * X_state
+
+    X_next <- sweep(
+        X_next,
+        2,
+        shift,
+        FUN = "+"
+    )
+
+    X_next <- X_next +
+        time_drift +
+        noise
+
+    # Stability constraint.
+    X_next <- pmin(
+        pmax(
+            X_next,
+            -4
+        ),
+        4
+    )
+
+    X_next
+}
+
+
+# =============================================================================
+# 11. REWARD SCALING FOR STATE HISTORY
+# =============================================================================
+
+fit_reward_scaling <- function(
+    X_train
+) {
+
+    reward_list <- vector(
+        "list",
+        N_ACTIONS
+    )
+
+    for (a in seq_len(N_ACTIONS)) {
+
+        reward_list[[a]] <-
+            calculate_reward_means(
+                X_train,
+                a
+            )
+    }
+
+    all_rewards <- do.call(
+        rbind,
+        reward_list
+    )
+
+    center <- colMeans(
+        all_rewards
+    )
+
+    scale_value <- apply(
+        all_rewards,
+        2,
+        sd
+    )
+
+    scale_value[
+        !is.finite(scale_value) |
+        scale_value < 1e-8
+    ] <- 1
+
+    list(
+        center = center,
+        scale = scale_value
+    )
+}
+
+
+scale_reward_history <- function(
+    R,
+    reward_scaling
+) {
+
+    R_scaled <- sweep(
+        R,
+        2,
+        reward_scaling$center,
+        FUN = "-"
+    )
+
+    R_scaled <- sweep(
+        R_scaled,
+        2,
+        reward_scaling$scale,
+        FUN = "/"
+    )
+
+    R_scaled
+}
+
+
+# =============================================================================
+# 12. STATE REPRESENTATION
+# =============================================================================
+#
+# Channels:
+#
+#   1. standardized state covariates
+#   2. empirical-copula state covariates
+#   3. previous action
+#   4. action × copula interaction
+#   5. previous reward dimension 1
+#   6. previous reward dimension 2
+#   7. previous reward dimension 3
+#
+# =============================================================================
+
+build_history_state <- function(
+    X_history,
+    C_history,
+    A_history,
+    R_history,
+    current_t,
+    T_steps,
+    reward_scaling
+) {
+
+    X_history <- as.matrix(
+        X_history
+    )
+
+    C_history <- as.matrix(
+        C_history
+    )
+
+    p <- ncol(
+        X_history
+    )
+
+    channels <- 7
+
+    state_full <- array(
+        0,
+        dim = c(
+            T_steps,
+            p,
+            channels
+        )
+    )
+
+    history_length <- current_t
+
+    for (h in seq_len(history_length)) {
+
+        state_full[h, , 1] <-
+            X_history[h, ]
+
+        state_full[h, , 2] <-
+            C_history[h, ]
+
+        # Previous action.
+        if (h > 1) {
+
+            previous_action <-
+                A_history[h - 1]
+
+            action_value <-
+                (previous_action - 1) /
+                max(
+                    N_ACTIONS - 1,
+                    1
+                )
+
+            state_full[h, , 3] <-
+                action_value
+
+            state_full[h, , 4] <-
+                C_history[h, ] *
+                action_value
+
+            previous_reward <-
+                R_history[h - 1, ]
+
+            previous_reward <-
+                scale_reward_history(
+                    matrix(
+                        previous_reward,
+                        nrow = 1
+                    ),
+                    reward_scaling
+                )[1, ]
+
+            state_full[h, , 5] <-
+                previous_reward[1]
+
+            state_full[h, , 6] <-
+                previous_reward[2]
+
+            state_full[h, , 7] <-
+                previous_reward[3]
+        }
+    }
+
+    state_full
+}
+
+
+state_to_batch <- function(
+    state
+) {
+
+    array(
+        state,
+        dim = c(
+            1,
+            dim(state)
+        )
+    )
+}
+
+
+# =============================================================================
+# 13. CNN-LSTM DQN
+# =============================================================================
+
+build_dqn <- function(
+    T_steps,
+    p,
+    channels,
+    n_actions = N_ACTIONS
+) {
+
+    inputs <- layer_input(
+        shape = c(
+            T_steps,
+            p,
+            channels
+        )
+    )
+
+    x <- inputs |>
+        layer_conv_2d(
+            filters = 32,
+            kernel_size = c(
+                1,
+                3
+            ),
+            padding = "same",
+            activation = "relu"
+        ) |>
+        layer_batch_normalization() |>
+        layer_conv_2d(
+            filters = 32,
+            kernel_size = c(
+                1,
+                3
+            ),
+            padding = "same",
+            activation = "relu"
+        ) |>
+        layer_average_pooling_2d(
+            pool_size = c(
+                1,
+                p
+            )
+        ) |>
+        layer_reshape(
+            target_shape = c(
+                T_steps,
+                32
+            )
+        ) |>
+        layer_lstm(
+            units = 64,
+            return_sequences = FALSE
+        ) |>
+        layer_dense(
+            64,
+            activation = "relu"
+        ) |>
+        layer_dropout(
+            0.10
+        ) |>
+        layer_dense(
+            32,
+            activation = "relu"
+        ) |>
+        layer_dense(
+            n_actions,
+            activation = "linear"
+        )
+
+    model <- keras_model(
+        inputs = inputs,
+        outputs = x
+    )
+
+    model |> compile(
+        optimizer = optimizer_adam(
+            learning_rate = LEARNING_RATE
+        ),
+        loss = "mse"
+    )
+
+    model
+}
+
+
+# =============================================================================
+# 14. REPLAY BUFFER
+# =============================================================================
+
+ReplayBuffer <- R6Class(
+    "ReplayBuffer",
+
+    public = list(
+
+        capacity = NULL,
+
+        buffer = NULL,
+
+        position = NULL,
+
+        size = NULL,
+
+        initialize = function(
+            capacity
+        ) {
+
+            self$capacity <-
+                capacity
+
+            self$buffer <-
+                vector(
+                    "list",
+                    capacity
+                )
+
+            self$position <- 1
+
+            self$size <- 0
+        },
+
+        add = function(
+            transition
+        ) {
+
+            self$buffer[[self$position]] <-
+                transition
+
+            self$position <-
+                self$position + 1
+
+            if (
+                self$position >
+                self$capacity
+            ) {
+
+                self$position <- 1
+            }
+
+            self$size <-
+                min(
+                    self$size + 1,
+                    self$capacity
+                )
+        },
+
+        get_all = function() {
+
+            if (
+                self$size == 0
+            ) {
+
+                return(
+                    list()
+                )
+            }
+
+            self$buffer[
+                seq_len(
+                    self$size
+                )
+            ]
+        }
+    )
+)
+
+
+# =============================================================================
+# 15. Q-DISPERSION UNCERTAINTY
+# =============================================================================
+
+calculate_q_uncertainty <- function(
+    model,
+    states
+) {
+
+    q_values <- predict(
+        model,
+        states,
+        verbose = 0
+    )
+
+    q_values <- as.matrix(
+        q_values
+    )
+
+    apply(
+        q_values,
+        1,
+        sd
+    )
+}
+
+
+# =============================================================================
+# 16. EPSILON-GREEDY ACTION
+# =============================================================================
+
+select_action <- function(
+    model,
+    state,
+    epsilon
+) {
+
+    if (
+        runif(1) <
+        epsilon
+    ) {
+
+        return(
+            sample(
+                seq_len(
+                    N_ACTIONS
+                ),
+                1
+            )
+        )
+    }
+
+    q_values <- predict(
+        model,
+        state,
+        verbose = 0
+    )
+
+    q_values <- as.numeric(
+        q_values[1, ]
+    )
+
+    which(
+        q_values ==
+            max(
+                q_values
+            )
+    )[1]
+}
+
+
+# =============================================================================
+# 17. TRANSITION COLLECTION
+# =============================================================================
+#
+# This is the central change from the previous implementation.
+#
+# The current DQN selects A_t.
+#
+# That action determines:
+#
+#   R_t = R(S_t,A_t)
+#
+# and:
+#
+#   S_{t+1} = f(S_t,A_t,eta_t)
+#
+# =============================================================================
+
+collect_dqn_transitions <- function(
+    model,
+    X_initial,
+    copula_fit,
+    reward_scaling,
+    rho,
+    epsilon,
+    n_episodes,
+    seed
+) {
+
+    set.seed(
+        seed
+    )
+
+    n_available <- nrow(
+        X_initial
+    )
+
+    episode_ids <- sample(
+        seq_len(
+            n_available
+        ),
+        size = n_episodes,
+        replace = n_episodes > n_available
+    )
+
+    transitions <- vector(
+        "list",
+        n_episodes * T_STEPS
+    )
+
+    counter <- 1
+
+    for (episode in seq_len(n_episodes)) {
+
+        id <- episode_ids[episode]
+
+        current_X <- matrix(
+            X_initial[id, ],
+            nrow = 1
+        )
+
+        p <- ncol(
+            current_X
+        )
+
+        X_history <- matrix(
+            0,
+            nrow = T_STEPS,
+            ncol = p
+        )
+
+        C_history <- matrix(
+            0,
+            nrow = T_STEPS,
+            ncol = p
+        )
+
+        A_history <- integer(
+            T_STEPS
+        )
+
+        R_history <- matrix(
+            0,
+            nrow = T_STEPS,
+            ncol = N_REWARD_DIM
+        )
+
+        for (t in seq_len(T_STEPS)) {
+
+            X_history[t, ] <-
+                current_X[1, ]
+
+            current_C <-
+                apply_copula(
+                    current_X,
+                    copula_fit
+                )
+
+            C_history[t, ] <-
+                current_C[1, ]
+
+            current_state <- build_history_state(
+                X_history = X_history,
+                C_history = C_history,
+                A_history = A_history,
+                R_history = R_history,
+                current_t = t,
+                T_steps = T_STEPS,
+                reward_scaling = reward_scaling
+            )
+
+            state_batch <- state_to_batch(
+                current_state
+            )
+
+            action <- select_action(
+                model = model,
+                state = state_batch,
+                epsilon = epsilon
+            )
+
+            reward_vector <- generate_reward(
+                X_state = current_X,
+                action = action,
+                rho = rho
+            )[1, ]
+
+            A_history[t] <- action
+
+            R_history[t, ] <-
+                reward_vector
+
+            done <- as.integer(
+                t == T_STEPS
+            )
+
+            if (!done) {
+
+                next_X <- transition_state(
+                    X_state = current_X,
+                    action = action,
+                    t = t
+                )
+
+                next_C <- apply_copula(
+                    next_X,
+                    copula_fit
+                )
+
+                X_history[t + 1, ] <-
+                    next_X[1, ]
+
+                C_history[t + 1, ] <-
+                    next_C[1, ]
+
+                next_state <- build_history_state(
+                    X_history = X_history,
+                    C_history = C_history,
+                    A_history = A_history,
+                    R_history = R_history,
+                    current_t = t + 1,
+                    T_steps = T_STEPS,
+                    reward_scaling = reward_scaling
+                )
+
+            } else {
+
+                next_state <- array(
+                    0,
+                    dim = dim(
+                        current_state
+                    )
+                )
+            }
+
+            transitions[[counter]] <- list(
+                state = state_batch,
+                action = action,
+                reward_vector = reward_vector,
+                reward = scalarize_reward(
+                    reward_vector
+                ),
+                next_state = state_to_batch(
+                    next_state
+                ),
+                done = done,
+                time = t,
+                subject = id,
+                uncertainty = 0
+            )
+
+            counter <- counter + 1
+
+            if (!done) {
+
+                current_X <- next_X
+            }
+        }
+    }
+
+    transitions
+}
+
+
+# =============================================================================
+# 18. SCALARIZE MULTIVARIATE REWARD
+# =============================================================================
+
+scalarize_reward <- function(
+    reward_vector
+) {
+
+    sum(
+        reward_vector *
+            REWARD_WEIGHTS
+    )
+}
+
+
+# =============================================================================
+# 19. REPLAY SAMPLING
+# =============================================================================
+
+sample_replay <- function(
+    replay,
+    batch_size,
+    model,
+    method = c(
+        "uniform",
+        "uncertainty"
+    )
+) {
+
+    method <- match.arg(
+        method
+    )
+
+    n <- replay$size
+
+    batch_size <- min(
+        batch_size,
+        n
+    )
+
+    transitions <- replay$get_all()
+
+    if (
+        method == "uniform"
+    ) {
+
+        probabilities <- rep(
+            1 / n,
+            n
+        )
+
+    } else {
+
+        states <- array(
+            0,
+            dim = c(
+                n,
+                dim(
+                    transitions[[1]]$state
+                )[2:4]
+            )
+        )
+
+        for (i in seq_len(n)) {
+
+            states[i, , , ] <-
+                transitions[[i]]$state[1, , , ]
+        }
+
+        uncertainty <- calculate_q_uncertainty(
+            model,
+            states
+        )
+
+        priorities <-
+            1 +
+            ALPHA_UNCERTAINTY *
+            uncertainty
+
+        probabilities <-
+            priorities /
+            sum(priorities)
+
+        # Update stored uncertainty.
+        for (i in seq_len(n)) {
+
+            transitions[[i]]$uncertainty <-
+                uncertainty[i]
+
+            replay$buffer[[i]] <-
+                transitions[[i]]
+        }
+    }
+
+    indices <- sample(
+        seq_len(n),
+        size = batch_size,
+        replace = n < batch_size,
+        prob = probabilities
+    )
+
+    sampled <- transitions[
+        indices
+    ]
+
+    sampling_probabilities <-
+        probabilities[
+            indices
+        ]
+
+    importance_weights <-
+        (
+            n *
+            sampling_probabilities
+        )^(-BETA_IS)
+
+    importance_weights <-
+        importance_weights /
+        max(
+            importance_weights
+        )
+
+    list(
+        transitions = sampled,
+        indices = indices,
+        probabilities = sampling_probabilities,
+        importance_weights = importance_weights
+    )
+}
+
+
+# =============================================================================
+# 20. TRAIN ONE DQN BATCH
+# =============================================================================
+
+train_dqn_batch <- function(
+    online_model,
+    target_model,
+    batch
+) {
+
+    transitions <-
+        batch$transitions
+
+    B <- length(
+        transitions
+    )
+
+    state_shape <- dim(
+        transitions[[1]]$state
+    )
+
+    state_array <- array(
+        0,
+        dim = c(
+            B,
+            state_shape[2],
+            state_shape[3],
+            state_shape[4]
+        )
+    )
+
+    next_state_array <- array(
+        0,
+        dim = c(
+            B,
+            state_shape[2],
+            state_shape[3],
+            state_shape[4]
+        )
+    )
+
+    actions <- integer(
+        B
+    )
+
+    rewards <- numeric(
+        B
+    )
+
+    dones <- numeric(
+        B
+    )
+
+    for (i in seq_len(B)) {
+
+        state_array[i, , , ] <-
+            transitions[[i]]$state[1, , , ]
+
+        next_state_array[i, , , ] <-
+            transitions[[i]]$next_state[1, , , ]
+
+        actions[i] <-
+            transitions[[i]]$action
+
+        rewards[i] <-
+            transitions[[i]]$reward
+
+        dones[i] <-
+            transitions[[i]]$done
+    }
+
+    current_q <- predict(
+        online_model,
+        state_array,
+        verbose = 0
+    )
+
+    next_q <- predict(
+        target_model,
+        next_state_array,
+        verbose = 0
+    )
+
+    max_next_q <- apply(
+        next_q,
+        1,
+        max
+    )
+
+    targets <- current_q
+
+    bellman_target <-
+        rewards +
+        GAMMA *
+        (1 - dones) *
+        max_next_q
+
+    for (i in seq_len(B)) {
+
+        targets[i, actions[i]] <-
+            bellman_target[i]
+    }
+
+    sample_weights <-
+        batch$importance_weights
+
+    fit_result <- online_model |> fit(
+        x = state_array,
+        y = targets,
+        sample_weight = sample_weights,
+        epochs = 1,
+        batch_size = B,
+        verbose = 0
+    )
+
+    loss_value <- NA_real_
+
+    if (
+        !is.null(
+            fit_result$metrics
+        )
+    ) {
+
+        if (
+            "loss" %in%
+            names(
+                fit_result$metrics
+            )
+        ) {
+
+            loss_value <-
+                as.numeric(
+                    tail(
+                        fit_result$metrics$loss,
+                        1
+                    )
+                )
+        }
+    }
+
+    list(
+        loss = loss_value,
+        targets = targets,
+        q_values = current_q
+    )
+}
+
+
+# =============================================================================
+# 21. UPDATE TARGET NETWORK
+# =============================================================================
+
+update_target_network <- function(
+    online_model,
+    target_model
+) {
+
+    target_model$set_weights(
+        online_model$get_weights()
+    )
+}
+
+
+# =============================================================================
+# 22. POLICY ROLLOUT
+# =============================================================================
+#
+# Unlike the previous implementation, evaluation does NOT use a pre-generated
+# observed reward trajectory.
+#
+# At each time:
+#
+#   current state
+#       |
+#       v
+#   DQN action
+#       |
+#       +------> reward
+#       |
+#       +------> next state
+#
+# =============================================================================
+
+rollout_policy <- function(
+    model,
+    X_initial,
+    copula_fit,
+    reward_scaling,
+    rho,
+    seed = NULL
+) {
+
+    if (!is.null(seed)) {
+
+        set.seed(
+            seed
+        )
+    }
+
+    n <- nrow(
+        X_initial
+    )
+
+    p <- ncol(
+        X_initial
+    )
+
+    actions <- matrix(
+        0,
+        nrow = n,
+        ncol = T_STEPS
+    )
+
+    rewards <- array(
+        0,
+        dim = c(
+            n,
+            T_STEPS,
+            N_REWARD_DIM
+        )
+    )
+
+    states_X <- array(
+        0,
+        dim = c(
+            n,
+            T_STEPS,
+            p
+        )
+    )
+
+    discounted_returns <- numeric(
+        n
+    )
+
+    undiscounted_returns <- numeric(
+        n
+    )
+
+    for (i in seq_len(n)) {
+
+        current_X <- matrix(
+            X_initial[i, ],
+            nrow = 1
+        )
+
+        X_history <- matrix(
+            0,
+            nrow = T_STEPS,
+            ncol = p
+        )
+
+        C_history <- matrix(
+            0,
+            nrow = T_STEPS,
+            ncol = p
+        )
+
+        A_history <- integer(
+            T_STEPS
+        )
+
+        R_history <- matrix(
+            0,
+            nrow = T_STEPS,
+            ncol = N_REWARD_DIM
+        )
+
+        for (t in seq_len(T_STEPS)) {
+
+            X_history[t, ] <-
+                current_X[1, ]
+
+            states_X[i, t, ] <-
+                current_X[1, ]
+
+            current_C <-
+                apply_copula(
+                    current_X,
+                    copula_fit
+                )
+
+            C_history[t, ] <-
+                current_C[1, ]
+
+            current_state <- build_history_state(
+                X_history = X_history,
+                C_history = C_history,
+                A_history = A_history,
+                R_history = R_history,
+                current_t = t,
+                T_steps = T_STEPS,
+                reward_scaling = reward_scaling
+            )
+
+            state_batch <- state_to_batch(
+                current_state
+            )
+
+            action <- select_action(
+                model = model,
+                state = state_batch,
+                epsilon = 0
+            )
+
+            reward_vector <- generate_reward(
+                X_state = current_X,
+                action = action,
+                rho = rho
+            )[1, ]
+
+            scalar_reward <-
+                scalarize_reward(
+                    reward_vector
+                )
+
+            actions[i, t] <-
+                action
+
+            rewards[i, t, ] <-
+                reward_vector
+
+            A_history[t] <-
+                action
+
+            R_history[t, ] <-
+                reward_vector
+
+            discounted_returns[i] <-
+                discounted_returns[i] +
+                GAMMA^(t - 1) *
+                scalar_reward
+
+            undiscounted_returns[i] <-
+                undiscounted_returns[i] +
+                scalar_reward
+
+            if (
+                t < T_STEPS
+            ) {
+
+                current_X <-
+                    transition_state(
+                        X_state = current_X,
+                        action = action,
+                        t = t
+                    )
+            }
+        }
+    }
+
+    list(
+        actions = actions,
+        rewards = rewards,
+        states_X = states_X,
+        discounted_returns =
+            discounted_returns,
+        undiscounted_returns =
+            undiscounted_returns
+    )
+}
+
+
+# =============================================================================
+# 23. DYNAMIC CATE
+# =============================================================================
+#
+# Immediate dynamic CATE:
+#
+#   CATE_2vs1(t) =
+#       E[R_t(2)-R_t(1) | S_t]
+#
+#   CATE_3vs1(t) =
+#       E[R_t(3)-R_t(1) | S_t]
+#
+# These are calculated from the conditional reward means, not noisy realized
+# rewards.
+#
+# =============================================================================
+
+calculate_dynamic_cate <- function(
+    rollout_result
+) {
+
+    states_X <- rollout_result$states_X
+
+    n <- dim(
+        states_X
+    )[1]
+
+    p <- dim(
+        states_X
+    )[3]
+
+    results <- vector(
+        "list",
+        T_STEPS
+    )
+
+    counter <- 1
+
+    for (t in seq_len(T_STEPS)) {
+
+        X_t <- matrix(
+            states_X[, t, ],
+            nrow = n,
+            ncol = p
+        )
+
+        mu1 <- calculate_reward_means(
+            X_t,
+            action = 1
+        )
+
+        mu2 <- calculate_reward_means(
+            X_t,
+            action = 2
+        )
+
+        mu3 <- calculate_reward_means(
+            X_t,
+            action = 3
+        )
+
+        cate21 <-
+            mu2 - mu1
+
+        cate31 <-
+            mu3 - mu1
+
+        for (k in seq_len(N_REWARD_DIM)) {
+
+            results[[counter]] <-
+                tibble(
+                    time = t,
+                    contrast = "Action 2 vs Action 1",
+                    reward_dimension = k,
+                    mean_CATE = mean(
+                        cate21[, k]
+                    ),
+                    sd_CATE = sd(
+                        cate21[, k]
+                    ),
+                    q025 = quantile(
+                        cate21[, k],
+                        0.025
+                    ),
+                    q975 = quantile(
+                        cate21[, k],
+                        0.975
+                    )
+                )
+
+            counter <- counter + 1
+
+            results[[counter]] <-
+                tibble(
+                    time = t,
+                    contrast = "Action 3 vs Action 1",
+                    reward_dimension = k,
+                    mean_CATE = mean(
+                        cate31[, k]
+                    ),
+                    sd_CATE = sd(
+                        cate31[, k]
+                    ),
+                    q025 = quantile(
+                        cate31[, k],
+                        0.025
+                    ),
+                    q975 = quantile(
+                        cate31[, k],
+                        0.975
+                    )
+                )
+
+            counter <- counter + 1
+        }
+    }
+
+    bind_rows(
+        results
+    )
+}
+
+
+# =============================================================================
+# 24. POLICY MATRIX
+# =============================================================================
+
+create_policy_matrix <- function(
+    actions
+) {
+
+    n <- nrow(
+        actions
+    )
+
+    result <- vector(
+        "list",
+        T_STEPS
+    )
+
+    for (t in seq_len(T_STEPS)) {
+
+        counts <- table(
+            factor(
+                actions[, t],
+                levels = seq_len(
+                    N_ACTIONS
+                )
+            )
+        )
+
+        result[[t]] <- tibble(
+            time = t,
+            action = seq_len(
+                N_ACTIONS
+            ),
+            count = as.numeric(
+                counts
+            ),
+            rate = as.numeric(
+                counts
+            ) / n
+        )
+    }
+
+    bind_rows(
+        result
+    )
+}
+
+
+# =============================================================================
+# 25. POLICY VALUE
+# =============================================================================
+
+calculate_policy_value <- function(
+    rollout_result
+) {
+
+    tibble(
+        discounted_policy_value =
+            mean(
+                rollout_result$discounted_returns
+            ),
+
+        discounted_policy_sd =
+            sd(
+                rollout_result$discounted_returns
+            ),
+
+        undiscounted_policy_value =
+            mean(
+                rollout_result$undiscounted_returns
+            ),
+
+        undiscounted_policy_sd =
+            sd(
+                rollout_result$undiscounted_returns
+            )
+    )
+}
+
+
+# =============================================================================
+# 26. TRAINING FUNCTION
+# =============================================================================
+
+train_sequential_dqn <- function(
+    X_train,
+    X_valid,
+    copula_fit,
+    reward_scaling,
+    rho,
+    replay_method,
+    seed
+) {
+
+    set.seed(
+        seed
+    )
+
+    p <- ncol(
+        X_train
+    )
+
+    channels <- 7
+
+    # -------------------------------------------------------------------------
+    # Initialize online and target networks.
+    # -------------------------------------------------------------------------
+
+    online_model <- build_dqn(
+        T_steps = T_STEPS,
+        p = p,
+        channels = channels,
+        n_actions = N_ACTIONS
+    )
+
+    target_model <- build_dqn(
+        T_steps = T_STEPS,
+        p = p,
+        channels = channels,
+        n_actions = N_ACTIONS
+    )
+
+    update_target_network(
+        online_model,
+        target_model
+    )
+
+    # -------------------------------------------------------------------------
+    # Replay buffer.
+    # -------------------------------------------------------------------------
+
+    replay <- ReplayBuffer$new(
+        REPLAY_CAPACITY
+    )
+
+    # -------------------------------------------------------------------------
+    # Training history.
+    # -------------------------------------------------------------------------
+
+    history_df <- tibble(
+        epoch = integer(),
+        epsilon = numeric(),
+        replay_size = integer(),
+        loss = numeric(),
+        validation_value = numeric(),
+        validation_undiscounted = numeric()
+    )
+
+    best_validation <- -Inf
+
+    best_weights <- NULL
+
+    epsilon <- EPSILON_START
+
+    # -------------------------------------------------------------------------
+    # Epoch loop.
+    # -------------------------------------------------------------------------
+
+    for (epoch in seq_len(EPOCHS)) {
+
+        epoch_seed <-
+            seed +
+            epoch
+
+        # ---------------------------------------------------------------------
+        # Collect new trajectories using the CURRENT policy.
+        # ---------------------------------------------------------------------
+
+        new_transitions <-
+            collect_dqn_transitions(
+                model = online_model,
+                X_initial = X_train,
+                copula_fit = copula_fit,
+                reward_scaling = reward_scaling,
+                rho = rho,
+                epsilon = epsilon,
+                n_episodes =
+                    EPISODES_PER_EPOCH,
+                seed = epoch_seed
+            )
+
+        # ---------------------------------------------------------------------
+        # Add transitions to replay.
+        # ---------------------------------------------------------------------
+
+        for (tr in new_transitions) {
+
+            replay$add(
+                tr
+            )
+        }
+
+        # ---------------------------------------------------------------------
+        # Train from replay.
+        # ---------------------------------------------------------------------
+
+        losses <- numeric(
+            0
+        )
+
+        if (
+            replay$size >=
+            MIN_REPLAY_SIZE
+        ) {
+
+            n_batches <- max(
+                1,
+                floor(
+                    replay$size /
+                    BATCH_SIZE
+                )
+            )
+
+            for (b in seq_len(n_batches)) {
+
+                batch <-
+                    sample_replay(
+                        replay = replay,
+                        batch_size = BATCH_SIZE,
+                        model = online_model,
+                        method = replay_method
+                    )
+
+                fit_result <-
+                    train_dqn_batch(
+                        online_model =
+                            online_model,
+                        target_model =
+                            target_model,
+                        batch = batch
+                    )
+
+                if (
+                    is.finite(
+                        fit_result$loss
+                    )
+                ) {
+
+                    losses <- c(
+                        losses,
+                        fit_result$loss
+                    )
+                }
+            }
+        }
+
+        # ---------------------------------------------------------------------
+        # Target network update.
+        # ---------------------------------------------------------------------
+
+        if (
+            epoch %% TARGET_UPDATE_FREQ == 0
+        ) {
+
+            update_target_network(
+                online_model,
+                target_model
+            )
+        }
+
+        # ---------------------------------------------------------------------
+        # Validation rollout.
+        # ---------------------------------------------------------------------
+
+        validation_rollout <-
+            rollout_policy(
+                model = online_model,
+                X_initial = X_valid,
+                copula_fit = copula_fit,
+                reward_scaling = reward_scaling,
+                rho = rho,
+                seed = seed + 10000
+            )
+
+        validation_value <-
+            mean(
+                validation_rollout$discounted_returns
+            )
+
+        validation_undiscounted <-
+            mean(
+                validation_rollout$undiscounted_returns
+            )
+
+        # ---------------------------------------------------------------------
+        # Save best validation model.
+        # ---------------------------------------------------------------------
+
+        if (
+            is.finite(validation_value) &&
+            validation_value > best_validation
+        ) {
+
+            best_validation <-
+                validation_value
+
+            best_weights <-
+                online_model$get_weights()
+        }
+
+        # ---------------------------------------------------------------------
+        # Record training history.
+        # ---------------------------------------------------------------------
+
+        history_df <- bind_rows(
+            history_df,
+            tibble(
+                epoch = epoch,
+                epsilon = epsilon,
+                replay_size =
+                    replay$size,
+                loss =
+                    if (
+                        length(losses) > 0
+                    ) {
+                        mean(losses)
+                    } else {
+                        NA_real_
+                    },
+                validation_value =
+                    validation_value,
+                validation_undiscounted =
+                    validation_undiscounted
+            )
+        )
+
+        # ---------------------------------------------------------------------
+        # Epsilon decay.
+        # ---------------------------------------------------------------------
+
+        epsilon <- max(
+            EPSILON_END,
+            epsilon *
+                EPSILON_DECAY
+        )
+
+        cat(
+            sprintf(
+                "Epoch %3d | epsilon = %.4f | replay = %4d | loss = %.6f | validation = %.6f\n",
+                epoch,
+                epsilon,
+                replay$size,
+                if (
+                    length(losses) > 0
+                ) {
+                    mean(losses)
+                } else {
+                    NA_real_
+                },
+                validation_value
+            )
+        )
+    }
+
+    # -------------------------------------------------------------------------
+    # Restore best validation model.
+    # -------------------------------------------------------------------------
+
+    if (
+        !is.null(
+            best_weights
+        )
+    ) {
+
+        online_model$set_weights(
+            best_weights
+        )
+    }
+
+    list(
+        model = online_model,
+        target_model = target_model,
+        replay = replay,
+        history = history_df,
+        best_validation =
+            best_validation
+    )
+}
+
+
+# =============================================================================
+# 27. TRAINING PLOT
+# =============================================================================
+
+create_training_plot <- function(
+    history_df,
+    dataset_name,
+    rho,
+    replay_method
+) {
+
+    plot_data <- history_df
+
+    p <- ggplot(
+        plot_data,
+        aes(
+            x = epoch,
+            y = validation_value
+        )
+    ) +
+        geom_line(
+            linewidth = 0.8
+        ) +
+        geom_point(
+            size = 1.5
+        ) +
+        labs(
+            title = paste(
+                "Validation Policy Value:",
+                dataset_name
+            ),
+            subtitle = paste(
+                "rho =",
+                rho,
+                "| Replay =",
+                replay_method
+            ),
+            x = "Epoch",
+            y = "Discounted Policy Value"
+        ) +
+        theme_minimal()
+
+    p
+}
+
+
+# =============================================================================
+# 28. CATE PLOT
+# =============================================================================
+
+create_cate_plot <- function(
+    cate_df,
+    dataset_name,
+    rho,
+    replay_method
+) {
+
+    plot_data <- cate_df |>
+        group_by(
+            time,
+            contrast
+        ) |>
+        summarise(
+            mean_CATE =
+                mean(
+                    mean_CATE
+                ),
+            .groups = "drop"
+        )
+
+    p <- ggplot(
+        plot_data,
+        aes(
+            x = time,
+            y = mean_CATE,
+            group = contrast
+        )
+    ) +
+        geom_line(
+            linewidth = 0.8
+        ) +
+        geom_point(
+            size = 1.5
+        ) +
+        labs(
+            title = paste(
+                "Dynamic CATE:",
+                dataset_name
+            ),
+            subtitle = paste(
+                "rho =",
+                rho,
+                "| Replay =",
+                replay_method
+            ),
+            x = "Decision Time",
+            y = "Mean Immediate CATE"
+        ) +
+        theme_minimal()
+
+    p
+}
+
+
+# =============================================================================
+# 29. RUN ONE EXPERIMENT
+# =============================================================================
+
+run_experiment <- function(
+    dataset_name,
+    X,
+    rho,
+    replay_method,
+    seed
+) {
+
+    cat(
+        "\n",
+        "============================================================\n",
+        sep = ""
+    )
+
+    cat(
+        "Dataset:",
+        dataset_name,
+        "\n"
+    )
+
+    cat(
+        "Correlation:",
+        rho,
+        "\n"
+    )
+
+    cat(
+        "Replay:",
+        replay_method,
+        "\n"
+    )
+
+    cat(
+        "============================================================\n"
+    )
+
+    # -------------------------------------------------------------------------
+    # Limit sample size if necessary.
+    # -------------------------------------------------------------------------
+
+    set.seed(
+        seed
+    )
+
+    if (
+        nrow(X) > N
+    ) {
+
+        selected <- sample(
+            seq_len(
+                nrow(X)
+            ),
+            N
+        )
+
+        X <- X[
+            selected,
+            ,
+            drop = FALSE
+        ]
+    }
+
+    # -------------------------------------------------------------------------
+    # Train / validation / test split.
+    # -------------------------------------------------------------------------
+
+    n <- nrow(
+        X
+    )
+
+    train_n <- floor(
+        TRAIN_PROP * n
+    )
+
+    valid_n <- floor(
+        VALID_PROP * n
+    )
+
+    test_n <- n -
+        train_n -
+        valid_n
+
+    indices <- sample(
+        seq_len(n)
+    )
+
+    train_idx <- indices[
+        seq_len(
+            train_n
+        )
+    ]
+
+    valid_start <-
+        train_n + 1
+
+    valid_end <-
+        train_n + valid_n
+
+    valid_idx <- indices[
+        valid_start:
+        valid_end
+    ]
+
+    test_idx <- indices[
+        (valid_end + 1):
+        n
+    ]
+
+    X_train_raw <- X[
+        train_idx,
+        ,
+        drop = FALSE
+    ]
+
+    X_valid_raw <- X[
+        valid_idx,
+        ,
+        drop = FALSE
+    ]
+
+    X_test_raw <- X[
+        test_idx,
+        ,
+        drop = FALSE
+    ]
+
+    # -------------------------------------------------------------------------
+    # Standardization based ONLY on training data.
+    # -------------------------------------------------------------------------
+
+    standardizer <- fit_standardizer(
+        X_train_raw
+    )
+
+    X_train <- create_initial_states(
+        X_train_raw,
+        standardizer
+    )
+
+    X_valid <- create_initial_states(
+        X_valid_raw,
+        standardizer
+    )
+
+    X_test <- create_initial_states(
+        X_test_raw,
+        standardizer
+    )
+
+    # -------------------------------------------------------------------------
+    # Empirical copula fitted ONLY on training states.
+    # -------------------------------------------------------------------------
+
+    copula_fit <- fit_copula(
+        X_train
+    )
+
+    # -------------------------------------------------------------------------
+    # Reward scaling fitted ONLY from training data.
+    # -------------------------------------------------------------------------
+
+    reward_scaling <-
+        fit_reward_scaling(
+            X_train
+        )
+
+    # -------------------------------------------------------------------------
+    # Train sequential DQN.
+    # -------------------------------------------------------------------------
+
+    trained <- train_sequential_dqn(
+        X_train = X_train,
+        X_valid = X_valid,
+        copula_fit = copula_fit,
+        reward_scaling = reward_scaling,
+        rho = rho,
+        replay_method = replay_method,
+        seed = seed
+    )
+
+    model <- trained$model
+
+    # -------------------------------------------------------------------------
+    # Independent test rollout.
+    # -------------------------------------------------------------------------
+
+    test_rollout <- rollout_policy(
+        model = model,
+        X_initial = X_test,
+        copula_fit = copula_fit,
+        reward_scaling = reward_scaling,
+        rho = rho,
+        seed = seed + 20000
+    )
+
+    # -------------------------------------------------------------------------
+    # Dynamic CATE.
+    # -------------------------------------------------------------------------
+
+    cate_df <- calculate_dynamic_cate(
+        test_rollout
+    )
+
+    # -------------------------------------------------------------------------
+    # Policy matrix.
+    # -------------------------------------------------------------------------
+
+    policy_matrix <- create_policy_matrix(
+        test_rollout$actions
+    )
+
+    # -------------------------------------------------------------------------
+    # Policy value.
+    # -------------------------------------------------------------------------
+
+    policy_value <- calculate_policy_value(
+        test_rollout
+    )
+
+    # -------------------------------------------------------------------------
+    # Treatment rates.
+    # -------------------------------------------------------------------------
+
+    treatment_rates <- policy_matrix |>
+        filter(
+            action != 1
+        ) |>
+        group_by(
+            action
+        ) |>
+        summarise(
+            treatment_rate =
+                mean(rate),
+            .groups = "drop"
+        )
+
+    treatment_rate_action2 <-
+        treatment_rates |>
+        filter(
+            action == 2
+        ) |>
+        pull(
+            treatment_rate
+        )
+
+    treatment_rate_action3 <-
+        treatment_rates |>
+        filter(
+            action == 3
+        ) |>
+        pull(
+            treatment_rate
+        )
+
+    if (
+        length(
+            treatment_rate_action2
+        ) == 0
+    ) {
+
+        treatment_rate_action2 <- NA_real_
+    }
+
+    if (
+        length(
+            treatment_rate_action3
+        ) == 0
+    ) {
+
+        treatment_rate_action3 <- NA_real_
+    }
+
+    # -------------------------------------------------------------------------
+    # CATE summary.
+    # -------------------------------------------------------------------------
+
+    cate_summary <- cate_df |>
+        group_by(
+            contrast,
+            reward_dimension
+        ) |>
+        summarise(
+            mean_CATE =
+                mean(
+                    mean_CATE
+                ),
+            sd_CATE =
+                mean(
+                    sd_CATE
+                ),
+            .groups = "drop"
+        )
+
+    # -------------------------------------------------------------------------
+    # Final summary.
+    # -------------------------------------------------------------------------
+
+    summary_row <- tibble(
+        dataset = dataset_name,
+        rho = rho,
+        replay_method = replay_method,
+        n_train = nrow(
+            X_train
+        ),
+        n_valid = nrow(
+            X_valid
+        ),
+        n_test = nrow(
+            X_test
+        ),
+        T_steps = T_STEPS,
+        n_actions = N_ACTIONS,
+        n_reward_dim = N_REWARD_DIM,
+        gamma = GAMMA,
+        best_validation_value =
+            trained$best_validation,
+        test_discounted_policy_value =
+            policy_value$discounted_policy_value,
+        test_discounted_policy_sd =
+            policy_value$discounted_policy_sd,
+        test_undiscounted_policy_value =
+            policy_value$undiscounted_policy_value,
+        test_undiscounted_policy_sd =
+            policy_value$undiscounted_policy_sd,
+        action2_rate =
+            treatment_rate_action2,
+        action3_rate =
+            treatment_rate_action3
+    )
+
+    # -------------------------------------------------------------------------
+    # Save experiment-specific files.
+    # -------------------------------------------------------------------------
+
+    experiment_tag <- paste(
+        dataset_name,
+        paste0(
+            "rho",
+            ifelse(
+                rho > 0,
+                "pos",
+                "neg"
+            ),
+            abs(rho)
+        ),
+        replay_method,
+        sep = "_"
+    )
+
+    experiment_tag <- gsub(
+        "[^A-Za-z0-9_]+",
+        "_",
+        experiment_tag
+    )
+
+    saveRDS(
+        trained$model,
+        file.path(
+            OUTPUT_DIR,
+            paste0(
+                experiment_tag,
+                "_model.rds"
+            )
+        )
+    )
+
+    saveRDS(
+        trained$target_model,
+        file.path(
+            OUTPUT_DIR,
+            paste0(
+                experiment_tag,
+                "_target_model.rds"
+            )
+        )
+    )
+
+    write.csv(
+        trained$history,
+        file.path(
+            OUTPUT_DIR,
+            paste0(
+                experiment_tag,
+                "_training_history.csv"
+            )
+        ),
+        row.names = FALSE
+    )
+
+    write.csv(
+        policy_matrix,
+        file.path(
+            OUTPUT_DIR,
+            paste0(
+                experiment_tag,
+                "_policy_matrix.csv"
+            )
+        ),
+        row.names = FALSE
+    )
+
+    write.csv(
+        cate_df,
+        file.path(
+            OUTPUT_DIR,
+            paste0(
+                experiment_tag,
+                "_dynamic_CATE.csv"
+            )
+        ),
+        row.names = FALSE
+    )
+
+    write.csv(
+        cate_summary,
+        file.path(
+            OUTPUT_DIR,
+            paste0(
+                experiment_tag,
+                "_CATE_summary.csv"
+            )
+        ),
+        row.names = FALSE
+    )
+
+    write.csv(
+        summary_row,
+        file.path(
+            OUTPUT_DIR,
+            paste0(
+                experiment_tag,
+                "_summary.csv"
+            )
+        ),
+        row.names = FALSE
+    )
+
+    # -------------------------------------------------------------------------
+    # Save plots.
+    # -------------------------------------------------------------------------
+
+    training_plot <- create_training_plot(
+        trained$history,
+        dataset_name,
+        rho,
+        replay_method
+    )
+
+    cate_plot <- create_cate_plot(
+        cate_df,
+        dataset_name,
+        rho,
+        replay_method
+    )
+
+    ggsave(
+        filename = file.path(
+            OUTPUT_DIR,
+            paste0(
+                experiment_tag,
+                "_training.png"
+            )
+        ),
+        plot = training_plot,
+        width = 8,
+        height = 5,
+        dpi = 300
+    )
+
+    ggsave(
+        filename = file.path(
+            OUTPUT_DIR,
+            paste0(
+                experiment_tag,
+                "_dynamic_CATE.png"
+            )
+        ),
+        plot = cate_plot,
+        width = 8,
+        height = 5,
+        dpi = 300
+    )
+
+    list(
+        summary = summary_row,
+        model = model,
+        training = trained,
+        test_rollout = test_rollout,
+        policy_matrix = policy_matrix,
+        dynamic_CATE = cate_df,
+        CATE_summary = cate_summary
+    )
+}
+
+# =============================================================================
+# 30. MAIN EXPERIMENT
+# =============================================================================
+
+all_results <- list()
+
+result_counter <- 1
+
+for (dataset_name in names(dataset_objects)) {
+
+    dataset <- dataset_objects[[dataset_name]]
+
+    # -------------------------------------------------------------------------
+    # Each dataset is evaluated under rho = +0.5 and rho = -0.5.
+    # -------------------------------------------------------------------------
+
+    for (rho in CORRELATIONS) {
+
+        # =====================================================================
+        # Uniform replay
+        # =====================================================================
+
+        seed_uniform <-
+            SEED_BASE +
+            result_counter * 100
+
+        result_uniform <- run_experiment(
+            dataset_name = dataset_name,
+            X = dataset,
+            rho = rho,
+            replay_method = "uniform",
+            seed = seed_uniform
+        )
+
+        all_results[[result_counter]] <-
+            result_uniform$summary
+
+        result_counter <-
+            result_counter + 1
+
+
+        # =====================================================================
+        # Uncertainty-weighted replay
+        # =====================================================================
+
+        seed_uncertainty <-
+            SEED_BASE +
+            result_counter * 100
+
+        result_uncertainty <- run_experiment(
+            dataset_name = dataset_name,
+            X = dataset,
+            rho = rho,
+            replay_method = "uncertainty",
+            seed = seed_uncertainty
+        )
+
+        all_results[[result_counter]] <-
+            result_uncertainty$summary
+
+        result_counter <-
+            result_counter + 1
+    }
+}
+
+# =============================================================================
+# 31. FINAL SUMMARY
+# =============================================================================
+
+final_summary <- bind_rows(
+    all_results
+)
+
+write.csv(
+    final_summary,
+    file.path(
+        OUTPUT_DIR,
+        "final_summary.csv"
+    ),
+    row.names = FALSE
+)
+
+print(
+    final_summary
+)
+
+
+# =============================================================================
+# 32. FINAL POLICY-VALUE PLOT
+# =============================================================================
+
+policy_plot_data <- final_summary
+
+policy_plot <- ggplot(
+    policy_plot_data,
+    aes(
+        x = factor(rho),
+        y = test_discounted_policy_value,
+        group = replay_method
+    )
+) +
+    geom_line(
+        aes(
+            linetype = replay_method
+        ),
+        linewidth = 0.8
+    ) +
+    geom_point(
+        aes(
+            shape = replay_method
+        ),
+        size = 2.5
+    ) +
+    facet_wrap(
+        ~ dataset
+    ) +
+    labs(
+        title =
+            "Sequential DQN Policy Value",
+        x =
+            "Reward Correlation",
+        y =
+            "Mean Discounted Policy Value",
+        linetype =
+            "Replay Method",
+        shape =
+            "Replay Method"
+    ) +
+    theme_minimal()
+
+ggsave(
+    filename = file.path(
+        OUTPUT_DIR,
+        "final_policy_value_comparison.png"
+    ),
+    plot = policy_plot,
+    width = 9,
+    height = 5.5,
+    dpi = 300
+)
+
+
+# =============================================================================
+# 33. FINAL MESSAGE
+# =============================================================================
+
+cat(
+    "\n============================================================\n"
+)
+
+cat(
+    "Sequential Copula-CNN-LSTM DQN experiment completed.\n"
+)
+
+cat(
+    "Results saved to:",
+    OUTPUT_DIR,
+    "\n"
+)
+
+cat(
+    "Datasets:",
+    paste(
+        names(dataset_objects),
+        collapse = ", "
+    ),
+    "\n"
+)
+
+cat(
+    "Reward correlations:",
+    paste(
+        CORRELATIONS,
+        collapse = ", "
+    ),
+    "\n"
+)
+
+cat(
+    "Replay methods: Uniform, Uncertainty-weighted\n"
+)
+
+cat(
+    "============================================================\n"
+)

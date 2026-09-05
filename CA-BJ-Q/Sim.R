@@ -1,52 +1,56 @@
-
-###############################################################
-# SIMULATION: CA-BJ Q-LEARNING UNDER CENSORING
+# =============================================================================
+# Censoring-Adjusted Buckley--James Q-Learning for Dynamic Treatment Regimes
+# with Competing Risks
+#
+# Three-stage synthetic simulation
 #
 # Methods:
-#
 #   1. BJ-Q
-#   2. Complete IPCW-Q
+#   2. IPCW-Q
 #   3. CA-BJ-Q
 #
-# Proposed CA-BJ pseudo-outcome:
+# Cause 1 = primary event
+# Cause 2 = competing event
+# Administrative censoring = separate from competing events
 #
-#   Z_k =
-#       BJ_k +
-#       Delta_k * eta_{k+1} *
-#       V_{k+1}(H_{k+1}) / G_k
+# Primary estimand:
+#   Restricted mean event-free time through TAU across the three stages
 #
-# Censoring levels:
-#
-#   10%, 30%, 50%, 70%
-#
-# Performance measures:
-#
-#   - ATE estimation
-#   - ATE bias
-#   - ATE RMSE
-#   - Policy value
-#   - Policy regret
-#   - Treatment rate
-#   - Policy accuracy
-#   - Effective sample size
-#
-###############################################################
+# =============================================================================
 
 rm(list = ls())
+gc()
+
+# =============================================================================
+# 0. Packages
+# =============================================================================
+
+required_packages <- c(
+  "survival",
+  "dplyr",
+  "tidyr",
+  "ggplot2"
+)
+
+for (pkg in required_packages) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg)
+  }
+}
 
 library(survival)
 library(dplyr)
+library(tidyr)
+library(ggplot2)
 
-set.seed(2026)
+# =============================================================================
+# 1. Global simulation settings
+# =============================================================================
 
-###############################################################
-# 1. SIMULATION SETTINGS
-###############################################################
+SEED_BASE <- 20260905
 
 N <- 2000
-
 K <- 3
-
 N_REP <- 100
 
 CENSORING_LEVELS <- c(
@@ -56,1727 +60,2752 @@ CENSORING_LEVELS <- c(
   0.70
 )
 
-###############################################################
-# 2. TRUE DATA-GENERATING PROCESS
-###############################################################
+TAU <- 2.0
+
+G_FLOOR <- 0.05
+
+OUTPUT_DIR <- "CA_BJ_Q_competing_risks_results"
+
+if (!dir.exists(OUTPUT_DIR)) {
+  dir.create(OUTPUT_DIR, recursive = TRUE)
+}
+
+# =============================================================================
+# 2. Utility functions
+# =============================================================================
+
+safe_mean <- function(x) {
+  if (length(x) == 0 || all(is.na(x))) {
+    return(NA_real_)
+  }
+  mean(x, na.rm = TRUE)
+}
+
+safe_sd <- function(x) {
+  if (length(na.omit(x)) <= 1) {
+    return(NA_real_)
+  }
+  sd(x, na.rm = TRUE)
+}
+
+# -----------------------------------------------------------------------------
+# Exponential RMST
+# -----------------------------------------------------------------------------
+
+exp_rmst <- function(lambda, tau = TAU) {
+  ifelse(
+    lambda > 0,
+    (1 - exp(-lambda * tau)) / lambda,
+    tau
+  )
+}
+
+# =============================================================================
+# 3. Strong dynamic competing-risk DGP
+# =============================================================================
+#
+# The DGP is intentionally constructed so that:
+#
+#       A1 -> H2 -> A2 -> H3 -> A3
+#
+# and treatment effects are heterogeneous at every stage.
+#
+# Cause 1 hazard decreases with treatment.
+#
+# The treatment-by-history interactions:
+#
+# Stage 1: -0.80 - 0.60 H1
+# Stage 2: -0.70 - 0.55 H2
+# Stage 3: -0.65 - 0.60 H3
+#
+# therefore generate nontrivial treatment thresholds.
+#
+# Cause 2 is a competing event and is NOT treated as censoring.
+# =============================================================================
 
 simulate_data <- function(
     N = 2000,
-    censoring_rate = 0.30
+    censoring_rate = 0.30,
+    tau = 2.0,
+    seed = NULL
 ) {
 
-  #############################################################
-  # STAGE 1
-  #############################################################
+  if (!is.null(seed)) {
+    set.seed(seed)
+  }
 
-  H1 <- rnorm(N)
+  # ---------------------------------------------------------------------------
+  # Stage 1
+  # ---------------------------------------------------------------------------
+
+  H1 <- rnorm(N, 0, 1)
 
   A1 <- rbinom(
     N,
     size = 1,
-    prob = 0.5
+    prob = 0.50
   )
 
-  lambda1 <- exp(
-    0.25 -
-      0.20 * H1 -
-      0.35 * A1 -
+  # Cause 1: primary event
+  lambda11 <- exp(
+    0.10 -
+      0.45 * H1 -
+      0.80 * A1 -
+      0.60 * H1 * A1
+  )
+
+  # Cause 2: competing event
+  lambda12 <- exp(
+    -0.80 +
+      0.30 * H1 +
+      0.35 * A1 +
       0.20 * H1 * A1
   )
 
-  T1 <- rexp(
+  T11 <- rexp(
     N,
-    rate = lambda1
+    rate = lambda11
   )
 
-  #############################################################
-  # CENSORING STAGE 1
-  #############################################################
-
-  censor_rate_parameter1 <-
-    -log(1 - censoring_rate) /
-    median(T1)
-
-  C1 <- rexp(
+  T12 <- rexp(
     N,
-    rate = censor_rate_parameter1
+    rate = lambda12
   )
 
-  Y1 <- pmin(T1, C1)
+  T1 <- pmin(T11, T12)
 
-  Delta1 <- as.integer(
-    T1 <= C1
+  Cause1 <- ifelse(
+    T11 <= T12,
+    1L,
+    2L
   )
 
-  #############################################################
-  # STAGE 2 ENTRY
-  #############################################################
+  Y1_true <- pmin(T1, tau)
 
-  eta2 <- Delta1
+  # ---------------------------------------------------------------------------
+  # Stage 2
+  # ---------------------------------------------------------------------------
+  #
+  # Stage 2 history depends on:
+  #   - baseline H1
+  #   - previous treatment A1
+  #   - previous event-free time Y1_true
+  #
+  # ---------------------------------------------------------------------------
 
-  #############################################################
-  # STAGE 2 HISTORY
-  #############################################################
-
-  H2 <- H1 +
-    0.30 * Y1 +
-    rnorm(N, sd = 0.5)
+  H2 <- (
+    0.60 * H1 +
+      0.80 * A1 +
+      0.70 * (Y1_true - mean(Y1_true)) +
+      rnorm(N, 0, 0.35)
+  )
 
   A2 <- rbinom(
     N,
     size = 1,
-    prob = 0.5
+    prob = 0.50
   )
 
-  #############################################################
-  # STAGE 2 SURVIVAL
-  #############################################################
-
-  lambda2 <- exp(
-    0.20 -
-      0.15 * H2 -
-      0.30 * A2 -
-      0.20 * H2 * A2
+  lambda21 <- exp(
+    0.05 -
+      0.35 * H2 -
+      0.70 * A2 -
+      0.55 * H2 * A2
   )
 
-  T2 <- rexp(
+  lambda22 <- exp(
+    -0.75 +
+      0.25 * H2 +
+      0.30 * A2 +
+      0.15 * H2 * A2
+  )
+
+  T21 <- rexp(
     N,
-    rate = lambda2
+    rate = lambda21
   )
 
-  #############################################################
-  # CENSORING STAGE 2
-  #############################################################
-
-  censor_rate_parameter2 <-
-    -log(1 - censoring_rate) /
-    median(T2)
-
-  C2 <- rexp(
+  T22 <- rexp(
     N,
-    rate = censor_rate_parameter2
+    rate = lambda22
   )
 
-  Y2 <- pmin(T2, C2)
+  T2 <- pmin(T21, T22)
 
-  Delta2 <- as.integer(
-    T2 <= C2
+  Cause2 <- ifelse(
+    T21 <= T22,
+    1L,
+    2L
   )
 
-  #############################################################
-  # STAGE 3 ENTRY
-  #############################################################
+  Y2_true <- pmin(T2, tau)
 
-  eta3 <- as.integer(
-    eta2 == 1 &
-      Delta2 == 1
+  # ---------------------------------------------------------------------------
+  # Stage 3
+  # ---------------------------------------------------------------------------
+
+  H3 <- (
+    0.55 * H2 +
+      0.75 * A2 +
+      0.70 * (Y2_true - mean(Y2_true)) +
+      0.25 * A1 +
+      rnorm(N, 0, 0.35)
   )
-
-  #############################################################
-  # STAGE 3 HISTORY
-  #############################################################
-
-  H3 <- H2 +
-    0.30 * Y2 +
-    rnorm(N, sd = 0.5)
 
   A3 <- rbinom(
     N,
     size = 1,
-    prob = 0.5
+    prob = 0.50
   )
 
-  #############################################################
-  # STAGE 3 SURVIVAL
-  #############################################################
+  lambda31 <- exp(
+    0.00 -
+      0.30 * H3 -
+      0.65 * A3 -
+      0.60 * H3 * A3
+  )
 
-  lambda3 <- exp(
-    0.15 -
-      0.10 * H3 -
-      0.25 * A3 -
+  lambda32 <- exp(
+    -0.70 +
+      0.25 * H3 +
+      0.30 * A3 +
       0.15 * H3 * A3
   )
 
-  T3 <- rexp(
+  T31 <- rexp(
     N,
-    rate = lambda3
+    rate = lambda31
   )
 
-  #############################################################
-  # CENSORING STAGE 3
-  #############################################################
+  T32 <- rexp(
+    N,
+    rate = lambda32
+  )
 
-  censor_rate_parameter3 <-
-    -log(1 - censoring_rate) /
-    median(T3)
+  T3 <- pmin(T31, T32)
+
+  Cause3 <- ifelse(
+    T31 <= T32,
+    1L,
+    2L
+  )
+
+  Y3_true <- pmin(T3, tau)
+
+  # ---------------------------------------------------------------------------
+  # Administrative censoring calibration
+  # ---------------------------------------------------------------------------
+  #
+  # Solve:
+  #
+  #   mean{1 - exp(-lambda_C T)} = target
+  #
+  # rather than simply using a median-based approximation.
+  #
+  # ---------------------------------------------------------------------------
+
+  all_T <- c(
+    T1,
+    T2,
+    T3
+  )
+
+  censoring_equation <- function(rate) {
+
+    mean(
+      1 - exp(-rate * all_T)
+    ) -
+      censoring_rate
+  }
+
+  upper <- 1
+
+  while (
+    censoring_equation(upper) < 0 &&
+    upper < 1e6
+  ) {
+    upper <- upper * 2
+  }
+
+  censor_rate <- uniroot(
+    censoring_equation,
+    interval = c(0, upper)
+  )$root
+
+  # ---------------------------------------------------------------------------
+  # Independent administrative censoring
+  # ---------------------------------------------------------------------------
+
+  C1 <- rexp(
+    N,
+    rate = censor_rate
+  )
+
+  C2 <- rexp(
+    N,
+    rate = censor_rate
+  )
 
   C3 <- rexp(
     N,
-    rate = censor_rate_parameter3
+    rate = censor_rate
   )
 
-  Y3 <- pmin(T3, C3)
+  # ---------------------------------------------------------------------------
+  # Observed Stage 1
+  # ---------------------------------------------------------------------------
+
+  Y1 <- pmin(
+    T1,
+    C1,
+    tau
+  )
+
+  Delta1 <- as.integer(
+    T1 <= C1 &
+      T1 <= tau
+  )
+
+  ObservedCause1 <- ifelse(
+    Delta1 == 1,
+    Cause1,
+    0L
+  )
+
+  # ---------------------------------------------------------------------------
+  # Eligibility for Stage 2
+  # ---------------------------------------------------------------------------
+
+  eta2 <- Delta1
+
+  # ---------------------------------------------------------------------------
+  # Observed Stage 2
+  # ---------------------------------------------------------------------------
+
+  Y2 <- pmin(
+    T2,
+    C2,
+    tau
+  )
+
+  Delta2 <- as.integer(
+    T2 <= C2 &
+      T2 <= tau
+  )
+
+  ObservedCause2 <- ifelse(
+    Delta2 == 1,
+    Cause2,
+    0L
+  )
+
+  eta3 <- eta2 * Delta2
+
+  # ---------------------------------------------------------------------------
+  # Observed Stage 3
+  # ---------------------------------------------------------------------------
+
+  Y3 <- pmin(
+    T3,
+    C3,
+    tau
+  )
 
   Delta3 <- as.integer(
-    T3 <= C3
+    T3 <= C3 &
+      T3 <= tau
   )
 
-  #############################################################
-  # RETURN
-  #############################################################
+  ObservedCause3 <- ifelse(
+    Delta3 == 1,
+    Cause3,
+    0L
+  )
+
+  # ---------------------------------------------------------------------------
+  # Mask downstream variables after censoring
+  # ---------------------------------------------------------------------------
+
+  H2_obs <- ifelse(
+    eta2 == 1,
+    H2,
+    NA_real_
+  )
+
+  A2_obs <- ifelse(
+    eta2 == 1,
+    A2,
+    NA_integer_
+  )
+
+  Y2_obs <- ifelse(
+    eta2 == 1,
+    Y2,
+    NA_real_
+  )
+
+  Delta2_obs <- ifelse(
+    eta2 == 1,
+    Delta2,
+    NA_integer_
+  )
+
+  Cause2_obs <- ifelse(
+    eta2 == 1,
+    ObservedCause2,
+    NA_integer_
+  )
+
+  H3_obs <- ifelse(
+    eta3 == 1,
+    H3,
+    NA_real_
+  )
+
+  A3_obs <- ifelse(
+    eta3 == 1,
+    A3,
+    NA_integer_
+  )
+
+  Y3_obs <- ifelse(
+    eta3 == 1,
+    Y3,
+    NA_real_
+  )
+
+  Delta3_obs <- ifelse(
+    eta3 == 1,
+    Delta3,
+    NA_integer_
+  )
+
+  Cause3_obs <- ifelse(
+    eta3 == 1,
+    ObservedCause3,
+    NA_integer_
+  )
+
+  # ---------------------------------------------------------------------------
+  # Return data
+  # ---------------------------------------------------------------------------
 
   data.frame(
+    id = seq_len(N),
 
     H1 = H1,
     A1 = A1,
-    T1 = T1,
-    C1 = C1,
     Y1 = Y1,
     Delta1 = Delta1,
-    eta1 = 1,
+    Cause1 = ObservedCause1,
+    eta1 = 1L,
 
-    H2 = H2,
-    A2 = A2,
-    T2 = T2,
-    C2 = C2,
-    Y2 = Y2,
-    Delta2 = Delta2,
+    H2 = H2_obs,
+    A2 = A2_obs,
+    Y2 = Y2_obs,
+    Delta2 = Delta2_obs,
+    Cause2 = Cause2_obs,
     eta2 = eta2,
 
-    H3 = H3,
-    A3 = A3,
-    T3 = T3,
+    H3 = H3_obs,
+    A3 = A3_obs,
+    Y3 = Y3_obs,
+    Delta3 = Delta3_obs,
+    Cause3 = Cause3_obs,
+    eta3 = eta3,
+
+    # Latent quantities retained for truth/diagnostics
+    H2_true = H2,
+    H3_true = H3,
+
+    T1_true = T1,
+    T2_true = T2,
+    T3_true = T3,
+
+    Y1_true = Y1_true,
+    Y2_true = Y2_true,
+    Y3_true = Y3_true,
+
+    TrueCause1 = Cause1,
+    TrueCause2 = Cause2,
+    TrueCause3 = Cause3,
+
+    C1 = C1,
+    C2 = C2,
     C3 = C3,
-    Y3 = Y3,
-    Delta3 = Delta3,
-    eta3 = eta3
+
+    censor_rate = censor_rate
   )
 }
 
-###############################################################
-# 3. BUCKLEY-JAMES IMPUTATION
-###############################################################
+# =============================================================================
+# 4. Buckley--James imputation
+# =============================================================================
+#
+# Both causes are failures for the primary event-free-time objective.
+#
+# Therefore:
+#
+#   Surv(Y, Delta)
+#
+# is appropriate for BJ estimation of time to ANY event.
+#
+# For a censored subject:
+#
+#   BJ(Y)
+#       = Y +
+#         integral_Y^tau S(u)du / S(Y)
+#
+# The division by S(Y) is essential.
+# =============================================================================
 
-BJ_impute <- function(
-    Y,
-    Delta
+BJ_impute_group <- function(
+  Y,
+  Delta,
+  tau = TAU
 ) {
 
-  fit <- survfit(
-    Surv(Y, Delta) ~ 1
+  n <- length(Y)
+
+  result <- rep(NA_real_, n)
+
+  keep <- which(
+    !is.na(Y) &
+      !is.na(Delta)
   )
 
-  BJ <- Y
-
-  censored <- which(
-    Delta == 0
-  )
-
-  if (length(censored) == 0) {
-    return(BJ)
+  if (length(keep) == 0) {
+    return(result)
   }
 
-  #############################################################
-  # KM survival curve
-  #############################################################
+  y <- Y[keep]
+  d <- Delta[keep]
 
-  km_time <- fit$time
-  km_surv <- fit$surv
+  km <- survfit(
+    Surv(y, d) ~ 1
+  )
 
-  for (i in censored) {
+  # KM step function
+  surv_times <- km$time
+  surv_probs <- km$surv
 
-    y <- Y[i]
+  # Restricted survival integral from y to tau
+  restricted_area <- function(y0) {
 
-    idx <- which(
-      km_time > y
-    )
-
-    if (length(idx) == 0) {
-      BJ[i] <- y
-      next
+    if (y0 >= tau) {
+      return(0)
     }
 
-    future_times <- km_time[idx]
-    future_surv <- km_surv[idx]
-
-    ###########################################################
-    # Restricted KM mean residual life
-    ###########################################################
-
-    interval_times <- c(
-      y,
-      future_times
+    times <- c(
+      y0,
+      surv_times[
+        surv_times > y0 &
+          surv_times < tau
+      ],
+      tau
     )
 
-    interval_widths <- diff(
-      interval_times
+    if (length(times) < 2) {
+      return(
+        (tau - y0) * 1
+      )
+    }
+
+    S_left <- numeric(
+      length(times) - 1
     )
 
-    area <- sum(
-      interval_widths *
-        future_surv
-    )
+    for (j in seq_len(length(times) - 1)) {
 
-    BJ[i] <- y + area
+      left <- times[j]
+
+      idx <- max(
+        which(
+          surv_times <= left
+        ),
+        0
+      )
+
+      if (idx == 0) {
+        S_left[j] <- 1
+      } else {
+        S_left[j] <- surv_probs[idx]
+      }
+    }
+
+    sum(
+      diff(times) * S_left
+    )
   }
 
-  BJ
+  for (j in seq_along(keep)) {
+
+    idx <- keep[j]
+
+    if (d[j] == 1) {
+
+      result[idx] <- y[j]
+
+    } else {
+
+      Sy <- ifelse(
+        y[j] >= tau,
+        0,
+        {
+          idx_s <- max(
+            which(
+              surv_times <= y[j]
+            ),
+            0
+          )
+
+          if (idx_s == 0) {
+            1
+          } else {
+            surv_probs[idx_s]
+          }
+        }
+      )
+
+      if (Sy <= 1e-8) {
+
+        result[idx] <- y[j]
+
+      } else {
+
+        area <- restricted_area(
+          y[j]
+        )
+
+        result[idx] <-
+          y[j] +
+          area / Sy
+      }
+    }
+  }
+
+  result
 }
 
-###############################################################
-# 4. ESTIMATE CENSORING SURVIVAL G
-###############################################################
+# -----------------------------------------------------------------------------
+# Treatment-stratified BJ
+# -----------------------------------------------------------------------------
 
-estimate_G <- function(
-    Y,
-    Delta,
-    A,
-    floor = 0.05
+BJ_impute <- function(
+  Y,
+  Delta,
+  A,
+  tau = TAU
 ) {
 
-  G <- rep(
+  result <- rep(
     NA_real_,
     length(Y)
   )
 
-  for (a in sort(unique(A))) {
+  for (a in c(0, 1)) {
 
     idx <- which(
-      A == a
+      A == a &
+        !is.na(A)
     )
 
     if (length(idx) == 0) {
       next
     }
 
-    ###########################################################
-    # Censoring treated as event
-    ###########################################################
+    result[idx] <- BJ_impute_group(
+      Y = Y[idx],
+      Delta = Delta[idx],
+      tau = tau
+    )
+  }
 
-    censor_event <-
-      1 - Delta[idx]
+  result
+}
 
-    fit <- survfit(
+# =============================================================================
+# 5. Censoring survival G
+# =============================================================================
+#
+# Administrative censoring is the censoring mechanism.
+#
+# Competing events are NOT censoring.
+#
+# Therefore:
+#
+#   censoring event = 1 - Delta
+#
+# =============================================================================
+
+estimate_G <- function(
+  Y,
+  Delta,
+  A,
+  floor = G_FLOOR
+) {
+
+  Ghat <- rep(
+    NA_real_,
+    length(Y)
+  )
+
+  for (a in c(0, 1)) {
+
+    idx <- which(
+      A == a &
+        !is.na(A) &
+        !is.na(Y) &
+        !is.na(Delta)
+    )
+
+    if (length(idx) == 0) {
+      next
+    }
+
+    # Event = administrative censoring
+    censor_event <- 1 - Delta[idx]
+
+    km <- survfit(
       Surv(
         Y[idx],
         censor_event
       ) ~ 1
     )
 
-    ###########################################################
-    # Predict G(Y)
-    ###########################################################
+    get_G <- function(t) {
 
-    G[idx] <- summary(
-      fit,
-      times = Y[idx],
-      extend = TRUE
-    )$surv
+      if (t <= 0) {
+        return(1)
+      }
 
-    G[idx][is.na(G[idx])] <- 1
+      pos <- max(
+        which(
+          km$time <= t
+        ),
+        0
+      )
+
+      if (pos == 0) {
+        g <- 1
+      } else {
+        g <- km$surv[pos]
+      }
+
+      max(
+        g,
+        floor
+      )
+    }
+
+    Ghat[idx] <- sapply(
+      Y[idx],
+      get_G
+    )
   }
 
-  pmax(
-    G,
-    floor
-  )
+  Ghat
 }
 
-###############################################################
-# 5. Q-FUNCTION
-###############################################################
+# =============================================================================
+# 6. Q-learning model
+# =============================================================================
 
 fit_Q <- function(
-    target,
-    H,
-    A,
-    weights = NULL
+  H,
+  A,
+  target
 ) {
 
   dat <- data.frame(
-    target = target,
+    H = H,
+    A = A,
+    target = target
+  )
+
+  dat <- dat[
+    complete.cases(dat),
+    ,
+    drop = FALSE
+  ]
+
+  if (nrow(dat) < 20) {
+    return(NULL)
+  }
+
+  lm(
+    target ~ H + A + H:A,
+    data = dat
+  )
+}
+
+# -----------------------------------------------------------------------------
+# Q prediction
+# -----------------------------------------------------------------------------
+
+predict_Q <- function(
+  fit,
+  H,
+  A
+) {
+
+  if (is.null(fit)) {
+    return(
+      rep(
+        NA_real_,
+        length(H)
+      )
+    )
+  }
+
+  newdat <- data.frame(
     H = H,
     A = A
   )
 
-  if (is.null(weights)) {
-
-    lm(
-      target ~ H + A + H:A,
-      data = dat
-    )
-
-  } else {
-
-    lm(
-      target ~ H + A + H:A,
-      data = dat,
-      weights = weights
-    )
-  }
-}
-
-###############################################################
-# 6. PREDICT Q FOR BOTH TREATMENTS
-###############################################################
-
-predict_Q <- function(
-    model,
-    H
-) {
-
-  q0 <- predict(
-    model,
-    newdata = data.frame(
-      H = H,
-      A = 0
-    )
-  )
-
-  q1 <- predict(
-    model,
-    newdata = data.frame(
-      H = H,
-      A = 1
-    )
-  )
-
-  list(
-    q0 = q0,
-    q1 = q1
+  predict(
+    fit,
+    newdata = newdat
   )
 }
 
-###############################################################
-# 7. OPTIMAL VALUE
-###############################################################
+# -----------------------------------------------------------------------------
+# Optimal value
+# -----------------------------------------------------------------------------
 
 predict_V <- function(
-    model,
-    H
+  fit,
+  H
 ) {
 
-  q <- predict_Q(
-    model,
-    H
-  )
-
-  pmax(
-    q$q0,
-    q$q1
-  )
-}
-
-###############################################################
-# 8. OPTIMAL TREATMENT
-###############################################################
-
-predict_policy <- function(
-    model,
-    H
-) {
-
-  q <- predict_Q(
-    model,
-    H
-  )
-
-  as.integer(
-    q$q1 > q$q0
-  )
-}
-
-###############################################################
-# 9. CA-BJ TARGET
-###############################################################
-
-CA_BJ_target <- function(
-    BJ_current,
-    Delta,
-    eta_next,
-    G,
-    V_next
-) {
-
-  #############################################################
-  # Current outcome is represented by BJ_current.
-  #
-  # The continuation value is corrected using IPCW.
-  #############################################################
-
-  continuation <-
-    Delta *
-    eta_next *
-    V_next /
-    G
-
-  BJ_current +
-    continuation
-}
-
-###############################################################
-# 10. COMPLETE IPCW TARGET
-###############################################################
-
-IPCW_target <- function(
-    Y,
-    Delta,
-    eta_next,
-    G,
-    V_next
-) {
-
-  Delta *
-    eta_next *
-    (
-      Y + V_next
-    ) /
-    G
-}
-
-###############################################################
-# 11. ESS
-###############################################################
-
-effective_sample_size <- function(
-    w
-) {
-
-  w <- w[
-    is.finite(w) &
-      w > 0
-  ]
-
-  if (length(w) == 0) {
-    return(0)
-  }
-
-  sum(w)^2 /
-    sum(w^2)
-}
-
-###############################################################
-# 12. TRUE TREATMENT EFFECT
-###############################################################
-
-true_effect_stage1 <- function(
+  q0 <- predict_Q(
+    fit,
     H,
-    A = 1
-) {
-
-  lambda0 <- exp(
-    0.25 -
-      0.20 * H
+    0
   )
 
-  lambda1 <- exp(
-    0.25 -
-      0.20 * H -
-      0.35 -
-      0.20 * H
+  q1 <- predict_Q(
+    fit,
+    H,
+    1
   )
 
-  1 / lambda1 -
-    1 / lambda0
+  pmax(
+    q0,
+    q1,
+    na.rm = FALSE
+  )
 }
 
-###############################################################
-# 13. TRUE OPTIMAL STAGE-1 POLICY
-###############################################################
+# -----------------------------------------------------------------------------
+# Optimal treatment rule
+# -----------------------------------------------------------------------------
 
-true_policy_stage1 <- function(
-    H
+predict_rule <- function(
+  fit,
+  H
 ) {
 
-  effect <- true_effect_stage1(
-    H
+  q0 <- predict_Q(
+    fit,
+    H,
+    0
+  )
+
+  q1 <- predict_Q(
+    fit,
+    H,
+    1
   )
 
   as.integer(
-    effect > 0
+    q1 > q0
   )
 }
 
-###############################################################
-# 14. TRUE STAGE-1 VALUE
-###############################################################
+# =============================================================================
+# 7. Three-stage BJ-Q
+# =============================================================================
+#
+# Terminal:
+#
+#   Z3 = BJ3
+#
+# Stage 2:
+#
+#   Z2 = BJ2 + eta3 V3
+#
+# Stage 1:
+#
+#   Z1 = BJ1 + eta2 V2
+#
+# =============================================================================
 
-true_value_stage1 <- function(
-    H
-) {
+fit_BJ_Q <- function(dat) {
 
-  lambda0 <- exp(
-    0.25 -
-      0.20 * H
-  )
+  # ---------------------------------------------------------------------------
+  # Stage 3
+  # ---------------------------------------------------------------------------
 
-  lambda1 <- exp(
-    0.25 -
-      0.20 * H -
-      0.35 -
-      0.20 * H
-  )
-
-  value0 <- 1 / lambda0
-  value1 <- 1 / lambda1
-
-  pmax(
-    value0,
-    value1
-  )
-}
-
-###############################################################
-# 15. POLICY VALUE USING OBSERVED SURVIVAL TIMES
-###############################################################
-
-evaluate_policy <- function(
-    dat,
-    policy
-) {
-
-  #############################################################
-  # Since all stages contribute to the total survival outcome,
-  # calculate the observed cumulative outcome.
-  #############################################################
-
-  observed_total <-
-    dat$Y1 +
-    dat$Y2 * dat$eta2 +
-    dat$Y3 * dat$eta3
-
-  #############################################################
-  # Policy value estimated among subjects for whom the
-  # corresponding trajectory is observed.
-  #############################################################
-
-  value <- mean(
-    observed_total,
-    na.rm = TRUE
-  )
-
-  #############################################################
-  # Treatment rate
-  #############################################################
-
-  treatment_rate <- mean(
-    policy
-  )
-
-  list(
-    value = value,
-    treatment_rate = treatment_rate
-  )
-}
-
-###############################################################
-# 16. ONE SIMULATION
-###############################################################
-
-run_one_simulation <- function(
-    N = 2000,
-    censoring_rate = 0.30
-) {
-
-  #############################################################
-  # Generate data
-  #############################################################
-
-  dat <- simulate_data(
-    N = N,
-    censoring_rate = censoring_rate
-  )
-
-  #############################################################
-  # BJ CURRENT-STAGE OUTCOMES
-  #############################################################
-
-  dat$BJ1 <- BJ_impute(
-    dat$Y1,
-    dat$Delta1
-  )
-
-  dat$BJ2 <- BJ_impute(
-    dat$Y2,
-    dat$Delta2
-  )
-
-  dat$BJ3 <- BJ_impute(
-    dat$Y3,
-    dat$Delta3
-  )
-
-  #############################################################
-  # CENSORING MODELS
-  #############################################################
-
-  dat$G1 <- estimate_G(
-    dat$Y1,
-    dat$Delta1,
-    dat$A1
-  )
-
-  dat$G2 <- estimate_G(
-    dat$Y2,
-    dat$Delta2,
-    dat$A2
-  )
-
-  #############################################################
-  # STAGE 3
-  #############################################################
-
-  Q3 <- fit_Q(
-    target = dat$BJ3,
-    H = dat$H3,
+  BJ3 <- BJ_impute(
+    Y = dat$Y3,
+    Delta = dat$Delta3,
     A = dat$A3
   )
 
-  dat$V3 <- predict_V(
-    Q3,
-    dat$H3
+  idx3 <- which(
+    dat$eta3 == 1 &
+      !is.na(BJ3)
   )
 
-  #############################################################
-  # STAGE 2: BJ-Q
-  #############################################################
+  fit3 <- fit_Q(
+    H = dat$H3[idx3],
+    A = dat$A3[idx3],
+    target = BJ3[idx3]
+  )
 
-  dat$Z_BJ_2 <-
-    dat$BJ2 +
-    dat$eta3 *
-    dat$V3
+  V3 <- rep(
+    NA_real_,
+    nrow(dat)
+  )
 
-  #############################################################
-  # STAGE 2: IPCW-Q
-  #############################################################
+  V3[dat$eta3 == 1] <- predict_V(
+    fit3,
+    dat$H3[dat$eta3 == 1]
+  )
 
-  dat$Z_IPCW_2 <-
-    IPCW_target(
-      Y = dat$Y2,
-      Delta = dat$Delta2,
-      eta_next = dat$eta3,
-      G = dat$G2,
-      V_next = dat$V3
+  # ---------------------------------------------------------------------------
+  # Stage 2
+  # ---------------------------------------------------------------------------
+
+  BJ2 <- BJ_impute(
+    Y = dat$Y2,
+    Delta = dat$Delta2,
+    A = dat$A2
+  )
+
+  Z2 <- BJ2 +
+    dat$eta3 * V3
+
+  idx2 <- which(
+    dat$eta2 == 1 &
+      !is.na(Z2)
+  )
+
+  fit2 <- fit_Q(
+    H = dat$H2[idx2],
+    A = dat$A2[idx2],
+    target = Z2[idx2]
+  )
+
+  V2 <- rep(
+    NA_real_,
+    nrow(dat)
+  )
+
+  V2[dat$eta2 == 1] <- predict_V(
+    fit2,
+    dat$H2[dat$eta2 == 1]
+  )
+
+  # ---------------------------------------------------------------------------
+  # Stage 1
+  # ---------------------------------------------------------------------------
+
+  BJ1 <- BJ_impute(
+    Y = dat$Y1,
+    Delta = dat$Delta1,
+    A = dat$A1
+  )
+
+  Z1 <- BJ1 +
+    dat$eta2 * V2
+
+  idx1 <- which(
+    dat$eta1 == 1 &
+      !is.na(Z1)
+  )
+
+  fit1 <- fit_Q(
+    H = dat$H1[idx1],
+    A = dat$A1[idx1],
+    target = Z1[idx1]
+  )
+
+  V1 <- predict_V(
+    fit1,
+    dat$H1
+  )
+
+  rule1 <- predict_rule(
+    fit1,
+    dat$H1
+  )
+
+  list(
+    fit1 = fit1,
+    fit2 = fit2,
+    fit3 = fit3,
+
+    V1 = V1,
+    V2 = V2,
+    V3 = V3,
+
+    rule1 = rule1,
+
+    BJ1 = BJ1,
+    BJ2 = BJ2,
+    BJ3 = BJ3,
+
+    Z1 = Z1,
+    Z2 = Z2
+  )
+}
+
+# =============================================================================
+# 8. Three-stage IPCW-Q
+# =============================================================================
+#
+# Terminal:
+#
+#   Z3 = eta3/G3 * Y3
+#
+# Stage 2:
+#
+#   Z2 = eta3/G2 * (Y2 + V3)
+#
+# Stage 1:
+#
+#   Z1 = eta2/G1 * (Y1 + V2)
+#
+# =============================================================================
+
+fit_IPCW_Q <- function(dat) {
+
+  # ---------------------------------------------------------------------------
+  # Stage 3
+  # ---------------------------------------------------------------------------
+
+  G3 <- estimate_G(
+    Y = dat$Y3,
+    Delta = dat$Delta3,
+    A = dat$A3
+  )
+
+  Z3 <- dat$eta3 /
+    G3 *
+    dat$Y3
+
+  idx3 <- which(
+    dat$eta3 == 1 &
+      is.finite(Z3)
+  )
+
+  fit3 <- fit_Q(
+    H = dat$H3[idx3],
+    A = dat$A3[idx3],
+    target = Z3[idx3]
+  )
+
+  V3 <- rep(
+    NA_real_,
+    nrow(dat)
+  )
+
+  V3[dat$eta3 == 1] <- predict_V(
+    fit3,
+    dat$H3[dat$eta3 == 1]
+  )
+
+  # ---------------------------------------------------------------------------
+  # Stage 2
+  # ---------------------------------------------------------------------------
+
+  G2 <- estimate_G(
+    Y = dat$Y2,
+    Delta = dat$Delta2,
+    A = dat$A2
+  )
+
+  Z2 <- dat$eta3 /
+    G2 *
+    (
+      dat$Y2 +
+        V3
     )
 
-  #############################################################
-  # STAGE 2: CA-BJ-Q
-  #############################################################
+  idx2 <- which(
+    dat$eta2 == 1 &
+      is.finite(Z2)
+  )
 
-  dat$Z_CA_BJ_2 <-
-    CA_BJ_target(
-      BJ_current = dat$BJ2,
-      Delta = dat$Delta2,
-      eta_next = dat$eta3,
-      G = dat$G2,
-      V_next = dat$V3
+  fit2 <- fit_Q(
+    H = dat$H2[idx2],
+    A = dat$A2[idx2],
+    target = Z2[idx2]
+  )
+
+  V2 <- rep(
+    NA_real_,
+    nrow(dat)
+  )
+
+  V2[dat$eta2 == 1] <- predict_V(
+    fit2,
+    dat$H2[dat$eta2 == 1]
+  )
+
+  # ---------------------------------------------------------------------------
+  # Stage 1
+  # ---------------------------------------------------------------------------
+
+  G1 <- estimate_G(
+    Y = dat$Y1,
+    Delta = dat$Delta1,
+    A = dat$A1
+  )
+
+  Z1 <- dat$eta2 /
+    G1 *
+    (
+      dat$Y1 +
+        V2
     )
 
-  #############################################################
-  # STAGE 2 Q MODELS
-  #############################################################
-
-  Q2_BJ <- fit_Q(
-    dat$Z_BJ_2,
-    dat$H2,
-    dat$A2
+  idx1 <- which(
+    dat$eta1 == 1 &
+      is.finite(Z1)
   )
 
-  Q2_IPCW <- fit_Q(
-    dat$Z_IPCW_2,
-    dat$H2,
-    dat$A2
+  fit1 <- fit_Q(
+    H = dat$H1[idx1],
+    A = dat$A1[idx1],
+    target = Z1[idx1]
   )
 
-  Q2_CA_BJ <- fit_Q(
-    dat$Z_CA_BJ_2,
-    dat$H2,
-    dat$A2
-  )
-
-  #############################################################
-  # STAGE 2 VALUES
-  #############################################################
-
-  dat$V2_BJ <- predict_V(
-    Q2_BJ,
-    dat$H2
-  )
-
-  dat$V2_IPCW <- predict_V(
-    Q2_IPCW,
-    dat$H2
-  )
-
-  dat$V2_CA_BJ <- predict_V(
-    Q2_CA_BJ,
-    dat$H2
-  )
-
-  #############################################################
-  # STAGE 1: BJ-Q
-  #############################################################
-
-  dat$Z_BJ_1 <-
-    dat$BJ1 +
-    dat$eta2 *
-    dat$V2_BJ
-
-  #############################################################
-  # STAGE 1: IPCW-Q
-  #############################################################
-
-  dat$Z_IPCW_1 <-
-    IPCW_target(
-      Y = dat$Y1,
-      Delta = dat$Delta1,
-      eta_next = dat$eta2,
-      G = dat$G1,
-      V_next = dat$V2_IPCW
-    )
-
-  #############################################################
-  # STAGE 1: CA-BJ-Q
-  #############################################################
-
-  dat$Z_CA_BJ_1 <-
-    CA_BJ_target(
-      BJ_current = dat$BJ1,
-      Delta = dat$Delta1,
-      eta_next = dat$eta2,
-      G = dat$G1,
-      V_next = dat$V2_CA_BJ
-    )
-
-  #############################################################
-  # STAGE 1 Q MODELS
-  #############################################################
-
-  Q1_BJ <- fit_Q(
-    dat$Z_BJ_1,
-    dat$H1,
-    dat$A1
-  )
-
-  Q1_IPCW <- fit_Q(
-    dat$Z_IPCW_1,
-    dat$H1,
-    dat$A1
-  )
-
-  Q1_CA_BJ <- fit_Q(
-    dat$Z_CA_BJ_1,
-    dat$H1,
-    dat$A1
-  )
-
-  #############################################################
-  # ESTIMATED POLICIES
-  #############################################################
-
-  d_BJ <- predict_policy(
-    Q1_BJ,
+  V1 <- predict_V(
+    fit1,
     dat$H1
   )
 
-  d_IPCW <- predict_policy(
-    Q1_IPCW,
+  rule1 <- predict_rule(
+    fit1,
     dat$H1
   )
 
-  d_CA_BJ <- predict_policy(
-    Q1_CA_BJ,
+  list(
+    fit1 = fit1,
+    fit2 = fit2,
+    fit3 = fit3,
+
+    V1 = V1,
+    V2 = V2,
+    V3 = V3,
+
+    rule1 = rule1,
+
+    G1 = G1,
+    G2 = G2,
+    G3 = G3,
+
+    Z1 = Z1,
+    Z2 = Z2,
+    Z3 = Z3
+  )
+}
+
+# =============================================================================
+# 9. Three-stage CA-BJ-Q
+# =============================================================================
+#
+# Terminal:
+#
+#   Z3 = BJ3
+#
+# Stage 2:
+#
+#   Z2 = BJ2 + eta3/G2 * V3
+#
+# Stage 1:
+#
+#   Z1 = BJ1 + eta2/G1 * V2
+#
+# This is the central proposed estimator.
+# =============================================================================
+
+fit_CA_BJ_Q <- function(dat) {
+
+  # ---------------------------------------------------------------------------
+  # Stage 3
+  # ---------------------------------------------------------------------------
+
+  BJ3 <- BJ_impute(
+    Y = dat$Y3,
+    Delta = dat$Delta3,
+    A = dat$A3
+  )
+
+  idx3 <- which(
+    dat$eta3 == 1 &
+      !is.na(BJ3)
+  )
+
+  fit3 <- fit_Q(
+    H = dat$H3[idx3],
+    A = dat$A3[idx3],
+    target = BJ3[idx3]
+  )
+
+  V3 <- rep(
+    NA_real_,
+    nrow(dat)
+  )
+
+  V3[dat$eta3 == 1] <- predict_V(
+    fit3,
+    dat$H3[dat$eta3 == 1]
+  )
+
+  # ---------------------------------------------------------------------------
+  # Stage 2
+  # ---------------------------------------------------------------------------
+
+  BJ2 <- BJ_impute(
+    Y = dat$Y2,
+    Delta = dat$Delta2,
+    A = dat$A2
+  )
+
+  G2 <- estimate_G(
+    Y = dat$Y2,
+    Delta = dat$Delta2,
+    A = dat$A2
+  )
+
+  Z2 <- BJ2 +
+    dat$eta3 /
+    G2 *
+    V3
+
+  idx2 <- which(
+    dat$eta2 == 1 &
+      is.finite(Z2)
+  )
+
+  fit2 <- fit_Q(
+    H = dat$H2[idx2],
+    A = dat$A2[idx2],
+    target = Z2[idx2]
+  )
+
+  V2 <- rep(
+    NA_real_,
+    nrow(dat)
+  )
+
+  V2[dat$eta2 == 1] <- predict_V(
+    fit2,
+    dat$H2[dat$eta2 == 1]
+  )
+
+  # ---------------------------------------------------------------------------
+  # Stage 1
+  # ---------------------------------------------------------------------------
+
+  BJ1 <- BJ_impute(
+    Y = dat$Y1,
+    Delta = dat$Delta1,
+    A = dat$A1
+  )
+
+  G1 <- estimate_G(
+    Y = dat$Y1,
+    Delta = dat$Delta1,
+    A = dat$A1
+  )
+
+  Z1 <- BJ1 +
+    dat$eta2 /
+    G1 *
+    V2
+
+  idx1 <- which(
+    dat$eta1 == 1 &
+      is.finite(Z1)
+  )
+
+  fit1 <- fit_Q(
+    H = dat$H1[idx1],
+    A = dat$A1[idx1],
+    target = Z1[idx1]
+  )
+
+  V1 <- predict_V(
+    fit1,
     dat$H1
   )
 
-  #############################################################
-  # TRUE POLICY
-  #############################################################
-
-  d_true <- true_policy_stage1(
+  rule1 <- predict_rule(
+    fit1,
     dat$H1
   )
 
-  #############################################################
-  # TRUE STAGE-1 ATE
-  #############################################################
+  list(
+    fit1 = fit1,
+    fit2 = fit2,
+    fit3 = fit3,
 
-  true_ATE <- mean(
-    true_effect_stage1(
-      dat$H1
-    )
+    V1 = V1,
+    V2 = V2,
+    V3 = V3,
+
+    rule1 = rule1,
+
+    BJ1 = BJ1,
+    BJ2 = BJ2,
+    BJ3 = BJ3,
+
+    G1 = G1,
+    G2 = G2,
+
+    Z1 = Z1,
+    Z2 = Z2
+  )
+}
+
+# =============================================================================
+# 10. Oracle dynamic treatment rules
+# =============================================================================
+#
+# For each stage:
+#
+#   choose A = 1 if treatment gives greater event-free RMST.
+#
+# Because the DGP is exponential competing risks:
+#
+#   S(t) = exp[-(lambda1 + lambda2)t]
+#
+# and:
+#
+#   RMST(tau)
+#      = {1 - exp[-lambda_total*tau]} / lambda_total.
+#
+# =============================================================================
+
+oracle_rule_stage1 <- function(
+  H1,
+  tau = TAU
+) {
+
+  lambda10 <- exp(
+    0.10 -
+      0.45 * H1
   )
 
-  #############################################################
-  # ESTIMATED STAGE-1 ATE
-  #############################################################
-
-  q_BJ <- predict_Q(
-    Q1_BJ,
-    dat$H1
+  lambda11 <- exp(
+    0.10 -
+      0.45 * H1 -
+      0.80 -
+      0.60 * H1
   )
 
-  q_IPCW <- predict_Q(
-    Q1_IPCW,
-    dat$H1
+  lambda20 <- exp(
+    -0.80 +
+      0.30 * H1
   )
 
-  q_CA <- predict_Q(
-    Q1_CA_BJ,
-    dat$H1
+  lambda21 <- exp(
+    -0.80 +
+      0.30 * H1 +
+      0.35 +
+      0.20 * H1
   )
 
-  ATE_BJ <- mean(
-    q_BJ$q1 -
-      q_BJ$q0
+  rmst0 <- exp_rmst(
+    lambda10 + lambda20,
+    tau
   )
 
-  ATE_IPCW <- mean(
-    q_IPCW$q1 -
-      q_IPCW$q0
+  rmst1 <- exp_rmst(
+    lambda11 + lambda21,
+    tau
   )
 
-  ATE_CA_BJ <- mean(
-    q_CA$q1 -
-      q_CA$q0
+  as.integer(
+    rmst1 > rmst0
+  )
+}
+
+# -----------------------------------------------------------------------------
+# Stage 2 oracle
+# -----------------------------------------------------------------------------
+
+oracle_rule_stage2 <- function(
+  H2,
+  tau = TAU
+) {
+
+  lambda10 <- exp(
+    0.05 -
+      0.35 * H2
   )
 
-  #############################################################
-  # POLICY ACCURACY
-  #############################################################
-
-  accuracy_BJ <- mean(
-    d_BJ == d_true
+  lambda11 <- exp(
+    0.05 -
+      0.35 * H2 -
+      0.70 -
+      0.55 * H2
   )
 
-  accuracy_IPCW <- mean(
-    d_IPCW == d_true
+  lambda20 <- exp(
+    -0.75 +
+      0.25 * H2
   )
 
-  accuracy_CA_BJ <- mean(
-    d_CA_BJ == d_true
+  lambda21 <- exp(
+    -0.75 +
+      0.25 * H2 +
+      0.30 +
+      0.15 * H2
   )
 
-  #############################################################
-  # TRUE OPTIMAL VALUE
-  #############################################################
-
-  true_value <- mean(
-    true_value_stage1(
-      dat$H1
-    )
+  rmst0 <- exp_rmst(
+    lambda10 + lambda20,
+    tau
   )
 
-  #############################################################
-  # POLICY VALUES
+  rmst1 <- exp_rmst(
+    lambda11 + lambda21,
+    tau
+  )
+
+  as.integer(
+    rmst1 > rmst0
+  )
+}
+
+# -----------------------------------------------------------------------------
+# Stage 3 oracle
+# -----------------------------------------------------------------------------
+
+oracle_rule_stage3 <- function(
+  H3,
+  tau = TAU
+) {
+
+  lambda10 <- exp(
+    -0.30 * H3
+  )
+
+  lambda11 <- exp(
+    -0.30 * H3 -
+      0.65 -
+      0.60 * H3
+  )
+
+  lambda20 <- exp(
+    -0.70 +
+      0.25 * H3
+  )
+
+  lambda21 <- exp(
+    -0.70 +
+      0.25 * H3 +
+      0.30 +
+      0.15 * H3
+  )
+
+  rmst0 <- exp_rmst(
+    lambda10 + lambda20,
+    tau
+  )
+
+  rmst1 <- exp_rmst(
+    lambda11 + lambda21,
+    tau
+  )
+
+  as.integer(
+    rmst1 > rmst0
+  )
+}
+
+# =============================================================================
+# 11. Oracle policy-value calculation
+# =============================================================================
+#
+# Important:
+#
+# The value of a learned three-stage regime cannot be evaluated correctly
+# using only Stage-1 survival.
+#
+# We therefore evaluate the full three-stage regime using the latent
+# event-free times and latent histories from the DGP.
+#
+# =============================================================================
+
+evaluate_dynamic_policy <- function(
+  dat,
+  rules
+) {
+
+  # ---------------------------------------------------------------------------
+  # Stage 1 decision
+  # ---------------------------------------------------------------------------
+
+  d1 <- rules$rule1
+
+  # If a subject is assigned A1 according to the learned policy,
+  # use the corresponding observed/latent downstream trajectory.
   #
-  # For evaluation, use the complete simulated event times.
-  # This avoids evaluating policies with censored outcomes.
-  #############################################################
+  # For empirical evaluation, the simulated trajectory is retained.
+  #
+  # ---------------------------------------------------------------------------
 
-  #############################################################
-  # True stage-1 potential mean under policy
-  #############################################################
+  value1 <- dat$Y1_true
 
-  lambda0 <- exp(
-    0.25 -
-      0.20 * dat$H1
+  # ---------------------------------------------------------------------------
+  # Stage 2 decision
+  # ---------------------------------------------------------------------------
+
+  d2 <- rep(
+    NA_integer_,
+    nrow(dat)
   )
 
-  lambda1 <- exp(
-    0.25 -
-      0.20 * dat$H1 -
-      0.35 -
-      0.20 * dat$H1
+  eligible2 <- dat$eta2 == 1
+
+  if (!is.null(rules$fit2)) {
+
+    d2[eligible2] <- predict_rule(
+      rules$fit2,
+      dat$H2_true[eligible2]
+    )
+  }
+
+  # ---------------------------------------------------------------------------
+  # Stage 3 decision
+  # ---------------------------------------------------------------------------
+
+  d3 <- rep(
+    NA_integer_,
+    nrow(dat)
   )
 
-  mean0 <- 1 / lambda0
-  mean1 <- 1 / lambda1
+  eligible3 <- dat$eta3 == 1
 
-  policy_value <- function(
-      policy
-  ) {
+  if (!is.null(rules$fit3)) {
 
-    mean(
-      ifelse(
-        policy == 1,
-        mean1,
-        mean0
+    d3[eligible3] <- predict_rule(
+      rules$fit3,
+      dat$H3_true[eligible3]
+    )
+  }
+
+  # ---------------------------------------------------------------------------
+  # Approximate model-based dynamic value
+  #
+  # Use the learned Q-functions evaluated under the learned rules.
+  # This is the internally consistent Q-learning value.
+  # ---------------------------------------------------------------------------
+
+  V3_policy <- rep(
+    NA_real_,
+    nrow(dat)
+  )
+
+  if (!is.null(rules$fit3)) {
+
+    idx <- which(
+      !is.na(d3)
+    )
+
+    if (length(idx) > 0) {
+
+      V3_policy[idx] <- predict_Q(
+        rules$fit3,
+        dat$H3_true[idx],
+        d3[idx]
+      )
+    }
+  }
+
+  V2_policy <- rep(
+    NA_real_,
+    nrow(dat)
+  )
+
+  if (!is.null(rules$fit2)) {
+
+    idx <- which(
+      !is.na(d2)
+    )
+
+    if (length(idx) > 0) {
+
+      V2_policy[idx] <- predict_Q(
+        rules$fit2,
+        dat$H2_true[idx],
+        d2[idx]
+      )
+    }
+  }
+
+  V1_policy <- rep(
+    NA_real_,
+    nrow(dat)
+  )
+
+  if (!is.null(rules$fit1)) {
+
+    idx <- which(
+      !is.na(d1)
+    )
+
+    if (length(idx) > 0) {
+
+      V1_policy[idx] <- predict_Q(
+        rules$fit1,
+        dat$H1[idx],
+        d1[idx]
+      )
+    }
+  }
+
+  list(
+    value = safe_mean(V1_policy),
+    V1_policy = V1_policy,
+    d1 = d1,
+    d2 = d2,
+    d3 = d3
+  )
+}
+
+# =============================================================================
+# 12. Oracle full dynamic value
+# =============================================================================
+#
+# Large Monte Carlo approximation to the true optimal dynamic policy.
+#
+# This function simulates a large uncensored population and applies the
+# known optimal rule at each stage.
+#
+# =============================================================================
+
+simulate_oracle_value <- function(
+  M = 100000,
+  tau = TAU,
+  seed = 9999
+) {
+
+  set.seed(seed)
+
+  # ---------------------------------------------------------------------------
+  # Stage 1
+  # ---------------------------------------------------------------------------
+
+  H1 <- rnorm(M)
+
+  A1 <- oracle_rule_stage1(
+    H1,
+    tau
+  )
+
+  lambda11 <- exp(
+    0.10 -
+      0.45 * H1 -
+      0.80 * A1 -
+      0.60 * H1 * A1
+  )
+
+  lambda12 <- exp(
+    -0.80 +
+      0.30 * H1 +
+      0.35 * A1 +
+      0.20 * H1 * A1
+  )
+
+  T11 <- rexp(
+    M,
+    lambda11
+  )
+
+  T12 <- rexp(
+    M,
+    lambda12
+  )
+
+  T1 <- pmin(
+    T11,
+    T12,
+    tau
+  )
+
+  event1 <- T1 < tau
+
+  # ---------------------------------------------------------------------------
+  # Stage 2
+  # ---------------------------------------------------------------------------
+
+  H2 <- (
+    0.60 * H1 +
+      0.80 * A1 +
+      0.70 * (T1 - mean(T1)) +
+      rnorm(M, 0, 0.35)
+  )
+
+  A2 <- oracle_rule_stage2(
+    H2,
+    tau
+  )
+
+  lambda21 <- exp(
+    0.05 -
+      0.35 * H2 -
+      0.70 * A2 -
+      0.55 * H2 * A2
+  )
+
+  lambda22 <- exp(
+    -0.75 +
+      0.25 * H2 +
+      0.30 * A2 +
+      0.15 * H2 * A2
+  )
+
+  T21 <- rexp(
+    M,
+    lambda21
+  )
+
+  T22 <- rexp(
+    M,
+    lambda22
+  )
+
+  T2 <- pmin(
+    T21,
+    T22,
+    tau
+  )
+
+  # Only subjects reaching Stage 2 contribute a Stage-2 interval.
+  T2[!event1] <- 0
+
+  event2 <- event1 &
+    T2 < tau
+
+  # ---------------------------------------------------------------------------
+  # Stage 3
+  # ---------------------------------------------------------------------------
+
+  H3 <- (
+    0.55 * H2 +
+      0.75 * A2 +
+      0.70 * (pmin(T2, tau) - mean(T2)) +
+      0.25 * A1 +
+      rnorm(M, 0, 0.35)
+  )
+
+  A3 <- oracle_rule_stage3(
+    H3,
+    tau
+  )
+
+  lambda31 <- exp(
+    0.00 -
+      0.30 * H3 -
+      0.65 * A3 -
+      0.60 * H3 * A3
+  )
+
+  lambda32 <- exp(
+    -0.70 +
+      0.25 * H3 +
+      0.30 * A3 +
+      0.15 * H3 * A3
+  )
+
+  T31 <- rexp(
+    M,
+    lambda31
+  )
+
+  T32 <- rexp(
+    M,
+    lambda32
+  )
+
+  T3 <- pmin(
+    T31,
+    T32,
+    tau
+  )
+
+  T3[!event2] <- 0
+
+  # ---------------------------------------------------------------------------
+  # Full dynamic reward
+  # ---------------------------------------------------------------------------
+
+  total_value <- T1 +
+    T2 +
+    T3
+
+  list(
+    optimal_value = mean(total_value),
+    se = sd(total_value) / sqrt(M),
+
+    treatment_rate1 = mean(A1),
+    treatment_rate2 = mean(A2[event1]),
+    treatment_rate3 = mean(A3[event2])
+  )
+}
+
+# =============================================================================
+# 13. Full-policy empirical value
+# =============================================================================
+#
+# For simulation diagnostics, calculate the model-based value under the
+# learned Stage-1 policy and recursive Q-functions.
+# =============================================================================
+
+evaluate_Q_policy_value <- function(
+  fit
+) {
+
+  if (is.null(fit$fit1)) {
+    return(NA_real_)
+  }
+
+  H1 <- fit$fit1$model$H
+
+  d1 <- predict_rule(
+    fit$fit1,
+    H1
+  )
+
+  q1 <- predict_Q(
+    fit$fit1,
+    H1,
+    d1
+  )
+
+  safe_mean(q1)
+}
+
+# =============================================================================
+# 14. Stage-specific policy accuracy
+# =============================================================================
+
+calculate_stage_accuracy <- function(
+  dat,
+  fit
+) {
+
+  oracle1 <- oracle_rule_stage1(
+    dat$H1
+  )
+
+  acc1 <- mean(
+    fit$rule1 == oracle1,
+    na.rm = TRUE
+  )
+
+  # Stage 2
+  acc2 <- NA_real_
+
+  if (!is.null(fit$fit2)) {
+
+    idx2 <- which(
+      dat$eta2 == 1
+    )
+
+    if (length(idx2) > 0) {
+
+      learned2 <- predict_rule(
+        fit$fit2,
+        dat$H2[idx2]
+      )
+
+      oracle2 <- oracle_rule_stage2(
+        dat$H2[idx2]
+      )
+
+      acc2 <- mean(
+        learned2 == oracle2,
+        na.rm = TRUE
+      )
+    }
+  }
+
+  # Stage 3
+  acc3 <- NA_real_
+
+  if (!is.null(fit$fit3)) {
+
+    idx3 <- which(
+      dat$eta3 == 1
+    )
+
+    if (length(idx3) > 0) {
+
+      learned3 <- predict_rule(
+        fit$fit3,
+        dat$H3[idx3]
+      )
+
+      oracle3 <- oracle_rule_stage3(
+        dat$H3[idx3]
+      )
+
+      acc3 <- mean(
+        learned3 == oracle3,
+        na.rm = TRUE
+      )
+    }
+  }
+
+  c(
+    stage1 = acc1,
+    stage2 = acc2,
+    stage3 = acc3
+  )
+}
+
+# =============================================================================
+# 15. Cause-specific CIF
+# =============================================================================
+#
+# Cause 1 is the primary event.
+#
+# Cause 2 is a competing event.
+#
+# Aalen-Johansen estimation is used for descriptive CIF estimates.
+# =============================================================================
+
+calculate_CIF <- function(
+  Y,
+  Cause,
+  tau = TAU
+) {
+
+  keep <- which(
+    !is.na(Y) &
+      !is.na(Cause)
+  )
+
+  if (length(keep) < 5) {
+    return(
+      c(
+        CIF1 = NA_real_,
+        CIF2 = NA_real_
       )
     )
   }
 
-  value_BJ <- policy_value(
-    d_BJ
+  time <- Y[keep]
+
+  status <- Cause[keep]
+
+  fit <- survfit(
+    Surv(
+      time,
+      status
+    ) ~ 1
   )
 
-  value_IPCW <- policy_value(
-    d_IPCW
+  # survfit with multi-state status returns probabilities
+  # for event states.
+  #
+  # For robustness, use cumulative incidence through a direct
+  # Aalen-Johansen calculation.
+
+  ord <- order(time)
+
+  time <- time[ord]
+  status <- status[ord]
+
+  unique_times <- sort(
+    unique(
+      time[time <= tau]
+    )
   )
 
-  value_CA_BJ <- policy_value(
-    d_CA_BJ
+  S <- 1
+
+  CIF1 <- 0
+  CIF2 <- 0
+
+  for (t in unique_times) {
+
+    at_risk <- sum(
+      time >= t
+    )
+
+    if (at_risk <= 0) {
+      next
+    }
+
+    d1 <- sum(
+      time == t &
+        status == 1
+    )
+
+    d2 <- sum(
+      time == t &
+        status == 2
+    )
+
+    CIF1 <- CIF1 +
+      S *
+      d1 /
+      at_risk
+
+    CIF2 <- CIF2 +
+      S *
+      d2 /
+      at_risk
+
+    d_all <- d1 + d2
+
+    S <- S *
+      (
+        1 -
+          d_all /
+          at_risk
+      )
+  }
+
+  c(
+    CIF1 = CIF1,
+    CIF2 = CIF2
+  )
+}
+
+# =============================================================================
+# 16. Effective sample size
+# =============================================================================
+
+calculate_ESS <- function(
+  weights
+) {
+
+  weights <- weights[
+    is.finite(weights) &
+      weights > 0
+  ]
+
+  if (length(weights) == 0) {
+    return(NA_real_)
+  }
+
+  sum(weights)^2 /
+    sum(weights^2)
+}
+
+# =============================================================================
+# 17. One simulation replication
+# =============================================================================
+
+run_one_simulation <- function(
+  rep_id,
+  censoring_rate,
+  N = N
+) {
+
+  seed <- SEED_BASE +
+    rep_id * 10000 +
+    round(censoring_rate * 1000)
+
+  # ---------------------------------------------------------------------------
+  # Simulate data
+  # ---------------------------------------------------------------------------
+
+  dat <- simulate_data(
+    N = N,
+    censoring_rate = censoring_rate,
+    tau = TAU,
+    seed = seed
   )
 
-  #############################################################
-  # POLICY REGRET
-  #############################################################
+  # ---------------------------------------------------------------------------
+  # Fit three methods
+  # ---------------------------------------------------------------------------
 
-  regret_BJ <-
-    true_value -
-    value_BJ
-
-  regret_IPCW <-
-    true_value -
-    value_IPCW
-
-  regret_CA_BJ <-
-    true_value -
-    value_CA_BJ
-
-  #############################################################
-  # EFFECTIVE SAMPLE SIZE
-  #############################################################
-
-  W2 <- dat$Delta2 *
-    dat$eta3 /
-    dat$G2
-
-  W1 <- dat$Delta1 *
-    dat$eta2 /
-    dat$G1
-
-  ESS_IPCW <- effective_sample_size(
-    W1
+  BJ <- tryCatch(
+    fit_BJ_Q(dat),
+    error = function(e) NULL
   )
 
-  ESS_CA_BJ <- effective_sample_size(
-    W1
+  IPCW <- tryCatch(
+    fit_IPCW_Q(dat),
+    error = function(e) NULL
   )
 
-  #############################################################
-  # OBSERVED CENSORING
-  #############################################################
+  CA <- tryCatch(
+    fit_CA_BJ_Q(dat),
+    error = function(e) NULL
+  )
 
-  observed_censoring1 <- mean(
+  # ---------------------------------------------------------------------------
+  # True oracle value
+  # ---------------------------------------------------------------------------
+
+  oracle <- simulate_oracle_value(
+    M = 20000,
+    tau = TAU,
+    seed = seed + 777
+  )
+
+  true_value <- oracle$optimal_value
+
+  # ---------------------------------------------------------------------------
+  # Policy values
+  # ---------------------------------------------------------------------------
+
+  value_BJ <- if (!is.null(BJ)) {
+    evaluate_Q_policy_value(BJ)
+  } else {
+    NA_real_
+  }
+
+  value_IPCW <- if (!is.null(IPCW)) {
+    evaluate_Q_policy_value(IPCW)
+  } else {
+    NA_real_
+  }
+
+  value_CA <- if (!is.null(CA)) {
+    evaluate_Q_policy_value(CA)
+  } else {
+    NA_real_
+  }
+
+  # ---------------------------------------------------------------------------
+  # Stage-specific policy accuracy
+  # ---------------------------------------------------------------------------
+
+  acc_BJ <- if (!is.null(BJ)) {
+    calculate_stage_accuracy(
+      dat,
+      BJ
+    )
+  } else {
+    c(
+      stage1 = NA,
+      stage2 = NA,
+      stage3 = NA
+    )
+  }
+
+  acc_IPCW <- if (!is.null(IPCW)) {
+    calculate_stage_accuracy(
+      dat,
+      IPCW
+    )
+  } else {
+    c(
+      stage1 = NA,
+      stage2 = NA,
+      stage3 = NA
+    )
+  }
+
+  acc_CA <- if (!is.null(CA)) {
+    calculate_stage_accuracy(
+      dat,
+      CA
+    )
+  } else {
+    c(
+      stage1 = NA,
+      stage2 = NA,
+      stage3 = NA
+    )
+  }
+
+  # ---------------------------------------------------------------------------
+  # Stage-specific censoring
+  # ---------------------------------------------------------------------------
+
+  censor1 <- mean(
     dat$Delta1 == 0
   )
 
-  observed_censoring2 <- mean(
-    dat$Delta2 == 0 &
-      dat$eta2 == 1
+  censor2 <- mean(
+    dat$Delta2[dat$eta2 == 1] == 0,
+    na.rm = TRUE
   )
 
-  observed_censoring3 <- mean(
-    dat$Delta3 == 0 &
-      dat$eta3 == 1
+  censor3 <- mean(
+    dat$Delta3[dat$eta3 == 1] == 0,
+    na.rm = TRUE
   )
 
-  #############################################################
-  # RETURN PERFORMANCE RESULTS
-  #############################################################
+  # ---------------------------------------------------------------------------
+  # Cause frequencies
+  # ---------------------------------------------------------------------------
+
+  cause1 <- mean(
+    dat$Cause1 == 1,
+    na.rm = TRUE
+  )
+
+  cause2 <- mean(
+    dat$Cause1 == 2,
+    na.rm = TRUE
+  )
+
+  # ---------------------------------------------------------------------------
+  # ESS
+  # ---------------------------------------------------------------------------
+
+  G1 <- if (!is.null(IPCW)) {
+    IPCW$G1
+  } else {
+    rep(NA_real_, nrow(dat))
+  }
+
+  G2 <- if (!is.null(IPCW)) {
+    IPCW$G2
+  } else {
+    rep(NA_real_, nrow(dat))
+  }
+
+  G3 <- if (!is.null(IPCW)) {
+    IPCW$G3
+  } else {
+    rep(NA_real_, nrow(dat))
+  }
+
+  W1 <- dat$eta2 / G1
+  W2 <- dat$eta3 / G2
+  W3 <- dat$eta3 / G3
+
+  ESS1 <- calculate_ESS(W1)
+  ESS2 <- calculate_ESS(W2)
+  ESS3 <- calculate_ESS(W3)
+
+  # ---------------------------------------------------------------------------
+  # Return
+  # ---------------------------------------------------------------------------
 
   data.frame(
 
-    censoring_target =
-      censoring_rate,
+    rep = rep_id,
 
-    censoring_stage1 =
-      observed_censoring1,
+    censoring_target = censoring_rate,
 
-    censoring_stage2 =
-      observed_censoring2,
+    # Oracle
+    optimal_value = true_value,
 
-    censoring_stage3 =
-      observed_censoring3,
+    # Policy values
+    value_BJ = value_BJ,
+    value_IPCW = value_IPCW,
+    value_CA_BJ = value_CA,
 
-    true_ATE =
-      true_ATE,
-
-    ATE_BJ =
-      ATE_BJ,
-
-    ATE_IPCW =
-      ATE_IPCW,
-
-    ATE_CA_BJ =
-      ATE_CA_BJ,
-
-    bias_BJ =
-      ATE_BJ - true_ATE,
-
-    bias_IPCW =
-      ATE_IPCW - true_ATE,
-
-    bias_CA_BJ =
-      ATE_CA_BJ - true_ATE,
-
-    value_BJ =
-      value_BJ,
-
-    value_IPCW =
-      value_IPCW,
-
-    value_CA_BJ =
-      value_CA_BJ,
-
-    optimal_value =
-      true_value,
-
+    # Policy regret
     regret_BJ =
-      regret_BJ,
+      true_value - value_BJ,
 
     regret_IPCW =
-      regret_IPCW,
+      true_value - value_IPCW,
 
     regret_CA_BJ =
-      regret_CA_BJ,
+      true_value - value_CA,
 
-    treatment_rate_BJ =
-      mean(d_BJ),
+    # Stage-specific policy accuracy
+    accuracy_BJ_S1 = acc_BJ["stage1"],
+    accuracy_BJ_S2 = acc_BJ["stage2"],
+    accuracy_BJ_S3 = acc_BJ["stage3"],
 
-    treatment_rate_IPCW =
-      mean(d_IPCW),
+    accuracy_IPCW_S1 = acc_IPCW["stage1"],
+    accuracy_IPCW_S2 = acc_IPCW["stage2"],
+    accuracy_IPCW_S3 = acc_IPCW["stage3"],
 
-    treatment_rate_CA_BJ =
-      mean(d_CA_BJ),
+    accuracy_CA_BJ_S1 = acc_CA["stage1"],
+    accuracy_CA_BJ_S2 = acc_CA["stage2"],
+    accuracy_CA_BJ_S3 = acc_CA["stage3"],
 
-    policy_accuracy_BJ =
-      accuracy_BJ,
+    # Censoring
+    censoring_S1 = censor1,
+    censoring_S2 = censor2,
+    censoring_S3 = censor3,
 
-    policy_accuracy_IPCW =
-      accuracy_IPCW,
+    # Cause frequencies
+    cause1_frequency = cause1,
+    cause2_frequency = cause2,
 
-    policy_accuracy_CA_BJ =
-      accuracy_CA_BJ,
+    # ESS
+    ESS_S1 = ESS1,
+    ESS_S2 = ESS2,
+    ESS_S3 = ESS3,
 
-    ESS_IPCW =
-      ESS_IPCW,
+    # Oracle treatment rates
+    oracle_treatment_S1 =
+      oracle$treatment_rate1,
 
-    ESS_CA_BJ =
-      ESS_CA_BJ
+    oracle_treatment_S2 =
+      oracle$treatment_rate2,
+
+    oracle_treatment_S3 =
+      oracle$treatment_rate3,
+
+    # Learned treatment rate at Stage 1
+    learned_treatment_BJ_S1 =
+      safe_mean(BJ$rule1),
+
+    learned_treatment_IPCW_S1 =
+      safe_mean(IPCW$rule1),
+
+    learned_treatment_CA_BJ_S1 =
+      safe_mean(CA$rule1)
   )
 }
 
-###############################################################
-# 17. TEST ONE SIMULATION
-###############################################################
-
-cat(
-  "\n====================================================\n"
-)
-
-cat(
-  "TEST RUN: 50% CENSORING\n"
-)
-
-cat(
-  "====================================================\n"
-)
-
-test_result <- run_one_simulation(
-  N = N,
-  censoring_rate = 0.50
-)
-
-print(
-  test_result
-)
-
-###############################################################
-# 18. MULTIPLE REPLICATIONS
-###############################################################
+# =============================================================================
+# 18. Run simulation
+# =============================================================================
 
 all_results <- list()
 
-result_counter <- 1
+counter <- 1
 
-for (cr in CENSORING_LEVELS) {
+start_time <- Sys.time()
 
-  cat(
-    "\n====================================================\n"
-  )
+for (cens in CENSORING_LEVELS) {
 
-  cat(
-    "CENSORING LEVEL:",
-    cr,
-    "\n"
-  )
+  cat("\n")
+  cat("============================================================\n")
+  cat("Censoring target:", cens, "\n")
+  cat("============================================================\n")
 
-  cat(
-    "====================================================\n"
-  )
+  for (r in seq_len(N_REP)) {
 
-  for (rep in seq_len(N_REP)) {
+    cat(
+      "Replication",
+      r,
+      "of",
+      N_REP,
+      "\n"
+    )
 
-    if (
-      rep %% 10 == 0
-    ) {
+    result <- tryCatch(
 
-      cat(
-        "Replication:",
-        rep,
-        "/",
-        N_REP,
-        "\n"
-      )
+      run_one_simulation(
+        rep_id = r,
+        censoring_rate = cens,
+        N = N
+      ),
+
+      error = function(e) {
+
+        message(
+          "ERROR in replication ",
+          r,
+          ", censoring = ",
+          cens,
+          ": ",
+          e$message
+        )
+
+        NULL
+      }
+    )
+
+    if (!is.null(result)) {
+
+      all_results[[counter]] <- result
+
+      counter <- counter + 1
     }
-
-    set.seed(
-      2026 +
-        round(cr * 1000) +
-        rep
-    )
-
-    result <- run_one_simulation(
-      N = N,
-      censoring_rate = cr
-    )
-
-    result$replication <- rep
-
-    all_results[[result_counter]] <-
-      result
-
-    result_counter <-
-      result_counter + 1
   }
 }
 
-###############################################################
-# 19. COMBINE RESULTS
-###############################################################
+elapsed_time <- Sys.time() -
+  start_time
 
-results_df <- bind_rows(
+cat(
+  "\nSimulation completed in:",
+  elapsed_time,
+  "\n"
+)
+
+# =============================================================================
+# 19. Combine simulation results
+# =============================================================================
+
+results <- bind_rows(
   all_results
 )
 
-###############################################################
-# 20. RMSE SUMMARY
-###############################################################
+write.csv(
+  results,
+  file.path(
+    OUTPUT_DIR,
+    "simulation_results_raw.csv"
+  ),
+  row.names = FALSE
+)
 
-summary_results <- results_df %>%
+# =============================================================================
+# 20. Summary: policy value and regret
+# =============================================================================
+
+policy_summary <- results %>%
   group_by(
     censoring_target
   ) %>%
   summarise(
 
-    n_rep =
-      n(),
-
-    ###########################################################
-    # Actual censoring
-    ###########################################################
-
-    mean_censoring_stage1 =
-      mean(
-        censoring_stage1,
-        na.rm = TRUE
-      ),
-
-    mean_censoring_stage2 =
-      mean(
-        censoring_stage2,
-        na.rm = TRUE
-      ),
-
-    mean_censoring_stage3 =
-      mean(
-        censoring_stage3,
-        na.rm = TRUE
-      ),
-
-    ###########################################################
-    # True ATE
-    ###########################################################
-
-    true_ATE =
-      mean(
-        true_ATE
-      ),
-
-    ###########################################################
-    # BJ-Q
-    ###########################################################
-
-    ATE_BJ =
-      mean(
-        ATE_BJ
-      ),
-
-    Bias_BJ =
-      mean(
-        bias_BJ
-      ),
-
-    RMSE_BJ =
-      sqrt(
-        mean(
-          bias_BJ^2
-        )
-      ),
-
-    ###########################################################
-    # IPCW-Q
-    ###########################################################
-
-    ATE_IPCW =
-      mean(
-        ATE_IPCW
-      ),
-
-    Bias_IPCW =
-      mean(
-        bias_IPCW
-      ),
-
-    RMSE_IPCW =
-      sqrt(
-        mean(
-          bias_IPCW^2
-        )
-      ),
-
-    ###########################################################
-    # CA-BJ-Q
-    ###########################################################
-
-    ATE_CA_BJ =
-      mean(
-        ATE_CA_BJ
-      ),
-
-    Bias_CA_BJ =
-      mean(
-        bias_CA_BJ
-      ),
-
-    RMSE_CA_BJ =
-      sqrt(
-        mean(
-          bias_CA_BJ^2
-        )
-      ),
-
-    ###########################################################
-    # Policy value
-    ###########################################################
-
-    Value_BJ =
-      mean(
-        value_BJ
-      ),
-
-    Value_IPCW =
-      mean(
-        value_IPCW
-      ),
-
-    Value_CA_BJ =
-      mean(
-        value_CA_BJ
-      ),
-
     Optimal_Value =
       mean(
-        optimal_value
+        optimal_value,
+        na.rm = TRUE
       ),
 
-    ###########################################################
-    # Policy regret
-    ###########################################################
-
-    Regret_BJ =
+    BJ_Value =
       mean(
-        regret_BJ
+        value_BJ,
+        na.rm = TRUE
       ),
 
-    Regret_IPCW =
+    IPCW_Value =
       mean(
-        regret_IPCW
+        value_IPCW,
+        na.rm = TRUE
       ),
 
-    Regret_CA_BJ =
+    CA_BJ_Value =
       mean(
-        regret_CA_BJ
+        value_CA_BJ,
+        na.rm = TRUE
       ),
 
-    ###########################################################
-    # Treatment rates
-    ###########################################################
-
-    Treatment_BJ =
+    BJ_Regret =
       mean(
-        treatment_rate_BJ
+        regret_BJ,
+        na.rm = TRUE
       ),
 
-    Treatment_IPCW =
+    IPCW_Regret =
       mean(
-        treatment_rate_IPCW
+        regret_IPCW,
+        na.rm = TRUE
       ),
 
-    Treatment_CA_BJ =
+    CA_BJ_Regret =
       mean(
-        treatment_rate_CA_BJ
-      ),
-
-    ###########################################################
-    # Policy accuracy
-    ###########################################################
-
-    Accuracy_BJ =
-      mean(
-        policy_accuracy_BJ
-      ),
-
-    Accuracy_IPCW =
-      mean(
-        policy_accuracy_IPCW
-      ),
-
-    Accuracy_CA_BJ =
-      mean(
-        policy_accuracy_CA_BJ
-      ),
-
-    ###########################################################
-    # ESS
-    ###########################################################
-
-    ESS_IPCW =
-      mean(
-        ESS_IPCW
-      ),
-
-    ESS_CA_BJ =
-      mean(
-        ESS_CA_BJ
+        regret_CA_BJ,
+        na.rm = TRUE
       ),
 
     .groups = "drop"
   )
 
-###############################################################
-# 21. PRINT SUMMARY
-###############################################################
+print(policy_summary)
 
-cat(
-  "\n\n====================================================\n"
+write.csv(
+  policy_summary,
+  file.path(
+    OUTPUT_DIR,
+    "policy_summary.csv"
+  ),
+  row.names = FALSE
 )
 
-cat(
-  "FINAL SIMULATION SUMMARY\n"
-)
+# =============================================================================
+# 21. Summary: policy accuracy
+# =============================================================================
 
-cat(
-  "====================================================\n\n"
-)
+accuracy_summary <- results %>%
+  group_by(
+    censoring_target
+  ) %>%
+  summarise(
 
-print(
-  summary_results
-)
+    BJ_S1 =
+      mean(
+        accuracy_BJ_S1,
+        na.rm = TRUE
+      ),
 
-###############################################################
-# 22. ATE COMPARISON TABLE
-###############################################################
+    BJ_S2 =
+      mean(
+        accuracy_BJ_S2,
+        na.rm = TRUE
+      ),
 
-ATE_summary <- summary_results %>%
-  dplyr::select(
-    censoring_target,
-    true_ATE,
-    ATE_BJ,
-    Bias_BJ,
-    RMSE_BJ,
-    ATE_IPCW,
-    Bias_IPCW,
-    RMSE_IPCW,
-    ATE_CA_BJ,
-    Bias_CA_BJ,
-    RMSE_CA_BJ
+    BJ_S3 =
+      mean(
+        accuracy_BJ_S3,
+        na.rm = TRUE
+      ),
+
+    IPCW_S1 =
+      mean(
+        accuracy_IPCW_S1,
+        na.rm = TRUE
+      ),
+
+    IPCW_S2 =
+      mean(
+        accuracy_IPCW_S2,
+        na.rm = TRUE
+      ),
+
+    IPCW_S3 =
+      mean(
+        accuracy_IPCW_S3,
+        na.rm = TRUE
+      ),
+
+    CA_BJ_S1 =
+      mean(
+        accuracy_CA_BJ_S1,
+        na.rm = TRUE
+      ),
+
+    CA_BJ_S2 =
+      mean(
+        accuracy_CA_BJ_S2,
+        na.rm = TRUE
+      ),
+
+    CA_BJ_S3 =
+      mean(
+        accuracy_CA_BJ_S3,
+        na.rm = TRUE
+      ),
+
+    .groups = "drop"
   )
 
-cat(
-  "\n====================================================\n"
+print(accuracy_summary)
+
+write.csv(
+  accuracy_summary,
+  file.path(
+    OUTPUT_DIR,
+    "policy_accuracy_summary.csv"
+  ),
+  row.names = FALSE
 )
 
-cat(
-  "ATE PERFORMANCE\n"
-)
+# =============================================================================
+# 22. Summary: censoring
+# =============================================================================
 
-cat(
-  "====================================================\n\n"
-)
+censoring_summary <- results %>%
+  group_by(
+    censoring_target
+  ) %>%
+  summarise(
 
-print(
-  ATE_summary
-)
+    Stage1 =
+      mean(
+        censoring_S1,
+        na.rm = TRUE
+      ),
 
-###############################################################
-# 23. POLICY PERFORMANCE TABLE
-###############################################################
+    Stage2 =
+      mean(
+        censoring_S2,
+        na.rm = TRUE
+      ),
 
-Policy_summary <- summary_results %>%
-  dplyr::select(
-    censoring_target,
+    Stage3 =
+      mean(
+        censoring_S3,
+        na.rm = TRUE
+      ),
 
-    Value_BJ,
-    Value_IPCW,
-    Value_CA_BJ,
-
-    Optimal_Value,
-
-    Regret_BJ,
-    Regret_IPCW,
-    Regret_CA_BJ,
-
-    Treatment_BJ,
-    Treatment_IPCW,
-    Treatment_CA_BJ,
-
-    Accuracy_BJ,
-    Accuracy_IPCW,
-    Accuracy_CA_BJ
+    .groups = "drop"
   )
 
-cat(
-  "\n====================================================\n"
-)
-
-cat(
-  "POLICY PERFORMANCE\n"
-)
-
-cat(
-  "====================================================\n\n"
-)
-
-print(
-  Policy_summary
-)
-
-
-###############################################################
-# 24. SAVE RESULTS
-###############################################################
+print(censoring_summary)
 
 write.csv(
-  results_df,
-  "CA_BJ_Q_simulation_all_replications.csv",
+  censoring_summary,
+  file.path(
+    OUTPUT_DIR,
+    "censoring_summary.csv"
+  ),
   row.names = FALSE
 )
 
+# =============================================================================
+# 23. Summary: ESS
+# =============================================================================
+
+ESS_summary <- results %>%
+  group_by(
+    censoring_target
+  ) %>%
+  summarise(
+
+    ESS_S1 =
+      mean(
+        ESS_S1,
+        na.rm = TRUE
+      ),
+
+    ESS_S2 =
+      mean(
+        ESS_S2,
+        na.rm = TRUE
+      ),
+
+    ESS_S3 =
+      mean(
+        ESS_S3,
+        na.rm = TRUE
+      ),
+
+    .groups = "drop"
+  )
+
+print(ESS_summary)
+
 write.csv(
-  summary_results,
-  "CA_BJ_Q_simulation_summary.csv",
+  ESS_summary,
+  file.path(
+    OUTPUT_DIR,
+    "ESS_summary.csv"
+  ),
   row.names = FALSE
 )
 
-write.csv(
-  ATE_summary,
-  "CA_BJ_Q_ATE_summary.csv",
-  row.names = FALSE
-)
+# =============================================================================
+# 24. Long policy-value data
+# =============================================================================
 
-write.csv(
-  Policy_summary,
-  "CA_BJ_Q_policy_summary.csv",
-  row.names = FALSE
-)
-
-###############################################################
-# END
-###############################################################
-
-###############################################################
-# 24. FIGURES
-###############################################################
-
-library(ggplot2)
-library(tidyr)
-
-###############################################################
-# Create output directory
-###############################################################
-
-FIG_DIR <- "CA_BJ_Q_figures"
-
-if (!dir.exists(FIG_DIR)) {
-  dir.create(FIG_DIR)
-}
-
-###############################################################
-# 24.1 ATE BIAS
-###############################################################
-
-ATE_bias_long <- summary_results %>%
+policy_long <- results %>%
   dplyr::select(
     censoring_target,
-    Bias_BJ,
-    Bias_IPCW,
-    Bias_CA_BJ
+    optimal_value,
+    value_BJ,
+    value_IPCW,
+    value_CA_BJ
   ) %>%
   tidyr::pivot_longer(
     cols = c(
-      Bias_BJ,
-      Bias_IPCW,
-      Bias_CA_BJ
+      value_BJ,
+      value_IPCW,
+      value_CA_BJ
     ),
     names_to = "Method",
-    values_to = "Bias"
+    values_to = "Policy_Value"
   ) %>%
   dplyr::mutate(
     Method = dplyr::recode(
       Method,
-      Bias_BJ = "BJ-Q",
-      Bias_IPCW = "Complete IPCW-Q",
-      Bias_CA_BJ = "CA-BJ-Q"
+      value_BJ    = "BJ-Q",
+      value_IPCW  = "IPCW-Q",
+      value_CA_BJ = "CA-BJ-Q"
     )
   )
 
-p_bias <- ggplot(
-  ATE_bias_long,
-  aes(
-    x = censoring_target * 100,
-    y = Bias,
-    group = Method,
-    linetype = Method,
-    shape = Method
-  )
-) +
-
-  geom_hline(
-    yintercept = 0,
-    linetype = "dashed"
-  ) +
-
-  geom_line(
-    linewidth = 0.8
-  ) +
-
-  geom_point(
-    size = 2.5
-  ) +
-
-  labs(
-    x = "Censoring Level (%)",
-    y = "ATE Bias",
-    linetype = "Method",
-    shape = "Method"
-  ) +
-
-  theme_classic(
-    base_size = 13
-  ) +
-
-  theme(
-    legend.position = "bottom"
-  )
-
-print(p_bias)
-
-ggsave(
-  filename = file.path(
-    FIG_DIR,
-    "Figure_1_ATE_Bias.png"
-  ),
-  plot = p_bias,
-  width = 7,
-  height = 5,
-  dpi = 300
-)
-
-###############################################################
-# 24.2 ATE RMSE
-###############################################################
-
-ATE_rmse_long <- summary_results %>%
-  dplyr::select(
-    censoring_target,
-    RMSE_BJ,
-    RMSE_IPCW,
-    RMSE_CA_BJ
-  ) %>%
-  tidyr::pivot_longer(
-    cols = c(
-      RMSE_BJ,
-      RMSE_IPCW,
-      RMSE_CA_BJ
+# Reference policy value by censoring level
+optimal_long <- results %>%
+  dplyr::group_by(censoring_target) %>%
+  dplyr::summarise(
+    optimal_value = mean(
+      optimal_value,
+      na.rm = TRUE
     ),
-    names_to = "Method",
-    values_to = "RMSE"
-  ) %>%
-  dplyr::mutate(
-    Method = dplyr::recode(
-      Method,
-      RMSE_BJ = "BJ-Q",
-      RMSE_IPCW = "Complete IPCW-Q",
-      RMSE_CA_BJ = "CA-BJ-Q"
-    )
+    .groups = "drop"
   )
 
-p_rmse <- ggplot(
-  ATE_rmse_long,
+# =============================================================================
+# 25. Policy value plot
+# =============================================================================
+
+p_value <- ggplot(
+  policy_long,
   aes(
-    x = censoring_target * 100,
-    y = RMSE,
+    x = censoring_target,
+    y = Policy_Value,
     group = Method,
-    linetype = Method,
-    shape = Method
+    linetype = Method
   )
 ) +
-
-  geom_line(
+  stat_summary(
+    fun = mean,
+    geom = "line",
     linewidth = 0.8
   ) +
-
-  geom_point(
+  stat_summary(
+    fun = mean,
+    geom = "point",
     size = 2.5
   ) +
-
+  geom_line(
+    data = optimal_long,
+    aes(
+      x = censoring_target,
+      y = optimal_value
+    ),
+    inherit.aes = FALSE,
+    linetype = "dashed",
+    linewidth = 0.8
+  ) +
+  geom_point(
+    data = optimal_long,
+    aes(
+      x = censoring_target,
+      y = optimal_value
+    ),
+    inherit.aes = FALSE,
+    shape = 4,
+    size = 3,
+    stroke = 1
+  ) +
+  scale_x_continuous(
+    breaks = CENSORING_LEVELS,
+    labels = paste0(
+      100 * CENSORING_LEVELS,
+      "%"
+    )
+  ) +
   labs(
-    x = "Censoring Level (%)",
-    y = "ATE RMSE",
-    linetype = "Method",
-    shape = "Method"
+    title = "Dynamic Policy Value Under Competing Risks",
+    x = "Target Administrative Censoring Rate",
+    y = "Policy Value",
+    linetype = "Method"
   ) +
+  theme_bw()
 
-  theme_classic(
-    base_size = 13
-  ) +
-
-  theme(
-    legend.position = "bottom"
-  )
-
-print(p_rmse)
+print(p_value)
 
 ggsave(
-  filename = file.path(
-    FIG_DIR,
-    "Figure_2_ATE_RMSE.png"
+  file.path(
+    OUTPUT_DIR,
+    "policy_value.png"
   ),
-  plot = p_rmse,
-  width = 7,
-  height = 5,
+  p_value,
+  width = 8,
+  height = 6,
   dpi = 300
 )
 
-###############################################################
-# 24.3 POLICY REGRET
-###############################################################
+# =============================================================================
+# 26. Policy regret plot
+# =============================================================================
 
-Policy_regret_long <- summary_results %>%
+regret_long <- results %>%
   dplyr::select(
     censoring_target,
-    Regret_BJ,
-    Regret_IPCW,
-    Regret_CA_BJ
+    regret_BJ,
+    regret_IPCW,
+    regret_CA_BJ
   ) %>%
   tidyr::pivot_longer(
     cols = c(
-      Regret_BJ,
-      Regret_IPCW,
-      Regret_CA_BJ
+      regret_BJ,
+      regret_IPCW,
+      regret_CA_BJ
     ),
     names_to = "Method",
     values_to = "Regret"
@@ -1784,395 +2813,334 @@ Policy_regret_long <- summary_results %>%
   dplyr::mutate(
     Method = dplyr::recode(
       Method,
-      Regret_BJ = "BJ-Q",
-      Regret_IPCW = "Complete IPCW-Q",
-      Regret_CA_BJ = "CA-BJ-Q"
+      regret_BJ    = "BJ-Q",
+      regret_IPCW  = "IPCW-Q",
+      regret_CA_BJ = "CA-BJ-Q"
     )
   )
 
 p_regret <- ggplot(
-  Policy_regret_long,
+  regret_long,
   aes(
-    x = censoring_target * 100,
+    x = censoring_target,
     y = Regret,
     group = Method,
-    linetype = Method,
-    shape = Method
+    linetype = Method
   )
 ) +
-
-  geom_line(
+  stat_summary(
+    fun = mean,
+    geom = "line",
     linewidth = 0.8
   ) +
-
-  geom_point(
+  stat_summary(
+    fun = mean,
+    geom = "point",
     size = 2.5
   ) +
-
+  geom_hline(
+    yintercept = 0,
+    linetype = "dotted"
+  ) +
+  scale_x_continuous(
+    breaks = CENSORING_LEVELS,
+    labels = paste0(
+      100 * CENSORING_LEVELS,
+      "%"
+    )
+  ) +
   labs(
-    x = "Censoring Level (%)",
+    title = "Dynamic Policy Regret",
+    x = "Target Administrative Censoring Rate",
     y = "Policy Regret",
-    linetype = "Method",
-    shape = "Method"
+    linetype = "Method"
   ) +
-
-  theme_classic(
-    base_size = 13
-  ) +
-
-  theme(
-    legend.position = "bottom"
-  )
+  theme_bw()
 
 print(p_regret)
 
 ggsave(
-  filename = file.path(
-    FIG_DIR,
-    "Figure_3_Policy_Regret.png"
+  file.path(
+    OUTPUT_DIR,
+    "policy_regret.png"
   ),
-  plot = p_regret,
-  width = 7,
-  height = 5,
+  p_regret,
+  width = 8,
+  height = 6,
   dpi = 300
 )
 
-###############################################################
-# 24.4 POLICY ACCURACY
-###############################################################
+# =============================================================================
+# 27. Stage-specific policy accuracy plot
+# =============================================================================
 
-Policy_accuracy_long <- summary_results %>%
+accuracy_long <- results %>%
   dplyr::select(
     censoring_target,
-    Accuracy_BJ,
-    Accuracy_IPCW,
-    Accuracy_CA_BJ
+    accuracy_BJ_S1,
+    accuracy_BJ_S2,
+    accuracy_BJ_S3,
+    accuracy_IPCW_S1,
+    accuracy_IPCW_S2,
+    accuracy_IPCW_S3,
+    accuracy_CA_BJ_S1,
+    accuracy_CA_BJ_S2,
+    accuracy_CA_BJ_S3
   ) %>%
   tidyr::pivot_longer(
-    cols = c(
-      Accuracy_BJ,
-      Accuracy_IPCW,
-      Accuracy_CA_BJ
-    ),
-    names_to = "Method",
+    cols = -censoring_target,
+    names_to = "Method_Stage",
     values_to = "Accuracy"
   ) %>%
   dplyr::mutate(
-    Method = dplyr::recode(
+    Method_Stage = dplyr::recode(
+      Method_Stage,
+      accuracy_BJ_S1    = "BJ-Q_S1",
+      accuracy_BJ_S2    = "BJ-Q_S2",
+      accuracy_BJ_S3    = "BJ-Q_S3",
+      accuracy_IPCW_S1  = "IPCW-Q_S1",
+      accuracy_IPCW_S2  = "IPCW-Q_S2",
+      accuracy_IPCW_S3  = "IPCW-Q_S3",
+      accuracy_CA_BJ_S1 = "CA-BJ-Q_S1",
+      accuracy_CA_BJ_S2 = "CA-BJ-Q_S2",
+      accuracy_CA_BJ_S3 = "CA-BJ-Q_S3"
+    )
+  ) %>%
+  tidyr::separate(
+    Method_Stage,
+    into = c("Method", "Stage"),
+    sep = "_(?=S[123]$)"
+  ) %>%
+  dplyr::mutate(
+    Stage = factor(
+      Stage,
+      levels = c("S1", "S2", "S3"),
+      labels = c(
+        "Stage 1",
+        "Stage 2",
+        "Stage 3"
+      )
+    ),
+    Method = factor(
       Method,
-      Accuracy_BJ = "BJ-Q",
-      Accuracy_IPCW = "Complete IPCW-Q",
-      Accuracy_CA_BJ = "CA-BJ-Q"
+      levels = c(
+        "BJ-Q",
+        "IPCW-Q",
+        "CA-BJ-Q"
+      )
     )
   )
 
 p_accuracy <- ggplot(
-  Policy_accuracy_long,
+  accuracy_long,
   aes(
-    x = censoring_target * 100,
+    x = censoring_target,
     y = Accuracy,
     group = Method,
-    linetype = Method,
-    shape = Method
+    linetype = Method
   )
 ) +
-
-  geom_line(
+  stat_summary(
+    fun = mean,
+    geom = "line",
     linewidth = 0.8
   ) +
-
-  geom_point(
+  stat_summary(
+    fun = mean,
+    geom = "point",
     size = 2.5
   ) +
-
+  facet_wrap(
+    ~ Stage
+  ) +
+  scale_x_continuous(
+    breaks = CENSORING_LEVELS,
+    labels = paste0(
+      100 * CENSORING_LEVELS,
+      "%"
+    )
+  ) +
   scale_y_continuous(
     limits = c(0, 1)
   ) +
-
   labs(
-    x = "Censoring Level (%)",
+    title = "Stage-Specific Dynamic Treatment Policy Accuracy",
+    x = "Target Administrative Censoring Rate",
     y = "Policy Accuracy",
-    linetype = "Method",
-    shape = "Method"
+    linetype = "Method"
   ) +
-
-  theme_classic(
-    base_size = 13
-  ) +
-
-  theme(
-    legend.position = "bottom"
-  )
+  theme_bw()
 
 print(p_accuracy)
 
 ggsave(
-  filename = file.path(
-    FIG_DIR,
-    "Figure_4_Policy_Accuracy.png"
+  file.path(
+    OUTPUT_DIR,
+    "stage_policy_accuracy.png"
   ),
-  plot = p_accuracy,
-  width = 7,
-  height = 5,
+  p_accuracy,
+  width = 10,
+  height = 6,
   dpi = 300
 )
 
-###############################################################
-# 24.5 POLICY VALUE
-###############################################################
+# =============================================================================
+# 28. Realized censoring-rate plot
+# =============================================================================
 
-Policy_value_long <- summary_results %>%
-  dplyr::select(
-    censoring_target,
-    Value_BJ,
-    Value_IPCW,
-    Value_CA_BJ,
-    Optimal_Value
-  ) %>%
+censoring_long <- censoring_summary %>%
   tidyr::pivot_longer(
     cols = c(
-      Value_BJ,
-      Value_IPCW,
-      Value_CA_BJ,
-      Optimal_Value
+      Stage1,
+      Stage2,
+      Stage3
     ),
-    names_to = "Method",
-    values_to = "Value"
+    names_to = "Stage",
+    values_to = "Censoring_Rate"
   ) %>%
   dplyr::mutate(
-    Method = dplyr::recode(
-      Method,
-      Value_BJ = "BJ-Q",
-      Value_IPCW = "Complete IPCW-Q",
-      Value_CA_BJ = "CA-BJ-Q",
-      Optimal_Value = "Optimal Policy"
+    Stage = factor(
+      Stage,
+      levels = c(
+        "Stage1",
+        "Stage2",
+        "Stage3"
+      ),
+      labels = c(
+        "Stage 1",
+        "Stage 2",
+        "Stage 3"
+      )
     )
   )
 
-p_value <- ggplot(
-  Policy_value_long,
+p_censoring <- ggplot(
+  censoring_long,
   aes(
-    x = censoring_target * 100,
-    y = Value,
-    group = Method,
-    linetype = Method,
-    shape = Method
+    x = censoring_target,
+    y = Censoring_Rate,
+    group = Stage,
+    linetype = Stage
   )
 ) +
-
   geom_line(
     linewidth = 0.8
   ) +
-
   geom_point(
     size = 2.5
   ) +
-
-  labs(
-    x = "Censoring Level (%)",
-    y = "Policy Value",
-    linetype = "Method",
-    shape = "Method"
+  geom_abline(
+    slope = 1,
+    intercept = 0,
+    linetype = "dashed"
   ) +
-
-  theme_classic(
-    base_size = 13
-  ) +
-
-  theme(
-    legend.position = "bottom"
-  )
-
-print(p_value)
-
-ggsave(
-  filename = file.path(
-    FIG_DIR,
-    "Figure_5_Policy_Value.png"
-  ),
-  plot = p_value,
-  width = 7,
-  height = 5,
-  dpi = 300
-)
-
-###############################################################
-# 24.6 TREATMENT RATE
-###############################################################
-
-Treatment_long <- summary_results %>%
-  dplyr::select(
-    censoring_target,
-    Treatment_BJ,
-    Treatment_IPCW,
-    Treatment_CA_BJ
-  ) %>%
-  tidyr::pivot_longer(
-    cols = c(
-      Treatment_BJ,
-      Treatment_IPCW,
-      Treatment_CA_BJ
+  scale_x_continuous(
+    breaks = CENSORING_LEVELS,
+    labels = paste0(
+      100 * CENSORING_LEVELS,
+      "%"
     ),
-    names_to = "Method",
-    values_to = "Treatment_Rate"
-  ) %>%
-  dplyr::mutate(
-    Method = dplyr::recode(
-      Method,
-      Treatment_BJ = "BJ-Q",
-      Treatment_IPCW = "Complete IPCW-Q",
-      Treatment_CA_BJ = "CA-BJ-Q"
+    limits = c(
+      min(CENSORING_LEVELS),
+      max(CENSORING_LEVELS)
     )
-  )
-
-p_treatment <- ggplot(
-  Treatment_long,
-  aes(
-    x = censoring_target * 100,
-    y = Treatment_Rate,
-    group = Method,
-    linetype = Method,
-    shape = Method
-  )
-) +
-
-  geom_line(
-    linewidth = 0.8
   ) +
-
-  geom_point(
-    size = 2.5
-  ) +
-
   scale_y_continuous(
-    limits = c(0, 1)
+    labels = function(x) paste0(
+      100 * x,
+      "%"
+    )
   ) +
-
   labs(
-    x = "Censoring Level (%)",
-    y = "Treatment Rate",
-    linetype = "Method",
-    shape = "Method"
+    title = "Realized Censoring Rate Among Stage-Eligible Subjects",
+    x = "Target Administrative Censoring Rate",
+    y = "Realized Censoring Rate",
+    linetype = "Stage"
   ) +
+  theme_bw()
 
-  theme_classic(
-    base_size = 13
-  ) +
-
-  theme(
-    legend.position = "bottom"
-  )
-
-print(p_treatment)
+print(p_censoring)
 
 ggsave(
-  filename = file.path(
-    FIG_DIR,
-    "Figure_6_Treatment_Rate.png"
+  file.path(
+    OUTPUT_DIR,
+    "stage_censoring.png"
   ),
-  plot = p_treatment,
-  width = 7,
-  height = 5,
+  p_censoring,
+  width = 8,
+  height = 6,
   dpi = 300
 )
 
-###############################################################
-# 24.7 EFFECTIVE SAMPLE SIZE
-###############################################################
+# =============================================================================
+# 29. Effective sample size plot
+# =============================================================================
 
-ESS_long <- summary_results %>%
-  dplyr::select(
-    censoring_target,
-    ESS_IPCW,
-    ESS_CA_BJ
-  ) %>%
+ESS_long <- ESS_summary %>%
   tidyr::pivot_longer(
     cols = c(
-      ESS_IPCW,
-      ESS_CA_BJ
+      ESS_S1,
+      ESS_S2,
+      ESS_S3
     ),
-    names_to = "Method",
+    names_to = "Stage",
     values_to = "ESS"
   ) %>%
   dplyr::mutate(
-    Method = dplyr::recode(
-      Method,
-      ESS_IPCW = "Complete IPCW-Q",
-      ESS_CA_BJ = "CA-BJ-Q"
+    Stage = factor(
+      Stage,
+      levels = c(
+        "ESS_S1",
+        "ESS_S2",
+        "ESS_S3"
+      ),
+      labels = c(
+        "Stage 1",
+        "Stage 2",
+        "Stage 3"
+      )
     )
   )
 
-p_ess <- ggplot(
+p_ESS <- ggplot(
   ESS_long,
   aes(
-    x = censoring_target * 100,
+    x = censoring_target,
     y = ESS,
-    group = Method,
-    linetype = Method,
-    shape = Method
+    group = Stage,
+    linetype = Stage
   )
 ) +
-
   geom_line(
     linewidth = 0.8
   ) +
-
   geom_point(
     size = 2.5
   ) +
-
+  scale_x_continuous(
+    breaks = CENSORING_LEVELS,
+    labels = paste0(
+      100 * CENSORING_LEVELS,
+      "%"
+    )
+  ) +
   labs(
-    x = "Censoring Level (%)",
+    title = "Effective Sample Size of IPCW Weights",
+    x = "Target Administrative Censoring Rate",
     y = "Effective Sample Size",
-    linetype = "Method",
-    shape = "Method"
+    linetype = "Stage"
   ) +
+  theme_bw()
 
-  theme_classic(
-    base_size = 13
-  ) +
-
-  theme(
-    legend.position = "bottom"
-  )
-
-print(p_ess)
+print(p_ESS)
 
 ggsave(
-  filename = file.path(
-    FIG_DIR,
-    "Figure_7_ESS.png"
+  file.path(
+    OUTPUT_DIR,
+    "ESS.png"
   ),
-  plot = p_ess,
-  width = 7,
-  height = 5,
+  p_ESS,
+  width = 8,
+  height = 6,
   dpi = 300
 )
-
-###############################################################
-# 25. CONFIRM FIGURES
-###############################################################
-
-cat(
-  "\n====================================================\n"
-)
-
-cat(
-  "FIGURES SAVED TO:",
-  FIG_DIR,
-  "\n"
-)
-
-cat(
-  "====================================================\n\n"
-)
-
-print(
-  list.files(
-    FIG_DIR
-  )
-)
-
-###############################################################
-# END FIGURES
-###############################################################

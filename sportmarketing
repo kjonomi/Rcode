@@ -1,0 +1,2120 @@
+###############################################################################
+# TEMPORAL CAUSAL DEEP LEARNING FOR INDIVIDUALIZED SPORTS-MARKETING TARGETING
+#
+# Central contribution:
+#   Temporal causal deep learning for individualized sports-marketing targeting
+#
+# Architecture:
+#
+# Historical fan/customer behavior
+#              |
+#       +------+------+
+#       |             |
+#      CNN          BiLSTM
+#       |             |
+#       +------+------+
+#              |
+#        Transformer
+#              |
+#      Shared temporal/
+#      causal representation
+#              |
+#       +------+------+ 
+#       |      |      |
+#  Propensity Y(0)  Y(1)
+#       |      |      |
+#       +------+------+ 
+#              |
+#       CATE = Y(1)-Y(0)
+#              |
+#       Incremental profit
+#              |
+#       Individualized
+#       marketing policy
+#
+# Primary decision criterion:
+#   incremental profit
+#
+# Treatment:
+#   targeted sports-marketing intervention
+#
+# Outcome:
+#   incremental customer revenue generated in the response window
+#
+# IMPORTANT:
+# This version uses the Python Keras 3 API directly through reticulate for
+# compile(), fit(), and predict(), avoiding R callback compatibility problems.
+###############################################################################
+
+rm(list = ls())
+gc()
+
+###############################################################################
+# 0. SETUP
+###############################################################################
+
+Sys.setenv(CUDA_VISIBLE_DEVICES = "")
+Sys.setenv(TF_CPP_MIN_LOG_LEVEL = "2")
+
+library(keras)
+library(tensorflow)
+library(reticulate)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+set.seed(20260906)
+tf$random$set_seed(20260906)
+
+np <- import("numpy", convert = FALSE)
+
+keras_python <- import(
+    "keras",
+    convert = FALSE
+)
+
+keras_layers <- import(
+    "keras.layers",
+    convert = FALSE
+)
+
+keras_optimizers <- import(
+    "keras.optimizers",
+    convert = FALSE
+)
+
+cat("\n============================================================\n")
+cat("KERAS ENVIRONMENT\n")
+cat("============================================================\n")
+cat("TensorFlow version: ", as.character(tf$`__version__`), "\n")
+cat("Keras version:      ", as.character(keras_python$`__version__`), "\n")
+
+###############################################################################
+# 1. SETTINGS
+###############################################################################
+
+N <- 5000
+P <- 20
+
+LOOKBACK <- 20
+
+TRAIN_PROP <- 0.70
+VALID_PROP <- 0.15
+TEST_PROP  <- 0.15
+
+BATCH_SIZE <- 64
+EPOCHS <- 30
+LEARNING_RATE <- 0.001
+
+# Primary policy criterion: estimated incremental revenue must exceed campaign
+# cost. The default cost is expressed in the same units as the simulated
+# revenue outcome.
+MARKETING_COST <- 0.50
+
+# Optional fixed profit threshold in addition to campaign cost.
+POLICY_THRESHOLD <- 0.00
+
+# Response window used conceptually for the simulated customer outcome.
+RESPONSE_WINDOW_DAYS <- 30
+
+OUTPUT_DIR <- "sports_marketing_results"
+if (!dir.exists(OUTPUT_DIR)) dir.create(OUTPUT_DIR, recursive = TRUE)
+
+###############################################################################
+# 2. SPORTS-MARKETING VARIABLE DEFINITIONS
+###############################################################################
+#
+# X1  = recent ticket-purchase intensity
+# X2  = merchandise spending propensity
+# X3  = digital/app engagement
+# X4  = game attendance frequency
+# X5  = email/social engagement
+# X6  = season-ticket/membership engagement
+# X7  = recent purchase recency
+# X8  = historical campaign responsiveness
+# X9  = game-interest intensity
+# X10 = opponent/game attractiveness
+# X11 = ticket-price sensitivity
+# X12 = fan tenure
+# X13-X20 = additional longitudinal behavioral/context variables
+#
+# A = 1: targeted marketing intervention
+# A = 0: no targeted intervention
+#
+# Y(a): future customer revenue under intervention a
+# tau(X) = Y(1)-Y(0): individualized incremental revenue
+###############################################################################
+
+###############################################################################
+# 3. SIMULATE LONGITUDINAL SPORTS-CUSTOMER DATA
+###############################################################################
+
+simulate_sports_marketing_data <- function(
+    n = N,
+    p = P,
+    rho = 0.70
+) {
+
+    Sigma <- outer(
+        1:p,
+        1:p,
+        function(i, j) rho^abs(i - j)
+    )
+
+    Z <- matrix(
+        rnorm(n * p),
+        nrow = n,
+        ncol = p
+    )
+
+    L <- chol(Sigma)
+    X <- Z %*% L
+
+    X <- scale(X)
+    X <- as.matrix(X)
+
+    colnames(X) <- paste0("X", 1:p)
+
+    return(X)
+}
+
+X <- simulate_sports_marketing_data()
+
+###############################################################################
+# 4. TRUE HETEROGENEOUS MARKETING EFFECT
+###############################################################################
+#
+# The treatment effect is intentionally nonlinear and heterogeneous.
+# This makes the problem genuinely causal rather than a simple response
+# prediction problem.
+###############################################################################
+
+true_tau <- function(X) {
+
+    tau <-
+        0.50 +
+        0.40 * sin(X[, 1]) +
+        0.30 * X[, 2] * X[, 3] +
+        0.25 * (X[, 4]^2 - 1) +
+        0.20 * X[, 5]
+
+    return(as.numeric(tau))
+}
+
+TAU_TRUE <- true_tau(X)
+
+###############################################################################
+# 5. TREATMENT ASSIGNMENT
+###############################################################################
+#
+# Treatment assignment depends on customer characteristics. Therefore,
+# treatment is not assumed to be completely randomized.
+###############################################################################
+
+treatment_probability <- function(X) {
+
+    lp <-
+        -0.10 +
+        0.35 * X[, 1] -
+        0.25 * X[, 2] +
+        0.20 * X[, 3] +
+        0.10 * X[, 4]
+
+    p <- plogis(lp)
+
+    # Enforce positivity.
+    p <- pmin(
+        pmax(p, 0.05),
+        0.95
+    )
+
+    return(p)
+}
+
+PROPENSITY_TRUE <- treatment_probability(X)
+
+A <- rbinom(
+    N,
+    size = 1,
+    prob = PROPENSITY_TRUE
+)
+
+###############################################################################
+# 6. BASELINE CUSTOMER REVENUE
+###############################################################################
+
+baseline_revenue <- function(X) {
+
+    y0 <-
+        1.00 +
+        0.20 * X[, 1] -
+        0.10 * X[, 2] +
+        0.08 * X[, 3] +
+        0.05 * sin(X[, 4]) +
+        0.05 * X[, 5]^2
+
+    return(as.numeric(y0))
+}
+
+Y0_TRUE <- baseline_revenue(X)
+
+###############################################################################
+# 7. POTENTIAL CUSTOMER REVENUES
+###############################################################################
+
+Y1_TRUE <- Y0_TRUE + TAU_TRUE
+
+###############################################################################
+# 8. OBSERVED CUSTOMER REVENUE
+###############################################################################
+
+EPS <- rnorm(
+    N,
+    mean = 0,
+    sd = 0.50
+)
+
+Y <- ifelse(
+    A == 1,
+    Y1_TRUE + EPS,
+    Y0_TRUE + EPS
+)
+
+###############################################################################
+# 9. DATA FRAME
+###############################################################################
+
+sim_data <- data.frame(
+    X,
+    A = A,
+    Y = Y,
+    Y0 = Y0_TRUE,
+    Y1 = Y1_TRUE,
+    TAU = TAU_TRUE,
+    PROPENSITY = PROPENSITY_TRUE
+)
+
+###############################################################################
+# 10. DATA SUMMARY
+###############################################################################
+
+cat("\n============================================================\n")
+cat("SPORTS-MARKETING SIMULATION SUMMARY\n")
+cat("============================================================\n")
+cat("Sample size:              ", N, "\n")
+cat("Number of covariates:     ", P, "\n")
+cat("Marketing treatment rate: ", round(mean(A), 4), "\n")
+cat("True ATE:                 ", round(mean(TAU_TRUE), 4), "\n")
+cat("True CATE SD:             ", round(sd(TAU_TRUE), 4), "\n")
+cat("Minimum propensity:       ", round(min(PROPENSITY_TRUE), 4), "\n")
+cat("Maximum propensity:       ", round(max(PROPENSITY_TRUE), 4), "\n")
+cat("Marketing cost:           ", MARKETING_COST, "\n")
+cat("Response window (days):   ", RESPONSE_WINDOW_DAYS, "\n")
+
+###############################################################################
+# 11. CREATE TEMPORAL SEQUENCES
+###############################################################################
+#
+# Genuine one-step-ahead decision:
+#
+#   X[t-LOOKBACK], ..., X[t-1]
+#                  |
+#                  v
+#                 A[t]
+#                  |
+#                  v
+#                 Y[t]
+#
+# The contemporaneous X[t] is excluded from the input sequence to prevent
+# temporal leakage.
+###############################################################################
+
+create_sequences <- function(
+    X,
+    A,
+    Y,
+    tau,
+    lookback
+) {
+
+    n <- nrow(X)
+    p <- ncol(X)
+    n_seq <- n - lookback
+
+    X_seq <- array(
+        0,
+        dim = c(
+            n_seq,
+            lookback,
+            p
+        )
+    )
+
+    A_seq <- numeric(n_seq)
+    Y_seq <- numeric(n_seq)
+    tau_seq <- numeric(n_seq)
+
+    for (i in seq_len(n_seq)) {
+
+        target_index <- i + lookback
+        start_index <- i
+        end_index <- target_index - 1
+
+        idx <- start_index:end_index
+
+        X_seq[i, , ] <- X[idx, ]
+        A_seq[i] <- A[target_index]
+        Y_seq[i] <- Y[target_index]
+        tau_seq[i] <- tau[target_index]
+    }
+
+    return(
+        list(
+            X = X_seq,
+            A = A_seq,
+            Y = Y_seq,
+            tau = tau_seq
+        )
+    )
+}
+
+SEQ <- create_sequences(
+    X = X,
+    A = A,
+    Y = Y,
+    tau = TAU_TRUE,
+    lookback = LOOKBACK
+)
+
+X_SEQ <- SEQ$X
+A_SEQ <- SEQ$A
+Y_SEQ <- SEQ$Y
+TAU_SEQ <- SEQ$tau
+
+N_SEQ <- dim(X_SEQ)[1]
+
+###############################################################################
+# 12. CHRONOLOGICAL TRAIN / VALIDATION / TEST SPLIT
+###############################################################################
+
+N_TRAIN <- floor(TRAIN_PROP * N_SEQ)
+N_VALID <- floor(VALID_PROP * N_SEQ)
+N_TEST <- N_SEQ - N_TRAIN - N_VALID
+
+TRAIN_IDX <- seq_len(N_TRAIN)
+
+VALID_IDX <- seq(
+    N_TRAIN + 1,
+    N_TRAIN + N_VALID
+)
+
+TEST_IDX <- seq(
+    N_TRAIN + N_VALID + 1,
+    N_SEQ
+)
+
+cat("\n============================================================\n")
+cat("CHRONOLOGICAL SPLIT\n")
+cat("============================================================\n")
+cat("Total sequences:      ", N_SEQ, "\n")
+cat("Training sequences:   ", length(TRAIN_IDX), "\n")
+cat("Validation sequences: ", length(VALID_IDX), "\n")
+cat("Test sequences:       ", length(TEST_IDX), "\n")
+
+###############################################################################
+# 13. TRAINING DATA
+###############################################################################
+
+X_train <- X_SEQ[
+    TRAIN_IDX, , ,
+    drop = FALSE
+]
+
+A_train <- A_SEQ[TRAIN_IDX]
+Y_train <- Y_SEQ[TRAIN_IDX]
+
+###############################################################################
+# 14. VALIDATION DATA
+###############################################################################
+
+X_valid <- X_SEQ[
+    VALID_IDX, , ,
+    drop = FALSE
+]
+
+A_valid <- A_SEQ[VALID_IDX]
+Y_valid <- Y_SEQ[VALID_IDX]
+
+###############################################################################
+# 15. TEST DATA
+###############################################################################
+
+X_test <- X_SEQ[
+    TEST_IDX, , ,
+    drop = FALSE
+]
+
+A_test <- A_SEQ[TEST_IDX]
+Y_test <- Y_SEQ[TEST_IDX]
+TAU_test <- TAU_SEQ[TEST_IDX]
+
+###############################################################################
+# 16. TRANSFORMER BLOCK
+###############################################################################
+
+transformer_block <- function(
+    x,
+    d_model = 16
+) {
+
+    attention <- layer_multi_head_attention(
+        num_heads = 2,
+        key_dim = d_model,
+        dropout = 0.10
+    )(
+        query = x,
+        key = x,
+        value = x
+    )
+
+    x1 <- layer_add(
+        list(
+            x,
+            attention
+        )
+    )
+
+    x1 <- layer_layer_normalization()(x1)
+
+    ff <- x1 %>%
+        layer_dense(
+            units = 64,
+            activation = "relu"
+        ) %>%
+        layer_dropout(
+            rate = 0.10
+        ) %>%
+        layer_dense(
+            units = P
+        )
+
+    x2 <- layer_add(
+        list(
+            x1,
+            ff
+        )
+    )
+
+    x2 <- layer_layer_normalization()(x2)
+
+    return(x2)
+}
+
+###############################################################################
+# 17. MODEL INPUT
+###############################################################################
+
+inputs <- layer_input(
+    shape = c(
+        LOOKBACK,
+        P
+    ),
+    name = "fan_behavior_sequence"
+)
+
+###############################################################################
+# 18. CNN BRANCH
+###############################################################################
+
+cnn_branch <- inputs %>%
+    layer_conv_1d(
+        filters = 32,
+        kernel_size = 3,
+        padding = "same",
+        activation = "relu"
+    ) %>%
+    layer_batch_normalization() %>%
+    layer_dropout(
+        rate = 0.10
+    ) %>%
+    layer_conv_1d(
+        filters = 32,
+        kernel_size = 3,
+        padding = "same",
+        activation = "relu"
+    ) %>%
+    layer_global_average_pooling_1d()
+
+###############################################################################
+# 19. BiLSTM BRANCH
+###############################################################################
+
+lstm_layer <- keras_layers$LSTM(
+    units = 32L,
+    return_sequences = FALSE
+)
+
+bidirectional_layer <- keras_layers$Bidirectional(
+    lstm_layer
+)
+
+lstm_branch <- bidirectional_layer(inputs)
+
+###############################################################################
+# 20. TRANSFORMER BRANCH
+###############################################################################
+
+transformer_output <- transformer_block(
+    inputs,
+    d_model = 16
+)
+
+transformer_branch <- transformer_output %>%
+    layer_global_average_pooling_1d()
+
+###############################################################################
+# 21. COMBINE TEMPORAL REPRESENTATIONS
+###############################################################################
+
+combined <- layer_concatenate(
+    list(
+        cnn_branch,
+        lstm_branch,
+        transformer_branch
+    ),
+    name = "combined_temporal_representation"
+)
+
+###############################################################################
+# 22. SHARED CAUSAL REPRESENTATION
+###############################################################################
+
+representation <- combined %>%
+    layer_dense(
+        units = 64,
+        activation = "relu"
+    ) %>%
+    layer_batch_normalization() %>%
+    layer_dropout(
+        rate = 0.10
+    ) %>%
+    layer_dense(
+        units = 32,
+        activation = "relu",
+        name = "causal_representation"
+    )
+
+###############################################################################
+# 23. PROPENSITY HEAD
+###############################################################################
+
+propensity_head <- representation %>%
+    layer_dense(
+        units = 16,
+        activation = "relu"
+    ) %>%
+    layer_dense(
+        units = 1,
+        activation = "sigmoid",
+        name = "propensity"
+    )
+
+###############################################################################
+# 24. Y(0) HEAD
+###############################################################################
+
+y0_head <- representation %>%
+    layer_dense(
+        units = 16,
+        activation = "relu"
+    ) %>%
+    layer_dense(
+        units = 1,
+        activation = "linear",
+        name = "Y0"
+    )
+
+###############################################################################
+# 25. Y(1) HEAD
+###############################################################################
+
+y1_head <- representation %>%
+    layer_dense(
+        units = 16,
+        activation = "relu"
+    ) %>%
+    layer_dense(
+        units = 1,
+        activation = "linear",
+        name = "Y1"
+    )
+
+###############################################################################
+# 26. CAUSAL MODEL
+###############################################################################
+
+causal_model <- keras_model(
+    inputs = inputs,
+    outputs = list(
+        propensity_head,
+        y0_head,
+        y1_head
+    )
+)
+
+###############################################################################
+# 27. COMPILE MODEL
+###############################################################################
+
+optimizer <- keras_optimizers$Adam(
+    learning_rate = LEARNING_RATE
+)
+
+causal_model$compile(
+    optimizer = optimizer,
+    loss = list(
+        "binary_crossentropy",
+        "mse",
+        "mse"
+    ),
+    loss_weights = list(
+        0.50,
+        1.00,
+        1.00
+    )
+)
+
+cat("\n============================================================\n")
+cat("MODEL SUMMARY\n")
+cat("============================================================\n")
+print(causal_model)
+
+###############################################################################
+# 28. MASKED POTENTIAL-OUTCOME TARGETS
+###############################################################################
+#
+# Only one potential outcome is observed for each customer:
+#
+#   A = 0 -> Y(0) observed
+#   A = 1 -> Y(1) observed
+#
+# Sample weights prevent the unobserved potential outcome from contributing
+# to its corresponding loss.
+###############################################################################
+
+Y0_target_train <- Y_train
+Y1_target_train <- Y_train
+
+Y0_target_valid <- Y_valid
+Y1_target_valid <- Y_valid
+
+W_A_train <- rep(1, length(A_train))
+
+W_Y0_train <- ifelse(
+    A_train == 0,
+    1,
+    0
+)
+
+W_Y1_train <- ifelse(
+    A_train == 1,
+    1,
+    0
+)
+
+W_A_valid <- rep(1, length(A_valid))
+
+W_Y0_valid <- ifelse(
+    A_valid == 0,
+    1,
+    0
+)
+
+W_Y1_valid <- ifelse(
+    A_valid == 1,
+    1,
+    0
+)
+
+cat("\n============================================================\n")
+cat("TREATMENT / MASK CHECK\n")
+cat("============================================================\n")
+cat("Training A=0:    ", sum(A_train == 0), "\n")
+cat("Training A=1:    ", sum(A_train == 1), "\n")
+cat("Validation A=0:  ", sum(A_valid == 0), "\n")
+cat("Validation A=1:  ", sum(A_valid == 1), "\n")
+
+###############################################################################
+# 29. CONVERT DATA TO NUMPY
+###############################################################################
+
+X_train_py <- np$array(
+    X_train,
+    dtype = "float32"
+)
+
+X_valid_py <- np$array(
+    X_valid,
+    dtype = "float32"
+)
+
+X_test_py <- np$array(
+    X_test,
+    dtype = "float32"
+)
+
+A_train_py <- np$array(
+    matrix(A_train, ncol = 1),
+    dtype = "float32"
+)
+
+A_valid_py <- np$array(
+    matrix(A_valid, ncol = 1),
+    dtype = "float32"
+)
+
+Y0_train_py <- np$array(
+    matrix(Y0_target_train, ncol = 1),
+    dtype = "float32"
+)
+
+Y0_valid_py <- np$array(
+    matrix(Y0_target_valid, ncol = 1),
+    dtype = "float32"
+)
+
+Y1_train_py <- np$array(
+    matrix(Y1_target_train, ncol = 1),
+    dtype = "float32"
+)
+
+Y1_valid_py <- np$array(
+    matrix(Y1_target_valid, ncol = 1),
+    dtype = "float32"
+)
+
+W_A_train_py <- np$array(
+    W_A_train,
+    dtype = "float32"
+)
+
+W_Y0_train_py <- np$array(
+    W_Y0_train,
+    dtype = "float32"
+)
+
+W_Y1_train_py <- np$array(
+    W_Y1_train,
+    dtype = "float32"
+)
+
+W_A_valid_py <- np$array(
+    W_A_valid,
+    dtype = "float32"
+)
+
+W_Y0_valid_py <- np$array(
+    W_Y0_valid,
+    dtype = "float32"
+)
+
+W_Y1_valid_py <- np$array(
+    W_Y1_valid,
+    dtype = "float32"
+)
+
+Y_train_py <- list(
+    A_train_py,
+    Y0_train_py,
+    Y1_train_py
+)
+
+Y_valid_py <- list(
+    A_valid_py,
+    Y0_valid_py,
+    Y1_valid_py
+)
+
+SW_train_py <- list(
+    W_A_train_py,
+    W_Y0_train_py,
+    W_Y1_train_py
+)
+
+SW_valid_py <- list(
+    W_A_valid_py,
+    W_Y0_valid_py,
+    W_Y1_valid_py
+)
+
+###############################################################################
+# 30. TRAIN MODEL
+###############################################################################
+
+cat("\n============================================================\n")
+cat("MODEL TRAINING\n")
+cat("============================================================\n")
+
+history_py <- causal_model$fit(
+    x = X_train_py,
+    y = Y_train_py,
+    sample_weight = SW_train_py,
+    validation_data = list(
+        X_valid_py,
+        Y_valid_py,
+        SW_valid_py
+    ),
+    epochs = as.integer(EPOCHS),
+    batch_size = as.integer(BATCH_SIZE),
+    verbose = 2L,
+    callbacks = list()
+)
+
+cat("\n============================================================\n")
+cat("TRAINING COMPLETED\n")
+cat("============================================================\n")
+
+###############################################################################
+# 31. PREDICTIONS
+###############################################################################
+
+cat("\n============================================================\n")
+cat("PREDICTION\n")
+cat("============================================================\n")
+
+pred <- causal_model$predict(
+    X_test_py,
+    verbose = 0L
+)
+
+PROPENSITY_HAT <- as.numeric(pred[[1]])
+Y0_HAT <- as.numeric(pred[[2]])
+Y1_HAT <- as.numeric(pred[[3]])
+
+PROPENSITY_HAT <- pmin(
+    pmax(PROPENSITY_HAT, 0.05),
+    0.95
+)
+
+###############################################################################
+# 32. ESTIMATED CATE
+###############################################################################
+
+TAU_HAT <- Y1_HAT - Y0_HAT
+
+###############################################################################
+# 33. CAUSAL EFFECT METRICS
+###############################################################################
+
+ATE_TRUE <- mean(TAU_test)
+ATE_HAT <- mean(TAU_HAT)
+ATE_BIAS <- ATE_HAT - ATE_TRUE
+
+CATE_BIAS <- mean(
+    TAU_HAT - TAU_test
+)
+
+PEHE <- sqrt(
+    mean(
+        (TAU_HAT - TAU_test)^2
+    )
+)
+
+CATE_COR <- cor(
+    TAU_HAT,
+    TAU_test
+)
+
+###############################################################################
+# 34. TRUE TEST POTENTIAL OUTCOMES
+###############################################################################
+
+ORIGINAL_TEST_IDX <- TEST_IDX + LOOKBACK
+
+Y0_test_true <- Y0_TRUE[
+    ORIGINAL_TEST_IDX
+]
+
+Y1_test_true <- Y1_TRUE[
+    ORIGINAL_TEST_IDX
+]
+
+PROPENSITY_TRUE_test <- PROPENSITY_TRUE[
+    ORIGINAL_TEST_IDX
+]
+
+###############################################################################
+# 35. POTENTIAL-OUTCOME AND PROPENSITY METRICS
+###############################################################################
+
+Y0_RMSE <- sqrt(
+    mean(
+        (Y0_HAT - Y0_test_true)^2
+    )
+)
+
+Y1_RMSE <- sqrt(
+    mean(
+        (Y1_HAT - Y1_test_true)^2
+    )
+)
+
+PROPENSITY_RMSE <- sqrt(
+    mean(
+        (PROPENSITY_HAT - PROPENSITY_TRUE_test)^2
+    )
+)
+
+cat("\n============================================================\n")
+cat("CAUSAL EFFECT RESULTS\n")
+cat("============================================================\n")
+cat("True ATE:             ", round(ATE_TRUE, 5), "\n")
+cat("Estimated ATE:        ", round(ATE_HAT, 5), "\n")
+cat("ATE Bias:             ", round(ATE_BIAS, 5), "\n")
+cat("CATE Bias:            ", round(CATE_BIAS, 5), "\n")
+cat("PEHE / CATE RMSE:     ", round(PEHE, 5), "\n")
+cat("CATE correlation:     ", round(CATE_COR, 5), "\n")
+cat("Y(0) RMSE:            ", round(Y0_RMSE, 5), "\n")
+cat("Y(1) RMSE:            ", round(Y1_RMSE, 5), "\n")
+cat("Propensity RMSE:      ", round(PROPENSITY_RMSE, 5), "\n")
+
+###############################################################################
+# 36. PROFIT-MAXIMIZING INDIVIDUALIZED MARKETING POLICY
+###############################################################################
+#
+# Estimated incremental revenue:
+#
+#   DeltaY_hat = Y1_hat - Y0_hat
+#
+# Estimated incremental profit:
+#
+#   DeltaPi_hat = DeltaY_hat - marketing cost
+#
+# Target the fan only if estimated incremental profit is positive.
+###############################################################################
+
+INCREMENTAL_REVENUE_HAT <- TAU_HAT
+
+INCREMENTAL_PROFIT_HAT <-
+    INCREMENTAL_REVENUE_HAT -
+    MARKETING_COST
+
+POLICY <- ifelse(
+    INCREMENTAL_PROFIT_HAT > POLICY_THRESHOLD,
+    1,
+    0
+)
+
+POLICY_RATE <- mean(POLICY)
+
+###############################################################################
+# 37. TRUE PROFIT-MAXIMIZING POLICY
+###############################################################################
+
+TRUE_INCREMENTAL_PROFIT <-
+    TAU_test -
+    MARKETING_COST
+
+OPTIMAL_POLICY <- ifelse(
+    TRUE_INCREMENTAL_PROFIT > POLICY_THRESHOLD,
+    1,
+    0
+)
+
+POLICY_ACCURACY <- mean(
+    POLICY == OPTIMAL_POLICY
+)
+
+###############################################################################
+# 38. TRUE POLICY INCREMENTAL PROFIT
+###############################################################################
+
+# Profit under the learned policy.
+POLICY_REVENUE <- ifelse(
+    POLICY == 1,
+    Y1_test_true,
+    Y0_test_true
+)
+
+POLICY_COST <- POLICY * MARKETING_COST
+
+TRUE_POLICY_PROFIT <- mean(
+    POLICY_REVENUE - POLICY_COST
+)
+
+###############################################################################
+# 39. OPTIMAL POLICY PROFIT
+###############################################################################
+
+OPTIMAL_REVENUE <- ifelse(
+    OPTIMAL_POLICY == 1,
+    Y1_test_true,
+    Y0_test_true
+)
+
+OPTIMAL_COST <- OPTIMAL_POLICY * MARKETING_COST
+
+TRUE_OPTIMAL_PROFIT <- mean(
+    OPTIMAL_REVENUE - OPTIMAL_COST
+)
+
+###############################################################################
+# 40. BASELINE POLICIES
+###############################################################################
+
+# Everyone receives the campaign.
+EVERYONE_POLICY <- rep(
+    1,
+    length(POLICY)
+)
+
+EVERYONE_PROFIT <- mean(
+    Y1_test_true - MARKETING_COST
+)
+
+# Nobody receives the campaign.
+NOBODY_POLICY <- rep(
+    0,
+    length(POLICY)
+)
+
+NOBODY_PROFIT <- mean(
+    Y0_test_true
+)
+
+# Random targeting with the same treatment rate as the learned policy.
+set.seed(20260907)
+
+RANDOM_POLICY <- rbinom(
+    length(POLICY),
+    size = 1,
+    prob = POLICY_RATE
+)
+
+RANDOM_PROFIT <- mean(
+    ifelse(
+        RANDOM_POLICY == 1,
+        Y1_test_true - MARKETING_COST,
+        Y0_test_true
+    )
+)
+
+###############################################################################
+# 41. POLICY VALUE AND REGRET
+###############################################################################
+
+POLICY_REGRET <-
+    TRUE_OPTIMAL_PROFIT -
+    TRUE_POLICY_PROFIT
+
+POLICY_INCREMENTAL_PROFIT <-
+    TRUE_POLICY_PROFIT -
+    NOBODY_PROFIT
+
+OPTIMAL_INCREMENTAL_PROFIT <-
+    TRUE_OPTIMAL_PROFIT -
+    NOBODY_PROFIT
+
+###############################################################################
+# 42. ROI
+###############################################################################
+
+POLICY_MARKETING_COST_TOTAL <- mean(
+    POLICY_COST
+)
+
+POLICY_ROI <- ifelse(
+    POLICY_MARKETING_COST_TOTAL > 0,
+    POLICY_INCREMENTAL_PROFIT /
+        POLICY_MARKETING_COST_TOTAL,
+    NA_real_
+)
+
+EVERYONE_ROI <- ifelse(
+    MARKETING_COST > 0,
+    EVERYONE_PROFIT - NOBODY_PROFIT,
+    NA_real_
+) / MARKETING_COST
+
+###############################################################################
+# 43. POLICY CONVERSION / TARGETING METRICS
+###############################################################################
+
+OBSERVED_POLICY_TARGET_RATE <- mean(POLICY)
+
+TRUE_OPTIMAL_TARGET_RATE <- mean(OPTIMAL_POLICY)
+
+POLICY_TREATMENT_MATCH <- mean(
+    POLICY == OPTIMAL_POLICY
+)
+
+###############################################################################
+# 44. IPW POLICY VALUE
+###############################################################################
+
+evaluate_policy_ipw <- function(
+    Y,
+    A,
+    propensity,
+    policy
+) {
+
+    propensity <- pmin(
+        pmax(propensity, 0.05),
+        0.95
+    )
+
+    policy_prob <- ifelse(
+        policy == 1,
+        propensity,
+        1 - propensity
+    )
+
+    matched <- as.numeric(
+        A == policy
+    )
+
+    value <- mean(
+        matched * Y / policy_prob
+    )
+
+    return(value)
+}
+
+IPW_REVENUE_VALUE <- evaluate_policy_ipw(
+    Y = Y_test,
+    A = A_test,
+    propensity = PROPENSITY_HAT,
+    policy = POLICY
+)
+
+IPW_PROFIT_VALUE <-
+    IPW_REVENUE_VALUE -
+    POLICY_MARKETING_COST_TOTAL
+
+###############################################################################
+# 45. DOUBLY ROBUST POLICY VALUE
+###############################################################################
+
+evaluate_policy_dr <- function(
+    Y,
+    A,
+    propensity,
+    policy,
+    mu0,
+    mu1,
+    marketing_cost
+) {
+
+    propensity <- pmin(
+        pmax(propensity, 0.05),
+        0.95
+    )
+
+    mu_policy <- ifelse(
+        policy == 1,
+        mu1,
+        mu0
+    )
+
+    observed_mu <- ifelse(
+        A == 1,
+        mu1,
+        mu0
+    )
+
+    observed_propensity <- ifelse(
+        A == 1,
+        propensity,
+        1 - propensity
+    )
+
+    correction <-
+        (
+            as.numeric(A == policy) /
+                observed_propensity
+        ) *
+        (
+            Y -
+                observed_mu
+        )
+
+    revenue_value <- mean(
+        mu_policy +
+            correction
+    )
+
+    profit_value <-
+        revenue_value -
+        mean(policy * marketing_cost)
+
+    return(profit_value)
+}
+
+DR_PROFIT_VALUE <- evaluate_policy_dr(
+    Y = Y_test,
+    A = A_test,
+    propensity = PROPENSITY_HAT,
+    policy = POLICY,
+    mu0 = Y0_HAT,
+    mu1 = Y1_HAT,
+    marketing_cost = MARKETING_COST
+)
+
+###############################################################################
+# 46. REPORT POLICY RESULTS
+###############################################################################
+
+cat("\n============================================================\n")
+cat("INDIVIDUALIZED SPORTS-MARKETING POLICY\n")
+cat("============================================================\n")
+cat("Marketing target rate:       ", round(POLICY_RATE, 5), "\n")
+cat("Optimal target rate:         ", round(TRUE_OPTIMAL_TARGET_RATE, 5), "\n")
+cat("Policy accuracy:             ", round(POLICY_ACCURACY, 5), "\n")
+cat("Learned policy profit:       ", round(TRUE_POLICY_PROFIT, 5), "\n")
+cat("Optimal policy profit:       ", round(TRUE_OPTIMAL_PROFIT, 5), "\n")
+cat("Nobody-target profit:        ", round(NOBODY_PROFIT, 5), "\n")
+cat("Everyone-target profit:      ", round(EVERYONE_PROFIT, 5), "\n")
+cat("Random-target profit:        ", round(RANDOM_PROFIT, 5), "\n")
+cat("Incremental policy profit:   ", round(POLICY_INCREMENTAL_PROFIT, 5), "\n")
+cat("Optimal incremental profit:  ", round(OPTIMAL_INCREMENTAL_PROFIT, 5), "\n")
+cat("Policy regret:               ", round(POLICY_REGRET, 5), "\n")
+cat("Policy ROI:                  ", round(POLICY_ROI, 5), "\n")
+cat("IPW profit value:            ", round(IPW_PROFIT_VALUE, 5), "\n")
+cat("Doubly robust profit value:  ", round(DR_PROFIT_VALUE, 5), "\n")
+
+###############################################################################
+# 47. POLICY RESULTS DATA FRAME
+###############################################################################
+
+policy_results <- data.frame(
+    True_CATE = TAU_test,
+    Estimated_CATE = TAU_HAT,
+    Propensity_True = PROPENSITY_TRUE_test,
+    Propensity_Hat = PROPENSITY_HAT,
+    Y0_True = Y0_test_true,
+    Y0_Hat = Y0_HAT,
+    Y1_True = Y1_test_true,
+    Y1_Hat = Y1_HAT,
+    A = A_test,
+    Y = Y_test,
+    Marketing_Cost = MARKETING_COST,
+    Estimated_Incremental_Revenue = INCREMENTAL_REVENUE_HAT,
+    Estimated_Incremental_Profit = INCREMENTAL_PROFIT_HAT,
+    Policy = POLICY,
+    Optimal_Policy = OPTIMAL_POLICY,
+    Policy_Profit =
+        ifelse(
+            POLICY == 1,
+            Y1_test_true - MARKETING_COST,
+            Y0_test_true
+        )
+)
+
+write.csv(
+    policy_results,
+    file.path(
+        OUTPUT_DIR,
+        "sports_marketing_policy_results.csv"
+    ),
+    row.names = FALSE
+)
+
+###############################################################################
+# 48. CAUSAL METRICS SUMMARY
+###############################################################################
+
+causal_summary <- data.frame(
+    Metric = c(
+        "True ATE",
+        "Estimated ATE",
+        "ATE Bias",
+        "CATE Bias",
+        "PEHE",
+        "CATE Correlation",
+        "Y(0) RMSE",
+        "Y(1) RMSE",
+        "Propensity RMSE"
+    ),
+    Value = c(
+        ATE_TRUE,
+        ATE_HAT,
+        ATE_BIAS,
+        CATE_BIAS,
+        PEHE,
+        CATE_COR,
+        Y0_RMSE,
+        Y1_RMSE,
+        PROPENSITY_RMSE
+    )
+)
+
+causal_summary$Value <- round(
+    causal_summary$Value,
+    5
+)
+
+print(causal_summary)
+
+write.csv(
+    causal_summary,
+    file.path(
+        OUTPUT_DIR,
+        "sports_marketing_causal_metrics.csv"
+    ),
+    row.names = FALSE
+)
+
+###############################################################################
+# 49. POLICY PERFORMANCE SUMMARY
+###############################################################################
+
+policy_summary <- data.frame(
+    Policy = c(
+        "Nobody",
+        "Everyone",
+        "Random",
+        "Proposed Temporal Causal DL",
+        "Optimal"
+    ),
+    Target_Rate = c(
+        mean(NOBODY_POLICY),
+        mean(EVERYONE_POLICY),
+        mean(RANDOM_POLICY),
+        POLICY_RATE,
+        TRUE_OPTIMAL_TARGET_RATE
+    ),
+    Profit = c(
+        NOBODY_PROFIT,
+        EVERYONE_PROFIT,
+        RANDOM_PROFIT,
+        TRUE_POLICY_PROFIT,
+        TRUE_OPTIMAL_PROFIT
+    ),
+    Incremental_Profit = c(
+        0,
+        EVERYONE_PROFIT - NOBODY_PROFIT,
+        RANDOM_PROFIT - NOBODY_PROFIT,
+        POLICY_INCREMENTAL_PROFIT,
+        OPTIMAL_INCREMENTAL_PROFIT
+    )
+)
+
+policy_summary$Target_Rate <- round(
+    policy_summary$Target_Rate,
+    5
+)
+
+policy_summary$Profit <- round(
+    policy_summary$Profit,
+    5
+)
+
+policy_summary$Incremental_Profit <- round(
+    policy_summary$Incremental_Profit,
+    5
+)
+
+print(policy_summary)
+
+write.csv(
+    policy_summary,
+    file.path(
+        OUTPUT_DIR,
+        "sports_marketing_policy_comparison.csv"
+    ),
+    row.names = FALSE
+)
+
+###############################################################################
+# 50. PUBLICATION-STYLE SUMMARY TABLE
+###############################################################################
+
+publication_summary <- data.frame(
+    Metric = c(
+        "True ATE",
+        "Estimated ATE",
+        "ATE Bias",
+        "CATE RMSE (PEHE)",
+        "CATE Correlation",
+        "Y(0) RMSE",
+        "Y(1) RMSE",
+        "Marketing Target Rate",
+        "Optimal Target Rate",
+        "Policy Accuracy",
+        "Policy Profit",
+        "Optimal Policy Profit",
+        "Nobody-Target Profit",
+        "Everyone-Target Profit",
+        "Random-Target Profit",
+        "Incremental Policy Profit",
+        "Optimal Incremental Profit",
+        "Policy Regret",
+        "Policy ROI",
+        "IPW Profit Value",
+        "Doubly Robust Profit Value"
+    ),
+    Estimate = c(
+        ATE_TRUE,
+        ATE_HAT,
+        ATE_BIAS,
+        PEHE,
+        CATE_COR,
+        Y0_RMSE,
+        Y1_RMSE,
+        POLICY_RATE,
+        TRUE_OPTIMAL_TARGET_RATE,
+        POLICY_ACCURACY,
+        TRUE_POLICY_PROFIT,
+        TRUE_OPTIMAL_PROFIT,
+        NOBODY_PROFIT,
+        EVERYONE_PROFIT,
+        RANDOM_PROFIT,
+        POLICY_INCREMENTAL_PROFIT,
+        OPTIMAL_INCREMENTAL_PROFIT,
+        POLICY_REGRET,
+        POLICY_ROI,
+        IPW_PROFIT_VALUE,
+        DR_PROFIT_VALUE
+    )
+)
+
+publication_summary$Estimate <- round(
+    publication_summary$Estimate,
+    5
+)
+
+write.csv(
+    publication_summary,
+    file.path(
+        OUTPUT_DIR,
+        "sports_marketing_publication_summary_table.csv"
+    ),
+    row.names = FALSE
+)
+
+###############################################################################
+# 51. CUMULATIVE INCREMENTAL PROFIT CURVE
+###############################################################################
+#
+# Unlike financial wealth, sports marketing is evaluated by cumulative
+# incremental profit generated by targeted campaigns.
+###############################################################################
+
+policy_profit_sequence <- ifelse(
+    POLICY == 1,
+    Y1_test_true - MARKETING_COST,
+    Y0_test_true
+)
+
+baseline_profit_sequence <- Y0_test_true
+
+incremental_profit_sequence <-
+    policy_profit_sequence -
+    baseline_profit_sequence
+
+cumulative_policy_profit <- cumsum(
+    incremental_profit_sequence
+)
+
+cumulative_zero_profit <- rep(
+    0,
+    length(cumulative_policy_profit)
+)
+
+profit_plot_data <- data.frame(
+    Time = seq_along(cumulative_policy_profit),
+    Proposed_Causal_Policy = cumulative_policy_profit,
+    No_Targeting = cumulative_zero_profit
+)
+
+p_profit <- ggplot(
+    profit_plot_data,
+    aes(x = Time)
+) +
+    geom_line(
+        aes(
+            y = Proposed_Causal_Policy,
+            linetype = "Proposed causal policy"
+        ),
+        linewidth = 0.9
+    ) +
+    geom_line(
+        aes(
+            y = No_Targeting,
+            linetype = "No targeting"
+        ),
+        linewidth = 0.9
+    ) +
+    labs(
+        title = "Cumulative Incremental Profit from Individualized Targeting",
+        x = "Test Period",
+        y = "Cumulative Incremental Profit",
+        linetype = "Strategy"
+    ) +
+    theme_minimal() +
+    theme(
+        plot.title = element_text(face = "bold"),
+        legend.position = "bottom"
+    )
+
+ggsave(
+    file.path(
+        OUTPUT_DIR,
+        "figure_sports_marketing_incremental_profit.png"
+    ),
+    p_profit,
+    width = 8,
+    height = 5,
+    dpi = 300
+)
+
+###############################################################################
+# 52. TRUE VS ESTIMATED CATE
+###############################################################################
+
+cate_plot_data <- data.frame(
+    True_CATE = TAU_test,
+    Estimated_CATE = TAU_HAT
+)
+
+p_cate <- ggplot(
+    cate_plot_data,
+    aes(
+        x = True_CATE,
+        y = Estimated_CATE
+    )
+) +
+    geom_point(
+        alpha = 0.35,
+        size = 1.5
+    ) +
+    geom_abline(
+        slope = 1,
+        intercept = 0,
+        linetype = "dashed"
+    ) +
+    labs(
+        title = "True vs. Estimated Individualized Marketing Effect",
+        x = "True CATE: Incremental Revenue",
+        y = "Estimated CATE: Incremental Revenue"
+    ) +
+    theme_minimal() +
+    theme(
+        plot.title = element_text(face = "bold")
+    )
+
+ggsave(
+    file.path(
+        OUTPUT_DIR,
+        "figure_sports_marketing_cate.png"
+    ),
+    p_cate,
+    width = 7,
+    height = 6,
+    dpi = 300
+)
+
+###############################################################################
+# 53. CATE DISTRIBUTION WITH PROFIT THRESHOLD
+###############################################################################
+
+cate_distribution <- data.frame(
+    CATE = TAU_HAT
+)
+
+p_distribution <- ggplot(
+    cate_distribution,
+    aes(x = CATE)
+) +
+    geom_histogram(
+        bins = 40
+    ) +
+    geom_vline(
+        xintercept = MARKETING_COST + POLICY_THRESHOLD,
+        linetype = "dashed",
+        linewidth = 0.7
+    ) +
+    labs(
+        title = "Distribution of Estimated Incremental Marketing Effects",
+        x = "Estimated Incremental Revenue",
+        y = "Frequency"
+    ) +
+    theme_minimal() +
+    theme(
+        plot.title = element_text(face = "bold")
+    )
+
+ggsave(
+    file.path(
+        OUTPUT_DIR,
+        "figure_sports_marketing_cate_distribution.png"
+    ),
+    p_distribution,
+    width = 7,
+    height = 5,
+    dpi = 300
+)
+
+###############################################################################
+# 54. POLICY DECISIONS THROUGH TIME
+###############################################################################
+
+policy_plot_data <- data.frame(
+    Time = seq_along(POLICY),
+    Policy = POLICY,
+    Estimated_Incremental_Profit = INCREMENTAL_PROFIT_HAT
+)
+
+p_policy <- ggplot(
+    policy_plot_data,
+    aes(
+        x = Time,
+        y = Estimated_Incremental_Profit
+    )
+) +
+    geom_line(
+        linewidth = 0.7
+    ) +
+    geom_hline(
+        yintercept = POLICY_THRESHOLD,
+        linetype = "dashed",
+        linewidth = 0.7
+    ) +
+    labs(
+        title = "Estimated Incremental Profit and Marketing Decisions",
+        x = "Test Period",
+        y = "Estimated Incremental Profit"
+    ) +
+    theme_minimal() +
+    theme(
+        plot.title = element_text(face = "bold")
+    )
+
+ggsave(
+    file.path(
+        OUTPUT_DIR,
+        "figure_sports_marketing_policy.png"
+    ),
+    p_policy,
+    width = 8,
+    height = 5,
+    dpi = 300
+)
+
+###############################################################################
+# 55. PROFIT BY TARGETING PERCENTILE
+###############################################################################
+#
+# Fans are ranked by estimated incremental profit. This provides a
+# marketing-oriented analogue of a policy gain / uplift curve.
+###############################################################################
+
+rank_order <- order(
+    INCREMENTAL_PROFIT_HAT,
+    decreasing = TRUE
+)
+
+ranked_true_incremental_profit <-
+    TRUE_INCREMENTAL_PROFIT[
+        rank_order
+    ]
+
+n_test <- length(ranked_true_incremental_profit)
+
+target_fraction <- seq(
+    0.05,
+    1.00,
+    by = 0.05
+)
+
+gain_values <- sapply(
+    target_fraction,
+    function(frac) {
+
+        k <- max(
+            1,
+            floor(frac * n_test)
+        )
+
+        mean(
+            ranked_true_incremental_profit[
+                seq_len(k)
+            ]
+        )
+    }
+)
+
+gain_data <- data.frame(
+    Targeting_Fraction = target_fraction,
+    Mean_Incremental_Profit = gain_values
+)
+
+p_gain <- ggplot(
+    gain_data,
+    aes(
+        x = Targeting_Fraction,
+        y = Mean_Incremental_Profit
+    )
+) +
+    geom_line(
+        linewidth = 0.9
+    ) +
+    geom_point() +
+    geom_hline(
+        yintercept = 0,
+        linetype = "dashed"
+    ) +
+    labs(
+        title = "Incremental Profit by Targeting Fraction",
+        x = "Fraction of Fans Targeted",
+        y = "Mean Incremental Profit"
+    ) +
+    theme_minimal() +
+    theme(
+        plot.title = element_text(face = "bold")
+    )
+
+ggsave(
+    file.path(
+        OUTPUT_DIR,
+        "figure_sports_marketing_profit_gain.png"
+    ),
+    p_gain,
+    width = 8,
+    height = 5,
+    dpi = 300
+)
+
+###############################################################################
+# 56. PREDICTIVE VS CAUSAL TARGETING DEMONSTRATION
+###############################################################################
+#
+# A conventional predictive strategy targets high expected treated outcome.
+# The proposed causal strategy targets high incremental profit.
+###############################################################################
+
+predictive_score <- Y1_HAT
+
+predictive_cutoff <- quantile(
+    predictive_score,
+    probs = 1 - POLICY_RATE
+)
+
+PREDICTIVE_POLICY <- ifelse(
+    predictive_score >= predictive_cutoff,
+    1,
+    0
+)
+
+PREDICTIVE_PROFIT <- mean(
+    ifelse(
+        PREDICTIVE_POLICY == 1,
+        Y1_test_true - MARKETING_COST,
+        Y0_test_true
+    )
+)
+
+predictive_comparison <- data.frame(
+    Strategy = c(
+        "Predictive targeting",
+        "Causal profit targeting"
+    ),
+    Target_Rate = c(
+        mean(PREDICTIVE_POLICY),
+        mean(POLICY)
+    ),
+    Profit = c(
+        PREDICTIVE_PROFIT,
+        TRUE_POLICY_PROFIT
+    ),
+    Incremental_Profit = c(
+        PREDICTIVE_PROFIT - NOBODY_PROFIT,
+        TRUE_POLICY_PROFIT - NOBODY_PROFIT
+    )
+)
+
+predictive_comparison$Target_Rate <-
+    round(
+        predictive_comparison$Target_Rate,
+        5
+    )
+
+predictive_comparison$Profit <-
+    round(
+        predictive_comparison$Profit,
+        5
+    )
+
+predictive_comparison$Incremental_Profit <-
+    round(
+        predictive_comparison$Incremental_Profit,
+        5
+    )
+
+print(predictive_comparison)
+
+write.csv(
+    predictive_comparison,
+    file.path(
+        OUTPUT_DIR,
+        "predictive_vs_causal_targeting.csv"
+    ),
+    row.names = FALSE
+)
+
+###############################################################################
+# 57. TRAINING HISTORY
+###############################################################################
+
+history_dict <- py_to_r(
+    history_py$history
+)
+
+if (!is.null(history_dict)) {
+
+    history_df <- as.data.frame(
+        history_dict
+    )
+
+    history_df$Epoch <-
+        seq_len(
+            nrow(history_df)
+        )
+
+    write.csv(
+        history_df,
+        file.path(
+            OUTPUT_DIR,
+            "sports_marketing_training_history.csv"
+        ),
+        row.names = FALSE
+    )
+}
+
+###############################################################################
+# 58. OPTIONAL REAL SPORTS/CUSTOMER DATA INTERFACE
+###############################################################################
+#
+# To analyze real data, create a CSV with one row per customer-time decision
+# and at least the following fields:
+#
+#   customer_id
+#   time
+#   A
+#   Y
+#   X1 ... X20
+#
+# Recommended X variables:
+#
+#   ticket purchases
+#   ticket spending
+#   merchandise spending
+#   attendance
+#   website/app engagement
+#   email opens/clicks
+#   social engagement
+#   campaign response history
+#   membership tenure
+#   game importance
+#   opponent attractiveness
+#   ticket price
+#   recency/frequency/monetary measures
+#
+# The real-data file is intentionally optional so that the simulation remains
+# fully reproducible without requiring proprietary sports CRM data.
+###############################################################################
+
+REAL_DATA_FILE <- file.path(
+    "data",
+    "sports_customer_marketing.csv"
+)
+
+if (file.exists(REAL_DATA_FILE)) {
+
+    real_data <- read.csv(
+        REAL_DATA_FILE,
+        stringsAsFactors = FALSE
+    )
+
+    cat("\n============================================================\n")
+    cat("REAL SPORTS/CUSTOMER DATA DETECTED\n")
+    cat("============================================================\n")
+
+    cat(
+        "Rows: ",
+        nrow(real_data),
+        "\n"
+    )
+
+    cat(
+        "Columns: ",
+        ncol(real_data),
+        "\n"
+    )
+
+    required_columns <- c(
+        "A",
+        "Y"
+    )
+
+    missing_required <- setdiff(
+        required_columns,
+        names(real_data)
+    )
+
+    if (length(missing_required) == 0) {
+
+        cat(
+            "Treatment column A and outcome Y are available.\n"
+        )
+
+        cat(
+            "For full temporal prediction, construct chronological",
+            "lookback sequences using X1-X20 before fitting the model.\n"
+        )
+
+    } else {
+
+        cat(
+            "Missing required columns: ",
+            paste(
+                missing_required,
+                collapse = ", "
+            ),
+            "\n"
+        )
+    }
+}
+
+###############################################################################
+# 59. FINAL SUMMARY
+###############################################################################
+
+cat("\n")
+cat("============================================================\n")
+cat("FINAL SPORTS-MARKETING CAUSAL SUMMARY\n")
+cat("============================================================\n")
+
+cat(
+    "True ATE:                  ",
+    round(ATE_TRUE, 5),
+    "\n"
+)
+
+cat(
+    "Estimated ATE:             ",
+    round(ATE_HAT, 5),
+    "\n"
+)
+
+cat(
+    "ATE Bias:                  ",
+    round(ATE_BIAS, 5),
+    "\n"
+)
+
+cat(
+    "CATE RMSE / PEHE:          ",
+    round(PEHE, 5),
+    "\n"
+)
+
+cat(
+    "CATE correlation:          ",
+    round(CATE_COR, 5),
+    "\n"
+)
+
+cat(
+    "Marketing target rate:     ",
+    round(POLICY_RATE, 5),
+    "\n"
+)
+
+cat(
+    "Optimal target rate:       ",
+    round(TRUE_OPTIMAL_TARGET_RATE, 5),
+    "\n"
+)
+
+cat(
+    "Policy accuracy:           ",
+    round(POLICY_ACCURACY, 5),
+    "\n"
+)
+
+cat(
+    "Nobody-target profit:      ",
+    round(NOBODY_PROFIT, 5),
+    "\n"
+)
+
+cat(
+    "Everyone-target profit:    ",
+    round(EVERYONE_PROFIT, 5),
+    "\n"
+)
+
+cat(
+    "Random-target profit:      ",
+    round(RANDOM_PROFIT, 5),
+    "\n"
+)
+
+cat(
+    "Causal policy profit:      ",
+    round(TRUE_POLICY_PROFIT, 5),
+    "\n"
+)
+
+cat(
+    "Optimal policy profit:     ",
+    round(TRUE_OPTIMAL_PROFIT, 5),
+    "\n"
+)
+
+cat(
+    "Incremental policy profit: ",
+    round(POLICY_INCREMENTAL_PROFIT, 5),
+    "\n"
+)
+
+cat(
+    "Optimal incremental profit:",
+    round(OPTIMAL_INCREMENTAL_PROFIT, 5),
+    "\n"
+)
+
+cat(
+    "Policy regret:             ",
+    round(POLICY_REGRET, 5),
+    "\n"
+)
+
+cat(
+    "Policy ROI:                ",
+    round(POLICY_ROI, 5),
+    "\n"
+)
+
+cat(
+    "IPW profit value:          ",
+    round(IPW_PROFIT_VALUE, 5),
+    "\n"
+)
+
+cat(
+    "DR profit value:           ",
+    round(DR_PROFIT_VALUE, 5),
+    "\n"
+)
+
+cat("\n")
+cat("Outputs saved in: ", OUTPUT_DIR, "\n")
+cat("Analysis completed successfully.\n")
+cat("============================================================\n")
+
+###############################################################################
+# END
+###############################################################################

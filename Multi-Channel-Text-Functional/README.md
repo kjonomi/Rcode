@@ -1,5 +1,4 @@
-# Dynamic Spatial-Temporal Functional Causal Inference for Unstructured Text Sequences
-
+# Multi-Channel Functional Causal Inference for Unstructured Text Sequences via Graph Spectral Convolutions and Doubly Robust Estimation
 A framework for causal effect estimation on longitudinal unstructured text sequences. The framework represents sequential text as multichannel functional trajectories, incorporates spatial dependencies among linguistic channels through Graph Fourier (GF) and Graph Convolutional Network (GCN) operators, learns temporal representations using CNN-LSTM models, and performs causal effect estimation using cross-fitted Augmented Inverse Probability Weighting (AIPW).
 
 ---

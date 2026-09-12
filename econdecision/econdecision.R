@@ -16299,9 +16299,30 @@ cat(
     "\n",
     sep = ""
 )
-
 # =============================================================================
 # 14. VERIFY AND COMPLETE CAUSAL PANEL
+# =============================================================================
+#
+# Canonical empirical structure:
+#
+#       X_t  ->  A_t  ->  Y_{t+1}
+#
+# where:
+#   X_t     = economic state at month t
+#   A_t     = binary economic decision/action at month t
+#   Y_{t+1} = next-month economic outcome
+#
+# This is a ONE-STEP CONTEXTUAL BANDIT.
+#
+# IMPORTANT:
+#   1. `model_data` must already be produced by the canonical monthly
+#      economic-data preparation.
+#   2. `build_real_panel(dat = model_data)` is the canonical panel builder.
+#   3. `Y_next` must come from the canonical monthly preparation.
+#   4. Do not reconstruct GDP_growth from raw quarterly GDPC1 here.
+#   5. Do not overwrite externally supplied AI_exposure.
+#   6. Do not construct an ad-hoc fallback reward.
+#   7. RL_data is constructed exactly once.
 # =============================================================================
 
 cat("\n============================================================\n")
@@ -16309,53 +16330,422 @@ cat("14. VERIFY AND COMPLETE CAUSAL PANEL\n")
 cat("============================================================\n")
 
 
-# -----------------------------------------------------------------------------
-# 14.1 Resolve analysis-ready monthly data
-# -----------------------------------------------------------------------------
-
-if (!exists("model_data", inherits = TRUE)) {
-  stop(
-    "`model_data` does not exist. ",
-    "Run the monthly economic-data preparation first."
-  )
-}
-
-if (!is.data.frame(model_data)) {
-  stop("`model_data` must be a data.frame.")
-}
-
 # =============================================================================
-# 14.2 BUILD THE CANONICAL REAL-DATA CAUSAL PANEL
+# 14.1 VERIFY ANALYSIS-READY MONTHLY DATA
 # =============================================================================
 
 cat("\n============================================================\n")
-cat("14.2 BUILD CANONICAL REAL-DATA CAUSAL PANEL\n")
+cat("14.1 VERIFY ANALYSIS-READY MONTHLY DATA\n")
+cat("============================================================\n")
+
+
+if (!exists("model_data", inherits = TRUE)) {
+  
+  stop(
+    "`model_data` does not exist.\n",
+    "Run the canonical monthly economic-data preparation first."
+  )
+}
+
+
+if (!is.data.frame(model_data)) {
+  
+  stop(
+    "`model_data` must be a data.frame."
+  )
+}
+
+
+# -----------------------------------------------------------------------------
+# Required variables that must already exist before build_real_panel().
+#
+# These variables should be created by:
+#
+#   04_fred_data.R
+#   05_ai_exposure_data.R
+#
+# In particular, Y_next and raw_reward must NOT be recreated here.
+# -----------------------------------------------------------------------------
+
+required_model_vars <- c(
+  
+  "month",
+  
+  # Raw economic variables
+  "DGS10",
+  "DTB3",
+  "DGS2",
+  "BAA10Y",
+  "UNRATE",
+  "PAYEMS",
+  "GDPC1",
+  "INDPRO",
+  "CPIAUCSL",
+  "VIXCLS",
+  
+  # Canonical derived variables
+  "term_spread",
+  "yield_2_10",
+  "rate_spread_2y",
+  "short_spread",
+  "credit_risk",
+  "credit_spread",
+  "unemployment_change",
+  "payroll_growth",
+  "GDP_growth",
+  "industrial_growth",
+  "inflation",
+  "VIX_change",
+  
+  # AI exposure and one-step outcome
+  "AI_exposure",
+  "Y_next",
+  "raw_reward"
+)
+
+
+missing_model_vars <- setdiff(
+  required_model_vars,
+  names(model_data)
+)
+
+
+if (length(missing_model_vars) > 0) {
+  
+  stop(
+    paste0(
+      "`model_data` is missing required canonical variables:\n  ",
+      paste(
+        missing_model_vars,
+        collapse = ", "
+      ),
+      "\n\n",
+      "These variables must be created by the monthly economic-data ",
+      "preparation before Section 14.\n",
+      "Do NOT recreate them here."
+    )
+  )
+}
+
+
+# -----------------------------------------------------------------------------
+# Verify monthly ordering.
+# -----------------------------------------------------------------------------
+
+model_data$month <- as.Date(
+  model_data$month
+)
+
+
+model_data <- model_data |>
+  dplyr::arrange(month)
+
+
+rownames(model_data) <- NULL
+
+
+if (anyNA(model_data$month)) {
+  
+  stop(
+    "`model_data$month` contains NA values."
+  )
+}
+
+
+if (anyDuplicated(model_data$month) > 0) {
+  
+  duplicate_months <- unique(
+    model_data$month[
+      duplicated(model_data$month)
+    ]
+  )
+  
+  stop(
+    paste0(
+      "Duplicate monthly observations detected:\n",
+      paste(
+        duplicate_months,
+        collapse = ", "
+      )
+    )
+  )
+}
+
+
+cat(
+  "Monthly observations:",
+  nrow(model_data),
+  "\n"
+)
+
+cat(
+  "Date range:",
+  format(
+    min(model_data$month),
+    "%Y-%m"
+  ),
+  "to",
+  format(
+    max(model_data$month),
+    "%Y-%m"
+  ),
+  "\n"
+)
+
+
+# =============================================================================
+# 14.2 VERIFY CANONICAL ONE-STEP OUTCOME
+# =============================================================================
+
+cat("\n============================================================\n")
+cat("14.2 VERIFY CANONICAL ONE-STEP OUTCOME\n")
+cat("============================================================\n")
+
+
+# -----------------------------------------------------------------------------
+# The canonical relationship is:
+#
+#       X_t -> A_t -> Y_{t+1}
+#
+# Therefore Y_next must equal:
+#
+#       lead(GDP_growth, HORIZON)
+#
+# for the project's configured horizon.
+#
+# No reward fallback is permitted here.
+# -----------------------------------------------------------------------------
+
+horizon_used <- 1L
+
+
+if (exists("HORIZON", inherits = TRUE)) {
+  
+  horizon_used <- as.integer(
+    HORIZON
+  )
+}
+
+
+if (
+  length(horizon_used) != 1L ||
+  is.na(horizon_used) ||
+  horizon_used < 1L
+) {
+  
+  stop(
+    "`HORIZON` must be a positive integer."
+  )
+}
+
+
+expected_Y_next <- dplyr::lead(
+  model_data$GDP_growth,
+  horizon_used
+)
+
+
+comparison_idx <- is.finite(
+  model_data$Y_next
+) &
+  is.finite(
+    expected_Y_next
+  )
+
+
+if (any(comparison_idx)) {
+  
+  max_outcome_difference <- max(
+    abs(
+      model_data$Y_next[comparison_idx] -
+        expected_Y_next[comparison_idx]
+    ),
+    na.rm = TRUE
+  )
+  
+} else {
+  
+  max_outcome_difference <- NA_real_
+}
+
+
+if (
+  is.finite(max_outcome_difference) &&
+  max_outcome_difference > 1e-10
+) {
+  
+  stop(
+    paste0(
+      "`Y_next` is inconsistent with the canonical ",
+      "next-period GDP-growth outcome.\n",
+      "Maximum absolute difference = ",
+      format(
+        max_outcome_difference,
+        scientific = TRUE
+      ),
+      "\n",
+      "Check `prepare_monthly_economic_data()` and the construction ",
+      "of `model_data`."
+    )
+  )
+}
+
+
+cat(
+  "Horizon:",
+  horizon_used,
+  "\n"
+)
+
+cat(
+  "`Y_next` verified as the canonical next-period GDP outcome.\n"
+)
+
+cat(
+  "Non-missing Y_next:",
+  sum(
+    is.finite(model_data$Y_next)
+  ),
+  "of",
+  nrow(model_data),
+  "\n"
+)
+
+
+# -----------------------------------------------------------------------------
+# Verify raw_reward is the same underlying next-period outcome.
+# -----------------------------------------------------------------------------
+
+reward_difference <- model_data$raw_reward -
+  model_data$Y_next
+
+
+reward_idx <- is.finite(
+  model_data$raw_reward
+) &
+  is.finite(
+    model_data$Y_next
+  )
+
+
+if (any(reward_idx)) {
+  
+  max_reward_difference <- max(
+    abs(
+      reward_difference[reward_idx]
+    ),
+    na.rm = TRUE
+  )
+  
+} else {
+  
+  max_reward_difference <- NA_real_
+}
+
+
+if (
+  is.finite(max_reward_difference) &&
+  max_reward_difference > 1e-10
+) {
+  
+  stop(
+    paste0(
+      "`raw_reward` and `Y_next` are inconsistent.\n",
+      "Maximum absolute difference = ",
+      format(
+        max_reward_difference,
+        scientific = TRUE
+      ),
+      "\n",
+      "The analysis requires one common underlying outcome definition."
+    )
+  )
+}
+
+
+cat(
+  "`raw_reward` verified against `Y_next`.\n"
+)
+
+
+# =============================================================================
+# 14.3 VERIFY AI EXPOSURE
+# =============================================================================
+
+cat("\n============================================================\n")
+cat("14.3 VERIFY AI EXPOSURE\n")
 cat("============================================================\n")
 
 
 # -----------------------------------------------------------------------------
 # IMPORTANT:
 #
-# The current econdecision.R implementation defines:
+# AI_exposure is NOT VIX.
 #
-#     build_real_panel <- function(dat)
+# If 05_ai_exposure_data.R supplied an external AI measure, preserve it.
+# If the canonical monthly preparation supplied the documented time-trend
+# proxy, preserve that value as well.
 #
-# Therefore `model_data` must be passed using the argument name `dat`.
-#
-# The resulting object is the canonical `panel` required by
-# `create_real_rl_data()`.
+# Section 14 must never overwrite AI_exposure.
 # -----------------------------------------------------------------------------
+
+if (!"AI_exposure" %in% names(model_data)) {
+  
+  stop(
+    "`AI_exposure` is missing from `model_data`.\n",
+    "Run the AI-exposure integration step before Section 14."
+  )
+}
+
+
+if (!is.numeric(model_data$AI_exposure)) {
+  
+  stop(
+    "`AI_exposure` must be numeric."
+  )
+}
+
+
+if (!any(is.finite(model_data$AI_exposure))) {
+  
+  stop(
+    "`AI_exposure` contains no finite observations."
+  )
+}
+
+
+cat(
+  "AI_exposure verified.\n"
+)
+
+cat(
+  "Finite observations:",
+  sum(
+    is.finite(model_data$AI_exposure)
+  ),
+  "\n"
+)
+
+
+# =============================================================================
+# 14.4 BUILD CANONICAL REAL-DATA PANEL
+# =============================================================================
+
+cat("\n============================================================\n")
+cat("14.4 BUILD CANONICAL REAL-DATA PANEL\n")
+cat("============================================================\n")
+
 
 if (!exists("build_real_panel", inherits = TRUE)) {
   
   stop(
-    "`build_real_panel()` is not available. ",
+    "`build_real_panel()` is not available.\n",
     "Run the real-data panel construction section first."
   )
 }
 
 
-build_panel_formals <- names(
+build_formals <- names(
   formals(build_real_panel)
 )
 
@@ -16365,32 +16755,33 @@ cat(
 )
 
 print(
-  build_panel_formals
+  build_formals
 )
 
 
 # -----------------------------------------------------------------------------
-# Validate the expected interface.
+# The canonical implementation is:
+#
+#     build_real_panel <- function(dat)
+#
+# Therefore require the explicit `dat` interface rather than silently
+# guessing another argument name.
 # -----------------------------------------------------------------------------
 
-if (!"dat" %in% build_panel_formals) {
+if (!"dat" %in% build_formals) {
   
   stop(
     paste0(
-      "`build_real_panel()` does not have the expected `dat` argument.\n",
+      "`build_real_panel()` does not expose the required `dat` argument.\n",
       "Available arguments: ",
       paste(
-        build_panel_formals,
+        build_formals,
         collapse = ", "
       )
     )
   )
 }
 
-
-# -----------------------------------------------------------------------------
-# Construct canonical panel.
-# -----------------------------------------------------------------------------
 
 panel <- tryCatch(
   
@@ -16402,8 +16793,8 @@ panel <- tryCatch(
     
     stop(
       paste0(
-        "Failed to construct the canonical real-data panel ",
-        "using `build_real_panel(dat = model_data)`.\n",
+        "Failed to construct the canonical real-data panel using ",
+        "`build_real_panel(dat = model_data)`.\n",
         "Original error: ",
         conditionMessage(e)
       )
@@ -16411,10 +16802,6 @@ panel <- tryCatch(
   }
 )
 
-
-# -----------------------------------------------------------------------------
-# Verify result.
-# -----------------------------------------------------------------------------
 
 if (is.null(panel)) {
   
@@ -16424,354 +16811,17 @@ if (is.null(panel)) {
 }
 
 
-cat(
-  "\nCanonical panel successfully constructed.\n"
-)
-
-cat(
-  "Panel class:\n"
-)
-
-print(
-  class(panel)
-)
-
-
-cat(
-  "\nPanel components:\n"
-)
-
-print(
-  names(panel)
-)
-
-
-
-# -----------------------------------------------------------------------------
-# 14.3 Validate canonical panel
-# -----------------------------------------------------------------------------
-
-if (is.null(panel)) {
-  stop("`build_real_panel()` returned NULL.")
-}
-
-cat("\nCanonical panel class:\n")
-print(class(panel))
-
-cat("\nCanonical panel dimensions:\n")
-print(dim(panel))
-
-
-# -----------------------------------------------------------------------------
-# 14.4 Construct contextual-bandit data
-# -----------------------------------------------------------------------------
-
-if (!exists("create_real_rl_data", inherits = TRUE)) {
-  
-  stop(
-    "`create_real_rl_data()` is not available. ",
-    "Run the real-data preparation sections first."
-  )
-}
-
-
-rl_formals <- names(
-  formals(create_real_rl_data)
-)
-
-cat("\n`create_real_rl_data()` arguments:\n")
-print(rl_formals)
-
-
-rl_args <- list()
-
-
-if ("panel" %in% rl_formals) {
-  
-  rl_args$panel <- panel
-  
-} else {
-  
-  stop(
-    "`create_real_rl_data()` does not accept the required `panel` ",
-    "argument.\nArguments: ",
-    paste(rl_formals, collapse = ", ")
-  )
-}
-
-
-if (
-  "LOOKBACK" %in% rl_formals &&
-  exists("LOOKBACK", inherits = TRUE)
-) {
-  rl_args$LOOKBACK <- LOOKBACK
-}
-
-if (
-  "lookback" %in% rl_formals &&
-  exists("LOOKBACK", inherits = TRUE)
-) {
-  rl_args$lookback <- LOOKBACK
-}
-
-
-if (
-  "AI_POLICY_COST" %in% rl_formals &&
-  exists("AI_POLICY_COST", inherits = TRUE)
-) {
-  rl_args$AI_POLICY_COST <- AI_POLICY_COST
-}
-
-if (
-  "policy_cost" %in% rl_formals &&
-  exists("AI_POLICY_COST", inherits = TRUE)
-) {
-  rl_args$policy_cost <- AI_POLICY_COST
-}
-
-
-RL_data <- tryCatch(
-  
-  do.call(
-    create_real_rl_data,
-    rl_args
-  ),
-  
-  error = function(e) {
-    
-    stop(
-      "Failed to construct `RL_data` from the canonical ",
-      "`build_real_panel()` output.\n",
-      "Original error: ",
-      conditionMessage(e)
-    )
-  }
-)
-
-
-message(
-  "Reviewer analysis: `RL_data` constructed successfully."
-)
-
-# =============================================================================
-# 14. VERIFY AND COMPLETE CAUSAL PANEL
-# =============================================================================
-
-cat("\n============================================================\n")
-cat("14. VERIFY AND COMPLETE CAUSAL PANEL\n")
-cat("============================================================\n")
-
-
-# =============================================================================
-# 14.1 VALIDATE REQUIRED FUNCTIONS AND DATA
-# =============================================================================
-
-# -----------------------------------------------------------------------------
-# The current econdecision.R architecture uses the following workflow:
-#
-#   model_data
-#       |
-#       v
-#   build_real_panel()
-#       |
-#       v
-#   panel
-#       |
-#       v
-#   create_real_rl_data()
-#       |
-#       v
-#   RL_data
-#
-# IMPORTANT:
-# `model_data` is the cleaned monthly economic dataset.
-# It is NOT itself the canonical causal panel.
-#
-# `create_real_rl_data()` explicitly requires `panel` to be an object
-# returned by `build_real_panel()`.
-# -----------------------------------------------------------------------------
-
-if (!exists("model_data", inherits = TRUE)) {
-  
-  stop(
-    "`model_data` does not exist. ",
-    "Run the monthly economic-data preparation sections first."
-  )
-}
-
-if (!is.data.frame(model_data)) {
-  
-  stop(
-    "`model_data` must be a data.frame."
-  )
-}
-
-
-if (!exists("build_real_panel", inherits = TRUE)) {
-  
-  stop(
-    "`build_real_panel()` is not available. ",
-    "Run the real-data panel construction section first."
-  )
-}
-
-
-if (!exists("create_real_rl_data", inherits = TRUE)) {
-  
-  stop(
-    "`create_real_rl_data()` is not available. ",
-    "Run the real-data preparation sections first."
-  )
-}
-
-
-# =============================================================================
-# 14.2 BUILD THE CANONICAL REAL-DATA CAUSAL PANEL
-# =============================================================================
-
-cat("\n============================================================\n")
-cat("14.2 BUILD CANONICAL REAL-DATA CAUSAL PANEL\n")
-cat("============================================================\n")
-
-
-# -----------------------------------------------------------------------------
-# Inspect the current build_real_panel() interface.
-#
-# This avoids assuming an obsolete argument name while ensuring that the
-# resulting object is genuinely produced by build_real_panel().
-# -----------------------------------------------------------------------------
-
-build_formals <- names(
-  formals(build_real_panel)
-)
-
-cat(
-  "build_real_panel() arguments:\n"
-)
-
-print(
-  build_formals
-)
-
-
-panel_args <- list()
-
-
-# -----------------------------------------------------------------------------
-# Identify the data argument.
-# -----------------------------------------------------------------------------
-
-if ("model_data" %in% build_formals) {
-  
-  panel_args$model_data <- model_data
-  
-} else if ("data" %in% build_formals) {
-  
-  panel_args$data <- model_data
-  
-} else if ("economic_data" %in% build_formals) {
-  
-  panel_args$economic_data <- model_data
-  
-} else {
-  
-  stop(
-    paste0(
-      "`build_real_panel()` is available, but no recognized data ",
-      "argument was found.\n",
-      "Available arguments: ",
-      paste(
-        build_formals,
-        collapse = ", "
-      )
-    )
-  )
-}
-
-
-# -----------------------------------------------------------------------------
-# Preserve the project's existing lookback configuration when supported.
-# -----------------------------------------------------------------------------
-
-if (
-  "LOOKBACK" %in% build_formals &&
-  exists("LOOKBACK", inherits = TRUE)
-) {
-  
-  panel_args$LOOKBACK <- LOOKBACK
-  
-}
-
-
-if (
-  "lookback" %in% build_formals &&
-  exists("LOOKBACK", inherits = TRUE)
-) {
-  
-  panel_args$lookback <- LOOKBACK
-  
-}
-
-
-# -----------------------------------------------------------------------------
-# Construct the canonical panel.
-# -----------------------------------------------------------------------------
-
-panel <- tryCatch(
-  
-  do.call(
-    build_real_panel,
-    panel_args
-  ),
-  
-  error = function(e) {
-    
-    stop(
-      paste0(
-        "Failed to construct the canonical causal panel using ",
-        "`build_real_panel()`.\n",
-        "Original error: ",
-        conditionMessage(e)
-      )
-    )
-  }
-)
-
-
-if (is.null(panel)) {
-  
-  stop(
-    "`build_real_panel()` returned NULL."
-  )
-}
-
-
-message(
-  "Reviewer analysis: canonical `panel` successfully constructed ",
-  "by `build_real_panel()`."
-)
-
-
-cat("\nCanonical panel class:\n")
-
-print(
-  class(panel)
-)
-
-
-# =============================================================================
-# 14.3 VERIFY CANONICAL PANEL STRUCTURE
-# =============================================================================
-
-cat("\n============================================================\n")
-cat("14.3 VERIFY CANONICAL PANEL STRUCTURE\n")
-cat("============================================================\n")
-
-
 if (!is.list(panel)) {
   
   stop(
-    "The object returned by `build_real_panel()` is not a list."
+    paste0(
+      "`build_real_panel()` must return a list-like canonical panel.\n",
+      "Returned class: ",
+      paste(
+        class(panel),
+        collapse = ", "
+      )
+    )
   )
 }
 
@@ -16780,9 +16830,8 @@ if (!"data" %in% names(panel)) {
   
   stop(
     paste0(
-      "The canonical panel returned by `build_real_panel()` ",
-      "does not contain `panel$data`.\n",
-      "Available panel components: ",
+      "Canonical panel does not contain `panel$data`.\n",
+      "Available components: ",
       paste(
         names(panel),
         collapse = ", "
@@ -16792,10 +16841,7 @@ if (!"data" %in% names(panel)) {
 }
 
 
-dat <- panel$data
-
-
-if (!is.data.frame(dat)) {
+if (!is.data.frame(panel$data)) {
   
   stop(
     "`panel$data` must be a data.frame."
@@ -16803,30 +16849,48 @@ if (!is.data.frame(dat)) {
 }
 
 
-cat("\nPanel components:\n")
-
-print(
-  names(panel)
+cat(
+  "\nCanonical panel constructed successfully.\n"
 )
-
 
 cat(
-  "\nPanel-data dimensions:\n"
+  "Panel class:",
+  paste(
+    class(panel),
+    collapse = ", "
+  ),
+  "\n"
 )
 
-print(
-  dim(dat)
+cat(
+  "Panel observations:",
+  nrow(panel$data),
+  "\n"
+)
+
+cat(
+  "Panel variables:",
+  ncol(panel$data),
+  "\n"
 )
 
 
 # =============================================================================
-# 14.4 CHRONOLOGICAL ORDERING
+# 14.5 VERIFY CANONICAL PANEL DATA
 # =============================================================================
+
+cat("\n============================================================\n")
+cat("14.5 VERIFY CANONICAL PANEL DATA\n")
+cat("============================================================\n")
+
+
+dat <- panel$data
+
 
 if (!"month" %in% names(dat)) {
   
   stop(
-    "The canonical causal panel must contain `month`."
+    "Canonical `panel$data` must contain `month`."
   )
 }
 
@@ -16843,19 +16907,62 @@ dat <- dat |>
 rownames(dat) <- NULL
 
 
+if (anyNA(dat$month)) {
+  
+  stop(
+    "`panel$data$month` contains NA values."
+  )
+}
+
+
 if (anyDuplicated(dat$month) > 0) {
   
-  duplicate_months <- unique(
-    dat$month[
-      duplicated(dat$month)
-    ]
+  stop(
+    "Duplicate monthly observations detected in `panel$data`."
   )
+}
+
+
+# -----------------------------------------------------------------------------
+# Required causal variables.
+# -----------------------------------------------------------------------------
+
+required_panel_vars <- c(
+  
+  "month",
+  
+  # Economic state variables
+  "unemployment_change",
+  "payroll_growth",
+  "GDP_growth",
+  "industrial_growth",
+  "inflation",
+  "VIX_change",
+  "yield_2_10",
+  "credit_risk",
+  "AI_exposure",
+  
+  # Treatment/action
+  "A",
+  
+  # One-step outcome
+  "Y_next"
+)
+
+
+missing_panel_vars <- setdiff(
+  required_panel_vars,
+  names(dat)
+)
+
+
+if (length(missing_panel_vars) > 0) {
   
   stop(
     paste0(
-      "Duplicate monthly observations detected: ",
+      "Canonical panel is missing required variables:\n  ",
       paste(
-        duplicate_months,
+        missing_panel_vars,
         collapse = ", "
       )
     )
@@ -16863,106 +16970,33 @@ if (anyDuplicated(dat$month) > 0) {
 }
 
 
-cat(
-  "\nObservations:",
-  nrow(dat),
-  "\n"
-)
+# -----------------------------------------------------------------------------
+# Check that canonical panel preserved the outcome.
+# -----------------------------------------------------------------------------
 
-cat(
-  "Variables:",
-  ncol(dat),
-  "\n"
-)
-
-cat(
-  "Date range:",
-  format(
-    min(dat$month, na.rm = TRUE),
-    "%Y-%m"
-  ),
-  "to",
-  format(
-    max(dat$month, na.rm = TRUE),
-    "%Y-%m"
-  ),
-  "\n"
-)
-
-
-# =============================================================================
-# 14.5 REQUIRED CAUSAL-PANEL VARIABLES
-# =============================================================================
-
-cat("\n============================================================\n")
-cat("14.5 VERIFY REQUIRED CAUSAL-PANEL VARIABLES\n")
-cat("============================================================\n")
-
-
-causal_core_vars <- c(
+if (!"raw_reward" %in% names(dat)) {
   
-  # Raw macroeconomic variables
-  "DGS10",
-  "DTB3",
-  "DGS2",
-  "BAA10Y",
-  "UNRATE",
-  "PAYEMS",
-  "GDPC1",
-  "INDPRO",
-  "CPIAUCSL",
-  "VIXCLS",
-  
-  # Derived macroeconomic variables
-  "term_spread",
-  "rate_spread_2y",
-  "credit_spread",
-  
-  # Contextual-bandit treatment
-  "A"
-)
-
-
-missing_core <- setdiff(
-  causal_core_vars,
-  names(dat)
-)
-
-
-if (length(missing_core) > 0) {
-  
-  stop(
-    paste0(
-      "Missing canonical causal-panel variables: ",
-      paste(
-        missing_core,
-        collapse = ", "
-      ),
-      "\n\nThese variables must be created by ",
-      "`build_real_panel()` before the contextual-bandit analysis."
-    )
+  warning(
+    "`raw_reward` is not present in `panel$data`.\n",
+    "This is acceptable only if `create_real_rl_data()` uses `Y_next` ",
+    "directly."
   )
 }
 
 
-cat(
-  "All required causal-panel variables are present.\n"
-)
-
-
 # =============================================================================
-# 14.6 VERIFY TREATMENT VARIABLE
+# 14.6 VERIFY TREATMENT / ACTION
 # =============================================================================
 
 cat("\n============================================================\n")
-cat("14.6 VERIFY TREATMENT VARIABLE A\n")
+cat("14.6 VERIFY TREATMENT / ACTION A\n")
 cat("============================================================\n")
 
 
-if (!"A" %in% names(dat)) {
+if (!is.numeric(dat$A)) {
   
   stop(
-    "Treatment variable `A` is missing from the canonical panel."
+    "Treatment/action `A` must be numeric."
   )
 }
 
@@ -16970,21 +17004,29 @@ if (!"A" %in% names(dat)) {
 if (any(!is.finite(dat$A))) {
   
   stop(
-    "Treatment variable `A` contains non-finite values."
+    "Treatment/action `A` contains non-finite values."
+  )
+}
+
+
+if (!all(dat$A %in% c(0, 1))) {
+  
+  stop(
+    "`A` must be binary and contain only 0 and 1."
   )
 }
 
 
 cat(
-  "Treatment values:\n"
+  "Treatment values:",
+  paste(
+    sort(
+      unique(dat$A)
+    ),
+    collapse = ", "
+  ),
+  "\n"
 )
-
-print(
-  sort(
-    unique(dat$A)
-  )
-)
-
 
 cat(
   "\nTreatment counts:\n"
@@ -16998,257 +17040,46 @@ print(
 )
 
 
-# -----------------------------------------------------------------------------
-# The economic causal-decision framework is a one-step contextual bandit.
-#
-# A is therefore the treatment/action at month t, and the outcome used for
-# evaluation must correspond to the subsequent period rather than a recursively
-# accumulated multi-step RL return.
-# -----------------------------------------------------------------------------
-
-if (
-  !all(
-    dat$A %in% c(0, 1)
-  )
-) {
-  
-  stop(
-    "`A` must be binary for the current contextual-bandit analysis."
-  )
-}
-
-
 # =============================================================================
-# 14.7 CREATE MONTHLY STATE VARIABLES
+# 14.7 DEFINE CANONICAL STATE SPECIFICATION
 # =============================================================================
 
 cat("\n============================================================\n")
-cat("14.7 CREATE MONTHLY STATE VARIABLES\n")
+cat("14.7 DEFINE CANONICAL STATE SPECIFICATION\n")
 cat("============================================================\n")
 
 
-# -----------------------------------------------------------------------------
-# These variables describe the economic state at time t.
-#
-# They are subsequently used as contextual covariates for the one-step
-# treatment decision A_t.
-# -----------------------------------------------------------------------------
-
-dat <- dat |>
-  dplyr::arrange(month) |>
-  dplyr::mutate(
-    
-    # ---------------------------------------------------------------------
-    # Yield-curve state
-    # ---------------------------------------------------------------------
-    
-    yield_2_10 =
-      DGS10 - DGS2,
-    
-    # ---------------------------------------------------------------------
-    # Credit-risk state
-    # ---------------------------------------------------------------------
-    
-    credit_risk =
-      BAA10Y - DGS10,
-    
-    # ---------------------------------------------------------------------
-    # Labor-market dynamics
-    # ---------------------------------------------------------------------
-    
-    unemployment_change =
-      UNRATE -
-      dplyr::lag(
-        UNRATE,
-        1L
-      ),
-    
-    payroll_growth =
-      100 *
-      (
-        PAYEMS /
-          dplyr::lag(
-            PAYEMS,
-            1L
-          ) -
-          1
-      ),
-    
-    # ---------------------------------------------------------------------
-    # Economic growth
-    # ---------------------------------------------------------------------
-    
-    GDP_growth =
-      100 *
-      (
-        GDPC1 /
-          dplyr::lag(
-            GDPC1,
-            1L
-          ) -
-          1
-      ),
-    
-    industrial_growth =
-      100 *
-      (
-        INDPRO /
-          dplyr::lag(
-            INDPRO,
-            1L
-          ) -
-          1
-      ),
-    
-    # ---------------------------------------------------------------------
-    # Inflation
-    # ---------------------------------------------------------------------
-    
-    inflation =
-      100 *
-      (
-        CPIAUCSL /
-          dplyr::lag(
-            CPIAUCSL,
-            1L
-          ) -
-          1
-      ),
-    
-    # ---------------------------------------------------------------------
-    # Financial-market stress dynamics
-    # ---------------------------------------------------------------------
-    
-    VIX_change =
-      VIXCLS -
-      dplyr::lag(
-        VIXCLS,
-        1L
-      ),
-    
-    # ---------------------------------------------------------------------
-    # AI-exposure proxy
-    #
-    # IMPORTANT:
-    # AI_exposure is not the VIX.
-    #
-    # The current economic-decision framework uses a time-based exposure
-    # proxy.  log1p(time_index) is monotone in calendar time and avoids
-    # incorrectly interpreting VIX as AI exposure.
-    # ---------------------------------------------------------------------
-    
-    time_index =
-      dplyr::row_number(),
-    
-    AI_exposure =
-      log1p(
-        time_index
-      )
-  )
-
-
-# =============================================================================
-# 14.8 VERIFY STATE VARIABLES
-# =============================================================================
-
-required_state_vars <- c(
+canonical_state_variables <- c(
   
-  "yield_2_10",
-  "credit_risk",
   "unemployment_change",
   "payroll_growth",
   "GDP_growth",
   "industrial_growth",
   "inflation",
   "VIX_change",
+  "yield_2_10",
+  "credit_risk",
   "AI_exposure"
 )
 
 
-missing_derived_states <- setdiff(
-  required_state_vars,
-  names(dat)
-)
+# -----------------------------------------------------------------------------
+# Use the project's existing state_variables only if it contains the complete
+# canonical specification. Otherwise reset it explicitly.
+# -----------------------------------------------------------------------------
 
-
-if (length(missing_derived_states) > 0) {
-  
-  stop(
-    paste0(
-      "The following state variables could not be created: ",
-      paste(
-        missing_derived_states,
-        collapse = ", "
-      )
-    )
+if (
+  !exists("state_variables", inherits = TRUE) ||
+  !all(
+    canonical_state_variables %in%
+    as.character(state_variables)
   )
-}
-
-
-cat(
-  "\nState variables created successfully:\n"
-)
-
-print(
-  required_state_vars
-)
-
-
-# =============================================================================
-# 14.9 STATE-VARIABLE DIAGNOSTICS
-# =============================================================================
-
-cat("\nNon-missing observations for state variables:\n")
-
-
-state_diagnostics <- data.frame(
+) {
   
-  Variable = required_state_vars,
-  
-  NonMissing = sapply(
-    dat[required_state_vars],
-    function(x) {
-      sum(
-        is.finite(x)
-      )
-    }
-  ),
-  
-  Missing = sapply(
-    dat[required_state_vars],
-    function(x) {
-      sum(
-        !is.finite(x)
-      )
-    }
-  ),
-  
-  row.names = NULL
-  
-)
-
-
-print(
-  state_diagnostics
-)
-
-
-# =============================================================================
-# 14.10 DEFINE / VERIFY STATE SPECIFICATION
-# =============================================================================
-
-cat("\n============================================================\n")
-cat("14.10 VERIFY STATE-VARIABLE SPECIFICATION\n")
-cat("============================================================\n")
-
-
-if (!exists("state_variables", inherits = TRUE)) {
-  
-  state_variables <- required_state_vars
+  state_variables <- canonical_state_variables
   
   cat(
-    "state_variables did not previously exist.\n",
-    "Created the canonical monthly macroeconomic state specification.\n"
+    "Using the canonical state-variable specification.\n"
   )
   
 } else {
@@ -17258,7 +17089,7 @@ if (!exists("state_variables", inherits = TRUE)) {
   )
   
   cat(
-    "Using the existing state_variables specification.\n"
+    "Existing state_variables specification retained.\n"
   )
 }
 
@@ -17273,8 +17104,7 @@ if (length(missing_states) > 0) {
   
   stop(
     paste0(
-      "The following state variables are missing from the canonical ",
-      "panel: ",
+      "State variables missing from canonical panel:\n  ",
       paste(
         missing_states,
         collapse = ", "
@@ -17285,7 +17115,7 @@ if (length(missing_states) > 0) {
 
 
 cat(
-  "\nFinal state_variables:\n"
+  "\nState variables:\n"
 )
 
 print(
@@ -17294,229 +17124,214 @@ print(
 
 
 # =============================================================================
-# 14.11 CREATE / VERIFY NEXT-PERIOD OUTCOME
+# 14.8 STATE-VARIABLE DIAGNOSTICS
 # =============================================================================
 
 cat("\n============================================================\n")
-cat("14.11 CREATE / VERIFY NEXT-PERIOD OUTCOME\n")
+cat("14.8 STATE-VARIABLE DIAGNOSTICS\n")
+cat("============================================================\n")
+
+
+state_diagnostics <- data.frame(
+  
+  Variable = state_variables,
+  
+  NonMissing = sapply(
+    dat[state_variables],
+    function(x) {
+      sum(
+        is.finite(x)
+      )
+    }
+  ),
+  
+  Missing = sapply(
+    dat[state_variables],
+    function(x) {
+      sum(
+        !is.finite(x)
+      )
+    }
+  ),
+  
+  Mean = sapply(
+    dat[state_variables],
+    function(x) {
+      if (any(is.finite(x))) {
+        mean(
+          x[
+            is.finite(x)
+          ],
+          na.rm = TRUE
+        )
+      } else {
+        NA_real_
+      }
+    }
+  ),
+  
+  SD = sapply(
+    dat[state_variables],
+    function(x) {
+      if (sum(is.finite(x)) > 1L) {
+        sd(
+          x[
+            is.finite(x)
+          ],
+          na.rm = TRUE
+        )
+      } else {
+        NA_real_
+      }
+    }
+  ),
+  
+  row.names = NULL
+)
+
+
+print(
+  state_diagnostics
+)
+
+
+# =============================================================================
+# 14.9 FINAL ONE-STEP CAUSAL VALIDATION
+# =============================================================================
+
+cat("\n============================================================\n")
+cat("14.9 FINAL ONE-STEP CAUSAL VALIDATION\n")
 cat("============================================================\n")
 
 
 # -----------------------------------------------------------------------------
-# The contextual-bandit observation is:
-#
-#       (X_t, A_t, Y_{t+1})
-#
-# where:
-#
-#       X_t = economic state at month t
-#       A_t = treatment/action at month t
-#       Y_{t+1} = economic outcome in the following month
-#
-# Therefore, Y_next must be aligned one period ahead.
+# Verify the temporal structure explicitly.
 # -----------------------------------------------------------------------------
 
-if (!"Y_next" %in% names(dat)) {
-  
-  if ("raw_reward" %in% names(dat)) {
-    
-    cat(
-      "Creating Y_next as the one-period-ahead raw_reward.\n"
-    )
-    
-    dat$Y_next <- dplyr::lead(
-      dat$raw_reward,
-      1L
-    )
-    
-  } else {
-    
-    stop(
-      paste0(
-        "`Y_next` and `raw_reward` are both absent from the canonical ",
-        "panel.\n",
-        "The next-period outcome must be defined by the canonical ",
-        "real-data construction rather than by an ad hoc fallback ",
-        "reward."
-      )
-    )
-  }
-}
+ordered_dat <- dat |>
+  dplyr::arrange(month)
 
 
-if (any(
-  !is.finite(
-    dat$Y_next[
-      !is.na(dat$Y_next)
-    ]
-  )
-)) {
+if (nrow(ordered_dat) < 2L) {
   
   stop(
-    "`Y_next` contains non-finite values."
+    "At least two monthly observations are required."
   )
 }
 
 
-cat(
-  "Y_next successfully verified.\n"
+# Check that Y_next is genuinely forward-looking relative to GDP_growth.
+expected_next <- dplyr::lead(
+  ordered_dat$GDP_growth,
+  horizon_used
 )
 
+
+valid_outcome <- is.finite(
+  ordered_dat$Y_next
+) &
+  is.finite(
+    expected_next
+  )
+
+
+if (!any(valid_outcome)) {
+  
+  stop(
+    "No valid observations exist for the one-step outcome."
+  )
+}
+
+
+outcome_error <- abs(
+  ordered_dat$Y_next[valid_outcome] -
+    expected_next[valid_outcome]
+)
+
+
+if (max(outcome_error) > 1e-10) {
+  
+  stop(
+    paste0(
+      "Temporal outcome validation failed.\n",
+      "Y_next is not equal to the configured ",
+      "lead(GDP_growth, HORIZON)."
+    )
+  )
+}
+
+
+# -----------------------------------------------------------------------------
+# Verify that treatment is defined at t while outcome is at t+1.
+# -----------------------------------------------------------------------------
+
+usable_bandit <- is.finite(
+  ordered_dat$A
+) &
+  apply(
+    ordered_dat[
+      ,
+      state_variables,
+      drop = FALSE
+    ],
+    1L,
+    function(z) {
+      all(
+        is.finite(z)
+      )
+    }
+  ) &
+  is.finite(
+    ordered_dat$Y_next
+  )
+
+
 cat(
-  "Non-missing Y_next:",
-  sum(
-    is.finite(dat$Y_next)
-  ),
+  "Usable contextual-bandit observations:",
+  sum(usable_bandit),
   "of",
-  nrow(dat),
+  nrow(ordered_dat),
   "\n"
 )
 
 
-# =============================================================================
-# 14.12 VERIFY RAW REWARD WHEN AVAILABLE
-# =============================================================================
-
-if ("raw_reward" %in% names(dat)) {
-  
-  cat(
-    "\nraw_reward is available in the canonical panel.\n"
-  )
-  
-  cat(
-    "Non-missing raw_reward:",
-    sum(
-      is.finite(dat$raw_reward)
-    ),
-    "of",
-    nrow(dat),
-    "\n"
-  )
-}
-
-
-# =============================================================================
-# 14.13 FINAL CAUSAL-PANEL VALIDATION
-# =============================================================================
-
-cat("\n============================================================\n")
-cat("14.13 FINAL CAUSAL-PANEL VALIDATION\n")
-cat("============================================================\n")
-
-
-# -----------------------------------------------------------------------------
-# Required variables for the final contextual-bandit dataset
-# -----------------------------------------------------------------------------
-
-final_required_vars <- unique(
-  c(
-    "month",
-    "A",
-    "Y_next",
-    state_variables
-  )
-)
-
-
-missing_final_vars <- setdiff(
-  final_required_vars,
-  names(dat)
-)
-
-
-if (length(missing_final_vars) > 0) {
+if (sum(usable_bandit) < 10L) {
   
   stop(
     paste0(
-      "Final causal panel is incomplete. Missing variables: ",
-      paste(
-        missing_final_vars,
-        collapse = ", "
-      )
+      "Too few complete contextual-bandit observations: ",
+      sum(usable_bandit),
+      "."
     )
   )
 }
 
 
 # -----------------------------------------------------------------------------
-# Check missingness.
+# Preserve the canonical panel object.
 #
-# We do not silently remove observations here. Temporal sequence construction
-# later will determine which observations can actually be used.
+# We update only chronological ordering. We do NOT manufacture new economic
+# variables here and do NOT overwrite the panel's canonical outcome.
 # -----------------------------------------------------------------------------
 
-final_missingness <- sapply(
-  dat[
-    ,
-    final_required_vars,
-    drop = FALSE
-  ],
-  function(x) {
-    sum(
-      !is.finite(x)
-    )
-  }
-)
-
-
-cat(
-  "\nMissing/non-finite values in final causal variables:\n"
-)
-
-print(
-  final_missingness
-)
-
-
-# -----------------------------------------------------------------------------
-# Treatment and outcome checks
-# -----------------------------------------------------------------------------
-
-if (any(
-  !is.finite(
-    dat$A
-  )
-)) {
-  
-  stop(
-    "Treatment A contains non-finite values."
-  )
-}
-
-
-if (any(
-  !is.na(dat$A) &
-  !dat$A %in% c(0, 1)
-)) {
-  
-  stop(
-    "Treatment A must contain only 0/1 values."
-  )
-}
+panel$data <- ordered_dat
 
 
 # =============================================================================
-# 14.14 UPDATE CANONICAL PANEL OBJECT
-# =============================================================================
-
-# -----------------------------------------------------------------------------
-# Preserve the panel object returned by build_real_panel(), but update its
-# data component with the verified state variables and Y_next.
-#
-# This is important: subsequent functions that validate the panel object
-# continue to receive the canonical `panel` object rather than `model_data`.
-# -----------------------------------------------------------------------------
-
-panel$data <- dat
-
-
-# =============================================================================
-# 14.15 CREATE CONTEXTUAL-BANDIT DATA
+# 14.10 CONSTRUCT CONTEXTUAL-BANDIT DATA
 # =============================================================================
 
 cat("\n============================================================\n")
-cat("14.15 CREATE CONTEXTUAL-BANDIT DATA\n")
+cat("14.10 CONSTRUCT CONTEXTUAL-BANDIT DATA\n")
 cat("============================================================\n")
+
+
+if (!exists("create_real_rl_data", inherits = TRUE)) {
+  
+  stop(
+    "`create_real_rl_data()` is not available."
+  )
+}
 
 
 rl_formals <- names(
@@ -17525,7 +17340,7 @@ rl_formals <- names(
 
 
 cat(
-  "create_real_rl_data() arguments:\n"
+  "`create_real_rl_data()` arguments:\n"
 )
 
 print(
@@ -17536,21 +17351,11 @@ print(
 rl_args <- list()
 
 
-# -----------------------------------------------------------------------------
-# The current architecture requires the canonical panel.
-# Do NOT pass model_data directly.
-# -----------------------------------------------------------------------------
-
-if ("panel" %in% rl_formals) {
-  
-  rl_args$panel <- panel
-  
-} else {
+if (!"panel" %in% rl_formals) {
   
   stop(
     paste0(
-      "`create_real_rl_data()` does not expose the required `panel` ",
-      "argument.\n",
+      "`create_real_rl_data()` must accept `panel`.\n",
       "Available arguments: ",
       paste(
         rl_formals,
@@ -17561,8 +17366,11 @@ if ("panel" %in% rl_formals) {
 }
 
 
+rl_args$panel <- panel
+
+
 # -----------------------------------------------------------------------------
-# Preserve existing project configuration when supported.
+# Pass only parameters explicitly supported by create_real_rl_data().
 # -----------------------------------------------------------------------------
 
 if (
@@ -17571,7 +17379,6 @@ if (
 ) {
   
   rl_args$LOOKBACK <- LOOKBACK
-  
 }
 
 
@@ -17581,7 +17388,6 @@ if (
 ) {
   
   rl_args$lookback <- LOOKBACK
-  
 }
 
 
@@ -17591,7 +17397,6 @@ if (
 ) {
   
   rl_args$AI_POLICY_COST <- AI_POLICY_COST
-  
 }
 
 
@@ -17601,13 +17406,8 @@ if (
 ) {
   
   rl_args$policy_cost <- AI_POLICY_COST
-  
 }
 
-
-# -----------------------------------------------------------------------------
-# Construct RL_data.
-# -----------------------------------------------------------------------------
 
 RL_data <- tryCatch(
   
@@ -17620,8 +17420,7 @@ RL_data <- tryCatch(
     
     stop(
       paste0(
-        "Failed to construct `RL_data` from the canonical ",
-        "`build_real_panel()` output.\n",
+        "Failed to construct `RL_data` from the canonical panel.\n",
         "Original error: ",
         conditionMessage(e)
       )
@@ -17630,13 +17429,29 @@ RL_data <- tryCatch(
 )
 
 
+if (is.null(RL_data)) {
+  
+  stop(
+    "`create_real_rl_data()` returned NULL."
+  )
+}
+
+
+if (!is.data.frame(RL_data) && !is.list(RL_data)) {
+  
+  stop(
+    "`RL_data` must be a data.frame or list-like object."
+  )
+}
+
+
 message(
   "Reviewer analysis: `RL_data` constructed successfully."
 )
 
 
 # =============================================================================
-# 14.16 FINAL SUMMARY
+# 14.11 FINAL SUMMARY
 # =============================================================================
 
 cat("\n============================================================\n")
@@ -17659,12 +17474,12 @@ cat(
 cat(
   "Date range:",
   format(
-    min(panel$data$month, na.rm = TRUE),
+    min(panel$data$month),
     "%Y-%m"
   ),
   "to",
   format(
-    max(panel$data$month, na.rm = TRUE),
+    max(panel$data$month),
     "%Y-%m"
   ),
   "\n"
@@ -17698,6 +17513,18 @@ cat(
 )
 
 cat(
+  "Horizon:",
+  horizon_used,
+  "\n"
+)
+
+cat(
+  "Usable contextual-bandit observations:",
+  sum(usable_bandit),
+  "\n"
+)
+
+cat(
   "RL_data constructed:",
   exists(
     "RL_data",
@@ -17706,10 +17533,26 @@ cat(
   "\n"
 )
 
+
 cat(
-  "\nCanonical causal panel successfully verified.\n"
+  "\n============================================================\n"
 )
 
+cat(
+  "Canonical one-step causal panel successfully verified.\n"
+)
+
+cat(
+  "Structure: X_t -> A_t -> Y_{t+1}\n"
+)
+
+cat(
+  "No ad-hoc reward or AI-exposure reconstruction was performed.\n"
+)
+
+cat(
+  "============================================================\n"
+)
 # =============================================================================
 # 15. SAVE CAUSAL DATA
 # =============================================================================

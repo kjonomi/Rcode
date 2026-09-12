@@ -2581,13 +2581,13 @@ print_tcl_model_summary <- function(
 #
 # Purpose:
 #
-#   Load and prepare the monthly economic panel used for:
+#   Prepare the monthly economic panel used for:
 #
 #     1. Temporal causal inference
 #     2. DR-CATE estimation
 #     3. Transformer-CNN-BiLSTM representation learning
 #     4. Dynamic policy learning
-#     5. DQN / Prioritized Experience Replay
+#     5. Contextual-bandit / Prioritized Experience Replay analysis
 #
 # Temporal causal structure:
 #
@@ -2599,6 +2599,16 @@ print_tcl_model_summary <- function(
 #       A_t     = policy/treatment
 #       Y_{t+1} = next-period economic outcome
 #
+# IMPORTANT:
+#
+#   This file defines ONLY the canonical monthly economic-data preparation
+#   and validation functions.
+#
+#   The main program is responsible for loading raw data through its
+#   load_monthly_economic_data() function.
+#
+#   Do NOT redefine load_monthly_economic_data() here.
+#
 # =============================================================================
 
 
@@ -2606,908 +2616,1149 @@ print_tcl_model_summary <- function(
 # 0. DEFAULT SETTINGS
 # =============================================================================
 
-if (!exists("DATA_FILE")) {
-    DATA_FILE <- "monthly_economic_data.RData"
-}
-
-if (!exists("DATA_OBJECT")) {
-    DATA_OBJECT <- "monthly_data"
-}
-
 if (!exists("HORIZON")) {
-    HORIZON <- 1L
+  HORIZON <- 1L
 }
 
 
 # =============================================================================
-# 1. LOAD MONTHLY ECONOMIC DATA
-# =============================================================================
-
-load_monthly_economic_data <- function(
-    path = DATA_FILE,
-    data_object = DATA_OBJECT
-) {
-
-    # -------------------------------------------------------------------------
-    # File check
-    # -------------------------------------------------------------------------
-
-    if (!file.exists(path)) {
-
-        stop(
-            "\nData file not found:\n",
-            normalizePath(
-                path,
-                mustWork = FALSE
-            )
-        )
-    }
-
-
-    # -------------------------------------------------------------------------
-    # Load into isolated environment
-    # -------------------------------------------------------------------------
-
-    e <- new.env(
-        parent = emptyenv()
-    )
-
-
-    load(
-        path,
-        envir = e
-    )
-
-
-    # -------------------------------------------------------------------------
-    # Check expected object
-    # -------------------------------------------------------------------------
-
-    if (!exists(
-        data_object,
-        envir = e,
-        inherits = FALSE
-    )) {
-
-        objects <- ls(
-            e,
-            all.names = TRUE
-        )
-
-        stop(
-            "\nExpected object '",
-            data_object,
-            "' was not found.\n\n",
-            "Objects in RData:\n",
-            paste(
-                objects,
-                collapse = ", "
-            )
-        )
-    }
-
-
-    # -------------------------------------------------------------------------
-    # Extract object
-    # -------------------------------------------------------------------------
-
-    d <- get(
-        data_object,
-        envir = e
-    )
-
-
-    # -------------------------------------------------------------------------
-    # Validate data type
-    # -------------------------------------------------------------------------
-
-    if (!is.data.frame(d)) {
-
-        stop(
-            "'",
-            data_object,
-            "' is not a data.frame/tibble."
-        )
-    }
-
-
-    return(d)
-}
-
-
-# =============================================================================
-# 2. PREPARE MONTHLY ECONOMIC DATA
+# 1. PREPARE MONTHLY ECONOMIC DATA
 # =============================================================================
 
 prepare_monthly_economic_data <- function(
     d,
     horizon = HORIZON,
     gdp_method = c(
-        "locf",
-        "interpolate"
+      "locf",
+      "interpolate"
     )
 ) {
-
-    gdp_method <- match.arg(
-        gdp_method
+  
+  # =========================================================================
+  # 1.1 HORIZON / METHOD VALIDATION
+  # =========================================================================
+  
+  gdp_method <- match.arg(
+    gdp_method
+  )
+  
+  
+  if (
+    length(horizon) != 1 ||
+    !is.numeric(horizon) ||
+    !is.finite(horizon) ||
+    horizon < 1 ||
+    horizon != as.integer(horizon)
+  ) {
+    
+    stop(
+      "`horizon` must be a positive integer."
     )
-
-
-    # =========================================================================
-    # 2.1 REQUIRED VARIABLES
-    # =========================================================================
-
-    required <- c(
-
-        "month",
-
-        "DGS10",
-        "DTB3",
-        "DGS2",
-        "BAA10Y",
-
-        "UNRATE",
-        "PAYEMS",
-
-        "GDPC1",
-        "INDPRO",
-        "CPIAUCSL",
-
-        "VIXCLS"
+  }
+  
+  
+  horizon <- as.integer(
+    horizon
+  )
+  
+  
+  # =========================================================================
+  # 1.2 BASIC DATA VALIDATION
+  # =========================================================================
+  
+  if (!is.data.frame(d)) {
+    
+    stop(
+      "Input `d` must be a data.frame."
     )
-
-
-    missing <- setdiff(
-        required,
-        names(d)
+  }
+  
+  
+  required <- c(
+    
+    "month",
+    
+    "DGS10",
+    "DTB3",
+    "DGS2",
+    "BAA10Y",
+    
+    "UNRATE",
+    "PAYEMS",
+    
+    "GDPC1",
+    "INDPRO",
+    "CPIAUCSL",
+    
+    "VIXCLS"
+  )
+  
+  
+  missing <- setdiff(
+    required,
+    names(d)
+  )
+  
+  
+  if (length(missing) > 0) {
+    
+    stop(
+      "Missing required economic variables: ",
+      paste(
+        missing,
+        collapse = ", "
+      )
     )
-
-
-    if (length(missing) > 0) {
-
-        stop(
-            "Missing variables: ",
-            paste(
-                missing,
-                collapse = ", "
+  }
+  
+  
+  # =========================================================================
+  # 1.3 DATE STANDARDIZATION
+  # =========================================================================
+  
+  if (inherits(d$month, "Date")) {
+    
+    d$month <- as.Date(
+      d$month
+    )
+    
+  } else if (
+    inherits(
+      d$month,
+      c("POSIXct", "POSIXlt")
+    )
+  ) {
+    
+    d$month <- as.Date(
+      d$month
+    )
+    
+  } else {
+    
+    month_character <- as.character(
+      d$month
+    )
+    
+    
+    # ---------------------------------------------------------------------
+    # First try YYYY-MM
+    # ---------------------------------------------------------------------
+    
+    parsed_month <- suppressWarnings(
+      as.Date(
+        paste0(
+          month_character,
+          "-01"
+        )
+      )
+    )
+    
+    
+    # ---------------------------------------------------------------------
+    # Then try ordinary Date representation
+    # ---------------------------------------------------------------------
+    
+    failed <- is.na(
+      parsed_month
+    )
+    
+    
+    if (any(failed)) {
+      
+      parsed_month[failed] <-
+        suppressWarnings(
+          as.Date(
+            month_character[failed]
+          )
+        )
+    }
+    
+    
+    d$month <- parsed_month
+  }
+  
+  
+  if (all(is.na(d$month))) {
+    
+    stop(
+      "Unable to convert `month` to valid Date values."
+    )
+  }
+  
+  
+  # -------------------------------------------------------------------------
+  # Remove rows with invalid dates
+  # -------------------------------------------------------------------------
+  
+  d <- d[
+    !is.na(d$month),
+    ,
+    drop = FALSE
+  ]
+  
+  
+  # -------------------------------------------------------------------------
+  # Sort chronologically
+  # -------------------------------------------------------------------------
+  
+  d <- d[
+    order(d$month),
+    ,
+    drop = FALSE
+  ]
+  
+  
+  # =========================================================================
+  # 1.4 DUPLICATE MONTH CHECK
+  # =========================================================================
+  
+  duplicated_months <- duplicated(
+    d$month
+  )
+  
+  
+  if (any(duplicated_months)) {
+    
+    dup_values <- unique(
+      d$month[duplicated_months]
+    )
+    
+    
+    stop(
+      "Duplicate monthly observations detected: ",
+      paste(
+        format(dup_values),
+        collapse = ", "
+      )
+    )
+  }
+  
+  
+  # =========================================================================
+  # 1.5 NUMERIC CONVERSION
+  # =========================================================================
+  
+  numeric_variables <- setdiff(
+    required,
+    "month"
+  )
+  
+  
+  for (v in numeric_variables) {
+    
+    d[[v]] <- suppressWarnings(
+      as.numeric(
+        as.character(
+          d[[v]]
+        )
+      )
+    )
+  }
+  
+  
+  # =========================================================================
+  # 1.6 NON-FINITE VALUES
+  # =========================================================================
+  
+  for (v in numeric_variables) {
+    
+    if (is.numeric(d[[v]])) {
+      
+      d[[v]][
+        !is.finite(
+          d[[v]]
+        )
+      ] <- NA_real_
+    }
+  }
+  
+  
+  # =========================================================================
+  # 1.7 STANDARDIZED DATE VARIABLE
+  # =========================================================================
+  
+  d$DATE <- d$month
+  
+  
+  # =========================================================================
+  # 1.8 INITIAL MISSING-VALUE REPORT
+  # =========================================================================
+  
+  missing_counts <- sapply(
+    d[numeric_variables],
+    function(x)
+      sum(is.na(x))
+  )
+  
+  
+  cat("\n")
+  cat("============================================================\n")
+  cat("RAW MONTHLY ECONOMIC DATA\n")
+  cat("============================================================\n")
+  cat("Observations:", nrow(d), "\n")
+  cat(
+    "Date range:",
+    format(min(d$DATE, na.rm = TRUE)),
+    "to",
+    format(max(d$DATE, na.rm = TRUE)),
+    "\n"
+  )
+  
+  
+  cat("\nMissing values by variable:\n")
+  
+  print(
+    missing_counts
+  )
+  
+  
+  # =========================================================================
+  # 1.9 GDP MONTHLY CONVERSION
+  # =========================================================================
+  #
+  # GDPC1 is a quarterly real GDP series.
+  #
+  # The monthly causal panel therefore uses GDPC1_monthly.
+  #
+  # Default:
+  #
+  #     LOCF
+  #
+  # Each observed quarterly GDP value is carried forward until the next
+  # quarterly observation.
+  #
+  # This is a measurement-frequency transformation and does not represent
+  # additional economic information.
+  #
+  # Do NOT calculate monthly GDP growth directly from raw GDPC1.
+  #
+  # =========================================================================
+  
+  if (gdp_method == "locf") {
+    
+    if (!requireNamespace(
+      "zoo",
+      quietly = TRUE
+    )) {
+      
+      stop(
+        "Package `zoo` is required for GDP LOCF conversion."
+      )
+    }
+    
+    
+    d$GDPC1_monthly <- zoo::na.locf(
+      d$GDPC1,
+      na.rm = FALSE
+    )
+    
+  } else {
+    
+    if (!requireNamespace(
+      "zoo",
+      quietly = TRUE
+    )) {
+      
+      stop(
+        "Package `zoo` is required for GDP interpolation."
+      )
+    }
+    
+    
+    d$GDPC1_monthly <- zoo::na.approx(
+      d$GDPC1,
+      x = d$DATE,
+      na.rm = FALSE
+    )
+  }
+  
+  
+  # =========================================================================
+  # 1.10 BACKFILL EARLY MISSING GDP
+  # =========================================================================
+  
+  first_valid_gdp <- which(
+    is.finite(
+      d$GDPC1_monthly
+    )
+  )[1]
+  
+  
+  if (
+    !is.na(first_valid_gdp) &&
+    first_valid_gdp > 1
+  ) {
+    
+    d$GDPC1_monthly[
+      seq_len(first_valid_gdp - 1)
+    ] <-
+      d$GDPC1_monthly[
+        first_valid_gdp
+      ]
+  }
+  
+  
+  # =========================================================================
+  # 1.11 ECONOMIC STATE VARIABLES
+  # =========================================================================
+  
+  d <- dplyr::mutate(
+    d,
+    
+    # ---------------------------------------------------------------------
+    # Yield-curve variables
+    # ---------------------------------------------------------------------
+    
+    term_spread =
+      DGS10 - DTB3,
+    
+    yield_2_10 =
+      DGS10 - DGS2,
+    
+    rate_spread_2y =
+      DGS10 - DGS2,
+    
+    short_spread =
+      DGS2 - DTB3,
+    
+    
+    # ---------------------------------------------------------------------
+    # Credit risk
+    # ---------------------------------------------------------------------
+    
+    credit_risk =
+      BAA10Y - DGS10,
+    
+    credit_spread =
+      BAA10Y - DGS10,
+    
+    
+    # ---------------------------------------------------------------------
+    # Labor-market dynamics
+    # ---------------------------------------------------------------------
+    
+    unemployment_change =
+      UNRATE -
+      dplyr::lag(
+        UNRATE
+      ),
+    
+    payroll_growth =
+      100 *
+      (
+        log(PAYEMS) -
+          log(
+            dplyr::lag(
+              PAYEMS
             )
-        )
-    }
-
-
-    # =========================================================================
-    # 2.2 HORIZON VALIDATION
-    # =========================================================================
-
-    if (length(horizon) != 1 ||
-        !is.numeric(horizon) ||
-        !is.finite(horizon) ||
-        horizon < 1 ||
-        horizon != as.integer(horizon)) {
-
-        stop(
-            "`horizon` must be a positive integer."
-        )
-    }
-
-
-    horizon <- as.integer(
-        horizon
-    )
-
-
-    # =========================================================================
-    # 2.3 DATE STANDARDIZATION
-    # =========================================================================
-
-    d <- d |>
-
-        dplyr::mutate(
-
-            DATE = as.Date(month)
-
-        ) |>
-
-        dplyr::arrange(
-            DATE
-        )
-
-
-    # -------------------------------------------------------------------------
-    # Check duplicate months
-    # -------------------------------------------------------------------------
-
-    duplicate_dates <- duplicated(
-        d$DATE
-    )
-
-
-    if (any(duplicate_dates)) {
-
-        dup_values <- unique(
-            d$DATE[duplicate_dates]
-        )
-
-        stop(
-            "Duplicate monthly observations detected: ",
-            paste(
-                dup_values,
-                collapse = ", "
+          )
+      ),
+    
+    
+    # ---------------------------------------------------------------------
+    # GDP growth
+    # ---------------------------------------------------------------------
+    
+    GDP_growth =
+      100 *
+      (
+        log(GDPC1_monthly) -
+          log(
+            dplyr::lag(
+              GDPC1_monthly
             )
+          )
+      ),
+    
+    
+    # ---------------------------------------------------------------------
+    # Industrial production
+    # ---------------------------------------------------------------------
+    
+    industrial_growth =
+      100 *
+      (
+        log(INDPRO) -
+          log(
+            dplyr::lag(
+              INDPRO
+            )
+          )
+      ),
+    
+    
+    # ---------------------------------------------------------------------
+    # Inflation
+    # ---------------------------------------------------------------------
+    
+    inflation =
+      100 *
+      (
+        log(CPIAUCSL) -
+          log(
+            dplyr::lag(
+              CPIAUCSL
+            )
+          )
+      ),
+    
+    
+    # ---------------------------------------------------------------------
+    # Financial volatility
+    # ---------------------------------------------------------------------
+    
+    VIX_change =
+      VIXCLS -
+      dplyr::lag(
+        VIXCLS
+      ),
+    
+    
+    # ---------------------------------------------------------------------
+    # Deterministic time index
+    # ---------------------------------------------------------------------
+    
+    time_index =
+      seq_len(
+        dplyr::n()
+      )
+  )
+  
+  
+  # =========================================================================
+  # 1.12 AI EXPOSURE
+  # =========================================================================
+  #
+  # The local FRED dataset does not contain a direct AI-adoption measure.
+  #
+  # Therefore this variable is explicitly a secular time-trend proxy.
+  #
+  # It must NOT be interpreted as observed AI exposure.
+  #
+  # If an external AI exposure measure is subsequently supplied, it should
+  # replace this proxy through the dedicated AI-exposure integration step.
+  #
+  # =========================================================================
+  
+  d <- dplyr::mutate(
+    d,
+    
+    AI_exposure =
+      as.numeric(
+        scale(
+          log1p(time_index)
         )
-    }
-
-
-    # =========================================================================
-    # 2.4 NUMERIC CONVERSION
-    # =========================================================================
-
-    numeric_vars <- setdiff(
-        required,
-        "month"
-    )
-
-
-    for (v in numeric_vars) {
-
-        d[[v]] <- as.numeric(
-            d[[v]]
-        )
-    }
-
-
-    # =========================================================================
-    # 2.5 GDP MONTHLY CONVERSION
-    # =========================================================================
-    #
-    # GDPC1 is a quarterly real GDP series.
-    #
-    # The original monthly panel must therefore NOT use complete cases on
-    # GDPC1 directly, otherwise the panel collapses toward quarterly frequency.
-    #
-    # We construct a monthly GDP level from the observed quarterly values.
-    #
-    # Default:
-    #
-    #       LOCF
-    #
-    # This keeps each quarterly GDP value until the next quarterly observation.
-    #
-    # IMPORTANT:
-    #
-    # This is a measurement-frequency transformation, not creation of new
-    # economic information.
-    #
-    # =========================================================================
-
-    if (gdp_method == "locf") {
-
-        d$GDPC1_monthly <- zoo::na.locf(
-            d$GDPC1,
-            na.rm = FALSE
-        )
-
-    } else if (gdp_method == "interpolate") {
-
-        d$GDPC1_monthly <- zoo::na.approx(
-            d$GDPC1,
-            x = d$DATE,
-            na.rm = FALSE
-        )
-
-    }
-
-
-    # =========================================================================
-    # 2.6 BACKFILL EARLY MISSING GDP
-    # =========================================================================
-
-    first_valid_gdp <- which(
-        is.finite(
-            d$GDPC1_monthly
-        )
+      )
+  )
+  
+  
+  # =========================================================================
+  # 1.13 LEADING DIFFERENCE VALUES
+  # =========================================================================
+  #
+  # The first observation naturally has no lagged value.
+  #
+  # Only leading missing values are replaced with zero.
+  #
+  # This does not alter interior missing values caused by missing source
+  # observations.
+  #
+  # =========================================================================
+  
+  initial_change_vars <- c(
+    
+    "unemployment_change",
+    "payroll_growth",
+    "GDP_growth",
+    "industrial_growth",
+    "inflation",
+    "VIX_change"
+  )
+  
+  
+  for (v in initial_change_vars) {
+    
+    first_finite <- which(
+      is.finite(
+        d[[v]]
+      )
     )[1]
-
-
-    if (!is.na(first_valid_gdp) &&
-        first_valid_gdp > 1) {
-
-        d$GDPC1_monthly[
-            seq_len(first_valid_gdp - 1)
-        ] <- d$GDPC1_monthly[
-            first_valid_gdp
-        ]
+    
+    
+    if (
+      !is.na(first_finite) &&
+      first_finite > 1
+    ) {
+      
+      d[[v]][
+        seq_len(first_finite - 1)
+      ] <- 0
     }
-
-
-    # =========================================================================
-    # 2.7 ECONOMIC STATE VARIABLES
-    # =========================================================================
-    #
-    # These are the variables used by the temporal causal model.
-    #
-    # =========================================================================
-
-    d <- d |>
-
-        dplyr::mutate(
-
-            # -----------------------------------------------------------------
-            # Yield-curve variables
-            # -----------------------------------------------------------------
-
-            term_spread =
-                DGS10 - DTB3,
-
-            yield_2_10 =
-                DGS10 - DGS2,
-
-            rate_spread_2y =
-                DGS10 - DGS2,
-
-            short_spread =
-                DGS2 - DTB3,
-
-
-            # -----------------------------------------------------------------
-            # Credit risk
-            # -----------------------------------------------------------------
-
-            credit_risk =
-                BAA10Y - DGS10,
-
-            credit_spread =
-                BAA10Y - DGS10,
-
-
-            # -----------------------------------------------------------------
-            # Labor-market dynamics
-            # -----------------------------------------------------------------
-
-            unemployment_change =
-                UNRATE -
-                dplyr::lag(
-                    UNRATE
-                ),
-
-
-            payroll_growth =
-                100 *
-                (
-                    log(PAYEMS) -
-                    log(
-                        dplyr::lag(
-                            PAYEMS
-                        )
-                    )
-                ),
-
-
-            # -----------------------------------------------------------------
-            # GDP growth
-            # -----------------------------------------------------------------
-
-            GDP_growth =
-                100 *
-                (
-                    log(GDPC1_monthly) -
-                    log(
-                        dplyr::lag(
-                            GDPC1_monthly
-                        )
-                    )
-                ),
-
-
-            # -----------------------------------------------------------------
-            # Industrial production
-            # -----------------------------------------------------------------
-
-            industrial_growth =
-                100 *
-                (
-                    log(INDPRO) -
-                    log(
-                        dplyr::lag(
-                            INDPRO
-                        )
-                    )
-                ),
-
-
-            # -----------------------------------------------------------------
-            # Inflation
-            # -----------------------------------------------------------------
-
-            inflation =
-                100 *
-                (
-                    log(CPIAUCSL) -
-                    log(
-                        dplyr::lag(
-                            CPIAUCSL
-                        )
-                    )
-                ),
-
-
-            # -----------------------------------------------------------------
-            # Financial volatility
-            # -----------------------------------------------------------------
-
-            VIX_change =
-                VIXCLS -
-                dplyr::lag(
-                    VIXCLS
-                ),
-
-
-            # -----------------------------------------------------------------
-            # Time index
-            # -----------------------------------------------------------------
-
-            time_index =
-                seq_len(
-                    dplyr::n()
-                )
-        )
-
-
-    # =========================================================================
-    # 2.8 AI EXPOSURE PROXY
-    # =========================================================================
-    #
-    # The supplied FRED dataset does not contain a direct AI-adoption variable.
-    #
-    # Therefore this variable should NOT be interpreted as measured AI
-    # exposure.
-    #
-    # We construct a deterministic time trend only for compatibility with
-    # models that require a slowly evolving structural factor.
-    #
-    # The variable is standardized to avoid an unnecessarily large scale.
-    #
-    # For publication-quality AI policy analysis, replace this variable with
-    # an actual AI exposure measure.
-    #
-    # =========================================================================
-
-    d <- d |>
-
-        dplyr::mutate(
-
-            AI_exposure =
-                as.numeric(
-                    scale(
-                        log1p(time_index)
-                    )
-                )
-        )
-
-
-    # =========================================================================
-    # 2.9 FIRST-OBSERVATION DIFFERENCE HANDLING
-    # =========================================================================
-    #
-    # Growth/change variables naturally produce one missing observation.
-    #
-    # We set only these initial changes to zero so that the temporal state
-    # representation can begin at the first usable observation.
-    #
-    # =========================================================================
-
-    initial_change_vars <- c(
-
-        "unemployment_change",
-
-        "payroll_growth",
-
-        "GDP_growth",
-
-        "industrial_growth",
-
-        "inflation",
-
-        "VIX_change"
+  }
+  
+  
+  # =========================================================================
+  # 1.14 NEXT-PERIOD CAUSAL OUTCOME
+  # =========================================================================
+  #
+  # Temporal causal structure:
+  #
+  #       X_t -> A_t -> Y_{t+h}
+  #
+  # where:
+  #
+  #       Y_{t+h} = GDP growth at t+h.
+  #
+  # For the default horizon h = 1:
+  #
+  #       Y_next,t = GDP_growth,t+1
+  #
+  # =========================================================================
+  
+  d <- dplyr::mutate(
+    d,
+    
+    Y_next =
+      dplyr::lead(
+        GDP_growth,
+        horizon
+      ),
+    
+    raw_reward =
+      Y_next
+  )
+  
+  
+  # =========================================================================
+  # 1.15 TEMPORAL REWARD
+  # =========================================================================
+  #
+  # The raw economic outcome remains the canonical reward at this stage.
+  #
+  # Treatment costs and policy-specific reward transformations are applied
+  # later by the causal decision / contextual-bandit module.
+  #
+  # =========================================================================
+  
+  d <- dplyr::mutate(
+    d,
+    
+    temporal_reward =
+      raw_reward
+  )
+  
+  
+  # =========================================================================
+  # 1.16 CLEAN DERIVED NUMERIC VALUES
+  # =========================================================================
+  
+  numeric_columns <- names(d)[
+    vapply(
+      d,
+      is.numeric,
+      logical(1)
     )
-
-
-    for (v in initial_change_vars) {
-
-        if (length(d[[v]]) > 0) {
-
-            first_finite <- which(
-                is.finite(
-                    d[[v]]
-                )
-            )[1]
-
-            if (!is.na(first_finite) &&
-                first_finite > 1) {
-
-                # Only fill leading missing values.
-                d[[v]][
-                    seq_len(first_finite - 1)
-                ] <- 0
-            }
-        }
-    }
-
-
-    # =========================================================================
-    # 2.10 NEXT-PERIOD OUTCOME
-    # =========================================================================
-    #
-    # Main temporal causal estimand:
-    #
-    #       tau_h(X_t)
-    #
-    # where:
-    #
-    #       Y_{t+h} = GDP growth at t+h.
-    #
-    # Treatment at time t therefore predicts a future economic outcome.
-    #
-    # =========================================================================
-
-    d <- d |>
-
-        dplyr::mutate(
-
-            Y_next =
-                dplyr::lead(
-                    GDP_growth,
-                    horizon
-                ),
-
-            raw_reward =
-                Y_next
-        )
-
-
-    # =========================================================================
-    # 2.11 TEMPORAL REWARD
-    # =========================================================================
-    #
-    # The causal module estimates the effect on Y_next.
-    #
-    # The RL module can subsequently transform this outcome into a policy
-    # reward, including treatment cost if desired.
-    #
-    # Here we preserve the raw economic reward.
-    #
-    # =========================================================================
-
-    d <- d |>
-
-        dplyr::mutate(
-
-            temporal_reward =
-                raw_reward
-        )
-
-
-    # =========================================================================
-    # 2.12 CLEAN NON-FINITE VALUES
-    # =========================================================================
-
-    numeric_columns <- names(d)[
-        vapply(
-            d,
-            is.numeric,
-            logical(1)
-        )
-    ]
-
-
-    for (v in numeric_columns) {
-
-        d[[v]][
-            !is.finite(
-                d[[v]]
-            )
-        ] <- NA_real_
-    }
-
-
-    # =========================================================================
-    # 2.13 REORDER VARIABLES
-    # =========================================================================
-
-    preferred_order <- c(
-
-        "DATE",
-        "month",
-
-        "DGS10",
-        "DTB3",
-        "DGS2",
-        "BAA10Y",
-
-        "UNRATE",
-        "PAYEMS",
-
-        "GDPC1",
-        "GDPC1_monthly",
-
-        "INDPRO",
-        "CPIAUCSL",
-        "VIXCLS",
-
-        "term_spread",
-        "yield_2_10",
-        "rate_spread_2y",
-        "short_spread",
-        "credit_risk",
-        "credit_spread",
-
-        "unemployment_change",
-        "payroll_growth",
-        "GDP_growth",
-        "industrial_growth",
-        "inflation",
-        "VIX_change",
-
-        "time_index",
-        "AI_exposure",
-
-        "Y_next",
-        "raw_reward",
-        "temporal_reward"
-    )
-
-
-    preferred_order <- intersect(
-        preferred_order,
-        names(d)
-    )
-
-
-    remaining <- setdiff(
-        names(d),
-        preferred_order
-    )
-
-
-    d <- d[
-        ,
-        c(
-            preferred_order,
-            remaining
-        ),
-        drop = FALSE
-    ]
-
-
-    # =========================================================================
-    # 2.14 RETURN
-    # =========================================================================
-
-    return(d)
+  ]
+  
+  
+  for (v in numeric_columns) {
+    
+    d[[v]][
+      !is.finite(
+        d[[v]]
+      )
+    ] <- NA_real_
+  }
+  
+  
+  # =========================================================================
+  # 1.17 VARIABLE ORDER
+  # =========================================================================
+  
+  preferred_order <- c(
+    
+    "DATE",
+    "month",
+    
+    "DGS10",
+    "DTB3",
+    "DGS2",
+    "BAA10Y",
+    
+    "UNRATE",
+    "PAYEMS",
+    
+    "GDPC1",
+    "GDPC1_monthly",
+    
+    "INDPRO",
+    "CPIAUCSL",
+    "VIXCLS",
+    
+    "term_spread",
+    "yield_2_10",
+    "rate_spread_2y",
+    "short_spread",
+    
+    "credit_risk",
+    "credit_spread",
+    
+    "unemployment_change",
+    "payroll_growth",
+    "GDP_growth",
+    "industrial_growth",
+    "inflation",
+    "VIX_change",
+    
+    "time_index",
+    "AI_exposure",
+    
+    "Y_next",
+    "raw_reward",
+    "temporal_reward"
+  )
+  
+  
+  preferred_order <- intersect(
+    preferred_order,
+    names(d)
+  )
+  
+  
+  remaining <- setdiff(
+    names(d),
+    preferred_order
+  )
+  
+  
+  d <- d[
+    ,
+    c(
+      preferred_order,
+      remaining
+    ),
+    drop = FALSE
+  ]
+  
+  
+  # =========================================================================
+  # 1.18 FINAL VALIDATION
+  # =========================================================================
+  
+  validate_monthly_economic_data(
+    d
+  )
+  
+  
+  return(d)
 }
 
 
 # =============================================================================
-# 3. VALIDATE MONTHLY ECONOMIC PANEL
+# 2. VALIDATE MONTHLY ECONOMIC PANEL
 # =============================================================================
 
 validate_monthly_economic_data <- function(
     d
 ) {
-
-    required <- c(
-
-        "DATE",
-
-        "term_spread",
-
-        "yield_2_10",
-
-        "credit_risk",
-
-        "unemployment_change",
-
-        "payroll_growth",
-
-        "GDP_growth",
-
-        "industrial_growth",
-
-        "inflation",
-
-        "VIX_change",
-
-        "AI_exposure",
-
-        "Y_next",
-
-        "raw_reward"
+  
+  required <- c(
+    
+    "DATE",
+    "month",
+    
+    "GDPC1_monthly",
+    
+    "term_spread",
+    "yield_2_10",
+    "rate_spread_2y",
+    "short_spread",
+    
+    "credit_risk",
+    "credit_spread",
+    
+    "unemployment_change",
+    "payroll_growth",
+    "GDP_growth",
+    "industrial_growth",
+    "inflation",
+    "VIX_change",
+    
+    "time_index",
+    "AI_exposure",
+    
+    "Y_next",
+    "raw_reward",
+    "temporal_reward"
+  )
+  
+  
+  missing <- setdiff(
+    required,
+    names(d)
+  )
+  
+  
+  if (length(missing) > 0) {
+    
+    stop(
+      "Prepared economic panel is missing: ",
+      paste(
+        missing,
+        collapse = ", "
+      )
     )
-
-
-    missing <- setdiff(
-        required,
-        names(d)
+  }
+  
+  
+  # -------------------------------------------------------------------------
+  # Date validation
+  # -------------------------------------------------------------------------
+  
+  if (!inherits(
+    d$DATE,
+    "Date"
+  )) {
+    
+    stop(
+      "`DATE` must be a Date variable."
     )
-
-
-    if (length(missing) > 0) {
-
-        stop(
-            "Prepared economic panel is missing: ",
-            paste(
-                missing,
-                collapse = ", "
-            )
-        )
+  }
+  
+  
+  if (!inherits(
+    d$month,
+    "Date"
+  )) {
+    
+    stop(
+      "`month` must be a Date variable."
+    )
+  }
+  
+  
+  if (any(
+    duplicated(
+      d$DATE
+    )
+  )) {
+    
+    stop(
+      "Duplicate dates remain in the economic panel."
+    )
+  }
+  
+  
+  if (!all(
+    diff(
+      as.numeric(
+        d$DATE
+      )
+    ) >= 0
+  )) {
+    
+    stop(
+      "Economic panel is not chronologically ordered."
+    )
+  }
+  
+  
+  # -------------------------------------------------------------------------
+  # Minimum sample size
+  # -------------------------------------------------------------------------
+  
+  if (nrow(d) < 100) {
+    
+    stop(
+      "Too few observations in monthly economic panel: ",
+      nrow(d)
+    )
+  }
+  
+  
+  # -------------------------------------------------------------------------
+  # Temporal outcome consistency
+  # -------------------------------------------------------------------------
+  
+  expected_y_next <- dplyr::lead(
+    d$GDP_growth,
+    1L
+  )
+  
+  
+  # The final horizon observations are naturally NA.
+  #
+  # Compare only observations for which both quantities are finite.
+  
+  comparable <- is.finite(
+    d$Y_next
+  ) &
+    is.finite(
+      expected_y_next
+    )
+  
+  
+  if (any(comparable)) {
+    
+    max_difference <- max(
+      abs(
+        d$Y_next[comparable] -
+          expected_y_next[comparable]
+      )
+    )
+    
+    
+    if (
+      !is.finite(max_difference) ||
+      max_difference > 1e-10
+    ) {
+      
+      stop(
+        "`Y_next` is inconsistent with one-period-ahead `GDP_growth`."
+      )
     }
-
-
-    if (!inherits(
+  }
+  
+  
+  # -------------------------------------------------------------------------
+  # Raw reward consistency
+  # -------------------------------------------------------------------------
+  
+  comparable_reward <- is.finite(
+    d$raw_reward
+  ) &
+    is.finite(
+      d$Y_next
+    )
+  
+  
+  if (any(comparable_reward)) {
+    
+    max_difference_reward <- max(
+      abs(
+        d$raw_reward[comparable_reward] -
+          d$Y_next[comparable_reward]
+      )
+    )
+    
+    
+    if (
+      !is.finite(max_difference_reward) ||
+      max_difference_reward > 1e-10
+    ) {
+      
+      stop(
+        "`raw_reward` must equal `Y_next`."
+      )
+    }
+  }
+  
+  
+  # -------------------------------------------------------------------------
+  # Temporal reward consistency
+  # -------------------------------------------------------------------------
+  
+  comparable_temporal_reward <- is.finite(
+    d$temporal_reward
+  ) &
+    is.finite(
+      d$raw_reward
+    )
+  
+  
+  if (any(comparable_temporal_reward)) {
+    
+    max_difference_temporal <- max(
+      abs(
+        d$temporal_reward[
+          comparable_temporal_reward
+        ] -
+          d$raw_reward[
+            comparable_temporal_reward
+          ]
+      )
+    )
+    
+    
+    if (
+      !is.finite(max_difference_temporal) ||
+      max_difference_temporal > 1e-10
+    ) {
+      
+      stop(
+        "`temporal_reward` must equal `raw_reward`."
+      )
+    }
+  }
+  
+  
+  # =========================================================================
+  # DIAGNOSTIC REPORT
+  # =========================================================================
+  
+  cat("\n")
+  cat("============================================================\n")
+  cat("MONTHLY ECONOMIC PANEL VALIDATION\n")
+  cat("============================================================\n")
+  
+  
+  cat(
+    "Observations: ",
+    nrow(d),
+    "\n",
+    sep = ""
+  )
+  
+  
+  cat(
+    "Date range: ",
+    format(
+      min(
         d$DATE,
-        "Date"
-    )) {
-
-        stop(
-            "`DATE` must be a Date variable."
-        )
-    }
-
-
-    if (any(
-        duplicated(
-            d$DATE
-        )
-    )) {
-
-        stop(
-            "Duplicate dates remain in the economic panel."
-        )
-    }
-
-
-    if (!all(
-        diff(
-            as.numeric(d$DATE)
-        ) >= 0
-    )) {
-
-        stop(
-            "Economic panel is not chronologically ordered."
-        )
-    }
-
-
-    if (nrow(d) < 100) {
-
-        stop(
-            "Too few observations in monthly economic panel: ",
-            nrow(d)
-        )
-    }
-
-
-    # -------------------------------------------------------------------------
-    # Diagnostic report
-    # -------------------------------------------------------------------------
-
-    cat("\n")
-    cat("============================================================\n")
-    cat("MONTHLY ECONOMIC PANEL VALIDATION\n")
-    cat("============================================================\n")
-
+        na.rm = TRUE
+      )
+    ),
+    " to ",
+    format(
+      max(
+        d$DATE,
+        na.rm = TRUE
+      )
+    ),
+    "\n",
+    sep = ""
+  )
+  
+  
+  if (nrow(d) > 1) {
+    
     cat(
-        "Observations: ",
-        nrow(d),
-        "\n",
-        sep = ""
-    )
-
-    cat(
-        "Date range: ",
-        format(min(d$DATE, na.rm = TRUE)),
-        " to ",
-        format(max(d$DATE, na.rm = TRUE)),
-        "\n",
-        sep = ""
-    )
-
-    cat(
-        "Median monthly interval: ",
-        round(
-            median(
-                diff(
-                    as.numeric(d$DATE)
-                )
-            ),
-            1
-        ),
-        " days\n",
-        sep = ""
-    )
-
-
-    cat("\nMissing values:\n")
-
-    check_vars <- c(
-
-        "term_spread",
-
-        "yield_2_10",
-
-        "credit_risk",
-
-        "unemployment_change",
-
-        "payroll_growth",
-
-        "GDP_growth",
-
-        "industrial_growth",
-
-        "inflation",
-
-        "VIX_change",
-
-        "AI_exposure",
-
-        "Y_next"
-    )
-
-
-    print(
-        colSums(
-            is.na(
-                d[
-                    ,
-                    check_vars,
-                    drop = FALSE
-                ]
+      "Median monthly interval: ",
+      round(
+        median(
+          diff(
+            as.numeric(
+              d$DATE
             )
-        )
+          )
+        ),
+        1
+      ),
+      " days\n",
+      sep = ""
     )
-
-
-    cat("\n")
-    cat("============================================================\n")
-
-
-    invisible(
-        TRUE
+  }
+  
+  
+  cat("\nMissing values:\n")
+  
+  
+  check_vars <- c(
+    
+    "GDPC1_monthly",
+    
+    "term_spread",
+    "yield_2_10",
+    "rate_spread_2y",
+    "short_spread",
+    
+    "credit_risk",
+    "credit_spread",
+    
+    "unemployment_change",
+    "payroll_growth",
+    "GDP_growth",
+    "industrial_growth",
+    "inflation",
+    "VIX_change",
+    
+    "AI_exposure",
+    
+    "Y_next",
+    "raw_reward",
+    "temporal_reward"
+  )
+  
+  
+  check_vars <- intersect(
+    check_vars,
+    names(d)
+  )
+  
+  
+  print(
+    colSums(
+      is.na(
+        d[
+          ,
+          check_vars,
+          drop = FALSE
+        ]
+      )
     )
+  )
+  
+  
+  cat("\n")
+  
+  
+  # -------------------------------------------------------------------------
+  # Key causal-data diagnostics
+  # -------------------------------------------------------------------------
+  
+  cat(
+    "Horizon validation: one-period-ahead outcome\n"
+  )
+  
+  
+  cat(
+    "Y_next = lead(GDP_growth, 1)\n"
+  )
+  
+  
+  cat(
+    "raw_reward = Y_next\n"
+  )
+  
+  
+  cat(
+    "temporal_reward = raw_reward\n"
+  )
+  
+  
+  cat(
+    "AI_exposure = standardized secular time-trend proxy\n"
+  )
+  
+  
+  cat("============================================================\n")
+  
+  
+  invisible(
+    TRUE
+  )
 }
 
 
 # =============================================================================
-# 4. EXAMPLE
+# 3. EXAMPLE USAGE
 # =============================================================================
 #
-# raw_data <- load_monthly_economic_data()
+# The main program should load the raw data separately.
 #
+# Example:
+#
+# raw_data <- load_monthly_economic_data(
+#     DATA_FILE
+# )
 #
 # model_data <- prepare_monthly_economic_data(
-#
 #     d = raw_data,
-#
-#     horizon = 1,
-#
+#     horizon = HORIZON,
 #     gdp_method = "locf"
 # )
 #
-#
-# validate_monthly_economic_data(
-#     model_data
-# )
-#
-#
-# write.csv(
-#     model_data,
-#     "prepared_monthly_economic_data.csv",
-#     row.names = FALSE
-# )
-#
 # =============================================================================
-
 # =============================================================================
 # 05_ai_exposure_data.R
 # =============================================================================
@@ -15168,407 +15419,143 @@ cat("============================================================\n")
 # =============================================================================
 
 load_monthly_economic_data <- function(DATA_FILE) {
-
-    if (!file.exists(DATA_FILE)) {
-        stop(
-            paste0(
-                "DATA_FILE does not exist:\n",
-                DATA_FILE
-            )
-        )
-    }
-
-    ext <- tolower(
-        tools::file_ext(DATA_FILE)
+  
+  if (!file.exists(DATA_FILE)) {
+    stop(
+      paste0(
+        "DATA_FILE does not exist:\n",
+        DATA_FILE
+      )
     )
-
-    # -------------------------------------------------------------------------
-    # CSV
-    # -------------------------------------------------------------------------
-
-    if (ext == "csv") {
-
-        dat <- read.csv(
-            DATA_FILE,
-            stringsAsFactors = FALSE,
-            check.names = FALSE
-        )
-
-        object_name <- basename(DATA_FILE)
-
-    # -------------------------------------------------------------------------
-    # RDS
-    # -------------------------------------------------------------------------
-
-    } else if (ext == "rds") {
-
-        dat <- readRDS(DATA_FILE)
-
-        object_name <- basename(DATA_FILE)
-
-    # -------------------------------------------------------------------------
-    # RData / RDA
-    # -------------------------------------------------------------------------
-
-    } else if (ext %in% c("rdata", "rda")) {
-
-        tmp_env <- new.env()
-
-        loaded_objects <- load(
-            DATA_FILE,
-            envir = tmp_env
-        )
-
-        if (length(loaded_objects) == 0) {
-            stop(
-                "No objects were found in the RData file."
-            )
-        }
-
-        candidates <- loaded_objects[
-            sapply(
-                loaded_objects,
-                function(x)
-                    is.data.frame(
-                        tmp_env[[x]]
-                    )
-            )
-        ]
-
-        if (length(candidates) == 0) {
-            stop(
-                "No data.frame object was found in the RData file."
-            )
-        }
-
-        sizes <- sapply(
-            candidates,
-            function(x)
-                nrow(tmp_env[[x]]) *
-                ncol(tmp_env[[x]])
-        )
-
-        object_name <- candidates[
-            which.max(sizes)
-        ]
-
-        dat <- tmp_env[[object_name]]
-
-    # -------------------------------------------------------------------------
-    # Excel
-    # -------------------------------------------------------------------------
-
-    } else if (ext %in% c("xlsx", "xls")) {
-
-        if (!requireNamespace(
-            "readxl",
-            quietly = TRUE
-        )) {
-            stop(
-                "Package 'readxl' is required for Excel files."
-            )
-        }
-
-        dat <- readxl::read_excel(
-            DATA_FILE
-        )
-
-        dat <- as.data.frame(dat)
-
-        object_name <- basename(DATA_FILE)
-
-    } else {
-
-        stop(
-            paste0(
-                "Unsupported file type: .",
-                ext
-            )
-        )
-    }
-
-    # -------------------------------------------------------------------------
-    # Validation
-    # -------------------------------------------------------------------------
-
-    if (!is.data.frame(dat)) {
-        dat <- as.data.frame(dat)
-    }
-
-    if (nrow(dat) == 0) {
-        stop(
-            "The loaded economic dataset contains zero rows."
-        )
-    }
-
-    if (ncol(dat) == 0) {
-        stop(
-            "The loaded economic dataset contains zero columns."
-        )
-    }
-
-    list(
-        data = dat,
-        object_name = object_name
+  }
+  
+  ext <- tolower(
+    tools::file_ext(DATA_FILE)
+  )
+  
+  if (ext == "csv") {
+    
+    dat <- read.csv(
+      DATA_FILE,
+      stringsAsFactors = FALSE,
+      check.names = FALSE
     )
+    
+    object_name <- basename(DATA_FILE)
+    
+  } else if (ext == "rds") {
+    
+    dat <- readRDS(DATA_FILE)
+    
+    object_name <- basename(DATA_FILE)
+    
+  } else if (ext %in% c("rdata", "rda")) {
+    
+    tmp_env <- new.env()
+    
+    loaded_objects <- load(
+      DATA_FILE,
+      envir = tmp_env
+    )
+    
+    if (length(loaded_objects) == 0) {
+      stop("No objects were found in the RData file.")
+    }
+    
+    candidates <- loaded_objects[
+      sapply(
+        loaded_objects,
+        function(x)
+          is.data.frame(tmp_env[[x]])
+      )
+    ]
+    
+    if (length(candidates) == 0) {
+      stop("No data.frame object was found in the RData file.")
+    }
+    
+    sizes <- sapply(
+      candidates,
+      function(x)
+        nrow(tmp_env[[x]]) *
+        ncol(tmp_env[[x]])
+    )
+    
+    object_name <- candidates[
+      which.max(sizes)
+    ]
+    
+    dat <- tmp_env[[object_name]]
+    
+  } else if (ext %in% c("xlsx", "xls")) {
+    
+    if (!requireNamespace("readxl", quietly = TRUE)) {
+      stop(
+        "Package 'readxl' is required for Excel files."
+      )
+    }
+    
+    dat <- readxl::read_excel(DATA_FILE)
+    
+    dat <- as.data.frame(dat)
+    
+    object_name <- basename(DATA_FILE)
+    
+  } else {
+    
+    stop(
+      paste0(
+        "Unsupported file type: .",
+        ext
+      )
+    )
+  }
+  
+  if (!is.data.frame(dat)) {
+    dat <- as.data.frame(dat)
+  }
+  
+  if (nrow(dat) == 0) {
+    stop(
+      "The loaded economic dataset contains zero rows."
+    )
+  }
+  
+  if (ncol(dat) == 0) {
+    stop(
+      "The loaded economic dataset contains zero columns."
+    )
+  }
+  
+  list(
+    data = dat,
+    object_name = object_name
+  )
 }
-
 
 # =============================================================================
 # 1. LOAD DATA
 # =============================================================================
 
 loaded_data <- load_monthly_economic_data(
-    DATA_FILE
+  DATA_FILE
 )
 
 raw_data <- loaded_data$data
 
 DATA_OBJECT <- loaded_data$object_name
 
-
-cat("\n============================================================\n")
-cat("LOADED ECONOMIC DATA\n")
-cat("============================================================\n")
-
-cat(
-    "Selected economic data object:",
-    DATA_OBJECT,
-    "\n"
-)
-
-cat(
-    "Rows:",
-    nrow(raw_data),
-    "\n"
-)
-
-cat(
-    "Columns:",
-    ncol(raw_data),
-    "\n"
-)
-
-cat("\nVariables:\n")
-
-print(
-    names(raw_data)
-)
-
-
 # =============================================================================
-# FUNCTION: PREPARE MONTHLY ECONOMIC DATA
-# =============================================================================
-
-prepare_monthly_economic_data <- function(dat) {
-
-    # -------------------------------------------------------------------------
-    # 1. Basic validation
-    # -------------------------------------------------------------------------
-
-    if (!is.data.frame(dat)) {
-        stop(
-            "Input must be a data.frame."
-        )
-    }
-
-    if (!"month" %in% names(dat)) {
-        stop(
-            "The economic dataset must contain a 'month' variable."
-        )
-    }
-
-    # -------------------------------------------------------------------------
-    # 2. Convert month to Date
-    # -------------------------------------------------------------------------
-
-    if (inherits(dat$month, "Date")) {
-
-        dat$month <- as.Date(
-            dat$month
-        )
-
-    } else if (
-        inherits(
-            dat$month,
-            c("POSIXct", "POSIXlt")
-        )
-    ) {
-
-        dat$month <- as.Date(
-            dat$month
-        )
-
-    } else {
-
-        month_character <- as.character(
-            dat$month
-        )
-
-        # Try YYYY-MM
-        parsed_month <- suppressWarnings(
-            as.Date(
-                paste0(
-                    month_character,
-                    "-01"
-                )
-            )
-        )
-
-        failed <- is.na(
-            parsed_month
-        )
-
-        # Try ordinary Date
-        if (any(failed)) {
-
-            parsed_month[failed] <-
-                suppressWarnings(
-                    as.Date(
-                        month_character[failed]
-                    )
-                )
-        }
-
-        dat$month <- parsed_month
-    }
-
-    # -------------------------------------------------------------------------
-    # 3. Validate dates
-    # -------------------------------------------------------------------------
-
-    if (all(is.na(dat$month))) {
-
-        stop(
-            "Unable to convert 'month' to a valid Date."
-        )
-    }
-
-    dat <- dat[
-        !is.na(dat$month),
-        ,
-        drop = FALSE
-    ]
-
-    # -------------------------------------------------------------------------
-    # 4. Sort chronologically
-    # -------------------------------------------------------------------------
-
-    dat <- dat[
-        order(dat$month),
-        ,
-        drop = FALSE
-    ]
-
-    # -------------------------------------------------------------------------
-    # 5. Remove duplicate months
-    # -------------------------------------------------------------------------
-
-    duplicated_months <- duplicated(
-        dat$month
-    )
-
-    if (any(duplicated_months)) {
-
-        warning(
-            sum(duplicated_months),
-            " duplicate month(s) detected. ",
-            "Keeping the first observation for each month."
-        )
-
-        dat <- dat[
-            !duplicated_months,
-            ,
-            drop = FALSE
-        ]
-    }
-
-    # -------------------------------------------------------------------------
-    # 6. Convert economic variables to numeric
-    # -------------------------------------------------------------------------
-
-    economic_variables <- setdiff(
-        names(dat),
-        "month"
-    )
-
-    for (v in economic_variables) {
-
-        if (!is.numeric(dat[[v]])) {
-
-            dat[[v]] <- suppressWarnings(
-                as.numeric(
-                    as.character(
-                        dat[[v]]
-                    )
-                )
-            )
-        }
-    }
-
-    # -------------------------------------------------------------------------
-    # 7. Replace infinite values with NA
-    # -------------------------------------------------------------------------
-
-    for (v in economic_variables) {
-
-        if (is.numeric(dat[[v]])) {
-
-            dat[[v]][
-                !is.finite(
-                    dat[[v]]
-                )
-            ] <- NA_real_
-        }
-    }
-
-    # -------------------------------------------------------------------------
-    # 8. Create standardized DATE variable
-    # -------------------------------------------------------------------------
-
-    dat$DATE <- dat$month
-
-    # -------------------------------------------------------------------------
-    # 9. Missing-value report
-    # -------------------------------------------------------------------------
-
-    missing_counts <- sapply(
-        dat[economic_variables],
-        function(x)
-            sum(is.na(x))
-    )
-
-    cat(
-        "\nMissing values by variable:\n"
-    )
-
-    print(
-        missing_counts
-    )
-
-    # -------------------------------------------------------------------------
-    # 10. Final validation
-    # -------------------------------------------------------------------------
-
-    if (nrow(dat) == 0) {
-
-        stop(
-            "No observations remain after data preparation."
-        )
-    }
-
-    return(dat)
-}
-
-
-# =============================================================================
-# 2. PREPARE DATA
+# 2. PREPARE MONTHLY ECONOMIC DATA
 # =============================================================================
 
 economic_data <- prepare_monthly_economic_data(
-    raw_data
+  d = raw_data,
+  horizon = HORIZON,
+  gdp_method = "locf"
 )
 
+model_data <- economic_data
 
 # =============================================================================
 # 3. PREPARED DATA CHECK

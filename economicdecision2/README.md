@@ -17,8 +17,6 @@ This project implements a **one-step contextual-bandit framework** for economic 
 - **PER:** sampling strategy only
 - **PER sensitivity:** \(\alpha\in\{0,0.25,0.50,0.75,1.00\}\)
 - **\(\alpha=0\):** exact uniform sampling
-- **No:** discount factor, target network, next-state value, or multi-step transitions
-- **AI exposure:** removed
 
 ### State Variables
 

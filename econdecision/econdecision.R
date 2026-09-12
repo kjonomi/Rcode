@@ -2581,13 +2581,13 @@ print_tcl_model_summary <- function(
 #
 # Purpose:
 #
-#   Prepare the monthly economic panel used for:
+#   Load and prepare the monthly economic panel used for:
 #
 #     1. Temporal causal inference
 #     2. DR-CATE estimation
 #     3. Transformer-CNN-BiLSTM representation learning
 #     4. Dynamic policy learning
-#     5. Contextual-bandit / Prioritized Experience Replay analysis
+#     5. DQN / Prioritized Experience Replay
 #
 # Temporal causal structure:
 #
@@ -2599,16 +2599,6 @@ print_tcl_model_summary <- function(
 #       A_t     = policy/treatment
 #       Y_{t+1} = next-period economic outcome
 #
-# IMPORTANT:
-#
-#   This file defines ONLY the canonical monthly economic-data preparation
-#   and validation functions.
-#
-#   The main program is responsible for loading raw data through its
-#   load_monthly_economic_data() function.
-#
-#   Do NOT redefine load_monthly_economic_data() here.
-#
 # =============================================================================
 
 
@@ -2616,1149 +2606,908 @@ print_tcl_model_summary <- function(
 # 0. DEFAULT SETTINGS
 # =============================================================================
 
+if (!exists("DATA_FILE")) {
+    DATA_FILE <- "monthly_economic_data.RData"
+}
+
+if (!exists("DATA_OBJECT")) {
+    DATA_OBJECT <- "monthly_data"
+}
+
 if (!exists("HORIZON")) {
-  HORIZON <- 1L
+    HORIZON <- 1L
 }
 
 
 # =============================================================================
-# 1. PREPARE MONTHLY ECONOMIC DATA
+# 1. LOAD MONTHLY ECONOMIC DATA
+# =============================================================================
+
+load_monthly_economic_data <- function(
+    path = DATA_FILE,
+    data_object = DATA_OBJECT
+) {
+
+    # -------------------------------------------------------------------------
+    # File check
+    # -------------------------------------------------------------------------
+
+    if (!file.exists(path)) {
+
+        stop(
+            "\nData file not found:\n",
+            normalizePath(
+                path,
+                mustWork = FALSE
+            )
+        )
+    }
+
+
+    # -------------------------------------------------------------------------
+    # Load into isolated environment
+    # -------------------------------------------------------------------------
+
+    e <- new.env(
+        parent = emptyenv()
+    )
+
+
+    load(
+        path,
+        envir = e
+    )
+
+
+    # -------------------------------------------------------------------------
+    # Check expected object
+    # -------------------------------------------------------------------------
+
+    if (!exists(
+        data_object,
+        envir = e,
+        inherits = FALSE
+    )) {
+
+        objects <- ls(
+            e,
+            all.names = TRUE
+        )
+
+        stop(
+            "\nExpected object '",
+            data_object,
+            "' was not found.\n\n",
+            "Objects in RData:\n",
+            paste(
+                objects,
+                collapse = ", "
+            )
+        )
+    }
+
+
+    # -------------------------------------------------------------------------
+    # Extract object
+    # -------------------------------------------------------------------------
+
+    d <- get(
+        data_object,
+        envir = e
+    )
+
+
+    # -------------------------------------------------------------------------
+    # Validate data type
+    # -------------------------------------------------------------------------
+
+    if (!is.data.frame(d)) {
+
+        stop(
+            "'",
+            data_object,
+            "' is not a data.frame/tibble."
+        )
+    }
+
+
+    return(d)
+}
+
+
+# =============================================================================
+# 2. PREPARE MONTHLY ECONOMIC DATA
 # =============================================================================
 
 prepare_monthly_economic_data <- function(
     d,
     horizon = HORIZON,
     gdp_method = c(
-      "locf",
-      "interpolate"
+        "locf",
+        "interpolate"
     )
 ) {
-  
-  # =========================================================================
-  # 1.1 HORIZON / METHOD VALIDATION
-  # =========================================================================
-  
-  gdp_method <- match.arg(
-    gdp_method
-  )
-  
-  
-  if (
-    length(horizon) != 1 ||
-    !is.numeric(horizon) ||
-    !is.finite(horizon) ||
-    horizon < 1 ||
-    horizon != as.integer(horizon)
-  ) {
-    
-    stop(
-      "`horizon` must be a positive integer."
+
+    gdp_method <- match.arg(
+        gdp_method
     )
-  }
-  
-  
-  horizon <- as.integer(
-    horizon
-  )
-  
-  
-  # =========================================================================
-  # 1.2 BASIC DATA VALIDATION
-  # =========================================================================
-  
-  if (!is.data.frame(d)) {
-    
-    stop(
-      "Input `d` must be a data.frame."
+
+
+    # =========================================================================
+    # 2.1 REQUIRED VARIABLES
+    # =========================================================================
+
+    required <- c(
+
+        "month",
+
+        "DGS10",
+        "DTB3",
+        "DGS2",
+        "BAA10Y",
+
+        "UNRATE",
+        "PAYEMS",
+
+        "GDPC1",
+        "INDPRO",
+        "CPIAUCSL",
+
+        "VIXCLS"
     )
-  }
-  
-  
-  required <- c(
-    
-    "month",
-    
-    "DGS10",
-    "DTB3",
-    "DGS2",
-    "BAA10Y",
-    
-    "UNRATE",
-    "PAYEMS",
-    
-    "GDPC1",
-    "INDPRO",
-    "CPIAUCSL",
-    
-    "VIXCLS"
-  )
-  
-  
-  missing <- setdiff(
-    required,
-    names(d)
-  )
-  
-  
-  if (length(missing) > 0) {
-    
-    stop(
-      "Missing required economic variables: ",
-      paste(
-        missing,
-        collapse = ", "
-      )
+
+
+    missing <- setdiff(
+        required,
+        names(d)
     )
-  }
-  
-  
-  # =========================================================================
-  # 1.3 DATE STANDARDIZATION
-  # =========================================================================
-  
-  if (inherits(d$month, "Date")) {
-    
-    d$month <- as.Date(
-      d$month
-    )
-    
-  } else if (
-    inherits(
-      d$month,
-      c("POSIXct", "POSIXlt")
-    )
-  ) {
-    
-    d$month <- as.Date(
-      d$month
-    )
-    
-  } else {
-    
-    month_character <- as.character(
-      d$month
-    )
-    
-    
-    # ---------------------------------------------------------------------
-    # First try YYYY-MM
-    # ---------------------------------------------------------------------
-    
-    parsed_month <- suppressWarnings(
-      as.Date(
-        paste0(
-          month_character,
-          "-01"
-        )
-      )
-    )
-    
-    
-    # ---------------------------------------------------------------------
-    # Then try ordinary Date representation
-    # ---------------------------------------------------------------------
-    
-    failed <- is.na(
-      parsed_month
-    )
-    
-    
-    if (any(failed)) {
-      
-      parsed_month[failed] <-
-        suppressWarnings(
-          as.Date(
-            month_character[failed]
-          )
-        )
-    }
-    
-    
-    d$month <- parsed_month
-  }
-  
-  
-  if (all(is.na(d$month))) {
-    
-    stop(
-      "Unable to convert `month` to valid Date values."
-    )
-  }
-  
-  
-  # -------------------------------------------------------------------------
-  # Remove rows with invalid dates
-  # -------------------------------------------------------------------------
-  
-  d <- d[
-    !is.na(d$month),
-    ,
-    drop = FALSE
-  ]
-  
-  
-  # -------------------------------------------------------------------------
-  # Sort chronologically
-  # -------------------------------------------------------------------------
-  
-  d <- d[
-    order(d$month),
-    ,
-    drop = FALSE
-  ]
-  
-  
-  # =========================================================================
-  # 1.4 DUPLICATE MONTH CHECK
-  # =========================================================================
-  
-  duplicated_months <- duplicated(
-    d$month
-  )
-  
-  
-  if (any(duplicated_months)) {
-    
-    dup_values <- unique(
-      d$month[duplicated_months]
-    )
-    
-    
-    stop(
-      "Duplicate monthly observations detected: ",
-      paste(
-        format(dup_values),
-        collapse = ", "
-      )
-    )
-  }
-  
-  
-  # =========================================================================
-  # 1.5 NUMERIC CONVERSION
-  # =========================================================================
-  
-  numeric_variables <- setdiff(
-    required,
-    "month"
-  )
-  
-  
-  for (v in numeric_variables) {
-    
-    d[[v]] <- suppressWarnings(
-      as.numeric(
-        as.character(
-          d[[v]]
-        )
-      )
-    )
-  }
-  
-  
-  # =========================================================================
-  # 1.6 NON-FINITE VALUES
-  # =========================================================================
-  
-  for (v in numeric_variables) {
-    
-    if (is.numeric(d[[v]])) {
-      
-      d[[v]][
-        !is.finite(
-          d[[v]]
-        )
-      ] <- NA_real_
-    }
-  }
-  
-  
-  # =========================================================================
-  # 1.7 STANDARDIZED DATE VARIABLE
-  # =========================================================================
-  
-  d$DATE <- d$month
-  
-  
-  # =========================================================================
-  # 1.8 INITIAL MISSING-VALUE REPORT
-  # =========================================================================
-  
-  missing_counts <- sapply(
-    d[numeric_variables],
-    function(x)
-      sum(is.na(x))
-  )
-  
-  
-  cat("\n")
-  cat("============================================================\n")
-  cat("RAW MONTHLY ECONOMIC DATA\n")
-  cat("============================================================\n")
-  cat("Observations:", nrow(d), "\n")
-  cat(
-    "Date range:",
-    format(min(d$DATE, na.rm = TRUE)),
-    "to",
-    format(max(d$DATE, na.rm = TRUE)),
-    "\n"
-  )
-  
-  
-  cat("\nMissing values by variable:\n")
-  
-  print(
-    missing_counts
-  )
-  
-  
-  # =========================================================================
-  # 1.9 GDP MONTHLY CONVERSION
-  # =========================================================================
-  #
-  # GDPC1 is a quarterly real GDP series.
-  #
-  # The monthly causal panel therefore uses GDPC1_monthly.
-  #
-  # Default:
-  #
-  #     LOCF
-  #
-  # Each observed quarterly GDP value is carried forward until the next
-  # quarterly observation.
-  #
-  # This is a measurement-frequency transformation and does not represent
-  # additional economic information.
-  #
-  # Do NOT calculate monthly GDP growth directly from raw GDPC1.
-  #
-  # =========================================================================
-  
-  if (gdp_method == "locf") {
-    
-    if (!requireNamespace(
-      "zoo",
-      quietly = TRUE
-    )) {
-      
-      stop(
-        "Package `zoo` is required for GDP LOCF conversion."
-      )
-    }
-    
-    
-    d$GDPC1_monthly <- zoo::na.locf(
-      d$GDPC1,
-      na.rm = FALSE
-    )
-    
-  } else {
-    
-    if (!requireNamespace(
-      "zoo",
-      quietly = TRUE
-    )) {
-      
-      stop(
-        "Package `zoo` is required for GDP interpolation."
-      )
-    }
-    
-    
-    d$GDPC1_monthly <- zoo::na.approx(
-      d$GDPC1,
-      x = d$DATE,
-      na.rm = FALSE
-    )
-  }
-  
-  
-  # =========================================================================
-  # 1.10 BACKFILL EARLY MISSING GDP
-  # =========================================================================
-  
-  first_valid_gdp <- which(
-    is.finite(
-      d$GDPC1_monthly
-    )
-  )[1]
-  
-  
-  if (
-    !is.na(first_valid_gdp) &&
-    first_valid_gdp > 1
-  ) {
-    
-    d$GDPC1_monthly[
-      seq_len(first_valid_gdp - 1)
-    ] <-
-      d$GDPC1_monthly[
-        first_valid_gdp
-      ]
-  }
-  
-  
-  # =========================================================================
-  # 1.11 ECONOMIC STATE VARIABLES
-  # =========================================================================
-  
-  d <- dplyr::mutate(
-    d,
-    
-    # ---------------------------------------------------------------------
-    # Yield-curve variables
-    # ---------------------------------------------------------------------
-    
-    term_spread =
-      DGS10 - DTB3,
-    
-    yield_2_10 =
-      DGS10 - DGS2,
-    
-    rate_spread_2y =
-      DGS10 - DGS2,
-    
-    short_spread =
-      DGS2 - DTB3,
-    
-    
-    # ---------------------------------------------------------------------
-    # Credit risk
-    # ---------------------------------------------------------------------
-    
-    credit_risk =
-      BAA10Y - DGS10,
-    
-    credit_spread =
-      BAA10Y - DGS10,
-    
-    
-    # ---------------------------------------------------------------------
-    # Labor-market dynamics
-    # ---------------------------------------------------------------------
-    
-    unemployment_change =
-      UNRATE -
-      dplyr::lag(
-        UNRATE
-      ),
-    
-    payroll_growth =
-      100 *
-      (
-        log(PAYEMS) -
-          log(
-            dplyr::lag(
-              PAYEMS
+
+
+    if (length(missing) > 0) {
+
+        stop(
+            "Missing variables: ",
+            paste(
+                missing,
+                collapse = ", "
             )
-          )
-      ),
-    
-    
-    # ---------------------------------------------------------------------
-    # GDP growth
-    # ---------------------------------------------------------------------
-    
-    GDP_growth =
-      100 *
-      (
-        log(GDPC1_monthly) -
-          log(
-            dplyr::lag(
-              GDPC1_monthly
-            )
-          )
-      ),
-    
-    
-    # ---------------------------------------------------------------------
-    # Industrial production
-    # ---------------------------------------------------------------------
-    
-    industrial_growth =
-      100 *
-      (
-        log(INDPRO) -
-          log(
-            dplyr::lag(
-              INDPRO
-            )
-          )
-      ),
-    
-    
-    # ---------------------------------------------------------------------
-    # Inflation
-    # ---------------------------------------------------------------------
-    
-    inflation =
-      100 *
-      (
-        log(CPIAUCSL) -
-          log(
-            dplyr::lag(
-              CPIAUCSL
-            )
-          )
-      ),
-    
-    
-    # ---------------------------------------------------------------------
-    # Financial volatility
-    # ---------------------------------------------------------------------
-    
-    VIX_change =
-      VIXCLS -
-      dplyr::lag(
-        VIXCLS
-      ),
-    
-    
-    # ---------------------------------------------------------------------
-    # Deterministic time index
-    # ---------------------------------------------------------------------
-    
-    time_index =
-      seq_len(
-        dplyr::n()
-      )
-  )
-  
-  
-  # =========================================================================
-  # 1.12 AI EXPOSURE
-  # =========================================================================
-  #
-  # The local FRED dataset does not contain a direct AI-adoption measure.
-  #
-  # Therefore this variable is explicitly a secular time-trend proxy.
-  #
-  # It must NOT be interpreted as observed AI exposure.
-  #
-  # If an external AI exposure measure is subsequently supplied, it should
-  # replace this proxy through the dedicated AI-exposure integration step.
-  #
-  # =========================================================================
-  
-  d <- dplyr::mutate(
-    d,
-    
-    AI_exposure =
-      as.numeric(
-        scale(
-          log1p(time_index)
         )
-      )
-  )
-  
-  
-  # =========================================================================
-  # 1.13 LEADING DIFFERENCE VALUES
-  # =========================================================================
-  #
-  # The first observation naturally has no lagged value.
-  #
-  # Only leading missing values are replaced with zero.
-  #
-  # This does not alter interior missing values caused by missing source
-  # observations.
-  #
-  # =========================================================================
-  
-  initial_change_vars <- c(
-    
-    "unemployment_change",
-    "payroll_growth",
-    "GDP_growth",
-    "industrial_growth",
-    "inflation",
-    "VIX_change"
-  )
-  
-  
-  for (v in initial_change_vars) {
-    
-    first_finite <- which(
-      is.finite(
-        d[[v]]
-      )
-    )[1]
-    
-    
-    if (
-      !is.na(first_finite) &&
-      first_finite > 1
-    ) {
-      
-      d[[v]][
-        seq_len(first_finite - 1)
-      ] <- 0
     }
-  }
-  
-  
-  # =========================================================================
-  # 1.14 NEXT-PERIOD CAUSAL OUTCOME
-  # =========================================================================
-  #
-  # Temporal causal structure:
-  #
-  #       X_t -> A_t -> Y_{t+h}
-  #
-  # where:
-  #
-  #       Y_{t+h} = GDP growth at t+h.
-  #
-  # For the default horizon h = 1:
-  #
-  #       Y_next,t = GDP_growth,t+1
-  #
-  # =========================================================================
-  
-  d <- dplyr::mutate(
-    d,
-    
-    Y_next =
-      dplyr::lead(
-        GDP_growth,
+
+
+    # =========================================================================
+    # 2.2 HORIZON VALIDATION
+    # =========================================================================
+
+    if (length(horizon) != 1 ||
+        !is.numeric(horizon) ||
+        !is.finite(horizon) ||
+        horizon < 1 ||
+        horizon != as.integer(horizon)) {
+
+        stop(
+            "`horizon` must be a positive integer."
+        )
+    }
+
+
+    horizon <- as.integer(
         horizon
-      ),
-    
-    raw_reward =
-      Y_next
-  )
-  
-  
-  # =========================================================================
-  # 1.15 TEMPORAL REWARD
-  # =========================================================================
-  #
-  # The raw economic outcome remains the canonical reward at this stage.
-  #
-  # Treatment costs and policy-specific reward transformations are applied
-  # later by the causal decision / contextual-bandit module.
-  #
-  # =========================================================================
-  
-  d <- dplyr::mutate(
-    d,
-    
-    temporal_reward =
-      raw_reward
-  )
-  
-  
-  # =========================================================================
-  # 1.16 CLEAN DERIVED NUMERIC VALUES
-  # =========================================================================
-  
-  numeric_columns <- names(d)[
-    vapply(
-      d,
-      is.numeric,
-      logical(1)
     )
-  ]
-  
-  
-  for (v in numeric_columns) {
-    
-    d[[v]][
-      !is.finite(
-        d[[v]]
-      )
-    ] <- NA_real_
-  }
-  
-  
-  # =========================================================================
-  # 1.17 VARIABLE ORDER
-  # =========================================================================
-  
-  preferred_order <- c(
-    
-    "DATE",
-    "month",
-    
-    "DGS10",
-    "DTB3",
-    "DGS2",
-    "BAA10Y",
-    
-    "UNRATE",
-    "PAYEMS",
-    
-    "GDPC1",
-    "GDPC1_monthly",
-    
-    "INDPRO",
-    "CPIAUCSL",
-    "VIXCLS",
-    
-    "term_spread",
-    "yield_2_10",
-    "rate_spread_2y",
-    "short_spread",
-    
-    "credit_risk",
-    "credit_spread",
-    
-    "unemployment_change",
-    "payroll_growth",
-    "GDP_growth",
-    "industrial_growth",
-    "inflation",
-    "VIX_change",
-    
-    "time_index",
-    "AI_exposure",
-    
-    "Y_next",
-    "raw_reward",
-    "temporal_reward"
-  )
-  
-  
-  preferred_order <- intersect(
-    preferred_order,
-    names(d)
-  )
-  
-  
-  remaining <- setdiff(
-    names(d),
-    preferred_order
-  )
-  
-  
-  d <- d[
-    ,
-    c(
-      preferred_order,
-      remaining
-    ),
-    drop = FALSE
-  ]
-  
-  
-  # =========================================================================
-  # 1.18 FINAL VALIDATION
-  # =========================================================================
-  
-  validate_monthly_economic_data(
-    d
-  )
-  
-  
-  return(d)
+
+
+    # =========================================================================
+    # 2.3 DATE STANDARDIZATION
+    # =========================================================================
+
+    d <- d |>
+
+        dplyr::mutate(
+
+            DATE = as.Date(month)
+
+        ) |>
+
+        dplyr::arrange(
+            DATE
+        )
+
+
+    # -------------------------------------------------------------------------
+    # Check duplicate months
+    # -------------------------------------------------------------------------
+
+    duplicate_dates <- duplicated(
+        d$DATE
+    )
+
+
+    if (any(duplicate_dates)) {
+
+        dup_values <- unique(
+            d$DATE[duplicate_dates]
+        )
+
+        stop(
+            "Duplicate monthly observations detected: ",
+            paste(
+                dup_values,
+                collapse = ", "
+            )
+        )
+    }
+
+
+    # =========================================================================
+    # 2.4 NUMERIC CONVERSION
+    # =========================================================================
+
+    numeric_vars <- setdiff(
+        required,
+        "month"
+    )
+
+
+    for (v in numeric_vars) {
+
+        d[[v]] <- as.numeric(
+            d[[v]]
+        )
+    }
+
+
+    # =========================================================================
+    # 2.5 GDP MONTHLY CONVERSION
+    # =========================================================================
+    #
+    # GDPC1 is a quarterly real GDP series.
+    #
+    # The original monthly panel must therefore NOT use complete cases on
+    # GDPC1 directly, otherwise the panel collapses toward quarterly frequency.
+    #
+    # We construct a monthly GDP level from the observed quarterly values.
+    #
+    # Default:
+    #
+    #       LOCF
+    #
+    # This keeps each quarterly GDP value until the next quarterly observation.
+    #
+    # IMPORTANT:
+    #
+    # This is a measurement-frequency transformation, not creation of new
+    # economic information.
+    #
+    # =========================================================================
+
+    if (gdp_method == "locf") {
+
+        d$GDPC1_monthly <- zoo::na.locf(
+            d$GDPC1,
+            na.rm = FALSE
+        )
+
+    } else if (gdp_method == "interpolate") {
+
+        d$GDPC1_monthly <- zoo::na.approx(
+            d$GDPC1,
+            x = d$DATE,
+            na.rm = FALSE
+        )
+
+    }
+
+
+    # =========================================================================
+    # 2.6 BACKFILL EARLY MISSING GDP
+    # =========================================================================
+
+    first_valid_gdp <- which(
+        is.finite(
+            d$GDPC1_monthly
+        )
+    )[1]
+
+
+    if (!is.na(first_valid_gdp) &&
+        first_valid_gdp > 1) {
+
+        d$GDPC1_monthly[
+            seq_len(first_valid_gdp - 1)
+        ] <- d$GDPC1_monthly[
+            first_valid_gdp
+        ]
+    }
+
+
+    # =========================================================================
+    # 2.7 ECONOMIC STATE VARIABLES
+    # =========================================================================
+    #
+    # These are the variables used by the temporal causal model.
+    #
+    # =========================================================================
+
+    d <- d |>
+
+        dplyr::mutate(
+
+            # -----------------------------------------------------------------
+            # Yield-curve variables
+            # -----------------------------------------------------------------
+
+            term_spread =
+                DGS10 - DTB3,
+
+            yield_2_10 =
+                DGS10 - DGS2,
+
+            rate_spread_2y =
+                DGS10 - DGS2,
+
+            short_spread =
+                DGS2 - DTB3,
+
+
+            # -----------------------------------------------------------------
+            # Credit risk
+            # -----------------------------------------------------------------
+
+            credit_risk =
+                BAA10Y - DGS10,
+
+            credit_spread =
+                BAA10Y - DGS10,
+
+
+            # -----------------------------------------------------------------
+            # Labor-market dynamics
+            # -----------------------------------------------------------------
+
+            unemployment_change =
+                UNRATE -
+                dplyr::lag(
+                    UNRATE
+                ),
+
+
+            payroll_growth =
+                100 *
+                (
+                    log(PAYEMS) -
+                    log(
+                        dplyr::lag(
+                            PAYEMS
+                        )
+                    )
+                ),
+
+
+            # -----------------------------------------------------------------
+            # GDP growth
+            # -----------------------------------------------------------------
+
+            GDP_growth =
+                100 *
+                (
+                    log(GDPC1_monthly) -
+                    log(
+                        dplyr::lag(
+                            GDPC1_monthly
+                        )
+                    )
+                ),
+
+
+            # -----------------------------------------------------------------
+            # Industrial production
+            # -----------------------------------------------------------------
+
+            industrial_growth =
+                100 *
+                (
+                    log(INDPRO) -
+                    log(
+                        dplyr::lag(
+                            INDPRO
+                        )
+                    )
+                ),
+
+
+            # -----------------------------------------------------------------
+            # Inflation
+            # -----------------------------------------------------------------
+
+            inflation =
+                100 *
+                (
+                    log(CPIAUCSL) -
+                    log(
+                        dplyr::lag(
+                            CPIAUCSL
+                        )
+                    )
+                ),
+
+
+            # -----------------------------------------------------------------
+            # Financial volatility
+            # -----------------------------------------------------------------
+
+            VIX_change =
+                VIXCLS -
+                dplyr::lag(
+                    VIXCLS
+                ),
+
+
+            # -----------------------------------------------------------------
+            # Time index
+            # -----------------------------------------------------------------
+
+            time_index =
+                seq_len(
+                    dplyr::n()
+                )
+        )
+
+
+    # =========================================================================
+    # 2.8 AI EXPOSURE PROXY
+    # =========================================================================
+    #
+    # The supplied FRED dataset does not contain a direct AI-adoption variable.
+    #
+    # Therefore this variable should NOT be interpreted as measured AI
+    # exposure.
+    #
+    # We construct a deterministic time trend only for compatibility with
+    # models that require a slowly evolving structural factor.
+    #
+    # The variable is standardized to avoid an unnecessarily large scale.
+    #
+    # For publication-quality AI policy analysis, replace this variable with
+    # an actual AI exposure measure.
+    #
+    # =========================================================================
+
+    d <- d |>
+
+        dplyr::mutate(
+
+            AI_exposure =
+                as.numeric(
+                    scale(
+                        log1p(time_index)
+                    )
+                )
+        )
+
+
+    # =========================================================================
+    # 2.9 FIRST-OBSERVATION DIFFERENCE HANDLING
+    # =========================================================================
+    #
+    # Growth/change variables naturally produce one missing observation.
+    #
+    # We set only these initial changes to zero so that the temporal state
+    # representation can begin at the first usable observation.
+    #
+    # =========================================================================
+
+    initial_change_vars <- c(
+
+        "unemployment_change",
+
+        "payroll_growth",
+
+        "GDP_growth",
+
+        "industrial_growth",
+
+        "inflation",
+
+        "VIX_change"
+    )
+
+
+    for (v in initial_change_vars) {
+
+        if (length(d[[v]]) > 0) {
+
+            first_finite <- which(
+                is.finite(
+                    d[[v]]
+                )
+            )[1]
+
+            if (!is.na(first_finite) &&
+                first_finite > 1) {
+
+                # Only fill leading missing values.
+                d[[v]][
+                    seq_len(first_finite - 1)
+                ] <- 0
+            }
+        }
+    }
+
+
+    # =========================================================================
+    # 2.10 NEXT-PERIOD OUTCOME
+    # =========================================================================
+    #
+    # Main temporal causal estimand:
+    #
+    #       tau_h(X_t)
+    #
+    # where:
+    #
+    #       Y_{t+h} = GDP growth at t+h.
+    #
+    # Treatment at time t therefore predicts a future economic outcome.
+    #
+    # =========================================================================
+
+    d <- d |>
+
+        dplyr::mutate(
+
+            Y_next =
+                dplyr::lead(
+                    GDP_growth,
+                    horizon
+                ),
+
+            raw_reward =
+                Y_next
+        )
+
+
+    # =========================================================================
+    # 2.11 TEMPORAL REWARD
+    # =========================================================================
+    #
+    # The causal module estimates the effect on Y_next.
+    #
+    # The RL module can subsequently transform this outcome into a policy
+    # reward, including treatment cost if desired.
+    #
+    # Here we preserve the raw economic reward.
+    #
+    # =========================================================================
+
+    d <- d |>
+
+        dplyr::mutate(
+
+            temporal_reward =
+                raw_reward
+        )
+
+
+    # =========================================================================
+    # 2.12 CLEAN NON-FINITE VALUES
+    # =========================================================================
+
+    numeric_columns <- names(d)[
+        vapply(
+            d,
+            is.numeric,
+            logical(1)
+        )
+    ]
+
+
+    for (v in numeric_columns) {
+
+        d[[v]][
+            !is.finite(
+                d[[v]]
+            )
+        ] <- NA_real_
+    }
+
+
+    # =========================================================================
+    # 2.13 REORDER VARIABLES
+    # =========================================================================
+
+    preferred_order <- c(
+
+        "DATE",
+        "month",
+
+        "DGS10",
+        "DTB3",
+        "DGS2",
+        "BAA10Y",
+
+        "UNRATE",
+        "PAYEMS",
+
+        "GDPC1",
+        "GDPC1_monthly",
+
+        "INDPRO",
+        "CPIAUCSL",
+        "VIXCLS",
+
+        "term_spread",
+        "yield_2_10",
+        "rate_spread_2y",
+        "short_spread",
+        "credit_risk",
+        "credit_spread",
+
+        "unemployment_change",
+        "payroll_growth",
+        "GDP_growth",
+        "industrial_growth",
+        "inflation",
+        "VIX_change",
+
+        "time_index",
+        "AI_exposure",
+
+        "Y_next",
+        "raw_reward",
+        "temporal_reward"
+    )
+
+
+    preferred_order <- intersect(
+        preferred_order,
+        names(d)
+    )
+
+
+    remaining <- setdiff(
+        names(d),
+        preferred_order
+    )
+
+
+    d <- d[
+        ,
+        c(
+            preferred_order,
+            remaining
+        ),
+        drop = FALSE
+    ]
+
+
+    # =========================================================================
+    # 2.14 RETURN
+    # =========================================================================
+
+    return(d)
 }
 
 
 # =============================================================================
-# 2. VALIDATE MONTHLY ECONOMIC PANEL
+# 3. VALIDATE MONTHLY ECONOMIC PANEL
 # =============================================================================
 
 validate_monthly_economic_data <- function(
     d
 ) {
-  
-  required <- c(
-    
-    "DATE",
-    "month",
-    
-    "GDPC1_monthly",
-    
-    "term_spread",
-    "yield_2_10",
-    "rate_spread_2y",
-    "short_spread",
-    
-    "credit_risk",
-    "credit_spread",
-    
-    "unemployment_change",
-    "payroll_growth",
-    "GDP_growth",
-    "industrial_growth",
-    "inflation",
-    "VIX_change",
-    
-    "time_index",
-    "AI_exposure",
-    
-    "Y_next",
-    "raw_reward",
-    "temporal_reward"
-  )
-  
-  
-  missing <- setdiff(
-    required,
-    names(d)
-  )
-  
-  
-  if (length(missing) > 0) {
-    
-    stop(
-      "Prepared economic panel is missing: ",
-      paste(
-        missing,
-        collapse = ", "
-      )
+
+    required <- c(
+
+        "DATE",
+
+        "term_spread",
+
+        "yield_2_10",
+
+        "credit_risk",
+
+        "unemployment_change",
+
+        "payroll_growth",
+
+        "GDP_growth",
+
+        "industrial_growth",
+
+        "inflation",
+
+        "VIX_change",
+
+        "AI_exposure",
+
+        "Y_next",
+
+        "raw_reward"
     )
-  }
-  
-  
-  # -------------------------------------------------------------------------
-  # Date validation
-  # -------------------------------------------------------------------------
-  
-  if (!inherits(
-    d$DATE,
-    "Date"
-  )) {
-    
-    stop(
-      "`DATE` must be a Date variable."
+
+
+    missing <- setdiff(
+        required,
+        names(d)
     )
-  }
-  
-  
-  if (!inherits(
-    d$month,
-    "Date"
-  )) {
-    
-    stop(
-      "`month` must be a Date variable."
-    )
-  }
-  
-  
-  if (any(
-    duplicated(
-      d$DATE
-    )
-  )) {
-    
-    stop(
-      "Duplicate dates remain in the economic panel."
-    )
-  }
-  
-  
-  if (!all(
-    diff(
-      as.numeric(
-        d$DATE
-      )
-    ) >= 0
-  )) {
-    
-    stop(
-      "Economic panel is not chronologically ordered."
-    )
-  }
-  
-  
-  # -------------------------------------------------------------------------
-  # Minimum sample size
-  # -------------------------------------------------------------------------
-  
-  if (nrow(d) < 100) {
-    
-    stop(
-      "Too few observations in monthly economic panel: ",
-      nrow(d)
-    )
-  }
-  
-  
-  # -------------------------------------------------------------------------
-  # Temporal outcome consistency
-  # -------------------------------------------------------------------------
-  
-  expected_y_next <- dplyr::lead(
-    d$GDP_growth,
-    1L
-  )
-  
-  
-  # The final horizon observations are naturally NA.
-  #
-  # Compare only observations for which both quantities are finite.
-  
-  comparable <- is.finite(
-    d$Y_next
-  ) &
-    is.finite(
-      expected_y_next
-    )
-  
-  
-  if (any(comparable)) {
-    
-    max_difference <- max(
-      abs(
-        d$Y_next[comparable] -
-          expected_y_next[comparable]
-      )
-    )
-    
-    
-    if (
-      !is.finite(max_difference) ||
-      max_difference > 1e-10
-    ) {
-      
-      stop(
-        "`Y_next` is inconsistent with one-period-ahead `GDP_growth`."
-      )
-    }
-  }
-  
-  
-  # -------------------------------------------------------------------------
-  # Raw reward consistency
-  # -------------------------------------------------------------------------
-  
-  comparable_reward <- is.finite(
-    d$raw_reward
-  ) &
-    is.finite(
-      d$Y_next
-    )
-  
-  
-  if (any(comparable_reward)) {
-    
-    max_difference_reward <- max(
-      abs(
-        d$raw_reward[comparable_reward] -
-          d$Y_next[comparable_reward]
-      )
-    )
-    
-    
-    if (
-      !is.finite(max_difference_reward) ||
-      max_difference_reward > 1e-10
-    ) {
-      
-      stop(
-        "`raw_reward` must equal `Y_next`."
-      )
-    }
-  }
-  
-  
-  # -------------------------------------------------------------------------
-  # Temporal reward consistency
-  # -------------------------------------------------------------------------
-  
-  comparable_temporal_reward <- is.finite(
-    d$temporal_reward
-  ) &
-    is.finite(
-      d$raw_reward
-    )
-  
-  
-  if (any(comparable_temporal_reward)) {
-    
-    max_difference_temporal <- max(
-      abs(
-        d$temporal_reward[
-          comparable_temporal_reward
-        ] -
-          d$raw_reward[
-            comparable_temporal_reward
-          ]
-      )
-    )
-    
-    
-    if (
-      !is.finite(max_difference_temporal) ||
-      max_difference_temporal > 1e-10
-    ) {
-      
-      stop(
-        "`temporal_reward` must equal `raw_reward`."
-      )
-    }
-  }
-  
-  
-  # =========================================================================
-  # DIAGNOSTIC REPORT
-  # =========================================================================
-  
-  cat("\n")
-  cat("============================================================\n")
-  cat("MONTHLY ECONOMIC PANEL VALIDATION\n")
-  cat("============================================================\n")
-  
-  
-  cat(
-    "Observations: ",
-    nrow(d),
-    "\n",
-    sep = ""
-  )
-  
-  
-  cat(
-    "Date range: ",
-    format(
-      min(
-        d$DATE,
-        na.rm = TRUE
-      )
-    ),
-    " to ",
-    format(
-      max(
-        d$DATE,
-        na.rm = TRUE
-      )
-    ),
-    "\n",
-    sep = ""
-  )
-  
-  
-  if (nrow(d) > 1) {
-    
-    cat(
-      "Median monthly interval: ",
-      round(
-        median(
-          diff(
-            as.numeric(
-              d$DATE
+
+
+    if (length(missing) > 0) {
+
+        stop(
+            "Prepared economic panel is missing: ",
+            paste(
+                missing,
+                collapse = ", "
             )
-          )
+        )
+    }
+
+
+    if (!inherits(
+        d$DATE,
+        "Date"
+    )) {
+
+        stop(
+            "`DATE` must be a Date variable."
+        )
+    }
+
+
+    if (any(
+        duplicated(
+            d$DATE
+        )
+    )) {
+
+        stop(
+            "Duplicate dates remain in the economic panel."
+        )
+    }
+
+
+    if (!all(
+        diff(
+            as.numeric(d$DATE)
+        ) >= 0
+    )) {
+
+        stop(
+            "Economic panel is not chronologically ordered."
+        )
+    }
+
+
+    if (nrow(d) < 100) {
+
+        stop(
+            "Too few observations in monthly economic panel: ",
+            nrow(d)
+        )
+    }
+
+
+    # -------------------------------------------------------------------------
+    # Diagnostic report
+    # -------------------------------------------------------------------------
+
+    cat("\n")
+    cat("============================================================\n")
+    cat("MONTHLY ECONOMIC PANEL VALIDATION\n")
+    cat("============================================================\n")
+
+    cat(
+        "Observations: ",
+        nrow(d),
+        "\n",
+        sep = ""
+    )
+
+    cat(
+        "Date range: ",
+        format(min(d$DATE, na.rm = TRUE)),
+        " to ",
+        format(max(d$DATE, na.rm = TRUE)),
+        "\n",
+        sep = ""
+    )
+
+    cat(
+        "Median monthly interval: ",
+        round(
+            median(
+                diff(
+                    as.numeric(d$DATE)
+                )
+            ),
+            1
         ),
-        1
-      ),
-      " days\n",
-      sep = ""
+        " days\n",
+        sep = ""
     )
-  }
-  
-  
-  cat("\nMissing values:\n")
-  
-  
-  check_vars <- c(
-    
-    "GDPC1_monthly",
-    
-    "term_spread",
-    "yield_2_10",
-    "rate_spread_2y",
-    "short_spread",
-    
-    "credit_risk",
-    "credit_spread",
-    
-    "unemployment_change",
-    "payroll_growth",
-    "GDP_growth",
-    "industrial_growth",
-    "inflation",
-    "VIX_change",
-    
-    "AI_exposure",
-    
-    "Y_next",
-    "raw_reward",
-    "temporal_reward"
-  )
-  
-  
-  check_vars <- intersect(
-    check_vars,
-    names(d)
-  )
-  
-  
-  print(
-    colSums(
-      is.na(
-        d[
-          ,
-          check_vars,
-          drop = FALSE
-        ]
-      )
+
+
+    cat("\nMissing values:\n")
+
+    check_vars <- c(
+
+        "term_spread",
+
+        "yield_2_10",
+
+        "credit_risk",
+
+        "unemployment_change",
+
+        "payroll_growth",
+
+        "GDP_growth",
+
+        "industrial_growth",
+
+        "inflation",
+
+        "VIX_change",
+
+        "AI_exposure",
+
+        "Y_next"
     )
-  )
-  
-  
-  cat("\n")
-  
-  
-  # -------------------------------------------------------------------------
-  # Key causal-data diagnostics
-  # -------------------------------------------------------------------------
-  
-  cat(
-    "Horizon validation: one-period-ahead outcome\n"
-  )
-  
-  
-  cat(
-    "Y_next = lead(GDP_growth, 1)\n"
-  )
-  
-  
-  cat(
-    "raw_reward = Y_next\n"
-  )
-  
-  
-  cat(
-    "temporal_reward = raw_reward\n"
-  )
-  
-  
-  cat(
-    "AI_exposure = standardized secular time-trend proxy\n"
-  )
-  
-  
-  cat("============================================================\n")
-  
-  
-  invisible(
-    TRUE
-  )
+
+
+    print(
+        colSums(
+            is.na(
+                d[
+                    ,
+                    check_vars,
+                    drop = FALSE
+                ]
+            )
+        )
+    )
+
+
+    cat("\n")
+    cat("============================================================\n")
+
+
+    invisible(
+        TRUE
+    )
 }
 
 
 # =============================================================================
-# 3. EXAMPLE USAGE
+# 4. EXAMPLE
 # =============================================================================
 #
-# The main program should load the raw data separately.
+# raw_data <- load_monthly_economic_data()
 #
-# Example:
-#
-# raw_data <- load_monthly_economic_data(
-#     DATA_FILE
-# )
 #
 # model_data <- prepare_monthly_economic_data(
+#
 #     d = raw_data,
-#     horizon = HORIZON,
+#
+#     horizon = 1,
+#
 #     gdp_method = "locf"
 # )
 #
+#
+# validate_monthly_economic_data(
+#     model_data
+# )
+#
+#
+# write.csv(
+#     model_data,
+#     "prepared_monthly_economic_data.csv",
+#     row.names = FALSE
+# )
+#
 # =============================================================================
+
 # =============================================================================
 # 05_ai_exposure_data.R
 # =============================================================================
@@ -15419,143 +15168,407 @@ cat("============================================================\n")
 # =============================================================================
 
 load_monthly_economic_data <- function(DATA_FILE) {
-  
-  if (!file.exists(DATA_FILE)) {
-    stop(
-      paste0(
-        "DATA_FILE does not exist:\n",
-        DATA_FILE
-      )
-    )
-  }
-  
-  ext <- tolower(
-    tools::file_ext(DATA_FILE)
-  )
-  
-  if (ext == "csv") {
-    
-    dat <- read.csv(
-      DATA_FILE,
-      stringsAsFactors = FALSE,
-      check.names = FALSE
-    )
-    
-    object_name <- basename(DATA_FILE)
-    
-  } else if (ext == "rds") {
-    
-    dat <- readRDS(DATA_FILE)
-    
-    object_name <- basename(DATA_FILE)
-    
-  } else if (ext %in% c("rdata", "rda")) {
-    
-    tmp_env <- new.env()
-    
-    loaded_objects <- load(
-      DATA_FILE,
-      envir = tmp_env
-    )
-    
-    if (length(loaded_objects) == 0) {
-      stop("No objects were found in the RData file.")
+
+    if (!file.exists(DATA_FILE)) {
+        stop(
+            paste0(
+                "DATA_FILE does not exist:\n",
+                DATA_FILE
+            )
+        )
     }
-    
-    candidates <- loaded_objects[
-      sapply(
-        loaded_objects,
-        function(x)
-          is.data.frame(tmp_env[[x]])
-      )
-    ]
-    
-    if (length(candidates) == 0) {
-      stop("No data.frame object was found in the RData file.")
+
+    ext <- tolower(
+        tools::file_ext(DATA_FILE)
+    )
+
+    # -------------------------------------------------------------------------
+    # CSV
+    # -------------------------------------------------------------------------
+
+    if (ext == "csv") {
+
+        dat <- read.csv(
+            DATA_FILE,
+            stringsAsFactors = FALSE,
+            check.names = FALSE
+        )
+
+        object_name <- basename(DATA_FILE)
+
+    # -------------------------------------------------------------------------
+    # RDS
+    # -------------------------------------------------------------------------
+
+    } else if (ext == "rds") {
+
+        dat <- readRDS(DATA_FILE)
+
+        object_name <- basename(DATA_FILE)
+
+    # -------------------------------------------------------------------------
+    # RData / RDA
+    # -------------------------------------------------------------------------
+
+    } else if (ext %in% c("rdata", "rda")) {
+
+        tmp_env <- new.env()
+
+        loaded_objects <- load(
+            DATA_FILE,
+            envir = tmp_env
+        )
+
+        if (length(loaded_objects) == 0) {
+            stop(
+                "No objects were found in the RData file."
+            )
+        }
+
+        candidates <- loaded_objects[
+            sapply(
+                loaded_objects,
+                function(x)
+                    is.data.frame(
+                        tmp_env[[x]]
+                    )
+            )
+        ]
+
+        if (length(candidates) == 0) {
+            stop(
+                "No data.frame object was found in the RData file."
+            )
+        }
+
+        sizes <- sapply(
+            candidates,
+            function(x)
+                nrow(tmp_env[[x]]) *
+                ncol(tmp_env[[x]])
+        )
+
+        object_name <- candidates[
+            which.max(sizes)
+        ]
+
+        dat <- tmp_env[[object_name]]
+
+    # -------------------------------------------------------------------------
+    # Excel
+    # -------------------------------------------------------------------------
+
+    } else if (ext %in% c("xlsx", "xls")) {
+
+        if (!requireNamespace(
+            "readxl",
+            quietly = TRUE
+        )) {
+            stop(
+                "Package 'readxl' is required for Excel files."
+            )
+        }
+
+        dat <- readxl::read_excel(
+            DATA_FILE
+        )
+
+        dat <- as.data.frame(dat)
+
+        object_name <- basename(DATA_FILE)
+
+    } else {
+
+        stop(
+            paste0(
+                "Unsupported file type: .",
+                ext
+            )
+        )
     }
-    
-    sizes <- sapply(
-      candidates,
-      function(x)
-        nrow(tmp_env[[x]]) *
-        ncol(tmp_env[[x]])
-    )
-    
-    object_name <- candidates[
-      which.max(sizes)
-    ]
-    
-    dat <- tmp_env[[object_name]]
-    
-  } else if (ext %in% c("xlsx", "xls")) {
-    
-    if (!requireNamespace("readxl", quietly = TRUE)) {
-      stop(
-        "Package 'readxl' is required for Excel files."
-      )
+
+    # -------------------------------------------------------------------------
+    # Validation
+    # -------------------------------------------------------------------------
+
+    if (!is.data.frame(dat)) {
+        dat <- as.data.frame(dat)
     }
-    
-    dat <- readxl::read_excel(DATA_FILE)
-    
-    dat <- as.data.frame(dat)
-    
-    object_name <- basename(DATA_FILE)
-    
-  } else {
-    
-    stop(
-      paste0(
-        "Unsupported file type: .",
-        ext
-      )
+
+    if (nrow(dat) == 0) {
+        stop(
+            "The loaded economic dataset contains zero rows."
+        )
+    }
+
+    if (ncol(dat) == 0) {
+        stop(
+            "The loaded economic dataset contains zero columns."
+        )
+    }
+
+    list(
+        data = dat,
+        object_name = object_name
     )
-  }
-  
-  if (!is.data.frame(dat)) {
-    dat <- as.data.frame(dat)
-  }
-  
-  if (nrow(dat) == 0) {
-    stop(
-      "The loaded economic dataset contains zero rows."
-    )
-  }
-  
-  if (ncol(dat) == 0) {
-    stop(
-      "The loaded economic dataset contains zero columns."
-    )
-  }
-  
-  list(
-    data = dat,
-    object_name = object_name
-  )
 }
+
 
 # =============================================================================
 # 1. LOAD DATA
 # =============================================================================
 
 loaded_data <- load_monthly_economic_data(
-  DATA_FILE
+    DATA_FILE
 )
 
 raw_data <- loaded_data$data
 
 DATA_OBJECT <- loaded_data$object_name
 
+
+cat("\n============================================================\n")
+cat("LOADED ECONOMIC DATA\n")
+cat("============================================================\n")
+
+cat(
+    "Selected economic data object:",
+    DATA_OBJECT,
+    "\n"
+)
+
+cat(
+    "Rows:",
+    nrow(raw_data),
+    "\n"
+)
+
+cat(
+    "Columns:",
+    ncol(raw_data),
+    "\n"
+)
+
+cat("\nVariables:\n")
+
+print(
+    names(raw_data)
+)
+
+
 # =============================================================================
-# 2. PREPARE MONTHLY ECONOMIC DATA
+# FUNCTION: PREPARE MONTHLY ECONOMIC DATA
+# =============================================================================
+
+prepare_monthly_economic_data <- function(dat) {
+
+    # -------------------------------------------------------------------------
+    # 1. Basic validation
+    # -------------------------------------------------------------------------
+
+    if (!is.data.frame(dat)) {
+        stop(
+            "Input must be a data.frame."
+        )
+    }
+
+    if (!"month" %in% names(dat)) {
+        stop(
+            "The economic dataset must contain a 'month' variable."
+        )
+    }
+
+    # -------------------------------------------------------------------------
+    # 2. Convert month to Date
+    # -------------------------------------------------------------------------
+
+    if (inherits(dat$month, "Date")) {
+
+        dat$month <- as.Date(
+            dat$month
+        )
+
+    } else if (
+        inherits(
+            dat$month,
+            c("POSIXct", "POSIXlt")
+        )
+    ) {
+
+        dat$month <- as.Date(
+            dat$month
+        )
+
+    } else {
+
+        month_character <- as.character(
+            dat$month
+        )
+
+        # Try YYYY-MM
+        parsed_month <- suppressWarnings(
+            as.Date(
+                paste0(
+                    month_character,
+                    "-01"
+                )
+            )
+        )
+
+        failed <- is.na(
+            parsed_month
+        )
+
+        # Try ordinary Date
+        if (any(failed)) {
+
+            parsed_month[failed] <-
+                suppressWarnings(
+                    as.Date(
+                        month_character[failed]
+                    )
+                )
+        }
+
+        dat$month <- parsed_month
+    }
+
+    # -------------------------------------------------------------------------
+    # 3. Validate dates
+    # -------------------------------------------------------------------------
+
+    if (all(is.na(dat$month))) {
+
+        stop(
+            "Unable to convert 'month' to a valid Date."
+        )
+    }
+
+    dat <- dat[
+        !is.na(dat$month),
+        ,
+        drop = FALSE
+    ]
+
+    # -------------------------------------------------------------------------
+    # 4. Sort chronologically
+    # -------------------------------------------------------------------------
+
+    dat <- dat[
+        order(dat$month),
+        ,
+        drop = FALSE
+    ]
+
+    # -------------------------------------------------------------------------
+    # 5. Remove duplicate months
+    # -------------------------------------------------------------------------
+
+    duplicated_months <- duplicated(
+        dat$month
+    )
+
+    if (any(duplicated_months)) {
+
+        warning(
+            sum(duplicated_months),
+            " duplicate month(s) detected. ",
+            "Keeping the first observation for each month."
+        )
+
+        dat <- dat[
+            !duplicated_months,
+            ,
+            drop = FALSE
+        ]
+    }
+
+    # -------------------------------------------------------------------------
+    # 6. Convert economic variables to numeric
+    # -------------------------------------------------------------------------
+
+    economic_variables <- setdiff(
+        names(dat),
+        "month"
+    )
+
+    for (v in economic_variables) {
+
+        if (!is.numeric(dat[[v]])) {
+
+            dat[[v]] <- suppressWarnings(
+                as.numeric(
+                    as.character(
+                        dat[[v]]
+                    )
+                )
+            )
+        }
+    }
+
+    # -------------------------------------------------------------------------
+    # 7. Replace infinite values with NA
+    # -------------------------------------------------------------------------
+
+    for (v in economic_variables) {
+
+        if (is.numeric(dat[[v]])) {
+
+            dat[[v]][
+                !is.finite(
+                    dat[[v]]
+                )
+            ] <- NA_real_
+        }
+    }
+
+    # -------------------------------------------------------------------------
+    # 8. Create standardized DATE variable
+    # -------------------------------------------------------------------------
+
+    dat$DATE <- dat$month
+
+    # -------------------------------------------------------------------------
+    # 9. Missing-value report
+    # -------------------------------------------------------------------------
+
+    missing_counts <- sapply(
+        dat[economic_variables],
+        function(x)
+            sum(is.na(x))
+    )
+
+    cat(
+        "\nMissing values by variable:\n"
+    )
+
+    print(
+        missing_counts
+    )
+
+    # -------------------------------------------------------------------------
+    # 10. Final validation
+    # -------------------------------------------------------------------------
+
+    if (nrow(dat) == 0) {
+
+        stop(
+            "No observations remain after data preparation."
+        )
+    }
+
+    return(dat)
+}
+
+
+# =============================================================================
+# 2. PREPARE DATA
 # =============================================================================
 
 economic_data <- prepare_monthly_economic_data(
-  d = raw_data,
-  horizon = HORIZON,
-  gdp_method = "locf"
+    raw_data
 )
 
-model_data <- economic_data
 
 # =============================================================================
 # 3. PREPARED DATA CHECK
@@ -16286,1260 +16299,462 @@ cat(
     "\n",
     sep = ""
 )
+
+
 # =============================================================================
 # 14. VERIFY AND COMPLETE CAUSAL PANEL
-# =============================================================================
-#
-# Canonical empirical structure:
-#
-#       X_t  ->  A_t  ->  Y_{t+1}
-#
-# where:
-#   X_t     = economic state at month t
-#   A_t     = binary economic decision/action at month t
-#   Y_{t+1} = next-month economic outcome
-#
-# This is a ONE-STEP CONTEXTUAL BANDIT.
-#
-# IMPORTANT:
-#   1. `model_data` must already be produced by the canonical monthly
-#      economic-data preparation.
-#   2. `build_real_panel(dat = model_data)` is the canonical panel builder.
-#   3. `Y_next` must come from the canonical monthly preparation.
-#   4. Do not reconstruct GDP_growth from raw quarterly GDPC1 here.
-#   5. Do not overwrite externally supplied AI_exposure.
-#   6. Do not construct an ad-hoc fallback reward.
-#   7. RL_data is constructed exactly once.
 # =============================================================================
 
 cat("\n============================================================\n")
 cat("14. VERIFY AND COMPLETE CAUSAL PANEL\n")
 cat("============================================================\n")
 
-
-# =============================================================================
-# 14.1 VERIFY ANALYSIS-READY MONTHLY DATA
-# =============================================================================
-
-cat("\n============================================================\n")
-cat("14.1 VERIFY ANALYSIS-READY MONTHLY DATA\n")
-cat("============================================================\n")
-
-
-if (!exists("model_data", inherits = TRUE)) {
-  
-  stop(
-    "`model_data` does not exist.\n",
-    "Run the canonical monthly economic-data preparation first."
-  )
-}
-
-
-if (!is.data.frame(model_data)) {
-  
-  stop(
-    "`model_data` must be a data.frame."
-  )
-}
-
-
 # -----------------------------------------------------------------------------
-# Required variables that must already exist before build_real_panel().
-#
-# These variables should be created by:
-#
-#   04_fred_data.R
-#   05_ai_exposure_data.R
-#
-# In particular, Y_next and raw_reward must NOT be recreated here.
+# Use the final panel returned by Section 13
 # -----------------------------------------------------------------------------
 
-required_model_vars <- c(
-  
-  "month",
-  
-  # Raw economic variables
-  "DGS10",
-  "DTB3",
-  "DGS2",
-  "BAA10Y",
-  "UNRATE",
-  "PAYEMS",
-  "GDPC1",
-  "INDPRO",
-  "CPIAUCSL",
-  "VIXCLS",
-  
-  # Canonical derived variables
-  "term_spread",
-  "yield_2_10",
-  "rate_spread_2y",
-  "short_spread",
-  "credit_risk",
-  "credit_spread",
-  "unemployment_change",
-  "payroll_growth",
-  "GDP_growth",
-  "industrial_growth",
-  "inflation",
-  "VIX_change",
-  
-  # AI exposure and one-step outcome
-  "AI_exposure",
-  "Y_next",
-  "raw_reward"
-)
-
-
-missing_model_vars <- setdiff(
-  required_model_vars,
-  names(model_data)
-)
-
-
-if (length(missing_model_vars) > 0) {
-  
-  stop(
-    paste0(
-      "`model_data` is missing required canonical variables:\n  ",
-      paste(
-        missing_model_vars,
-        collapse = ", "
-      ),
-      "\n\n",
-      "These variables must be created by the monthly economic-data ",
-      "preparation before Section 14.\n",
-      "Do NOT recreate them here."
-    )
-  )
+if (!exists("panel")) {
+    stop("Object 'panel' does not exist. Run Section 13 first.")
 }
-
-
-# -----------------------------------------------------------------------------
-# Verify monthly ordering.
-# -----------------------------------------------------------------------------
-
-model_data$month <- as.Date(
-  model_data$month
-)
-
-
-model_data <- model_data |>
-  dplyr::arrange(month)
-
-
-rownames(model_data) <- NULL
-
-
-if (anyNA(model_data$month)) {
-  
-  stop(
-    "`model_data$month` contains NA values."
-  )
-}
-
-
-if (anyDuplicated(model_data$month) > 0) {
-  
-  duplicate_months <- unique(
-    model_data$month[
-      duplicated(model_data$month)
-    ]
-  )
-  
-  stop(
-    paste0(
-      "Duplicate monthly observations detected:\n",
-      paste(
-        duplicate_months,
-        collapse = ", "
-      )
-    )
-  )
-}
-
-
-cat(
-  "Monthly observations:",
-  nrow(model_data),
-  "\n"
-)
-
-cat(
-  "Date range:",
-  format(
-    min(model_data$month),
-    "%Y-%m"
-  ),
-  "to",
-  format(
-    max(model_data$month),
-    "%Y-%m"
-  ),
-  "\n"
-)
-
-
-# =============================================================================
-# 14.2 VERIFY CANONICAL ONE-STEP OUTCOME
-# =============================================================================
-
-cat("\n============================================================\n")
-cat("14.2 VERIFY CANONICAL ONE-STEP OUTCOME\n")
-cat("============================================================\n")
-
-
-# -----------------------------------------------------------------------------
-# The canonical relationship is:
-#
-#       X_t -> A_t -> Y_{t+1}
-#
-# Therefore Y_next must equal:
-#
-#       lead(GDP_growth, HORIZON)
-#
-# for the project's configured horizon.
-#
-# No reward fallback is permitted here.
-# -----------------------------------------------------------------------------
-
-horizon_used <- 1L
-
-
-if (exists("HORIZON", inherits = TRUE)) {
-  
-  horizon_used <- as.integer(
-    HORIZON
-  )
-}
-
-
-if (
-  length(horizon_used) != 1L ||
-  is.na(horizon_used) ||
-  horizon_used < 1L
-) {
-  
-  stop(
-    "`HORIZON` must be a positive integer."
-  )
-}
-
-
-expected_Y_next <- dplyr::lead(
-  model_data$GDP_growth,
-  horizon_used
-)
-
-
-comparison_idx <- is.finite(
-  model_data$Y_next
-) &
-  is.finite(
-    expected_Y_next
-  )
-
-
-if (any(comparison_idx)) {
-  
-  max_outcome_difference <- max(
-    abs(
-      model_data$Y_next[comparison_idx] -
-        expected_Y_next[comparison_idx]
-    ),
-    na.rm = TRUE
-  )
-  
-} else {
-  
-  max_outcome_difference <- NA_real_
-}
-
-
-if (
-  is.finite(max_outcome_difference) &&
-  max_outcome_difference > 1e-10
-) {
-  
-  stop(
-    paste0(
-      "`Y_next` is inconsistent with the canonical ",
-      "next-period GDP-growth outcome.\n",
-      "Maximum absolute difference = ",
-      format(
-        max_outcome_difference,
-        scientific = TRUE
-      ),
-      "\n",
-      "Check `prepare_monthly_economic_data()` and the construction ",
-      "of `model_data`."
-    )
-  )
-}
-
-
-cat(
-  "Horizon:",
-  horizon_used,
-  "\n"
-)
-
-cat(
-  "`Y_next` verified as the canonical next-period GDP outcome.\n"
-)
-
-cat(
-  "Non-missing Y_next:",
-  sum(
-    is.finite(model_data$Y_next)
-  ),
-  "of",
-  nrow(model_data),
-  "\n"
-)
-
-
-# -----------------------------------------------------------------------------
-# Verify raw_reward is the same underlying next-period outcome.
-# -----------------------------------------------------------------------------
-
-reward_difference <- model_data$raw_reward -
-  model_data$Y_next
-
-
-reward_idx <- is.finite(
-  model_data$raw_reward
-) &
-  is.finite(
-    model_data$Y_next
-  )
-
-
-if (any(reward_idx)) {
-  
-  max_reward_difference <- max(
-    abs(
-      reward_difference[reward_idx]
-    ),
-    na.rm = TRUE
-  )
-  
-} else {
-  
-  max_reward_difference <- NA_real_
-}
-
-
-if (
-  is.finite(max_reward_difference) &&
-  max_reward_difference > 1e-10
-) {
-  
-  stop(
-    paste0(
-      "`raw_reward` and `Y_next` are inconsistent.\n",
-      "Maximum absolute difference = ",
-      format(
-        max_reward_difference,
-        scientific = TRUE
-      ),
-      "\n",
-      "The analysis requires one common underlying outcome definition."
-    )
-  )
-}
-
-
-cat(
-  "`raw_reward` verified against `Y_next`.\n"
-)
-
-
-# =============================================================================
-# 14.3 VERIFY AI EXPOSURE
-# =============================================================================
-
-cat("\n============================================================\n")
-cat("14.3 VERIFY AI EXPOSURE\n")
-cat("============================================================\n")
-
-
-# -----------------------------------------------------------------------------
-# IMPORTANT:
-#
-# AI_exposure is NOT VIX.
-#
-# If 05_ai_exposure_data.R supplied an external AI measure, preserve it.
-# If the canonical monthly preparation supplied the documented time-trend
-# proxy, preserve that value as well.
-#
-# Section 14 must never overwrite AI_exposure.
-# -----------------------------------------------------------------------------
-
-if (!"AI_exposure" %in% names(model_data)) {
-  
-  stop(
-    "`AI_exposure` is missing from `model_data`.\n",
-    "Run the AI-exposure integration step before Section 14."
-  )
-}
-
-
-if (!is.numeric(model_data$AI_exposure)) {
-  
-  stop(
-    "`AI_exposure` must be numeric."
-  )
-}
-
-
-if (!any(is.finite(model_data$AI_exposure))) {
-  
-  stop(
-    "`AI_exposure` contains no finite observations."
-  )
-}
-
-
-cat(
-  "AI_exposure verified.\n"
-)
-
-cat(
-  "Finite observations:",
-  sum(
-    is.finite(model_data$AI_exposure)
-  ),
-  "\n"
-)
-
-
-# =============================================================================
-# 14.4 BUILD CANONICAL REAL-DATA PANEL
-# =============================================================================
-
-cat("\n============================================================\n")
-cat("14.4 BUILD CANONICAL REAL-DATA PANEL\n")
-cat("============================================================\n")
-
-
-if (!exists("build_real_panel", inherits = TRUE)) {
-  
-  stop(
-    "`build_real_panel()` is not available.\n",
-    "Run the real-data panel construction section first."
-  )
-}
-
-
-build_formals <- names(
-  formals(build_real_panel)
-)
-
-
-cat(
-  "`build_real_panel()` arguments:\n"
-)
-
-print(
-  build_formals
-)
-
-
-# -----------------------------------------------------------------------------
-# The canonical implementation is:
-#
-#     build_real_panel <- function(dat)
-#
-# Therefore require the explicit `dat` interface rather than silently
-# guessing another argument name.
-# -----------------------------------------------------------------------------
-
-if (!"dat" %in% build_formals) {
-  
-  stop(
-    paste0(
-      "`build_real_panel()` does not expose the required `dat` argument.\n",
-      "Available arguments: ",
-      paste(
-        build_formals,
-        collapse = ", "
-      )
-    )
-  )
-}
-
-
-panel <- tryCatch(
-  
-  build_real_panel(
-    dat = model_data
-  ),
-  
-  error = function(e) {
-    
-    stop(
-      paste0(
-        "Failed to construct the canonical real-data panel using ",
-        "`build_real_panel(dat = model_data)`.\n",
-        "Original error: ",
-        conditionMessage(e)
-      )
-    )
-  }
-)
-
-
-if (is.null(panel)) {
-  
-  stop(
-    "`build_real_panel(dat = model_data)` returned NULL."
-  )
-}
-
-
-if (!is.list(panel)) {
-  
-  stop(
-    paste0(
-      "`build_real_panel()` must return a list-like canonical panel.\n",
-      "Returned class: ",
-      paste(
-        class(panel),
-        collapse = ", "
-      )
-    )
-  )
-}
-
 
 if (!"data" %in% names(panel)) {
-  
-  stop(
-    paste0(
-      "Canonical panel does not contain `panel$data`.\n",
-      "Available components: ",
-      paste(
-        names(panel),
-        collapse = ", "
-      )
-    )
-  )
+    stop("panel$data does not exist.")
 }
-
-
-if (!is.data.frame(panel$data)) {
-  
-  stop(
-    "`panel$data` must be a data.frame."
-  )
-}
-
-
-cat(
-  "\nCanonical panel constructed successfully.\n"
-)
-
-cat(
-  "Panel class:",
-  paste(
-    class(panel),
-    collapse = ", "
-  ),
-  "\n"
-)
-
-cat(
-  "Panel observations:",
-  nrow(panel$data),
-  "\n"
-)
-
-cat(
-  "Panel variables:",
-  ncol(panel$data),
-  "\n"
-)
-
-
-# =============================================================================
-# 14.5 VERIFY CANONICAL PANEL DATA
-# =============================================================================
-
-cat("\n============================================================\n")
-cat("14.5 VERIFY CANONICAL PANEL DATA\n")
-cat("============================================================\n")
-
 
 dat <- panel$data
 
+# -----------------------------------------------------------------------------
+# Chronological ordering
+# -----------------------------------------------------------------------------
 
 if (!"month" %in% names(dat)) {
-  
-  stop(
-    "Canonical `panel$data` must contain `month`."
-  )
+    stop("The causal panel must contain 'month'.")
 }
 
-
-dat$month <- as.Date(
-  dat$month
-)
-
-
 dat <- dat |>
-  dplyr::arrange(month)
-
+    dplyr::arrange(month)
 
 rownames(dat) <- NULL
 
+cat(
+    "Observations:",
+    nrow(dat),
+    "\n"
+)
 
-if (anyNA(dat$month)) {
-  
-  stop(
-    "`panel$data$month` contains NA values."
-  )
-}
+cat(
+    "Variables:",
+    ncol(dat),
+    "\n"
+)
 
-
-if (anyDuplicated(dat$month) > 0) {
-  
-  stop(
-    "Duplicate monthly observations detected in `panel$data`."
-  )
-}
-
-
-# -----------------------------------------------------------------------------
-# Required causal variables.
-# -----------------------------------------------------------------------------
-
-required_panel_vars <- c(
-  
-  "month",
-  
-  # Economic state variables
-  "unemployment_change",
-  "payroll_growth",
-  "GDP_growth",
-  "industrial_growth",
-  "inflation",
-  "VIX_change",
-  "yield_2_10",
-  "credit_risk",
-  "AI_exposure",
-  
-  # Treatment/action
-  "A",
-  
-  # One-step outcome
-  "Y_next"
+cat(
+    "Date range:",
+    format(min(dat$month, na.rm = TRUE), "%Y-%m"),
+    "to",
+    format(max(dat$month, na.rm = TRUE), "%Y-%m"),
+    "\n"
 )
 
 
-missing_panel_vars <- setdiff(
-  required_panel_vars,
-  names(dat)
+# -----------------------------------------------------------------------------
+# Required macroeconomic variables
+# -----------------------------------------------------------------------------
+
+causal_core_vars <- c(
+    "DGS10",
+    "DTB3",
+    "DGS2",
+    "BAA10Y",
+    "UNRATE",
+    "PAYEMS",
+    "GDPC1",
+    "INDPRO",
+    "CPIAUCSL",
+    "VIXCLS",
+    "term_spread",
+    "rate_spread_2y",
+    "credit_spread",
+    "A"
 )
 
+missing_core <- setdiff(
+    causal_core_vars,
+    names(dat)
+)
 
-if (length(missing_panel_vars) > 0) {
-  
-  stop(
-    paste0(
-      "Canonical panel is missing required variables:\n  ",
-      paste(
-        missing_panel_vars,
-        collapse = ", "
-      )
+if (length(missing_core) > 0) {
+
+    stop(
+        paste0(
+            "Missing causal-panel variables: ",
+            paste(missing_core, collapse = ", ")
+        )
     )
-  )
-}
-
-
-# -----------------------------------------------------------------------------
-# Check that canonical panel preserved the outcome.
-# -----------------------------------------------------------------------------
-
-if (!"raw_reward" %in% names(dat)) {
-  
-  warning(
-    "`raw_reward` is not present in `panel$data`.\n",
-    "This is acceptable only if `create_real_rl_data()` uses `Y_next` ",
-    "directly."
-  )
 }
 
 
 # =============================================================================
-# 14.6 VERIFY TREATMENT / ACTION
+# 14A. CREATE MONTHLY STATE VARIABLES
 # =============================================================================
 
 cat("\n============================================================\n")
-cat("14.6 VERIFY TREATMENT / ACTION A\n")
+cat("14A. CREATE MONTHLY STATE VARIABLES\n")
 cat("============================================================\n")
 
+# -----------------------------------------------------------------------------
+# The state_variables object used later in the RL analysis expects the names
+# below. We explicitly create them here.
+#
+# IMPORTANT:
+# These are all contemporaneous or lag-compatible macroeconomic state
+# variables. No complete-case filtering is performed here.
+# -----------------------------------------------------------------------------
 
-if (!is.numeric(dat$A)) {
-  
-  stop(
-    "Treatment/action `A` must be numeric."
-  )
-}
+dat <- dat |>
+    dplyr::arrange(month) |>
+    dplyr::mutate(
+
+        # ---------------------------------------------------------------------
+        # Yield-curve state
+        # ---------------------------------------------------------------------
+
+        yield_2_10 =
+            DGS10 - DGS2,
+
+        # ---------------------------------------------------------------------
+        # Credit-risk state
+        # ---------------------------------------------------------------------
+
+        credit_risk =
+            BAA10Y - DGS10,
+
+        # ---------------------------------------------------------------------
+        # Labor-market dynamics
+        # ---------------------------------------------------------------------
+
+        unemployment_change =
+            UNRATE -
+            dplyr::lag(UNRATE, 1L),
+
+        payroll_growth =
+            100 *
+            (
+                PAYEMS /
+                dplyr::lag(PAYEMS, 1L) -
+                1
+            ),
+
+        # ---------------------------------------------------------------------
+        # Economic growth
+        # ---------------------------------------------------------------------
+
+        GDP_growth =
+            100 *
+            (
+                GDPC1 /
+                dplyr::lag(GDPC1, 1L) -
+                1
+            ),
+
+        industrial_growth =
+            100 *
+            (
+                INDPRO /
+                dplyr::lag(INDPRO, 1L) -
+                1
+            ),
+
+        # ---------------------------------------------------------------------
+        # Inflation
+        # ---------------------------------------------------------------------
+
+        inflation =
+            100 *
+            (
+                CPIAUCSL /
+                dplyr::lag(CPIAUCSL, 1L) -
+                1
+            ),
+
+        # ---------------------------------------------------------------------
+        # VIX dynamics
+        # ---------------------------------------------------------------------
+
+        VIX_change =
+            VIXCLS -
+            dplyr::lag(VIXCLS, 1L),
+
+        # ---------------------------------------------------------------------
+        # Policy / AI exposure proxy
+        #
+        # This variable is retained for compatibility with the existing
+        # state_variables specification.
+        #
+        # VIX level represents contemporaneous financial-market stress/
+        # exposure to macroeconomic uncertainty.
+        # ---------------------------------------------------------------------
+
+        AI_exposure =
+            VIXCLS
+    )
 
 
-if (any(!is.finite(dat$A))) {
-  
-  stop(
-    "Treatment/action `A` contains non-finite values."
-  )
-}
+# -----------------------------------------------------------------------------
+# Verify derived variables
+# -----------------------------------------------------------------------------
 
-
-if (!all(dat$A %in% c(0, 1))) {
-  
-  stop(
-    "`A` must be binary and contain only 0 and 1."
-  )
-}
-
-
-cat(
-  "Treatment values:",
-  paste(
-    sort(
-      unique(dat$A)
-    ),
-    collapse = ", "
-  ),
-  "\n"
+required_state_vars <- c(
+    "yield_2_10",
+    "credit_risk",
+    "unemployment_change",
+    "payroll_growth",
+    "GDP_growth",
+    "industrial_growth",
+    "inflation",
+    "VIX_change",
+    "AI_exposure"
 )
 
-cat(
-  "\nTreatment counts:\n"
+missing_derived_states <- setdiff(
+    required_state_vars,
+    names(dat)
 )
+
+if (length(missing_derived_states) > 0) {
+
+    stop(
+        paste0(
+            "The following state variables could not be created: ",
+            paste(
+                missing_derived_states,
+                collapse = ", "
+            )
+        )
+    )
+}
+
+cat("\nState variables created successfully:\n")
 
 print(
-  table(
-    dat$A,
-    useNA = "ifany"
-  )
-)
-
-
-# =============================================================================
-# 14.7 DEFINE CANONICAL STATE SPECIFICATION
-# =============================================================================
-
-cat("\n============================================================\n")
-cat("14.7 DEFINE CANONICAL STATE SPECIFICATION\n")
-cat("============================================================\n")
-
-
-canonical_state_variables <- c(
-  
-  "unemployment_change",
-  "payroll_growth",
-  "GDP_growth",
-  "industrial_growth",
-  "inflation",
-  "VIX_change",
-  "yield_2_10",
-  "credit_risk",
-  "AI_exposure"
+    required_state_vars
 )
 
 
 # -----------------------------------------------------------------------------
-# Use the project's existing state_variables only if it contains the complete
-# canonical specification. Otherwise reset it explicitly.
+# Diagnostics
 # -----------------------------------------------------------------------------
 
-if (
-  !exists("state_variables", inherits = TRUE) ||
-  !all(
-    canonical_state_variables %in%
-    as.character(state_variables)
-  )
-) {
-  
-  state_variables <- canonical_state_variables
-  
-  cat(
-    "Using the canonical state-variable specification.\n"
-  )
-  
-} else {
-  
-  state_variables <- as.character(
-    state_variables
-  )
-  
-  cat(
-    "Existing state_variables specification retained.\n"
-  )
-}
-
-
-missing_states <- setdiff(
-  state_variables,
-  names(dat)
-)
-
-
-if (length(missing_states) > 0) {
-  
-  stop(
-    paste0(
-      "State variables missing from canonical panel:\n  ",
-      paste(
-        missing_states,
-        collapse = ", "
-      )
-    )
-  )
-}
-
-
-cat(
-  "\nState variables:\n"
-)
-
-print(
-  state_variables
-)
-
-
-# =============================================================================
-# 14.8 STATE-VARIABLE DIAGNOSTICS
-# =============================================================================
-
-cat("\n============================================================\n")
-cat("14.8 STATE-VARIABLE DIAGNOSTICS\n")
-cat("============================================================\n")
-
+cat("\nNon-missing observations for state variables:\n")
 
 state_diagnostics <- data.frame(
-  
-  Variable = state_variables,
-  
-  NonMissing = sapply(
-    dat[state_variables],
-    function(x) {
-      sum(
-        is.finite(x)
-      )
-    }
-  ),
-  
-  Missing = sapply(
-    dat[state_variables],
-    function(x) {
-      sum(
-        !is.finite(x)
-      )
-    }
-  ),
-  
-  Mean = sapply(
-    dat[state_variables],
-    function(x) {
-      if (any(is.finite(x))) {
-        mean(
-          x[
-            is.finite(x)
-          ],
-          na.rm = TRUE
-        )
-      } else {
-        NA_real_
-      }
-    }
-  ),
-  
-  SD = sapply(
-    dat[state_variables],
-    function(x) {
-      if (sum(is.finite(x)) > 1L) {
-        sd(
-          x[
-            is.finite(x)
-          ],
-          na.rm = TRUE
-        )
-      } else {
-        NA_real_
-      }
-    }
-  ),
-  
-  row.names = NULL
-)
 
+    Variable = required_state_vars,
 
-print(
-  state_diagnostics
-)
-
-
-# =============================================================================
-# 14.9 FINAL ONE-STEP CAUSAL VALIDATION
-# =============================================================================
-
-cat("\n============================================================\n")
-cat("14.9 FINAL ONE-STEP CAUSAL VALIDATION\n")
-cat("============================================================\n")
-
-
-# -----------------------------------------------------------------------------
-# Verify the temporal structure explicitly.
-# -----------------------------------------------------------------------------
-
-ordered_dat <- dat |>
-  dplyr::arrange(month)
-
-
-if (nrow(ordered_dat) < 2L) {
-  
-  stop(
-    "At least two monthly observations are required."
-  )
-}
-
-
-# Check that Y_next is genuinely forward-looking relative to GDP_growth.
-expected_next <- dplyr::lead(
-  ordered_dat$GDP_growth,
-  horizon_used
-)
-
-
-valid_outcome <- is.finite(
-  ordered_dat$Y_next
-) &
-  is.finite(
-    expected_next
-  )
-
-
-if (!any(valid_outcome)) {
-  
-  stop(
-    "No valid observations exist for the one-step outcome."
-  )
-}
-
-
-outcome_error <- abs(
-  ordered_dat$Y_next[valid_outcome] -
-    expected_next[valid_outcome]
-)
-
-
-if (max(outcome_error) > 1e-10) {
-  
-  stop(
-    paste0(
-      "Temporal outcome validation failed.\n",
-      "Y_next is not equal to the configured ",
-      "lead(GDP_growth, HORIZON)."
-    )
-  )
-}
-
-
-# -----------------------------------------------------------------------------
-# Verify that treatment is defined at t while outcome is at t+1.
-# -----------------------------------------------------------------------------
-
-usable_bandit <- is.finite(
-  ordered_dat$A
-) &
-  apply(
-    ordered_dat[
-      ,
-      state_variables,
-      drop = FALSE
-    ],
-    1L,
-    function(z) {
-      all(
-        is.finite(z)
-      )
-    }
-  ) &
-  is.finite(
-    ordered_dat$Y_next
-  )
-
-
-cat(
-  "Usable contextual-bandit observations:",
-  sum(usable_bandit),
-  "of",
-  nrow(ordered_dat),
-  "\n"
-)
-
-
-if (sum(usable_bandit) < 10L) {
-  
-  stop(
-    paste0(
-      "Too few complete contextual-bandit observations: ",
-      sum(usable_bandit),
-      "."
-    )
-  )
-}
-
-
-# -----------------------------------------------------------------------------
-# Preserve the canonical panel object.
-#
-# We update only chronological ordering. We do NOT manufacture new economic
-# variables here and do NOT overwrite the panel's canonical outcome.
-# -----------------------------------------------------------------------------
-
-panel$data <- ordered_dat
-
-
-# =============================================================================
-# 14.10 CONSTRUCT CONTEXTUAL-BANDIT DATA
-# =============================================================================
-
-cat("\n============================================================\n")
-cat("14.10 CONSTRUCT CONTEXTUAL-BANDIT DATA\n")
-cat("============================================================\n")
-
-
-if (!exists("create_real_rl_data", inherits = TRUE)) {
-  
-  stop(
-    "`create_real_rl_data()` is not available."
-  )
-}
-
-
-rl_formals <- names(
-  formals(create_real_rl_data)
-)
-
-
-cat(
-  "`create_real_rl_data()` arguments:\n"
-)
-
-print(
-  rl_formals
-)
-
-
-rl_args <- list()
-
-
-if (!"panel" %in% rl_formals) {
-  
-  stop(
-    paste0(
-      "`create_real_rl_data()` must accept `panel`.\n",
-      "Available arguments: ",
-      paste(
-        rl_formals,
-        collapse = ", "
-      )
-    )
-  )
-}
-
-
-rl_args$panel <- panel
-
-
-# -----------------------------------------------------------------------------
-# Pass only parameters explicitly supported by create_real_rl_data().
-# -----------------------------------------------------------------------------
-
-if (
-  "LOOKBACK" %in% rl_formals &&
-  exists("LOOKBACK", inherits = TRUE)
-) {
-  
-  rl_args$LOOKBACK <- LOOKBACK
-}
-
-
-if (
-  "lookback" %in% rl_formals &&
-  exists("LOOKBACK", inherits = TRUE)
-) {
-  
-  rl_args$lookback <- LOOKBACK
-}
-
-
-if (
-  "AI_POLICY_COST" %in% rl_formals &&
-  exists("AI_POLICY_COST", inherits = TRUE)
-) {
-  
-  rl_args$AI_POLICY_COST <- AI_POLICY_COST
-}
-
-
-if (
-  "policy_cost" %in% rl_formals &&
-  exists("AI_POLICY_COST", inherits = TRUE)
-) {
-  
-  rl_args$policy_cost <- AI_POLICY_COST
-}
-
-
-RL_data <- tryCatch(
-  
-  do.call(
-    create_real_rl_data,
-    rl_args
-  ),
-  
-  error = function(e) {
-    
-    stop(
-      paste0(
-        "Failed to construct `RL_data` from the canonical panel.\n",
-        "Original error: ",
-        conditionMessage(e)
-      )
-    )
-  }
-)
-
-
-if (is.null(RL_data)) {
-  
-  stop(
-    "`create_real_rl_data()` returned NULL."
-  )
-}
-
-
-if (!is.data.frame(RL_data) && !is.list(RL_data)) {
-  
-  stop(
-    "`RL_data` must be a data.frame or list-like object."
-  )
-}
-
-
-message(
-  "Reviewer analysis: `RL_data` constructed successfully."
-)
-
-
-# =============================================================================
-# 14.11 FINAL SUMMARY
-# =============================================================================
-
-cat("\n============================================================\n")
-cat("FINAL CAUSAL-PANEL SUMMARY\n")
-cat("============================================================\n")
-
-
-cat(
-  "Panel observations:",
-  nrow(panel$data),
-  "\n"
-)
-
-cat(
-  "Panel variables:",
-  ncol(panel$data),
-  "\n"
-)
-
-cat(
-  "Date range:",
-  format(
-    min(panel$data$month),
-    "%Y-%m"
-  ),
-  "to",
-  format(
-    max(panel$data$month),
-    "%Y-%m"
-  ),
-  "\n"
-)
-
-cat(
-  "Treatment variable: A\n"
-)
-
-cat(
-  "Treatment values:",
-  paste(
-    sort(
-      unique(
-        panel$data$A
-      )
+    NonMissing = sapply(
+        dat[required_state_vars],
+        function(x) sum(is.finite(x))
     ),
-    collapse = ", "
-  ),
-  "\n"
+
+    Missing = sapply(
+        dat[required_state_vars],
+        function(x) sum(!is.finite(x))
+    )
+)
+
+print(
+    state_diagnostics
+)
+
+
+# =============================================================================
+# 14B. CREATE NEXT-PERIOD CAUSAL OUTCOME
+# =============================================================================
+
+cat("\n============================================================\n")
+cat("14B. CREATE NEXT-PERIOD CAUSAL OUTCOME\n")
+cat("============================================================\n")
+
+# -----------------------------------------------------------------------------
+# Y_next must exist BEFORE create_temporal_sequences().
+#
+# If Section 13 already generated Y_next, preserve it.
+#
+# Otherwise use raw_reward as the one-period economic outcome and construct
+# its one-month-ahead value.
+# -----------------------------------------------------------------------------
+
+if (!"Y_next" %in% names(dat)) {
+
+    if ("raw_reward" %in% names(dat)) {
+
+        cat(
+            "Creating Y_next from raw_reward.\n"
+        )
+
+        dat$Y_next <- dplyr::lead(
+            dat$raw_reward,
+            1L
+        )
+
+    } else {
+
+        # ---------------------------------------------------------------------
+        # Fallback economic reward
+        #
+        # This is used only if Section 13 did not create raw_reward.
+        #
+        # Economic interpretation:
+        #   + payroll growth
+        #   - unemployment change
+        #   - inflation
+        #
+        # Standardization is based on the available sample.
+        # ---------------------------------------------------------------------
+
+        cat(
+            "raw_reward not found.\n"
+        )
+
+        cat(
+            "Constructing fallback macroeconomic reward.\n"
+        )
+
+        zscore_safe <- function(x) {
+
+            s <- sd(
+                x,
+                na.rm = TRUE
+            )
+
+            m <- mean(
+                x,
+                na.rm = TRUE
+            )
+
+            if (
+                !is.finite(s) ||
+                s == 0
+            ) {
+
+                return(
+                    rep(0, length(x))
+                )
+            }
+
+            (x - m) / s
+        }
+
+        dat$raw_reward <-
+
+            zscore_safe(
+                dat$payroll_growth
+            ) -
+
+            zscore_safe(
+                dat$unemployment_change
+            ) -
+
+            0.5 *
+            zscore_safe(
+                dat$inflation
+            )
+
+        dat$Y_next <- dplyr::lead(
+            dat$raw_reward,
+            1L
+        )
+    }
+}
+
+cat(
+    "Y_next created successfully.\n"
 )
 
 cat(
-  "State variables:",
-  length(state_variables),
-  "\n"
+    "Non-missing Y_next:",
+    sum(is.finite(dat$Y_next)),
+    "of",
+    nrow(dat),
+    "\n"
+)
+
+
+# =============================================================================
+# 14C. DEFINE / VERIFY STATE VARIABLES
+# =============================================================================
+
+cat("\n============================================================\n")
+cat("14C. VERIFY STATE-VARIABLE SPECIFICATION\n")
+cat("============================================================\n")
+
+# -----------------------------------------------------------------------------
+# If state_variables already exists, preserve it.
+# Otherwise create the intended monthly macroeconomic state representation.
+# -----------------------------------------------------------------------------
+
+if (!exists("state_variables")) {
+
+    state_variables <- c(
+        "yield_2_10",
+        "credit_risk",
+        "unemployment_change",
+        "payroll_growth",
+        "GDP_growth",
+        "industrial_growth",
+        "inflation",
+        "VIX_change",
+        "AI_exposure"
+    )
+
+    cat(
+        "state_variables did not exist.\n",
+        "Created the default monthly macroeconomic state representation.\n"
+    )
+}
+
+missing_states <- setdiff(
+    state_variables,
+    names(dat)
+)
+
+if (length(missing_states) > 0) {
+
+    stop(
+        paste0(
+            "The following state variables are still missing from dat: ",
+            paste(
+                missing_states,
+                collapse = ", "
+            )
+        )
+    )
+}
+
+cat("\nFinal state_variables:\n")
+
+print(
+    state_variables
+)
+
+
+# -----------------------------------------------------------------------------
+# Final panel dimensions
+# -----------------------------------------------------------------------------
+
+cat(
+    "\nFinal panel observations:",
+    nrow(dat),
+    "\n"
 )
 
 cat(
-  "Outcome variable: Y_next\n"
-)
-
-cat(
-  "Horizon:",
-  horizon_used,
-  "\n"
-)
-
-cat(
-  "Usable contextual-bandit observations:",
-  sum(usable_bandit),
-  "\n"
-)
-
-cat(
-  "RL_data constructed:",
-  exists(
-    "RL_data",
-    inherits = TRUE
-  ),
-  "\n"
+    "Final panel variables:",
+    ncol(dat),
+    "\n"
 )
 
 
-cat(
-  "\n============================================================\n"
-)
-
-cat(
-  "Canonical one-step causal panel successfully verified.\n"
-)
-
-cat(
-  "Structure: X_t -> A_t -> Y_{t+1}\n"
-)
-
-cat(
-  "No ad-hoc reward or AI-exposure reconstruction was performed.\n"
-)
-
-cat(
-  "============================================================\n"
-)
 # =============================================================================
 # 15. SAVE CAUSAL DATA
 # =============================================================================
@@ -18397,1951 +17612,2149 @@ panel$data <- dat
 cat("\nSection 19 completed successfully.\n")
 
 # =============================================================================
-
-# =============================================================================
-# REVIEWER-REVISED PRIMARY ANALYSIS
-# =============================================================================
-# CAUSAL CONTEXTUAL BANDIT WITH MLP + PER
-#
-# Reviewer-driven changes:
-#   1. Primary problem is a one-step contextual bandit:
-#          X_t -> A_t -> Y_{t+1}
-#      No Bellman recursion is used in the primary analysis.
-#
-#   2. MLP is the primary policy learner.
-#
-#   3. CNN-LSTM is a sequence-model ablation.
-#
-#   4. PER sensitivity:
-#          alpha = {0, .25, .50, .75, 1}
-#
-#   5. alpha = 0 is implemented explicitly as EXACT uniform sampling.
-#
-#   6. All policies are evaluated on the identical chronological test set
-#      using the identical causal reward pair:
-#          R(0) = mu0
-#          R(1) = mu1 - policy_cost
-#
-#   7. Uniform policy value is evaluated analytically as:
-#          E[R(A)|X] = .5 R(0) + .5 R(1)
-#      rather than from a new Monte Carlo action draw.
-#
-#   8. Policy comparisons include paired t-test, Wilcoxon signed-rank test,
-#      and paired bootstrap confidence intervals.
-#
-#   9. No automatic "improvement" claim is made when statistical evidence
-#      does not support superiority.
-#
-#  10. The old dynamic DQN/PER analysis is not used as the primary result.
-#      Dynamic DQN can be retained as a secondary robustness analysis.
+# 20. CONSTRUCT CAUSAL EXPERIENCE REPLAY
 # =============================================================================
 
+cat("\n============================================================\n")
+cat("20. CAUSAL EXPERIENCE REPLAY\n")
+cat("============================================================\n")
 
-# =============================================================================
-# 20. REVIEWER-REVISED CONFIGURATION
-# =============================================================================
+# -----------------------------------------------------------------------------
+# 20.1 Verify RL object
+# -----------------------------------------------------------------------------
 
-REVIEWER_REVISION <- TRUE
-# This reviewer section is designed to run from the current analysis objects
-# without requiring an interactively created object named `panel`.
+if (!exists("RL_data")) {
+    stop("RL_data does not exist. Run Section 17 first.")
+}
 
+if (is.null(RL_data$X)) {
+    stop("RL_data$X is NULL.")
+}
 
-BANDIT_SEED <- 20260912L
+if (is.null(RL_data$df_index)) {
+    stop("RL_data$df_index is missing from RL_data.")
+}
 
-# Primary learner
-BANDIT_HIDDEN_UNITS <- c(128L, 64L)
-BANDIT_DROPOUT <- 0.10
-BANDIT_LEARNING_RATE <- 0.001
-BANDIT_EPOCHS <- 100L
-BANDIT_BATCH_SIZE <- 32L
-BANDIT_PATIENCE <- 10L
+n_rl <- length(RL_data$df_index)
 
-# Primary PER sensitivity
-PER_ALPHA_GRID <- c(
-    0.00,
-    0.25,
-    0.50,
-    0.75,
-    1.00
+cat(
+    "Number of RL sequences:",
+    n_rl,
+    "\n"
 )
 
-PER_BETA_PRIMARY <- 0.40
-PER_EPSILON_REVISED <- 1e-6
-
-# One-step bandit: no future-value term.
-BANDIT_GAMMA <- 0.00
-
-# CNN-LSTM ablation
-CNN_LSTM_FILTERS <- 32L
-CNN_LSTM_UNITS <- 32L
-CNN_LSTM_DROPOUT <- 0.10
-
-# Statistical inference
-BOOTSTRAP_REPS <- 2000L
-INFERENCE_ALPHA <- 0.05
-
-REVISED_OUTPUT_DIR <- file.path(
-    OUTPUT_DIR,
-    "reviewer_revised"
+cat(
+    "RL_data$X class:",
+    paste(class(RL_data$X), collapse = ", "),
+    "\n"
 )
 
-if (!dir.exists(REVISED_OUTPUT_DIR)) {
-    dir.create(
-        REVISED_OUTPUT_DIR,
-        recursive = TRUE,
-        showWarnings = FALSE
-    )
-}
-
-
-# =============================================================================
-# 21. VALIDATION HELPERS
-# =============================================================================
-
-validate_binary_vector <- function(x, name = "action") {
-
-    x <- as.integer(x)
-
-    if (length(x) == 0L) {
-        stop(name, " is empty.")
-    }
-
-    if (any(!is.finite(x))) {
-        stop(name, " contains non-finite values.")
-    }
-
-    if (!all(x %in% c(0L, 1L))) {
-        stop(name, " must contain only 0/1.")
-    }
-
-    x
-}
-
-
-validate_bandit_data <- function(RL_data) {
-
-    required <- c(
-        "X",
-        "A",
-        "y",
-        "mu0",
-        "mu1",
-        "split"
-    )
-
-    missing <- setdiff(
-        required,
-        names(RL_data)
-    )
-
-    if (length(missing) > 0L) {
-        stop(
-            "RL_data is missing: ",
-            paste(missing, collapse = ", ")
-        )
-    }
-
-    if (length(dim(RL_data$X)) != 3L) {
-        stop("RL_data$X must be a 3-dimensional array.")
-    }
-
-    n <- dim(RL_data$X)[1L]
-
-    if (length(RL_data$A) != n ||
-        length(RL_data$y) != n ||
-        length(RL_data$mu0) != n ||
-        length(RL_data$mu1) != n ||
-        length(RL_data$split) != n) {
-
-        stop("RL_data components have incompatible lengths.")
-    }
-
-    validate_binary_vector(
-        RL_data$A,
-        "RL_data$A"
-    )
-
-    invisible(TRUE)
-}
-
-
-# =============================================================================
-# 22. EXACT PER PROBABILITIES
-# =============================================================================
-
-calculate_revised_per_probabilities <- function(
-    priorities,
-    alpha,
-    epsilon = PER_EPSILON_REVISED
-) {
-
-    priorities <- as.numeric(priorities)
-
-    if (length(priorities) == 0L) {
-        stop("priorities is empty.")
-    }
-
-    if (length(alpha) != 1L ||
-        !is.finite(alpha) ||
-        alpha < 0) {
-
-        stop("alpha must be a finite scalar >= 0.")
-    }
-
-    # -------------------------------------------------------------------------
-    # CRITICAL REVIEWER FIX:
-    # alpha = 0 is EXACTLY Uniform.
-    # -------------------------------------------------------------------------
-    if (alpha == 0) {
-
-        return(
-            rep(
-                1 / length(priorities),
-                length(priorities)
-            )
-        )
-    }
-
-    priorities[!is.finite(priorities)] <- epsilon
-    priorities <- pmax(
-        priorities,
-        epsilon
-    )
-
-    z <- priorities ^ alpha
-    total <- sum(z)
-
-    if (!is.finite(total) || total <= 0) {
-
-        return(
-            rep(
-                1 / length(priorities),
-                length(priorities)
-            )
-        )
-    }
-
-    p <- z / total
-
-    # Numerical normalization
-    p / sum(p)
-}
-
-
-check_exact_uniform <- function() {
-
-    priorities <- c(
-        0.001,
-        0.01,
-        0.1,
-        1,
-        10,
-        100
-    )
-
-    p <- calculate_revised_per_probabilities(
-        priorities = priorities,
-        alpha = 0
-    )
-
-    expected <- rep(
-        1 / length(priorities),
-        length(priorities)
-    )
-
-    if (max(abs(p - expected)) > 1e-12) {
-        stop(
-            "Reviewer check failed: alpha=0 is not exactly Uniform."
-        )
-    }
-
-    invisible(TRUE)
-}
-
-
-check_exact_uniform()
-
-
-# =============================================================================
-# 23. ONE-STEP BANDIT DATA CONSTRUCTION
-# =============================================================================
-
-prepare_bandit_dataset <- function(
-    RL_data,
-    policy_cost = AI_POLICY_COST
-) {
-
-    validate_bandit_data(RL_data)
-
-    X <- RL_data$X
-
-    # The primary MLP receives the current state X_t.
-    # For a sequence object, use the endpoint state at t.
-    endpoint <- dim(X)[2L]
-
-    X_current <- X[
-        ,
-        endpoint,
-        ,
-        drop = FALSE
-    ]
-
-    X_current <- matrix(
-        as.numeric(X_current),
-        nrow = dim(X)[1L],
-        ncol = dim(X)[3L]
-    )
-
-    A <- as.integer(RL_data$A)
-    y <- as.numeric(RL_data$y)
-    mu0 <- as.numeric(RL_data$mu0)
-    mu1 <- as.numeric(RL_data$mu1)
-
-    # Policy cost is applied once to the treated potential reward.
-    reward0 <- mu0
-    reward1 <- mu1 - policy_cost
-
-    ok <-
-
-        apply(
-            X_current,
-            1L,
-            function(z) all(is.finite(z))
-        ) &
-
-        is.finite(A) &
-        is.finite(y) &
-        is.finite(mu0) &
-        is.finite(mu1) &
-
-        is.finite(reward0) &
-        is.finite(reward1) &
-
-        RL_data$split %in%
-            c("train", "validation", "test")
-
-    if (sum(ok) < 30L) {
-        stop(
-            "Too few valid observations for the revised contextual bandit."
-        )
-    }
-
-    list(
-        X = X_current[ok, , drop = FALSE],
-        X_sequence = X[ok, , , drop = FALSE],
-        A = A[ok],
-        y = y[ok],
-        reward0 = reward0[ok],
-        reward1 = reward1[ok],
-        CATE = if ("CATE" %in% names(RL_data)) RL_data$CATE[ok] else rep(NA_real_, sum(ok)),
-        split = as.character(RL_data$split[ok]),
-        df_index = if ("df_index" %in% names(RL_data)) {
-            RL_data$df_index[ok]
-        } else {
-            seq_len(sum(ok))
-        }
-    )
-}
-
-
-# =============================================================================
-# 24. PRIMARY MLP Q-MODEL
-# =============================================================================
-
-build_bandit_mlp <- function(
-    n_features,
-    hidden_units = BANDIT_HIDDEN_UNITS,
-    dropout = BANDIT_DROPOUT,
-    learning_rate = BANDIT_LEARNING_RATE
-) {
-
-    if (!requireNamespace("keras3", quietly = TRUE)) {
-        stop("Package 'keras3' is required for the MLP.")
-    }
-
-    input <- keras3::layer_input(
-        shape = n_features + 1L,
-        name = "state_action"
-    )
-
-    x <- input
-
-    for (j in seq_along(hidden_units)) {
-
-        x <- x |>
-            keras3::layer_dense(
-                units = hidden_units[j],
-                activation = "relu"
-            ) |>
-            keras3::layer_dropout(
-                rate = dropout
-            )
-    }
-
-    output <- x |>
-        keras3::layer_dense(
-            units = 1L,
-            activation = "linear",
-            name = "reward"
-        )
-
-    model <- keras3::keras_model(
-        inputs = input,
-        outputs = output,
-        name = "primary_contextual_bandit_mlp"
-    )
-
-    model$compile(
-        optimizer = keras3::optimizer_adam(
-            learning_rate = learning_rate
-        ),
-        loss = "mse",
-        metrics = list("mae")
-    )
-
-    model
-}
-
-
-make_mlp_design <- function(
+cat(
+    "RL_data$X length:",
+    length(RL_data$X),
+    "\n"
+)
+
+# -----------------------------------------------------------------------------
+# 20.2 Helper function to safely extract a state
+# -----------------------------------------------------------------------------
+
+extract_rl_state <- function(
     X,
-    A
+    k,
+    state_dim
 ) {
 
-    X <- as.matrix(X)
-    A <- as.numeric(A)
+    # -------------------------------------------------------------------------
+    # Case 1: 3-dimensional array
+    # -------------------------------------------------------------------------
 
-    if (nrow(X) != length(A)) {
-        stop("X and A have incompatible lengths.")
+    if (length(dim(X)) == 3) {
+
+        state <- X[
+            k,
+            ,
+            ,
+            drop = TRUE
+        ]
+
+        state <- as.numeric(state)
+
+        return(state)
     }
 
-    cbind(
-        X,
-        A
-    )
-}
+    # -------------------------------------------------------------------------
+    # Case 2: matrix
+    # -------------------------------------------------------------------------
 
+    if (length(dim(X)) == 2) {
 
-predict_mlp_potential_rewards <- function(
-    model,
-    X
-) {
+        state <- X[
+            k,
+            ,
+            drop = TRUE
+        ]
 
-    X <- as.matrix(X)
+        state <- as.numeric(state)
 
-    x0 <- cbind(
-        X,
-        0
-    )
-
-    x1 <- cbind(
-        X,
-        1
-    )
-
-    mu0 <- as.numeric(
-        predict(
-            model,
-            x0,
-            verbose = 0
-        )
-    )
-
-    mu1 <- as.numeric(
-        predict(
-            model,
-            x1,
-            verbose = 0
-        )
-    )
-
-    list(
-        mu0 = mu0,
-        mu1 = mu1
-    )
-}
-
-
-# =============================================================================
-# 25. PER TRAINING FOR THE ONE-STEP MLP
-# =============================================================================
-#
-# PER changes only the training-sample distribution. It does NOT change the
-# held-out test observations or their evaluation weights.
-#
-# alpha = 0 -> exact Uniform.
-# alpha > 0 -> probability proportional to priority^alpha.
-#
-# Priorities are updated from the absolute observed-action prediction error.
-# This avoids using test information to construct the replay distribution.
-# =============================================================================
-
-train_bandit_mlp_per <- function(
-    X_train,
-    A_train,
-    y_train,
-    X_valid = NULL,
-    A_valid = NULL,
-    y_valid = NULL,
-    alpha = 0,
-    beta = PER_BETA_PRIMARY,
-    epochs = BANDIT_EPOCHS,
-    batch_size = BANDIT_BATCH_SIZE,
-    patience = BANDIT_PATIENCE,
-    seed = BANDIT_SEED,
-    verbose = FALSE
-) {
-
-    set.seed(seed)
-
-    if (requireNamespace("tensorflow", quietly = TRUE)) {
-        try(
-            tensorflow::tf$random$set_seed(seed),
-            silent = TRUE
-        )
+        return(state)
     }
 
-    if (requireNamespace("keras3", quietly = TRUE)) {
-        try(
-            keras3::set_random_seed(seed),
-            silent = TRUE
-        )
-    }
+    # -------------------------------------------------------------------------
+    # Case 3: list of state vectors
+    # -------------------------------------------------------------------------
 
-    X_train <- as.matrix(X_train)
-    A_train <- validate_binary_vector(
-        A_train,
-        "A_train"
-    )
-    y_train <- as.numeric(y_train)
+    if (is.list(X)) {
 
-    if (nrow(X_train) != length(A_train) ||
-        length(A_train) != length(y_train)) {
+        if (k > length(X)) {
 
-        stop("Training data have incompatible lengths.")
-    }
-
-    if (alpha == 0) {
-        beta <- 0
-    }
-
-    model <- build_bandit_mlp(
-        n_features = ncol(X_train)
-    )
-
-    priorities <- rep(
-        1,
-        nrow(X_train)
-    )
-
-    history_rows <- vector(
-        "list",
-        epochs
-    )
-
-    best_val <- Inf
-    best_weights <- NULL
-    stale <- 0L
-
-    for (epoch in seq_len(epochs)) {
-
-        p <- calculate_revised_per_probabilities(
-            priorities = priorities,
-            alpha = alpha
-        )
-
-        idx <- sample.int(
-            n = nrow(X_train),
-            size = max(
-                nrow(X_train),
-                batch_size
-            ),
-            replace = TRUE,
-            prob = p
-        )
-
-        x_batch <- make_mlp_design(
-            X_train[idx, , drop = FALSE],
-            A_train[idx]
-        )
-
-        y_batch <- y_train[idx]
-
-        fit_one <- model$fit(
-            x = x_batch,
-            y = y_batch,
-            epochs = 1L,
-            batch_size = batch_size,
-            verbose = if (verbose) 1L else 0L
-        )
-
-        pred_train <- as.numeric(
-            predict(
-                model,
-                make_mlp_design(
-                    X_train,
-                    A_train
-                ),
-                verbose = 0
-            )
-        )
-
-        residuals <- abs(
-            y_train - pred_train
-        )
-
-        priorities <- pmax(
-            residuals,
-            PER_EPSILON_REVISED
-        )
-
-        train_loss <- mean(
-            (y_train - pred_train)^2
-        )
-
-        val_loss <- NA_real_
-
-        if (!is.null(X_valid) &&
-            !is.null(A_valid) &&
-            !is.null(y_valid)) {
-
-            pred_valid <- as.numeric(
-                predict(
-                    model,
-                    make_mlp_design(
-                        X_valid,
-                        A_valid
-                    ),
-                    verbose = 0
+            stop(
+                paste0(
+                    "RL sequence index ",
+                    k,
+                    " exceeds RL_data$X list length."
                 )
             )
-
-            val_loss <- mean(
-                (y_valid - pred_valid)^2
-            )
-
-            if (is.finite(val_loss) &&
-                val_loss < best_val) {
-
-                best_val <- val_loss
-                best_weights <- model$get_weights()
-                stale <- 0L
-
-            } else {
-
-                stale <- stale + 1L
-            }
-
-            if (stale >= patience) {
-                break
-            }
         }
 
-        history_rows[[epoch]] <- data.frame(
-            epoch = epoch,
-            alpha = alpha,
-            beta = beta,
-            train_mse = train_loss,
-            validation_mse = val_loss,
-            mean_priority = mean(priorities),
-            max_priority = max(priorities)
-        )
+        state <- X[[k]]
 
-        rm(fit_one)
-    }
-
-    if (!is.null(best_weights)) {
-        model$set_weights(best_weights)
-    }
-
-    history <- dplyr::bind_rows(
-        history_rows[
-            !vapply(
-                history_rows,
-                is.null,
-                logical(1)
+        # Some sequence builders may return a nested list
+        if (is.list(state)) {
+            state <- unlist(
+                state,
+                recursive = TRUE,
+                use.names = FALSE
             )
-        ]
-    )
+        }
 
-    list(
-        model = model,
-        history = history,
-        alpha = alpha,
-        beta = beta,
-        priorities = priorities
-    )
-}
+        state <- as.numeric(state)
 
-
-# =============================================================================
-# 26. POLICY DEFINITIONS
-# =============================================================================
-
-policy_from_predictions <- function(
-    mu0,
-    mu1
-) {
-
-    as.integer(
-        mu1 > mu0
-    )
-}
-
-
-policy_uniform_expected <- function(
-    reward0,
-    reward1
-) {
-
-    # Exact expected reward under A ~ Bernoulli(0.5).
-    0.5 * reward0 +
-        0.5 * reward1
-}
-
-
-policy_never <- function(n) {
-    rep(0L, n)
-}
-
-
-policy_always <- function(n) {
-    rep(1L, n)
-}
-
-
-policy_oracle <- function(
-    reward0,
-    reward1
-) {
-
-    as.integer(
-        reward1 > reward0
-    )
-}
-
-
-# =============================================================================
-# 27. COMMON TEST-SET EVALUATION
-# =============================================================================
-
-evaluate_policy_vector <- function(
-    policy,
-    reward0,
-    reward1,
-    policy_name = "policy"
-) {
-
-    policy <- validate_binary_vector(
-        policy,
-        policy_name
-    )
-
-    reward0 <- as.numeric(reward0)
-    reward1 <- as.numeric(reward1)
-
-    if (length(policy) != length(reward0) ||
-        length(policy) != length(reward1)) {
-
-        stop(
-            "Policy and reward vectors must have identical lengths."
-        )
+        return(state)
     }
 
-    ok <-
+    # -------------------------------------------------------------------------
+    # Case 4: vector
+    # -------------------------------------------------------------------------
 
-        is.finite(reward0) &
-        is.finite(reward1)
+    if (is.atomic(X)) {
 
-    if (!any(ok)) {
-        stop("No finite test-set rewards remain.")
-    }
+        total_length <- length(X)
 
-    selected <- ifelse(
-        policy == 1L,
-        reward1,
-        reward0
-    )
+        if (total_length == state_dim) {
 
-    oracle <- pmax(
-        reward0,
-        reward1
-    )
+            # One single state
+            if (k != 1L) {
+                stop(
+                    "RL_data$X contains only one state but multiple RL sequences exist."
+                )
+            }
 
-    data.frame(
-        Model = policy_name,
-        N = sum(ok),
-        Policy_Value = mean(selected[ok]),
-        Oracle_Value = mean(oracle[ok]),
-        Regret = mean(oracle[ok] - selected[ok]),
-        Treatment_Rate = mean(policy[ok]),
-        stringsAsFactors = FALSE
-    )
-}
+            return(as.numeric(X))
+        }
 
+        if (total_length %% state_dim == 0) {
 
-evaluate_uniform_expected <- function(
-    reward0,
-    reward1
-) {
+            n_states <- total_length / state_dim
 
-    ok <-
-        is.finite(reward0) &
-        is.finite(reward1)
+            if (k > n_states) {
 
-    expected <- policy_uniform_expected(
-        reward0[ok],
-        reward1[ok]
-    )
+                stop(
+                    paste0(
+                        "Requested state ",
+                        k,
+                        " but only ",
+                        n_states,
+                        " states can be reconstructed."
+                    )
+                )
+            }
 
-    oracle <- pmax(
-        reward0[ok],
-        reward1[ok]
-    )
+            start <- ((k - 1L) * state_dim) + 1L
+            end <- k * state_dim
 
-    data.frame(
-        Model = "Uniform",
-        N = sum(ok),
-        Policy_Value = mean(expected),
-        Oracle_Value = mean(oracle),
-        Regret = mean(oracle - expected),
-        Treatment_Rate = 0.50,
-        stringsAsFactors = FALSE
-    )
-}
-
-
-# =============================================================================
-# 28. PAIRED INFERENCE
-# =============================================================================
-
-bootstrap_mean_ci <- function(
-    differences,
-    B = BOOTSTRAP_REPS,
-    seed = BANDIT_SEED
-) {
-
-    differences <- as.numeric(differences)
-    differences <- differences[
-        is.finite(differences)
-    ]
-
-    if (length(differences) < 2L) {
-        return(
-            c(
-                lower = NA_real_,
-                upper = NA_real_
+            return(
+                as.numeric(
+                    X[start:end]
+                )
             )
-        )
-    }
-
-    set.seed(seed)
-
-    boot <- replicate(
-        B,
-        mean(
-            sample(
-                differences,
-                size = length(differences),
-                replace = TRUE
-            )
-        )
-    )
-
-    q <- quantile(
-        boot,
-        probs = c(0.025, 0.975),
-        na.rm = TRUE,
-        names = FALSE
-    )
-
-    c(
-        lower = q[1L],
-        upper = q[2L]
-    )
-}
-
-
-compare_policy_vectors <- function(
-    policy_a,
-    policy_b,
-    reward0,
-    reward1,
-    name_a,
-    name_b,
-    B = BOOTSTRAP_REPS,
-    seed = BANDIT_SEED
-) {
-
-    policy_a <- validate_binary_vector(
-        policy_a,
-        name_a
-    )
-
-    policy_b <- validate_binary_vector(
-        policy_b,
-        name_b
-    )
-
-    reward0 <- as.numeric(reward0)
-    reward1 <- as.numeric(reward1)
-
-    ok <-
-
-        is.finite(reward0) &
-        is.finite(reward1)
-
-    ra <- ifelse(
-        policy_a == 1L,
-        reward1,
-        reward0
-    )
-
-    rb <- ifelse(
-        policy_b == 1L,
-        reward1,
-        reward0
-    )
-
-    d <- ra[ok] - rb[ok]
-
-    t_obj <- t.test(
-        d,
-        mu = 0
-    )
-
-    w_obj <- suppressWarnings(
-        wilcox.test(
-            d,
-            mu = 0,
-            exact = FALSE
-        )
-    )
-
-    ci <- bootstrap_mean_ci(
-        d,
-        B = B,
-        seed = seed
-    )
-
-    supported <-
-
-        is.finite(t_obj$p.value) &&
-        is.finite(w_obj$p.value) &&
-        is.finite(ci[1L]) &&
-        t_obj$p.value < INFERENCE_ALPHA &&
-        w_obj$p.value < INFERENCE_ALPHA &&
-        ci[1L] > 0
-
-    interpretation <- if (supported) {
-        "Statistically supported superiority"
-    } else {
-        "No statistically supported superiority"
-    }
-
-    data.frame(
-        Model_A = name_a,
-        Model_B = name_b,
-        N = length(d),
-        Mean_Difference = mean(d),
-        t_statistic = unname(t_obj$statistic),
-        t_p_value = t_obj$p.value,
-        Wilcoxon_statistic = unname(w_obj$statistic),
-        Wilcoxon_p_value = w_obj$p.value,
-        Bootstrap_CI_Lower = ci[1L],
-        Bootstrap_CI_Upper = ci[2L],
-        Interpretation = interpretation,
-        stringsAsFactors = FALSE
-    )
-}
-
-
-compare_model_to_uniform <- function(
-    policy,
-    reward0,
-    reward1,
-    name_model,
-    B = BOOTSTRAP_REPS,
-    seed = BANDIT_SEED
-) {
-
-    # Uniform's per-observation expected reward is deterministic.
-    uniform_reward <- policy_uniform_expected(
-        reward0,
-        reward1
-    )
-
-    model_reward <- ifelse(
-        policy == 1L,
-        reward1,
-        reward0
-    )
-
-    ok <-
-
-        is.finite(model_reward) &
-        is.finite(uniform_reward)
-
-    d <- model_reward[ok] -
-        uniform_reward[ok]
-
-    t_obj <- t.test(
-        d,
-        mu = 0
-    )
-
-    w_obj <- suppressWarnings(
-        wilcox.test(
-            d,
-            mu = 0,
-            exact = FALSE
-        )
-    )
-
-    ci <- bootstrap_mean_ci(
-        d,
-        B = B,
-        seed = seed
-    )
-
-    supported <-
-
-        is.finite(t_obj$p.value) &&
-        is.finite(w_obj$p.value) &&
-        is.finite(ci[1L]) &&
-        t_obj$p.value < INFERENCE_ALPHA &&
-        w_obj$p.value < INFERENCE_ALPHA &&
-        ci[1L] > 0
-
-    interpretation <- if (supported) {
-        "Statistically supported superiority"
-    } else {
-        "No statistically supported superiority"
-    }
-
-    data.frame(
-        Model_A = name_model,
-        Model_B = "Uniform",
-        N = length(d),
-        Mean_Difference = mean(d),
-        t_statistic = unname(t_obj$statistic),
-        t_p_value = t_obj$p.value,
-        Wilcoxon_statistic = unname(w_obj$statistic),
-        Wilcoxon_p_value = w_obj$p.value,
-        Bootstrap_CI_Lower = ci[1L],
-        Bootstrap_CI_Upper = ci[2L],
-        Interpretation = interpretation,
-        stringsAsFactors = FALSE
-    )
-}
-
-
-# =============================================================================
-# 29. SIMPLE CNN-LSTM ABLATION
-# =============================================================================
-
-build_cnn_lstm_ablation <- function(
-    lookback,
-    n_features,
-    filters = CNN_LSTM_FILTERS,
-    lstm_units = CNN_LSTM_UNITS,
-    dropout = CNN_LSTM_DROPOUT,
-    learning_rate = BANDIT_LEARNING_RATE
-) {
-
-    if (!requireNamespace("keras3", quietly = TRUE)) {
-        stop("Package 'keras3' is required for the CNN-LSTM ablation.")
-    }
-
-    input <- keras3::layer_input(
-        shape = c(
-            lookback,
-            n_features + 1L
-        ),
-        name = "economic_sequence_action"
-    )
-
-    x <- input |>
-        keras3::layer_conv_1d(
-            filters = filters,
-            kernel_size = 3L,
-            padding = "same",
-            activation = "relu"
-        ) |>
-        keras3::layer_dropout(
-            rate = dropout
-        ) |>
-        keras3::layer_lstm(
-            units = lstm_units,
-            return_sequences = FALSE
-        ) |>
-        keras3::layer_dropout(
-            rate = dropout
-        ) |>
-        keras3::layer_dense(
-            units = 32L,
-            activation = "relu"
-        )
-
-    output <- x |>
-        keras3::layer_dense(
-            units = 1L,
-            activation = "linear",
-            name = "reward"
-        )
-
-    model <- keras3::keras_model(
-        inputs = input,
-        outputs = output,
-        name = "cnn_lstm_bandit_ablation"
-    )
-
-    model$compile(
-        optimizer = keras3::optimizer_adam(
-            learning_rate = learning_rate
-        ),
-        loss = "mse"
-    )
-
-    model
-}
-
-
-make_sequence_action_input <- function(
-    X_sequence,
-    A
-) {
-
-    X_sequence <- array(
-        as.numeric(X_sequence),
-        dim = dim(X_sequence)
-    )
-
-    A <- as.numeric(A)
-
-    if (length(A) != dim(X_sequence)[1L]) {
-        stop("A and X_sequence have incompatible lengths.")
-    }
-
-    action_channel <- array(
-        rep(
-            A,
-            each = dim(X_sequence)[2L]
-        ),
-        dim = c(
-            dim(X_sequence)[1L],
-            dim(X_sequence)[2L],
-            1L
-        )
-    )
-
-    # Construct the additional action channel explicitly so channel order is
-    # deterministic and independent of R's array concatenation order.
-    out <- array(
-        0,
-        dim = c(
-            dim(X_sequence)[1L],
-            dim(X_sequence)[2L],
-            dim(X_sequence)[3L] + 1L
-        )
-    )
-
-    out[, , seq_len(dim(X_sequence)[3L])] <- X_sequence
-    out[, , dim(X_sequence)[3L] + 1L] <- action_channel[, , 1L]
-
-    out
-}
-
-
-train_cnn_lstm_ablation <- function(
-    X_train,
-    A_train,
-    y_train,
-    X_valid,
-    A_valid,
-    y_valid,
-    seed = BANDIT_SEED
-) {
-
-    set.seed(seed)
-
-    try(
-        keras3::set_random_seed(seed),
-        silent = TRUE
-    )
-
-    model <- build_cnn_lstm_ablation(
-        lookback = dim(X_train)[2L],
-        n_features = dim(X_train)[3L]
-    )
-
-    x_train <- make_sequence_action_input(
-        X_train,
-        A_train
-    )
-
-    x_valid <- make_sequence_action_input(
-        X_valid,
-        A_valid
-    )
-
-    model$fit(
-        x = x_train,
-        y = y_train,
-        validation_data = list(
-            x_valid,
-            y_valid
-        ),
-        epochs = BANDIT_EPOCHS,
-        batch_size = BANDIT_BATCH_SIZE,
-        verbose = 0,
-        callbacks = list(
-            keras3::callback_early_stopping(
-                monitor = "val_loss",
-                patience = BANDIT_PATIENCE,
-                restore_best_weights = TRUE
-            )
-        )
-    )
-
-    model
-}
-
-
-predict_cnn_lstm_potential_rewards <- function(
-    model,
-    X_sequence
-) {
-
-    n <- dim(X_sequence)[1L]
-
-    x0 <- make_sequence_action_input(
-        X_sequence,
-        rep(0L, n)
-    )
-
-    x1 <- make_sequence_action_input(
-        X_sequence,
-        rep(1L, n)
-    )
-
-    list(
-        mu0 = as.numeric(
-            predict(
-                model,
-                x0,
-                verbose = 0
-            )
-        ),
-        mu1 = as.numeric(
-            predict(
-                model,
-                x1,
-                verbose = 0
-            )
-        )
-    )
-}
-
-
-# =============================================================================
-# 30. MAIN REVIEWER-REVISED PIPELINE
-# =============================================================================
-
-run_reviewer_revised_bandit <- function(
-    RL_data,
-    policy_cost = AI_POLICY_COST,
-    alpha_grid = PER_ALPHA_GRID,
-    seed = BANDIT_SEED,
-    bootstrap_reps = BOOTSTRAP_REPS
-) {
-
-    set.seed(seed)
-
-    bandit <- prepare_bandit_dataset(
-        RL_data = RL_data,
-        policy_cost = policy_cost
-    )
-
-    train_idx <- which(
-        bandit$split == "train"
-    )
-
-    valid_idx <- which(
-        bandit$split == "validation"
-    )
-
-    test_idx <- which(
-        bandit$split == "test"
-    )
-
-    if (length(train_idx) < 30L ||
-        length(valid_idx) < 10L ||
-        length(test_idx) < 10L) {
-
-        stop(
-            "Insufficient chronological train/validation/test observations."
-        )
-    }
-
-    X_train <- bandit$X[train_idx, , drop = FALSE]
-    A_train <- bandit$A[train_idx]
-    y_train <- bandit$y[train_idx]
-
-    X_valid <- bandit$X[valid_idx, , drop = FALSE]
-    A_valid <- bandit$A[valid_idx]
-    y_valid <- bandit$y[valid_idx]
-
-    X_test <- bandit$X[test_idx, , drop = FALSE]
-    X_test_seq <- bandit$X_sequence[test_idx, , , drop = FALSE]
-
-    reward0_test <- bandit$reward0[test_idx]
-    reward1_test <- bandit$reward1[test_idx]
-
-    # -------------------------------------------------------------------------
-    # Exact common test set
-    # -------------------------------------------------------------------------
-
-    common_test <-
-
-        is.finite(reward0_test) &
-        is.finite(reward1_test) &
-
-        apply(
-            X_test,
-            1L,
-            function(z) all(is.finite(z))
-        )
-
-    X_test <- X_test[
-        common_test,
-        ,
-        drop = FALSE
-    ]
-
-    X_test_seq <- X_test_seq[
-        common_test,
-        ,
-        ,
-        drop = FALSE
-    ]
-
-    reward0_test <- reward0_test[
-        common_test
-    ]
-
-    reward1_test <- reward1_test[
-        common_test
-    ]
-
-    # -------------------------------------------------------------------------
-    # Baselines
-    # -------------------------------------------------------------------------
-
-    baseline_uniform <- evaluate_uniform_expected(
-        reward0 = reward0_test,
-        reward1 = reward1_test
-    )
-
-    baseline_never <- evaluate_policy_vector(
-        policy_never(length(reward0_test)),
-        reward0_test,
-        reward1_test,
-        "Never Treat"
-    )
-
-    baseline_always <- evaluate_policy_vector(
-        policy_always(length(reward0_test)),
-        reward0_test,
-        reward1_test,
-        "Always Treat"
-    )
-
-    oracle_policy_test <- policy_oracle(
-        reward0_test,
-        reward1_test
-    )
-
-    baseline_oracle <- evaluate_policy_vector(
-        oracle_policy_test,
-        reward0_test,
-        reward1_test,
-        "Model-based oracle"
-    )
-
-    # -------------------------------------------------------------------------
-    # MLP + PER alpha sensitivity
-    # -------------------------------------------------------------------------
-
-    model_results <- vector(
-        "list",
-        length(alpha_grid)
-    )
-
-    model_metrics <- vector(
-        "list",
-        length(alpha_grid)
-    )
-
-    comparison_results <- vector(
-        "list",
-        length(alpha_grid)
-    )
-
-    for (j in seq_along(alpha_grid)) {
-
-        alpha_j <- alpha_grid[j]
-
-        fit_j <- train_bandit_mlp_per(
-            X_train = X_train,
-            A_train = A_train,
-            y_train = y_train,
-            X_valid = X_valid,
-            A_valid = A_valid,
-            y_valid = y_valid,
-            alpha = alpha_j,
-            beta = PER_BETA_PRIMARY,
-            seed = seed + j,
-            verbose = FALSE
-        )
-
-        pred_j <- predict_mlp_potential_rewards(
-            model = fit_j$model,
-            X = X_test
-        )
-
-        policy_j <- policy_from_predictions(
-            mu0 = pred_j$mu0,
-            mu1 = pred_j$mu1 - policy_cost
-        )
-
-        name_j <- sprintf(
-            "MLP-PER-alpha-%s",
-            format(
-                alpha_j,
-                trim = TRUE,
-                nsmall = 2
-            )
-        )
-
-        metric_j <- evaluate_policy_vector(
-            policy = policy_j,
-            reward0 = reward0_test,
-            reward1 = reward1_test,
-            policy_name = name_j
-        )
-
-        comparison_j <- compare_model_to_uniform(
-            policy = policy_j,
-            reward0 = reward0_test,
-            reward1 = reward1_test,
-            name_model = name_j,
-            B = bootstrap_reps,
-            seed = seed + 100L + j
-        )
-
-        model_results[[j]] <- list(
-            alpha = alpha_j,
-            beta = if (alpha_j == 0) 0 else PER_BETA_PRIMARY,
-            fit = fit_j,
-            mu0 = pred_j$mu0,
-            mu1 = pred_j$mu1,
-            policy = policy_j
-        )
-
-        model_metrics[[j]] <- metric_j
-        comparison_results[[j]] <- comparison_j
-    }
-
-    mlp_metrics <- dplyr::bind_rows(
-        model_metrics
-    )
-
-    mlp_uniform_tests <- dplyr::bind_rows(
-        comparison_results
-    )
-
-    # -------------------------------------------------------------------------
-    # CNN-LSTM ablation
-    # -------------------------------------------------------------------------
-
-    cnn_model <- train_cnn_lstm_ablation(
-        X_train = bandit$X_sequence[train_idx, , , drop = FALSE],
-        A_train = A_train,
-        y_train = y_train,
-        X_valid = bandit$X_sequence[valid_idx, , , drop = FALSE],
-        A_valid = A_valid,
-        y_valid = y_valid,
-        seed = seed + 500L
-    )
-
-    cnn_pred <- predict_cnn_lstm_potential_rewards(
-        model = cnn_model,
-        X_sequence = X_test_seq
-    )
-
-    cnn_policy <- policy_from_predictions(
-        mu0 = cnn_pred$mu0,
-        mu1 = cnn_pred$mu1 - policy_cost
-    )
-
-    cnn_metrics <- evaluate_policy_vector(
-        policy = cnn_policy,
-        reward0 = reward0_test,
-        reward1 = reward1_test,
-        policy_name = "CNN-LSTM ablation"
-    )
-
-    cnn_uniform_test <- compare_model_to_uniform(
-        policy = cnn_policy,
-        reward0 = reward0_test,
-        reward1 = reward1_test,
-        name_model = "CNN-LSTM ablation",
-        B = bootstrap_reps,
-        seed = seed + 600L
-    )
-
-    # -------------------------------------------------------------------------
-    # Causal-policy benchmark already generated by the cross-fitted causal model
-    # -------------------------------------------------------------------------
-
-    causal_policy <- if (
-        "CATE" %in% names(bandit)
-    ) {
-        as.integer(
-            bandit$CATE[test_idx][common_test] >
-                policy_cost
-        )
-    } else {
-        NULL
-    }
-
-    causal_metrics <- NULL
-    causal_uniform_test <- NULL
-
-    if (!is.null(causal_policy)) {
-
-        causal_metrics <- evaluate_policy_vector(
-            policy = causal_policy,
-            reward0 = reward0_test,
-            reward1 = reward1_test,
-            policy_name = "Cross-fitted causal policy"
-        )
-
-        causal_uniform_test <- compare_model_to_uniform(
-            policy = causal_policy,
-            reward0 = reward0_test,
-            reward1 = reward1_test,
-            name_model = "Cross-fitted causal policy",
-            B = bootstrap_reps,
-            seed = seed + 700L
-        )
-    }
-
-    # -------------------------------------------------------------------------
-    # Main results table
-    # -------------------------------------------------------------------------
-
-    summary_rows <- list(
-        baseline_uniform,
-        baseline_never,
-        baseline_always,
-        baseline_oracle,
-        cnn_metrics
-    )
-
-    summary_rows <- c(
-        summary_rows,
-        lapply(
-            seq_len(nrow(mlp_metrics)),
-            function(i) mlp_metrics[i, , drop = FALSE]
-        )
-    )
-
-    if (!is.null(causal_metrics)) {
-        summary_rows <- c(
-            summary_rows,
-            list(causal_metrics)
-        )
-    }
-
-    summary_table <- dplyr::bind_rows(
-        summary_rows
-    )
-
-    # -------------------------------------------------------------------------
-    # Pairwise statistical comparisons among the principal models
-    # -------------------------------------------------------------------------
-
-    pairwise <- list()
-
-    # Best MLP alpha is selected by validation performance, NOT test performance.
-    validation_values <- numeric(length(model_results))
-
-    for (j in seq_along(model_results)) {
-
-        history_j <- model_results[[j]]$fit$history
-
-        validation_values[j] <- if (
-            nrow(history_j) > 0L &&
-            any(is.finite(history_j$validation_mse))
-        ) {
-            min(
-                history_j$validation_mse,
-                na.rm = TRUE
-            )
-        } else {
-            Inf
         }
     }
-
-    best_j <- which.min(
-        validation_values
-    )
-
-    best_mlp <- model_results[[best_j]]
-
-    pairwise[[1L]] <- compare_model_to_uniform(
-        policy = best_mlp$policy,
-        reward0 = reward0_test,
-        reward1 = reward1_test,
-        name_model = sprintf(
-            "Selected MLP-PER-alpha-%s",
-            format(
-                best_mlp$alpha,
-                nsmall = 2
-            )
-        ),
-        B = bootstrap_reps,
-        seed = seed + 800L
-    )
-
-    pairwise[[2L]] <- compare_policy_vectors(
-        policy_a = best_mlp$policy,
-        policy_b = cnn_policy,
-        reward0 = reward0_test,
-        reward1 = reward1_test,
-        name_a = "Selected MLP",
-        name_b = "CNN-LSTM ablation",
-        B = bootstrap_reps,
-        seed = seed + 801L
-    )
-
-    if (!is.null(causal_policy)) {
-
-        pairwise[[3L]] <- compare_policy_vectors(
-            policy_a = best_mlp$policy,
-            policy_b = causal_policy,
-            reward0 = reward0_test,
-            reward1 = reward1_test,
-            name_a = "Selected MLP",
-            name_b = "Cross-fitted causal policy",
-            B = bootstrap_reps,
-            seed = seed + 802L
-        )
-    }
-
-    pairwise_table <- dplyr::bind_rows(
-        pairwise
-    )
-
-    # -------------------------------------------------------------------------
-    # Exact alpha=0 / Uniform consistency diagnostic
-    # -------------------------------------------------------------------------
-
-    alpha0_idx <- which(
-        vapply(
-            model_results,
-            function(z) z$alpha == 0,
-            logical(1)
-        )
-    )
-
-    alpha0_probability_check <- calculate_revised_per_probabilities(
-        priorities = c(
-            0.001,
-            0.01,
-            0.1,
-            1,
-            10
-        ),
-        alpha = 0
-    )
-
-    # -------------------------------------------------------------------------
-    # Save machine-readable outputs
-    # -------------------------------------------------------------------------
-
-    utils::write.csv(
-        summary_table,
-        file.path(
-            REVISED_OUTPUT_DIR,
-            "reviewer_revised_policy_results.csv"
-        ),
-        row.names = FALSE
-    )
-
-    utils::write.csv(
-        mlp_uniform_tests,
-        file.path(
-            REVISED_OUTPUT_DIR,
-            "reviewer_revised_mlp_uniform_inference.csv"
-        ),
-        row.names = FALSE
-    )
-
-    utils::write.csv(
-        pairwise_table,
-        file.path(
-            REVISED_OUTPUT_DIR,
-            "reviewer_revised_pairwise_inference.csv"
-        ),
-        row.names = FALSE
-    )
-
-    utils::write.csv(
-        data.frame(
-            alpha = alpha_grid,
-            validation_mse = validation_values
-        ),
-        file.path(
-            REVISED_OUTPUT_DIR,
-            "reviewer_revised_alpha_selection.csv"
-        ),
-        row.names = FALSE
-    )
-
-    saveRDS(
-        list(
-            summary = summary_table,
-            mlp_uniform_inference = mlp_uniform_tests,
-            pairwise_inference = pairwise_table,
-            alpha_selection = data.frame(
-                alpha = alpha_grid,
-                validation_mse = validation_values
-            ),
-            selected_alpha = best_mlp$alpha,
-            test_n = length(reward0_test),
-            test_reward0 = reward0_test,
-            test_reward1 = reward1_test,
-            alpha0_probability_check = alpha0_probability_check,
-            mlp_results = model_results,
-            cnn_lstm_model = cnn_model,
-            configuration = list(
-                seed = seed,
-                alpha_grid = alpha_grid,
-                beta = PER_BETA_PRIMARY,
-                policy_cost = policy_cost,
-                bootstrap_reps = bootstrap_reps,
-                gamma = BANDIT_GAMMA
-            )
-        ),
-        file.path(
-            REVISED_OUTPUT_DIR,
-            "reviewer_revised_bandit_analysis.rds"
-        )
-    )
-
-    # -------------------------------------------------------------------------
-    # Console report
-    # -------------------------------------------------------------------------
-
-    cat(
-        "\n============================================================\n"
-    )
-
-    cat(
-        "REVIEWER-REVISED ONE-STEP CONTEXTUAL BANDIT ANALYSIS\n"
-    )
-
-    cat(
-        "============================================================\n"
-    )
-
-    cat(
-        "Test observations:",
-        length(reward0_test),
-        "\n"
-    )
-
-    cat(
-        "Uniform expected policy value:",
-        round(
-            baseline_uniform$Policy_Value,
-            6
-        ),
-        "\n"
-    )
-
-    cat(
-        "Selected MLP PER alpha:",
-        best_mlp$alpha,
-        "\n"
-    )
-
-    cat(
-        "Selected MLP policy value:",
-        round(
-            mlp_metrics$Policy_Value[best_j],
-            6
-        ),
-        "\n"
-    )
-
-    cat(
-        "CNN-LSTM policy value:",
-        round(
-            cnn_metrics$Policy_Value,
-            6
-        ),
-        "\n"
-    )
-
-    if (!is.null(causal_metrics)) {
-
-        cat(
-            "Cross-fitted causal policy value:",
-            round(
-                causal_metrics$Policy_Value,
-                6
-            ),
-            "\n"
-        )
-    }
-
-    cat(
-        "\nImportant: statistical superiority is reported only when the ",
-        "paired t-test, Wilcoxon test, and bootstrap CI all support it.\n"
-    )
-
-    cat(
-        "Results:",
-        normalizePath(
-            REVISED_OUTPUT_DIR,
-            mustWork = FALSE
-        ),
-        "\n"
-    )
-
-    cat(
-        "============================================================\n"
-    )
-
-    list(
-        bandit_data = bandit,
-        summary = summary_table,
-        mlp_uniform_inference = mlp_uniform_tests,
-        pairwise_inference = pairwise_table,
-        alpha_selection = data.frame(
-            alpha = alpha_grid,
-            validation_mse = validation_values
-        ),
-        selected_alpha = best_mlp$alpha,
-        selected_mlp = best_mlp,
-        cnn_lstm_model = cnn_model,
-        baseline_uniform = baseline_uniform,
-        baseline_never = baseline_never,
-        baseline_always = baseline_always,
-        baseline_oracle = baseline_oracle
-    )
-}
-
-
-# =============================================================================
-# 31. RUN REVIEWER-REVISED PRIMARY ANALYSIS
-# =============================================================================
-
-if (!exists("RL_data") || !is.list(RL_data)) {
 
     stop(
-        paste(
-            "RL_data is not available.",
-            "Run the real-data panel construction and Section 19 causal",
-            "counterfactual estimation before this section."
+        paste0(
+            "Unsupported RL_data$X structure. ",
+            "Class = ",
+            paste(class(X), collapse = ", "),
+            ", dimensions = ",
+            paste(dim(X), collapse = " x ")
         )
     )
 }
 
-reviewer_results <- run_reviewer_revised_bandit(
-    RL_data = RL_data,
-    policy_cost = AI_POLICY_COST,
-    alpha_grid = PER_ALPHA_GRID,
-    seed = BANDIT_SEED,
-    bootstrap_reps = BOOTSTRAP_REPS
-)
+# -----------------------------------------------------------------------------
+# 20.3 Determine state dimension
+# -----------------------------------------------------------------------------
 
+if (!exists("state_dim") || !is.numeric(state_dim)) {
 
-# =============================================================================
-# 32. REVIEWER-RESPONSE DIAGNOSTICS
-# =============================================================================
+    state_dim <- length(state_variables)
+}
+
+state_dim <- as.integer(state_dim)
 
 cat(
-    "\n============================================================\n"
+    "State dimension:",
+    state_dim,
+    "\n"
 )
 
-cat(
-    "REVIEWER VALIDATION CHECKS\n"
-)
+# -----------------------------------------------------------------------------
+# 20.4 Test state extraction before constructing replay
+# -----------------------------------------------------------------------------
 
-cat(
-    "============================================================\n"
-)
-
-cat(
-    "1. Exact alpha=0 Uniform check: PASSED\n"
-)
-
-cat(
-    "2. Primary learner: MLP\n"
+test_state <- extract_rl_state(
+    RL_data$X,
+    k = 1L,
+    state_dim = state_dim
 )
 
 cat(
-    "3. Sequence learner: CNN-LSTM ablation\n"
+    "First state length:",
+    length(test_state),
+    "\n"
+)
+
+if (length(test_state) != state_dim) {
+
+    stop(
+        paste0(
+            "State dimension mismatch. Expected ",
+            state_dim,
+            " but extracted ",
+            length(test_state),
+            "."
+        )
+    )
+}
+
+if (any(!is.finite(test_state))) {
+
+    stop(
+        "The first RL state contains non-finite values."
+    )
+}
+
+# -----------------------------------------------------------------------------
+# 20.5 Construct causal transitions
+# -----------------------------------------------------------------------------
+
+transitions <- list()
+
+counter <- 0L
+
+skipped_mu <- 0L
+skipped_state <- 0L
+
+# -----------------------------------------------------------------------------
+# Only training sequences are used to train DQN
+# -----------------------------------------------------------------------------
+
+for (k in rl_train_idx) {
+
+    # -------------------------------------------------------------------------
+    # Current data index
+    # -------------------------------------------------------------------------
+
+    current_index <- RL_data$df_index[k]
+
+    if (
+        is.na(current_index) ||
+        current_index < 1 ||
+        current_index > nrow(dat)
+    ) {
+
+        next
+    }
+
+    current <- dat[
+        current_index,
+        ,
+        drop = FALSE
+    ]
+
+    # -------------------------------------------------------------------------
+    # Counterfactual predictions
+    # -------------------------------------------------------------------------
+
+    if (
+        !is.finite(
+            as.numeric(current$mu0)
+        ) ||
+        !is.finite(
+            as.numeric(current$mu1)
+        )
+    ) {
+
+        skipped_mu <- skipped_mu + 1L
+
+        next
+    }
+
+    # -------------------------------------------------------------------------
+    # Current state
+    # -------------------------------------------------------------------------
+
+    current_state <- extract_rl_state(
+        RL_data$X,
+        k,
+        state_dim
+    )
+
+    if (
+        length(current_state) != state_dim ||
+        any(!is.finite(current_state))
+    ) {
+
+        skipped_state <- skipped_state + 1L
+
+        next
+    }
+
+    # -------------------------------------------------------------------------
+    # Next temporal state
+    # -------------------------------------------------------------------------
+
+    if (k < n_rl) {
+
+        next_k <- k + 1L
+
+        next_state <- extract_rl_state(
+            RL_data$X,
+            next_k,
+            state_dim
+        )
+
+        done <- FALSE
+
+    } else {
+
+        next_state <- rep(
+            0,
+            state_dim
+        )
+
+        done <- TRUE
+    }
+
+    # -------------------------------------------------------------------------
+    # Validate next state
+    # -------------------------------------------------------------------------
+
+    if (
+        length(next_state) != state_dim ||
+        any(!is.finite(next_state))
+    ) {
+
+        next_state <- rep(
+            0,
+            state_dim
+        )
+
+        done <- TRUE
+    }
+
+    # =========================================================================
+    # ACTION 0
+    # =========================================================================
+
+    counter <- counter + 1L
+
+    transitions[[counter]] <- data.frame(
+
+        action = 0L,
+
+        reward = as.numeric(
+            current$mu0
+        ),
+
+        done = done,
+
+        stringsAsFactors = FALSE
+    )
+
+    transitions[[counter]]$state <- list(
+        current_state
+    )
+
+    transitions[[counter]]$next_state <- list(
+        next_state
+    )
+
+    # =========================================================================
+    # ACTION 1
+    # =========================================================================
+
+    counter <- counter + 1L
+
+    reward_1 <- as.numeric(
+        current$mu1
+    )
+
+    policy_cost <- 0
+
+    if (
+        exists("AI_POLICY_COST") &&
+        is.numeric(AI_POLICY_COST) &&
+        length(AI_POLICY_COST) == 1
+    ) {
+
+        policy_cost <- AI_POLICY_COST
+    }
+
+    reward_1 <- reward_1 - policy_cost
+
+    transitions[[counter]] <- data.frame(
+
+        action = 1L,
+
+        reward = reward_1,
+
+        done = done,
+
+        stringsAsFactors = FALSE
+    )
+
+    transitions[[counter]]$state <- list(
+        current_state
+    )
+
+    transitions[[counter]]$next_state <- list(
+        next_state
+    )
+}
+
+# -----------------------------------------------------------------------------
+# 20.6 Check replay size
+# -----------------------------------------------------------------------------
+
+cat(
+    "\nTransitions constructed:",
+    counter,
+    "\n"
 )
 
 cat(
-    "4. PER alpha grid:",
+    "Skipped due to missing mu0/mu1:",
+    skipped_mu,
+    "\n"
+)
+
+cat(
+    "Skipped due to invalid state:",
+    skipped_state,
+    "\n"
+)
+
+if (counter == 0L) {
+
+    stop(
+        paste0(
+            "No causal replay transitions were constructed.\n",
+            "Check RL_data$X, rl_train_idx, mu0, and mu1."
+        )
+    )
+}
+
+# -----------------------------------------------------------------------------
+# 20.7 Combine transitions
+# -----------------------------------------------------------------------------
+
+transitions_df <- dplyr::bind_rows(
+    transitions
+)
+
+# -----------------------------------------------------------------------------
+# 20.8 Verify structure
+# -----------------------------------------------------------------------------
+
+required_transition_columns <- c(
+    "state",
+    "action",
+    "reward",
+    "next_state",
+    "done"
+)
+
+missing_transition_columns <- setdiff(
+    required_transition_columns,
+    names(transitions_df)
+)
+
+if (length(missing_transition_columns) > 0) {
+
+    stop(
+        paste0(
+            "Transitions are missing columns: ",
+            paste(
+                missing_transition_columns,
+                collapse = ", "
+            )
+        )
+    )
+}
+
+# -----------------------------------------------------------------------------
+# 20.9 Verify state dimensions
+# -----------------------------------------------------------------------------
+
+state_lengths <- vapply(
+    transitions_df$state,
+    length,
+    integer(1)
+)
+
+next_state_lengths <- vapply(
+    transitions_df$next_state,
+    length,
+    integer(1)
+)
+
+cat(
+    "State lengths:",
     paste(
-        PER_ALPHA_GRID,
+        unique(state_lengths),
         collapse = ", "
     ),
     "\n"
 )
 
 cat(
-    "5. Primary objective: one-step contextual-bandit policy value\n"
+    "Next-state lengths:",
+    paste(
+        unique(next_state_lengths),
+        collapse = ", "
+    ),
+    "\n"
 )
 
+if (
+    any(state_lengths != state_dim) ||
+    any(next_state_lengths != state_dim)
+) {
+
+    stop(
+        paste0(
+            "Invalid state dimension in replay buffer. ",
+            "Expected state_dim = ",
+            state_dim,
+            "."
+        )
+    )
+}
+
+# -----------------------------------------------------------------------------
+# 20.10 Final replay diagnostics
+# -----------------------------------------------------------------------------
+
 cat(
-    "6. Gamma used in primary analysis:",
-    BANDIT_GAMMA,
+    "Action 0 transitions:",
+    sum(transitions_df$action == 0L),
     "\n"
 )
 
 cat(
-    "7. Test set is fixed before policy comparison.\n"
+    "Action 1 transitions:",
+    sum(transitions_df$action == 1L),
+    "\n"
 )
 
 cat(
-    "8. Uniform value is evaluated analytically at treatment probability 0.5.\n"
+    "Mean reward:",
+    round(
+        mean(
+            transitions_df$reward,
+            na.rm = TRUE
+        ),
+        6
+    ),
+    "\n"
 )
 
 cat(
-    "9. Paired t-test + Wilcoxon + bootstrap CI are reported.\n"
+    "Mean reward A=0:",
+    round(
+        mean(
+            transitions_df$reward[
+                transitions_df$action == 0L
+            ],
+            na.rm = TRUE
+        ),
+        6
+    ),
+    "\n"
 )
 
 cat(
-    "10. No unsupported performance-gain claim is generated.\n"
+    "Mean reward A=1:",
+    round(
+        mean(
+            transitions_df$reward[
+                transitions_df$action == 1L
+            ],
+            na.rm = TRUE
+        ),
+        6
+    ),
+    "\n"
+)
+
+cat("\nCausal experience replay constructed successfully.\n")
+
+# =============================================================================
+# 21. TRAIN PRIORITIZED-REPLAY DQN
+# =============================================================================
+
+cat("\n============================================================\n")
+cat("21. TRAIN PRIORITIZED-REPLAY DQN\n")
+cat("============================================================\n")
+
+if (!exists("train_dqn_per")) {
+
+    stop(
+        "train_dqn_per() is not available."
+    )
+}
+
+dqn_fit <- train_dqn_per(
+
+    transitions =
+        transitions_df,
+
+    state_dim =
+        state_dim,
+
+    n_actions =
+        2
+)
+
+if (!"model" %in% names(dqn_fit)) {
+
+    stop(
+        "train_dqn_per() did not return dqn_fit$model."
+    )
+}
+
+dqn_model <- dqn_fit$model
+
+cat(
+    "DQN training completed.\n"
+)
+
+
+# =============================================================================
+# 22. DQN POLICY
+# =============================================================================
+
+cat("\n============================================================\n")
+cat("22. DQN POLICY\n")
+cat("============================================================\n")
+
+X_all <- array(
+
+    RL_data$X,
+
+    dim = c(
+        n_rl,
+        state_dim
+    )
+)
+
+q_values <- predict(
+
+    dqn_model,
+
+    X_all,
+
+    verbose = 0
+)
+
+q_values <- as.matrix(
+    q_values
+)
+
+if (
+    ncol(q_values) != 2
+) {
+
+    stop(
+        paste0(
+            "DQN output must contain two action values. ",
+            "Observed columns: ",
+            ncol(q_values)
+        )
+    )
+}
+
+rl_policy <- max.col(
+    q_values,
+    ties.method = "first"
+) - 1L
+
+rl_policy <- as.integer(
+    rl_policy
 )
 
 cat(
-    "============================================================\n"
+    "DQN treatment rate:",
+    round(
+        mean(
+            rl_policy,
+            na.rm = TRUE
+        ),
+        4
+    ),
+    "\n"
+)
+
+
+# =============================================================================
+# 23. TEST POLICY
+# =============================================================================
+
+cat("\n============================================================\n")
+cat("23. TEST POLICY\n")
+cat("============================================================\n")
+
+test_df_index <- RL_data$df_index[
+    rl_test_idx
+]
+
+test_data <- dat[
+    test_df_index,
+    ,
+    drop = FALSE
+]
+
+test_policy <- rl_policy[
+    rl_test_idx
+]
+
+# -----------------------------------------------------------------------------
+# Construct causal policy
+# -----------------------------------------------------------------------------
+
+if (!"causal_policy" %in% names(test_data)) {
+
+    policy_cost <- if (
+        exists("AI_POLICY_COST")
+    ) {
+        AI_POLICY_COST
+    } else {
+        0
+    }
+
+    test_data$causal_policy <- as.integer(
+
+        (
+            test_data$mu1 -
+            policy_cost
+        ) >
+
+            test_data$mu0
+    )
+}
+
+cat(
+    "Test observations:",
+    nrow(test_data),
+    "\n"
 )
 
 cat(
-    "END OF REVIEWER-REVISED ANALYSIS\n"
+    "DQN treatment rate:",
+    round(
+        mean(
+            test_policy,
+            na.rm = TRUE
+        ),
+        4
+    ),
+    "\n"
 )
 
 cat(
-    "============================================================\n"
+    "Causal treatment rate:",
+    round(
+        mean(
+            test_data$causal_policy,
+            na.rm = TRUE
+        ),
+        4
+    ),
+    "\n"
 )
+
+
+# =============================================================================
+# 24. DOUBLY ROBUST POLICY VALUE
+# =============================================================================
+
+cat("\n============================================================\n")
+cat("24. DOUBLY ROBUST POLICY VALUE\n")
+cat("============================================================\n")
+
+dr_policy_value <- function(
+    data,
+    policy,
+    cost = 0
+) {
+
+    required <- c(
+        "A",
+        "propensity",
+        "mu0",
+        "mu1",
+        "Y_next"
+    )
+
+    missing_vars <- setdiff(
+        required,
+        names(data)
+    )
+
+    if (length(missing_vars) > 0) {
+
+        stop(
+            paste0(
+                "Missing DR variables: ",
+                paste(
+                    missing_vars,
+                    collapse = ", "
+                )
+            )
+        )
+    }
+
+    valid <-
+
+        is.finite(policy) &
+
+        is.finite(data$propensity) &
+
+        is.finite(data$mu0) &
+
+        is.finite(data$mu1) &
+
+        is.finite(data$Y_next) &
+
+        is.finite(data$A)
+
+    if (sum(valid) == 0) {
+
+        return(
+            NA_real_
+        )
+    }
+
+    d <- as.integer(
+        policy[valid]
+    )
+
+    p <- data$propensity[valid]
+
+    y <- data$Y_next[valid]
+
+    a <- data$A[valid]
+
+    m0 <- data$mu0[valid]
+
+    m1 <- data$mu1[valid]
+
+    # -------------------------------------------------------------------------
+    # Stabilize propensity
+    # -------------------------------------------------------------------------
+
+    eps <- 0.01
+
+    p <- pmin(
+        pmax(
+            p,
+            eps
+        ),
+        1 - eps
+    )
+
+    # -------------------------------------------------------------------------
+    # Policy-specific outcome regression
+    # -------------------------------------------------------------------------
+
+    mu_d <- ifelse(
+        d == 1,
+        m1,
+        m0
+    )
+
+    # -------------------------------------------------------------------------
+    # Doubly robust correction
+    # -------------------------------------------------------------------------
+
+    correction <- ifelse(
+
+        d == 1,
+
+        a / p *
+            (y - m1),
+
+        (1 - a) /
+            (1 - p) *
+            (y - m0)
+    )
+
+    value <- mean(
+
+        mu_d +
+            correction -
+            cost * d,
+
+        na.rm = TRUE
+    )
+
+    as.numeric(
+        value
+    )
+}
+
+
+# =============================================================================
+# 25. POLICY VALUES
+# =============================================================================
+
+cat("\n============================================================\n")
+cat("25. POLICY VALUES\n")
+cat("============================================================\n")
+
+policy_cost <- if (
+    exists("AI_POLICY_COST")
+) {
+    AI_POLICY_COST
+} else {
+    0
+}
+
+# -----------------------------------------------------------------------------
+# DQN
+# -----------------------------------------------------------------------------
+
+dqn_value <- dr_policy_value(
+
+    test_data,
+
+    test_policy,
+
+    cost = policy_cost
+)
+
+# -----------------------------------------------------------------------------
+# Causal policy
+# -----------------------------------------------------------------------------
+
+causal_policy <- as.integer(
+    test_data$causal_policy
+)
+
+causal_value <- dr_policy_value(
+
+    test_data,
+
+    causal_policy,
+
+    cost = policy_cost
+)
+
+# -----------------------------------------------------------------------------
+# Always treat
+# -----------------------------------------------------------------------------
+
+always_policy <- rep(
+    1L,
+    nrow(test_data)
+)
+
+always_value <- dr_policy_value(
+
+    test_data,
+
+    always_policy,
+
+    cost = policy_cost
+)
+
+# -----------------------------------------------------------------------------
+# Never treat
+# -----------------------------------------------------------------------------
+
+never_policy <- rep(
+    0L,
+    nrow(test_data)
+)
+
+never_value <- dr_policy_value(
+
+    test_data,
+
+    never_policy,
+
+    cost = policy_cost
+)
+
+cat(
+    "DQN value:",
+    round(
+        dqn_value,
+        6
+    ),
+    "\n"
+)
+
+cat(
+    "Causal policy value:",
+    round(
+        causal_value,
+        6
+    ),
+    "\n"
+)
+
+cat(
+    "Always-treat value:",
+    round(
+        always_value,
+        6
+    ),
+    "\n"
+)
+
+cat(
+    "Never-treat value:",
+    round(
+        never_value,
+        6
+    ),
+    "\n"
+)
+
+
+# =============================================================================
+# 26. MODEL-BASED ORACLE
+# =============================================================================
+
+cat("\n============================================================\n")
+cat("26. MODEL-BASED ORACLE\n")
+cat("============================================================\n")
+
+oracle_policy <- as.integer(
+
+    (
+        test_data$mu1 -
+        policy_cost
+    ) >
+
+        test_data$mu0
+)
+
+oracle_value <- dr_policy_value(
+
+    test_data,
+
+    oracle_policy,
+
+    cost = policy_cost
+)
+
+cat(
+    "Oracle treatment rate:",
+    round(
+        mean(
+            oracle_policy,
+            na.rm = TRUE
+        ),
+        4
+    ),
+    "\n"
+)
+
+cat(
+    "Oracle value:",
+    round(
+        oracle_value,
+        6
+    ),
+    "\n"
+)
+
+
+# =============================================================================
+# 27. POLICY SUMMARY
+# =============================================================================
+
+cat("\n============================================================\n")
+cat("27. POLICY SUMMARY\n")
+cat("============================================================\n")
+
+policy_summary <- data.frame(
+
+    Policy = c(
+
+        "DQN",
+
+        "Causal CATE",
+
+        "Always Treat",
+
+        "Never Treat",
+
+        "Model-Based Oracle"
+    ),
+
+    Policy_Value = c(
+
+        dqn_value,
+
+        causal_value,
+
+        always_value,
+
+        never_value,
+
+        oracle_value
+    ),
+
+    Treatment_Rate = c(
+
+        mean(
+            test_policy,
+            na.rm = TRUE
+        ),
+
+        mean(
+            causal_policy,
+            na.rm = TRUE
+        ),
+
+        1,
+
+        0,
+
+        mean(
+            oracle_policy,
+            na.rm = TRUE
+        )
+    )
+)
+
+policy_summary$Policy_Regret <-
+
+    oracle_value -
+    policy_summary$Policy_Value
+
+print(
+    policy_summary
+)
+
+write.csv(
+
+    policy_summary,
+
+    file.path(
+        OUTPUT_DIR,
+        "real_policy_summary.csv"
+    ),
+
+    row.names = FALSE
+)
+
+
+# =============================================================================
+# 28. DYNAMIC TREATMENT EFFECTS
+# =============================================================================
+
+cat("\n============================================================\n")
+cat("28. DYNAMIC TREATMENT EFFECTS\n")
+cat("============================================================\n")
+
+if (!"Y_next" %in% names(dat)) {
+
+    stop(
+        "The causal panel must contain Y_next."
+    )
+}
+
+dynamic_results <- list()
+
+for (h in DYNAMIC_HORIZONS) {
+
+    cat(
+        "\nDynamic horizon:",
+        h,
+        "month(s)\n"
+    )
+
+    # -------------------------------------------------------------------------
+    # Construct h-month-ahead outcome
+    #
+    # Y_next = outcome at t+1
+    #
+    # Therefore:
+    # h = 1 -> t+1
+    # h = 2 -> t+2
+    # h = 3 -> t+3
+    # etc.
+    # -------------------------------------------------------------------------
+
+    dat_dynamic <- dat
+
+    if (h == 1) {
+
+        dat_dynamic$Y_h <-
+            dat_dynamic$Y_next
+
+    } else {
+
+        dat_dynamic$Y_h <-
+            dplyr::lead(
+                dat_dynamic$Y_next,
+                h - 1L
+            )
+    }
+
+    # -------------------------------------------------------------------------
+    # Training sample
+    # -------------------------------------------------------------------------
+
+    train <- dat_dynamic[
+        panel$causal_train_idx,
+        ,
+        drop = FALSE
+    ]
+
+    dynamic_vars <- c(
+        "Y_h",
+        "A",
+        state_variables
+    )
+
+    train <- train[
+        complete.cases(
+            train[
+                ,
+                dynamic_vars,
+                drop = FALSE
+            ]
+        ),
+        ,
+        drop = FALSE
+    ]
+
+    if (
+        nrow(train) < 50 ||
+        length(
+            unique(
+                train$A
+            )
+        ) < 2
+    ) {
+
+        dynamic_results[[as.character(h)]] <-
+            data.frame(
+
+                horizon = h,
+
+                estimate = NA_real_,
+
+                SE = NA_real_,
+
+                CI_low = NA_real_,
+
+                CI_high = NA_real_,
+
+                N = nrow(train)
+            )
+
+        next
+    }
+
+    # -------------------------------------------------------------------------
+    # Treatment-specific samples
+    # -------------------------------------------------------------------------
+
+    train0 <- train[
+        train$A == 0,
+        ,
+        drop = FALSE
+    ]
+
+    train1 <- train[
+        train$A == 1,
+        ,
+        drop = FALSE
+    ]
+
+    if (
+        nrow(train0) < 20 ||
+        nrow(train1) < 20
+    ) {
+
+        dynamic_results[[as.character(h)]] <-
+            data.frame(
+
+                horizon = h,
+
+                estimate = NA_real_,
+
+                SE = NA_real_,
+
+                CI_low = NA_real_,
+
+                CI_high = NA_real_,
+
+                N = nrow(train)
+            )
+
+        next
+    }
+
+    # -------------------------------------------------------------------------
+    # Outcome models
+    # -------------------------------------------------------------------------
+
+    f <- as.formula(
+
+        paste(
+            "Y_h ~",
+            paste(
+                state_variables,
+                collapse = " + "
+            )
+        )
+    )
+
+    m0 <- ranger::ranger(
+
+        f,
+
+        data =
+            train0,
+
+        num.trees =
+            CAUSAL_TREES,
+
+        min.node.size =
+            CAUSAL_MIN_NODE
+    )
+
+    m1 <- ranger::ranger(
+
+        f,
+
+        data =
+            train1,
+
+        num.trees =
+            CAUSAL_TREES,
+
+        min.node.size =
+            CAUSAL_MIN_NODE
+    )
+
+    # -------------------------------------------------------------------------
+    # Test sample
+    # -------------------------------------------------------------------------
+
+    test <- dat_dynamic[
+        panel$causal_test_idx,
+        ,
+        drop = FALSE
+    ]
+
+    test_vars <- c(
+        "Y_h",
+        "A",
+        "propensity",
+        state_variables
+    )
+
+    test <- test[
+        complete.cases(
+            test[
+                ,
+                test_vars,
+                drop = FALSE
+            ]
+        ),
+        ,
+        drop = FALSE
+    ]
+
+    if (nrow(test) < 10) {
+
+        dynamic_results[[as.character(h)]] <-
+            data.frame(
+
+                horizon = h,
+
+                estimate = NA_real_,
+
+                SE = NA_real_,
+
+                CI_low = NA_real_,
+
+                CI_high = NA_real_,
+
+                N = nrow(test)
+            )
+
+        next
+    }
+
+    # -------------------------------------------------------------------------
+    # Counterfactual predictions
+    # -------------------------------------------------------------------------
+
+    mu0_h <- predict(
+
+        m0,
+
+        data =
+            test[
+                ,
+                state_variables,
+                drop = FALSE
+            ]
+
+    )$predictions
+
+    mu1_h <- predict(
+
+        m1,
+
+        data =
+            test[
+                ,
+                state_variables,
+                drop = FALSE
+            ]
+
+    )$predictions
+
+    p <- test$propensity
+
+    a <- test$A
+
+    y <- test$Y_h
+
+    # -------------------------------------------------------------------------
+    # Stabilize propensity
+    # -------------------------------------------------------------------------
+
+    eps <- 0.01
+
+    p <- pmin(
+        pmax(
+            p,
+            eps
+        ),
+        1 - eps
+    )
+
+    # -------------------------------------------------------------------------
+    # Doubly robust treatment effect
+    # -------------------------------------------------------------------------
+
+    dr <-
+
+        mu1_h -
+        mu0_h +
+
+        a / p *
+        (y - mu1_h) -
+
+        (1 - a) /
+        (1 - p) *
+        (y - mu0_h)
+
+    finite_dr <- dr[
+        is.finite(dr)
+    ]
+
+    if (
+        length(finite_dr) == 0
+    ) {
+
+        dynamic_results[[as.character(h)]] <-
+            data.frame(
+
+                horizon = h,
+
+                estimate = NA_real_,
+
+                SE = NA_real_,
+
+                CI_low = NA_real_,
+
+                CI_high = NA_real_,
+
+                N = 0
+            )
+
+        next
+    }
+
+    estimate <- mean(
+        finite_dr
+    )
+
+    n <- length(
+        finite_dr
+    )
+
+    se <- if (
+        n > 1
+    ) {
+
+        sd(
+            finite_dr
+        ) /
+            sqrt(n)
+
+    } else {
+
+        NA_real_
+    }
+
+    dynamic_results[[as.character(h)]] <-
+        data.frame(
+
+            horizon = h,
+
+            estimate = estimate,
+
+            SE = se,
+
+            CI_low =
+                estimate -
+                1.96 * se,
+
+            CI_high =
+                estimate +
+                1.96 * se,
+
+            N = n
+        )
+}
+
+dynamic_results_df <- dplyr::bind_rows(
+    dynamic_results
+)
+
+print(
+    dynamic_results_df
+)
+
+write.csv(
+
+    dynamic_results_df,
+
+    file.path(
+        OUTPUT_DIR,
+        "dynamic_treatment_effects.csv"
+    ),
+
+    row.names = FALSE
+)
+
+
+# =============================================================================
+# 29. DQN TRAINING DIAGNOSTICS
+# =============================================================================
+
+cat("\n============================================================\n")
+cat("29. DQN TRAINING DIAGNOSTICS\n")
+cat("============================================================\n")
+
+if (
+    "loss_history" %in% names(dqn_fit) &&
+    !is.null(
+        dqn_fit$loss_history
+    )
+) {
+
+    td_history <- NULL
+
+    if (
+        "td_history" %in% names(dqn_fit)
+    ) {
+
+        td_history <-
+            dqn_fit$td_history
+    }
+
+    n_loss <- length(
+        dqn_fit$loss_history
+    )
+
+    if (
+        is.null(td_history) ||
+        length(td_history) != n_loss
+    ) {
+
+        td_history <- rep(
+            NA_real_,
+            n_loss
+        )
+    }
+
+    loss_df <- data.frame(
+
+        epoch =
+            seq_len(n_loss),
+
+        loss =
+            dqn_fit$loss_history,
+
+        mean_abs_td =
+            td_history
+    )
+
+    write.csv(
+
+        loss_df,
+
+        file.path(
+            OUTPUT_DIR,
+            "dqn_training_loss.csv"
+        ),
+
+        row.names = FALSE
+    )
+
+    p_loss <- ggplot(
+
+        loss_df,
+
+        aes(
+            x = epoch,
+            y = loss
+        )
+
+    ) +
+
+        geom_line() +
+
+        theme_minimal() +
+
+        labs(
+
+            title =
+                "Prioritized Experience Replay DQN Training",
+
+            x =
+                "Epoch",
+
+            y =
+                "Loss"
+        )
+
+    ggsave(
+
+        file.path(
+            OUTPUT_DIR,
+            "dqn_training_loss.png"
+        ),
+
+        p_loss,
+
+        width = 8,
+
+        height = 5,
+
+        dpi = 300
+    )
+}
+
+
+# =============================================================================
+# 30. DYNAMIC EFFECT PLOT
+# =============================================================================
+
+cat("\n============================================================\n")
+cat("30. DYNAMIC EFFECT PLOT\n")
+cat("============================================================\n")
+
+plot_data <- dynamic_results_df[
+    is.finite(
+        dynamic_results_df$estimate
+    ),
+    ,
+    drop = FALSE
+]
+
+if (
+    nrow(plot_data) > 0
+) {
+
+    p_dynamic <- ggplot(
+
+        plot_data,
+
+        aes(
+            x = horizon,
+            y = estimate
+        )
+
+    ) +
+
+        geom_hline(
+
+            yintercept = 0,
+
+            linetype = "dashed"
+        ) +
+
+        geom_line() +
+
+        geom_point() +
+
+        geom_errorbar(
+
+            aes(
+                ymin = CI_low,
+                ymax = CI_high
+            ),
+
+            width = 0.15
+        ) +
+
+        theme_minimal() +
+
+        labs(
+
+            title =
+                "Dynamic Treatment Effects",
+
+            x =
+                "Horizon (Months)",
+
+            y =
+                "Doubly Robust Treatment Effect"
+        )
+
+    ggsave(
+
+        file.path(
+            OUTPUT_DIR,
+            "dynamic_treatment_effects.png"
+        ),
+
+        p_dynamic,
+
+        width = 8,
+
+        height = 5,
+
+        dpi = 300
+    )
+}
+
+
+# =============================================================================
+# 31. SAVE MODELS AND ANALYSIS OBJECTS
+# =============================================================================
+
+cat("\n============================================================\n")
+cat("31. SAVE ANALYSIS OBJECTS\n")
+cat("============================================================\n")
+
+# -----------------------------------------------------------------------------
+# Update panel$data with all variables created in Sections 14-30
+# -----------------------------------------------------------------------------
+
+panel$data <- dat
+
+saveRDS(
+
+    panel,
+
+    file.path(
+        OUTPUT_DIR,
+        "causal_panel_models.rds"
+    )
+)
+
+saveRDS(
+
+    dqn_model,
+
+    file.path(
+        OUTPUT_DIR,
+        "dqn_model.rds"
+    )
+)
+
+saveRDS(
+
+    RL_data,
+
+    file.path(
+        OUTPUT_DIR,
+        "rl_temporal_data.rds"
+    )
+)
+
+saveRDS(
+
+    transitions_df,
+
+    file.path(
+        OUTPUT_DIR,
+        "causal_experience_replay.rds"
+    )
+)
+
+saveRDS(
+
+    policy_summary,
+
+    file.path(
+        OUTPUT_DIR,
+        "policy_summary.rds"
+    )
+)
+
+saveRDS(
+
+    state_variables,
+
+    file.path(
+        OUTPUT_DIR,
+        "state_variables.rds"
+    )
+)
+
+
+# =============================================================================
+# 32. FINAL SUMMARY
+# =============================================================================
+
+cat("\n============================================================\n")
+cat("32. FINAL SUMMARY\n")
+cat("============================================================\n")
+
+final_summary <- data.frame(
+
+    Metric = c(
+
+        "Observations",
+
+        "Causal Training",
+
+        "Causal Validation",
+
+        "Causal Test",
+
+        "RL Sequences",
+
+        "RL Training",
+
+        "RL Validation",
+
+        "RL Test",
+
+        "DQN Value",
+
+        "Causal Policy Value",
+
+        "Always Treat Value",
+
+        "Never Treat Value",
+
+        "Oracle Value",
+
+        "DQN Regret",
+
+        "Causal Policy Regret",
+
+        "DQN Treatment Rate",
+
+        "Causal Treatment Rate",
+
+        "Always Treat Rate",
+
+        "Never Treat Rate",
+
+        "Oracle Treatment Rate",
+
+        "VIX Treatment Threshold"
+    ),
+
+    Value = c(
+
+        nrow(dat),
+
+        length(
+            panel$causal_train_idx
+        ),
+
+        length(
+            panel$causal_valid_idx
+        ),
+
+        length(
+            panel$causal_test_idx
+        ),
+
+        n_rl,
+
+        length(
+            rl_train_idx
+        ),
+
+        length(
+            rl_valid_idx
+        ),
+
+        length(
+            rl_test_idx
+        ),
+
+        dqn_value,
+
+        causal_value,
+
+        always_value,
+
+        never_value,
+
+        oracle_value,
+
+        oracle_value -
+            dqn_value,
+
+        oracle_value -
+            causal_value,
+
+        mean(
+            test_policy,
+            na.rm = TRUE
+        ),
+
+        mean(
+            causal_policy,
+            na.rm = TRUE
+        ),
+
+        1,
+
+        0,
+
+        mean(
+            oracle_policy,
+            na.rm = TRUE
+        ),
+
+        panel$vix_threshold
+    )
+)
+
+print(
+    final_summary
+)
+
+write.csv(
+
+    final_summary,
+
+    file.path(
+        OUTPUT_DIR,
+        "final_summary.csv"
+    ),
+
+    row.names = FALSE
+)
+
+
+# =============================================================================
+# 33. FINAL REPORT
+# =============================================================================
+
+cat("\n============================================================\n")
+cat("REAL-DATA CAUSAL-RL ANALYSIS COMPLETE\n")
+cat("============================================================\n\n")
+
+cat(
+    "Monthly causal sample:",
+    nrow(dat),
+    "\n"
+)
+
+cat(
+    "Date range:",
+    format(
+        min(
+            dat$month,
+            na.rm = TRUE
+        ),
+        "%Y-%m"
+    ),
+    "to",
+    format(
+        max(
+            dat$month,
+            na.rm = TRUE
+        ),
+        "%Y-%m"
+    ),
+    "\n"
+)
+
+cat(
+    "VIX treatment threshold:",
+    round(
+        panel$vix_threshold,
+        4
+    ),
+    "\n"
+)
+
+cat(
+    "Temporal sequences:",
+    n_rl,
+    "\n"
+)
+
+cat(
+    "Lookback:",
+    LOOKBACK,
+    "months\n"
+)
+
+cat(
+    "DQN policy value:",
+    round(
+        dqn_value,
+        6
+    ),
+    "\n"
+)
+
+cat(
+    "Causal policy value:",
+    round(
+        causal_value,
+        6
+    ),
+    "\n"
+)
+
+cat(
+    "Always-treat value:",
+    round(
+        always_value,
+        6
+    ),
+    "\n"
+)
+
+cat(
+    "Never-treat value:",
+    round(
+        never_value,
+        6
+    ),
+    "\n"
+)
+
+cat(
+    "Oracle value:",
+    round(
+        oracle_value,
+        6
+    ),
+    "\n"
+)
+
+cat(
+    "DQN regret:",
+    round(
+        oracle_value -
+            dqn_value,
+        6
+    ),
+    "\n"
+)
+
+cat(
+    "Causal-policy regret:",
+    round(
+        oracle_value -
+            causal_value,
+        6
+    ),
+    "\n"
+)
+
+cat(
+    "DQN treatment rate:",
+    round(
+        mean(
+            test_policy,
+            na.rm = TRUE
+        ),
+        4
+    ),
+    "\n"
+)
+
+cat(
+    "Causal treatment rate:",
+    round(
+        mean(
+            causal_policy,
+            na.rm = TRUE
+        ),
+        4
+    ),
+    "\n"
+)
+
+cat(
+    "\nResults directory:\n"
+)
+
+cat(
+    normalizePath(
+        OUTPUT_DIR,
+        mustWork = FALSE
+    ),
+    "\n"
+)
+
+
+# =============================================================================
+# 34. FILES CREATED
+# =============================================================================
+
+cat("\n============================================================\n")
+cat("34. FILES CREATED\n")
+cat("============================================================\n")
+
+print(
+    list.files(
+        OUTPUT_DIR,
+        full.names = FALSE
+    )
+)
+
+cat("\n============================================================\n")
+cat("END OF REAL-DATA CAUSAL-RL ANALYSIS\n")
+cat("============================================================\n")

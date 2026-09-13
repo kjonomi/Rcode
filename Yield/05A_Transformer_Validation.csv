@@ -1,0 +1,14 @@
+"Check","Result"
+"X_train is 3-dimensional",TRUE
+"X_valid is 3-dimensional",TRUE
+"X_test is 3-dimensional",TRUE
+"Training data finite",TRUE
+"Validation data finite",TRUE
+"Testing data finite",TRUE
+"Feature scaler valid",TRUE
+"Target dimensions valid",TRUE
+"Forward pass successful",TRUE
+"Output dimension correct",TRUE
+"Output finite",TRUE
+"Model file exists",TRUE
+"Model file non-empty",TRUE

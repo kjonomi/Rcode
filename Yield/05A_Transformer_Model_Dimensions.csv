@@ -1,0 +1,14 @@
+"Parameter","Value"
+"Training samples",914
+"Validation samples",196
+"Testing samples",197
+"Sequence length",20
+"Input feature dimension",125
+"Attention embedding dimension",64
+"Head size",16
+"Number of heads",4
+"Feed-forward dimension",128
+"Dropout",0.1
+"Transformer blocks",2
+"Forecast horizon",1
+"Number of model parameters",75008

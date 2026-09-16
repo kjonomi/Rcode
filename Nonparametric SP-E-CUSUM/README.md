@@ -243,8 +243,7 @@ $$
 The alarm time, or run length, is defined as
 
 $$
-\tau
-=
+\tau=
 \inf\left\{
 t \geq 1:
 S_{\mathrm{ensemble}}(t) \geq H

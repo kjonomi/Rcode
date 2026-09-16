@@ -205,54 +205,50 @@ Let \(x_t\) denote a continuous process observation at time \(t\), and let \(F_n
 
 ### Empirical PIT and Standardization
 
-The observation is transformed using the empirical probability integral transform:
+For a continuous observation \(x_t\) at time \(t\), let \(F_n\) denote the empirical Phase I distribution. The empirical probability integral transform is
 
-\[
-U_t = F_n(x_t),
-\]
+$$
+U_t = F_n(x_t).
+$$
 
-followed by normal-score standardization:
+The corresponding normal score is
 
-\[
-Z_t =
-\Phi^{-1}
-\left[
-\min\left\{
-\max(U_t,\epsilon),1-\epsilon
-\right\}
-\right],
-\]
+$$
+Z_t = \Phi^{-1}\left(\min\left(\max(U_t,\epsilon),1-\epsilon\right)\right),
+$$
 
-where \(\epsilon\) is a small numerical truncation constant.
+where \(\Phi^{-1}\) is the standard normal quantile function and \(\epsilon\) is a small numerical truncation constant.
 
 ---
 
 ### Ensemble CUSUM Components
 
-For \(m\) reference values \(k_j\), the sequential state of component \(j\) is updated as
+For \(m\) reference values \(k_j\), the sequential state of component \(j\) is updated according to
 
-\[
-S_{t,j}
-=
-\max
-\left[
-0,\,
-S_{t-1,j}+Z_t-k_j
-\right],
-\qquad j=1,\ldots,m.
-\]
+$$
+S_{t,j} = \max\left(0,\; S_{t-1,j} + Z_t - k_j\right),
+\qquad j = 1,\ldots,m.
+$$
 
-The ensemble statistic is
+The weighted ensemble statistic is
 
-\[
-S_{\mathrm{ensemble}}(t)
-=
-\sum_{j=1}^{m} w_j S_{t,j},
-\]
+$$
+S_{\mathrm{ensemble}}(t) = \sum_{j=1}^{m} w_j S_{t,j},
+$$
 
-where \(w_j\) denotes the calibrated weight of component \(j\).
+where \(w_j\) denotes the calibrated weight assigned to the \(j\)-th CUSUM component.
 
 ---
+
+### Decision Rule
+
+An out-of-control signal is generated when
+
+$$
+S_{\mathrm{ensemble}}(t) \geq H,
+$$
+
+where \(H\) is the calibrated decision threshold.
 
 ### Alarm Rule
 

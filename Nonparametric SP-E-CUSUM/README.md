@@ -240,18 +240,13 @@ $$
 S_{\mathrm{ensemble}}(t) \geq H.
 $$
 
-The alarm time, or run length, is defined as
+The alarm time, or run length, is defined by
 
 $$
-\tau
-=
-\inf\left\{
-t \geq 1:
-S_{\mathrm{ensemble}}(t) \geq H
-\right\}.
+\tau = \min\{t \geq 1 : S_{\mathrm{ensemble}}(t) \geq H\}.
 $$
 
-where $H$ denotes the calibrated decision threshold. Thus, an alarm is
+Here, $H$ denotes the calibrated decision threshold. Thus, an alarm is
 issued at the **first monitoring time** at which the ensemble statistic
 reaches or exceeds $H$.
 
@@ -261,7 +256,6 @@ the specified average run length,
 $$
 \mathrm{ARL}_0 = \mathbb{E}_0[\tau].
 $$
-
 ## Monitoring Workflow
 
 The overall workflow is:

@@ -130,12 +130,6 @@ Launch the production API server:
 Rscript main_R_session_to_start_serving_endpoints.R
 ```
 
-The default service is available at:
-
-```text
-http://127.0.0.1:8080
-```
-
 ---
 
 ### 4. Launch the Shiny Dashboard

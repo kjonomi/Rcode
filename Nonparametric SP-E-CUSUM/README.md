@@ -232,33 +232,35 @@ $$
 
 where \(w_j\) denotes the calibrated weight assigned to the \(j\)-th CUSUM component.
 
----
+### Decision and Alarm Rule
 
-### Decision Rule
-
-An out-of-control signal is generated when
+An out-of-control signal is generated when the ensemble statistic satisfies
 
 $$
-S_{\mathrm{ensemble}}(t) \geq H,
+S_{\mathrm{ensemble}}(t) \geq H.
 $$
 
-where \(H\) is the calibrated decision threshold.
+The alarm time, or run length, is defined as
 
-### Alarm Rule
+$$
+\tau
+=
+\inf\left\{
+t \geq 1:
+S_{\mathrm{ensemble}}(t) \geq H
+\right\},
+$$
 
-An out-of-control signal is generated at the first monitoring time \(t\)
-for which
+where $H$ denotes the calibrated decision threshold. Thus, an alarm is
+issued at the **first monitoring time** at which the ensemble statistic
+reaches or exceeds $H$.
 
-\[
-S_{\mathrm{ensemble}}(t) \geq H,
-\]
+The threshold $H$ is calibrated under the in-control condition to achieve
+the specified average run length,
 
-where \(H\) is the calibrated decision threshold. The corresponding
-run length is the first time at which this condition is satisfied.
-
-The threshold \(H\) is calibrated to achieve the specified in-control
-average run length, \(\mathrm{ARL}_0\).
----
+$$
+\mathrm{ARL}_0 = \mathbb{E}_0[\tau].
+$$
 
 ## Monitoring Workflow
 

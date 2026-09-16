@@ -243,7 +243,11 @@ $$
 The alarm time, or run length, is defined as
 
 $$
-\tau=\inf\left\{t \geq 1:S_{\mathrm{ensemble}}(t) \geq H \right\},
+\tau=
+\inf\left\{
+t \geq 1:
+S_{\mathrm{ensemble}}(t) \geq H
+\right\}.
 $$
 
 where $H$ denotes the calibrated decision threshold. Thus, an alarm is

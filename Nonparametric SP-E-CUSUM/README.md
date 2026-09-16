@@ -246,16 +246,18 @@ where \(H\) is the calibrated decision threshold.
 
 ### Alarm Rule
 
-An out-of-control signal is generated when
+An out-of-control signal is generated at the first monitoring time \(t\)
+for which
 
 \[
 S_{\mathrm{ensemble}}(t) \geq H,
 \]
 
-where \(H\) is the calibrated decision threshold.
+where \(H\) is the calibrated decision threshold. The corresponding
+run length is the first time at which this condition is satisfied.
 
-The calibration procedure is designed to control the in-control run-length behavior at the specified target \(\mathrm{ARL}_0\).
-
+The threshold \(H\) is calibrated to achieve the specified in-control
+average run length, \(\mathrm{ARL}_0\).
 ---
 
 ## Monitoring Workflow

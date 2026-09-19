@@ -473,12 +473,14 @@ make_candidate_fit <- function(
 # =============================================================================
 
 catboost_sp_ecusum_update <- function(state, z, fit) {
-  J <- fit$J \%\vert{}\vert{}\% length(fit$k_values)
+
+  J <- fit$J %||% length(fit$k_values)
 
   C_new <- numeric(J)
   probabilities <- numeric(J)
 
   for (j in seq_len(J)) {
+
     C_new[j] <- catboost_cusum_update(
       C_prev = state[j],
       z = z,
@@ -502,7 +504,6 @@ catboost_sp_ecusum_update <- function(state, z, fit) {
     signal = isTRUE(ensemble > fit$H)
   )
 }
-
 
 # =============================================================================
 # 15. RUN ONE MONITORING PATH

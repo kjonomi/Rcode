@@ -20,6 +20,8 @@
 #   - The empirical copula is fitted once from a fixed reference sample.
 #   - The same Normal innovation drives all ensemble CUSUM components.
 #   - No copula sampling method is assumed.
+#   - The default probability transformation is the stationary mid-rank
+#     transformation.
 ###############################################################################
 
 
@@ -29,7 +31,11 @@
 
 .safe_scalar <- function(x, default = NA_real_) {
 
-    if (length(x) == 0L || is.null(x) || !is.finite(x[1])) {
+    if (
+        is.null(x) ||
+        length(x) == 0L ||
+        !is.finite(x[1])
+    ) {
         return(default)
     }
 
@@ -70,7 +76,8 @@
     }
 
     stop(
-        "No stationary CUSUM reference models were found in 'fit'."
+        "No stationary CUSUM reference models were found in 'fit'.",
+        call. = FALSE
     )
 }
 
@@ -82,6 +89,10 @@
 #
 # The SAME innovation Z_t is used for every CUSUM component.
 # This preserves the dependence induced by the ensemble construction.
+#
+# The resulting probability-scale vectors are used ONLY to estimate the
+# fixed reference empirical copula. The copula is not refitted during
+# ARL0 calibration.
 # =============================================================================
 
 .generate_copula_reference_data <- function(
@@ -90,18 +101,44 @@
         mu0 = 0,
         sigma0 = 1,
         side = "upper",
-        transform_method = "lower_tail",
+        transform_method = "mid",
         seed = NULL) {
 
     if (!is.null(seed)) {
         set.seed(as.integer(seed))
     }
 
+    n_samples <- as.integer(n_samples)
+
+    if (
+        length(n_samples) != 1L ||
+        !is.finite(n_samples) ||
+        n_samples < 2L
+    ) {
+        stop(
+            "n_samples must be an integer greater than or equal to 2.",
+            call. = FALSE
+        )
+    }
+
     J <- length(stationary_models)
 
     if (J < 1L) {
-        stop("At least one stationary model is required.")
+        stop(
+            "At least one stationary model is required.",
+            call. = FALSE
+        )
     }
+
+    transform_method <- match.arg(
+        transform_method,
+        choices = c("mid", "lower_tail")
+    )
+
+    side <- match.arg(
+        side,
+        choices = c("upper", "lower")
+    )
 
     k_values <- vapply(
         stationary_models,
@@ -112,7 +149,29 @@
     if (any(!is.finite(k_values))) {
         stop(
             "Unable to extract finite CUSUM reference values k ",
-            "from stationary models."
+            "from stationary models.",
+            call. = FALSE
+        )
+    }
+
+    if (
+        length(mu0) != 1L ||
+        !is.finite(mu0)
+    ) {
+        stop(
+            "mu0 must be a single finite numeric value.",
+            call. = FALSE
+        )
+    }
+
+    if (
+        length(sigma0) != 1L ||
+        !is.finite(sigma0) ||
+        sigma0 <= 0
+    ) {
+        stop(
+            "sigma0 must be a single positive finite numeric value.",
+            call. = FALSE
         )
     }
 
@@ -149,17 +208,11 @@
                     c_current[j] + z[t] - k_values[j]
                 )
 
-            } else if (side == "lower") {
+            } else {
 
                 c_current[j] <- max(
                     0,
                     c_current[j] - z[t] - k_values[j]
-                )
-
-            } else {
-
-                stop(
-                    "side must be either 'upper' or 'lower'."
                 )
             }
         }
@@ -188,7 +241,10 @@
         )
     }
 
-    colnames(U_ref) <- paste0("CUSUM_", seq_len(J))
+    colnames(U_ref) <- paste0(
+        "CUSUM_",
+        seq_len(J)
+    )
 
     U_ref
 }
@@ -204,8 +260,13 @@
         mu0 = 0,
         sigma0 = 1,
         side = "upper",
-        transform_method = "lower_tail",
+        transform_method = "mid",
         seed = NULL) {
+
+    transform_method <- match.arg(
+        transform_method,
+        choices = c("mid", "lower_tail")
+    )
 
     U_ref <- .generate_copula_reference_data(
         stationary_models = stationary_models,
@@ -224,7 +285,45 @@
 
     list(
         reference_probability_scale = U_ref,
-        copula = copula
+        copula = copula,
+        n_samples = nrow(U_ref),
+        n_components = ncol(U_ref),
+        transform_method = transform_method,
+        side = side,
+        mu0 = mu0,
+        sigma0 = sigma0,
+        seed = seed
+    )
+}
+
+
+# =============================================================================
+# 4A. PUBLIC REFERENCE EMPIRICAL COPULA FITTER
+#
+# Public wrapper used by 01_sp_ecusum_main.R.
+#
+# This creates the fixed empirical copula ONCE. The returned copula object
+# should subsequently be passed unchanged to calibrate_threshold(),
+# estimate_arl0(), and evaluate_threshold().
+# =============================================================================
+
+fit_reference_empirical_copula <- function(
+        stationary_models,
+        n_samples = 10000L,
+        mu0 = 0,
+        sigma0 = 1,
+        side = "upper",
+        transform_method = "mid",
+        seed = NULL) {
+
+    .fit_reference_empirical_copula(
+        stationary_models = stationary_models,
+        n_samples = n_samples,
+        mu0 = mu0,
+        sigma0 = sigma0,
+        side = side,
+        transform_method = transform_method,
+        seed = seed
     )
 }
 
@@ -238,7 +337,7 @@
         stationary_models,
         weights,
         copula = NULL,
-        transform_method = "lower_tail",
+        transform_method = "mid",
         use_empirical_copula = FALSE) {
 
     cusum_values <- as.numeric(cusum_values)
@@ -248,9 +347,51 @@
     if (length(cusum_values) != J) {
         stop(
             "Length of cusum_values does not match the number ",
-            "of stationary models."
+            "of stationary models.",
+            call. = FALSE
         )
     }
+
+    if (
+        any(!is.finite(cusum_values)) ||
+        any(cusum_values < 0)
+    ) {
+        stop(
+            "CUSUM values must be finite and non-negative.",
+            call. = FALSE
+        )
+    }
+
+    transform_method <- match.arg(
+        transform_method,
+        choices = c("mid", "lower_tail")
+    )
+
+    # -------------------------------------------------------------------------
+    # Component weights
+    # -------------------------------------------------------------------------
+
+    weights <- as.numeric(weights)
+
+    if (length(weights) != J) {
+        stop(
+            "weights must have length equal to the number of models.",
+            call. = FALSE
+        )
+    }
+
+    if (
+        any(!is.finite(weights)) ||
+        any(weights < 0) ||
+        sum(weights) <= 0
+    ) {
+        stop(
+            "weights must be finite, non-negative, and have positive sum.",
+            call. = FALSE
+        )
+    }
+
+    weights <- weights / sum(weights)
 
     # -------------------------------------------------------------------------
     # Component-wise probability transformations
@@ -276,7 +417,26 @@
         if (is.null(copula)) {
             stop(
                 "Empirical copula requested but no fitted reference ",
-                "copula was supplied."
+                "copula was supplied.",
+                call. = FALSE
+            )
+        }
+
+        if (!inherits(copula, "empirical_copula")) {
+            stop(
+                "copula must be an object of class 'empirical_copula'.",
+                call. = FALSE
+            )
+        }
+
+        if (copula$n_comp != J) {
+            stop(
+                "Reference empirical copula dimension (",
+                copula$n_comp,
+                ") does not match the number of stationary models (",
+                J,
+                ").",
+                call. = FALSE
             )
         }
 
@@ -310,23 +470,112 @@ simulate_arl0_single_run <- function(
         side = "upper",
         mu0 = 0,
         sigma0 = 1,
-        transform_method = "lower_tail",
+        transform_method = "mid",
         use_empirical_copula = FALSE,
         copula = NULL) {
 
     J <- length(stationary_models)
 
+    if (J < 1L) {
+        stop(
+            "At least one stationary model is required.",
+            call. = FALSE
+        )
+    }
+
     if (is.null(weights)) {
-        weights <- rep(1 / J, J)
+        weights <- rep(
+            1 / J,
+            J
+        )
     }
 
     weights <- as.numeric(weights)
 
     if (length(weights) != J) {
-        stop("weights must have length equal to number of models.")
+        stop(
+            "weights must have length equal to number of models.",
+            call. = FALSE
+        )
+    }
+
+    if (
+        any(!is.finite(weights)) ||
+        any(weights < 0) ||
+        sum(weights) <= 0
+    ) {
+        stop(
+            "weights must be finite, non-negative, and have positive sum.",
+            call. = FALSE
+        )
     }
 
     weights <- weights / sum(weights)
+
+    if (
+        length(H) != 1L ||
+        !is.finite(H)
+    ) {
+        stop(
+            "H must be a single finite numeric value.",
+            call. = FALSE
+        )
+    }
+
+    max_run <- as.integer(max_run)
+
+    if (
+        length(max_run) != 1L ||
+        !is.finite(max_run) ||
+        max_run < 1L
+    ) {
+        stop(
+            "max_run must be a positive integer.",
+            call. = FALSE
+        )
+    }
+
+    side <- match.arg(
+        side,
+        choices = c("upper", "lower")
+    )
+
+    transform_method <- match.arg(
+        transform_method,
+        choices = c("mid", "lower_tail")
+    )
+
+    if (
+        length(mu0) != 1L ||
+        !is.finite(mu0)
+    ) {
+        stop(
+            "mu0 must be a single finite numeric value.",
+            call. = FALSE
+        )
+    }
+
+    if (
+        length(sigma0) != 1L ||
+        !is.finite(sigma0) ||
+        sigma0 <= 0
+    ) {
+        stop(
+            "sigma0 must be a single positive finite numeric value.",
+            call. = FALSE
+        )
+    }
+
+    if (
+        isTRUE(use_empirical_copula) &&
+        is.null(copula)
+    ) {
+        stop(
+            "use_empirical_copula = TRUE requires a fixed reference ",
+            "empirical copula.",
+            call. = FALSE
+        )
+    }
 
     k_values <- vapply(
         stationary_models,
@@ -335,8 +584,15 @@ simulate_arl0_single_run <- function(
     )
 
     if (any(!is.finite(k_values))) {
-        stop("Invalid k values in stationary models.")
+        stop(
+            "Invalid k values in stationary models.",
+            call. = FALSE
+        )
     }
+
+    # -------------------------------------------------------------------------
+    # Zero initialization
+    # -------------------------------------------------------------------------
 
     c_current <- numeric(J)
 
@@ -365,17 +621,11 @@ simulate_arl0_single_run <- function(
                     c_current[j] + z - k_values[j]
                 )
 
-            } else if (side == "lower") {
+            } else {
 
                 c_current[j] <- max(
                     0,
                     c_current[j] - z - k_values[j]
-                )
-
-            } else {
-
-                stop(
-                    "side must be either 'upper' or 'lower'."
                 )
             }
         }
@@ -393,7 +643,18 @@ simulate_arl0_single_run <- function(
             use_empirical_copula = use_empirical_copula
         )
 
-        if (is.finite(E_t) && E_t > H) {
+        # ---------------------------------------------------------------------
+        # Strict alarm rule
+        #
+        # Canonical SP-E-CUSUM:
+        #
+        #                   E_t > H
+        # ---------------------------------------------------------------------
+
+        if (
+            is.finite(E_t) &&
+            E_t > H
+        ) {
             return(t)
         }
     }
@@ -415,12 +676,32 @@ estimate_arl0 <- function(
         side = "upper",
         mu0 = 0,
         sigma0 = 1,
-        transform_method = "lower_tail",
+        transform_method = "mid",
         use_empirical_copula = FALSE,
         copula = NULL) {
 
-    if (n_rep < 1L) {
-        stop("n_rep must be at least 1.")
+    n_rep <- as.integer(n_rep)
+
+    if (
+        length(n_rep) != 1L ||
+        !is.finite(n_rep) ||
+        n_rep < 1L
+    ) {
+        stop(
+            "n_rep must be a positive integer.",
+            call. = FALSE
+        )
+    }
+
+    if (
+        isTRUE(use_empirical_copula) &&
+        is.null(copula)
+    ) {
+        stop(
+            "use_empirical_copula = TRUE requires a fixed reference ",
+            "empirical copula.",
+            call. = FALSE
+        )
     }
 
     run_lengths <- numeric(n_rep)
@@ -441,13 +722,19 @@ estimate_arl0 <- function(
         )
     }
 
+    sd_value <- stats::sd(
+        run_lengths
+    )
+
     list(
         H = H,
         arl0 = mean(run_lengths),
-        sd_arl0 = stats::sd(run_lengths),
-        se_arl0 = stats::sd(run_lengths) / sqrt(n_rep),
+        sd_arl0 = sd_value,
+        se_arl0 = sd_value / sqrt(n_rep),
         n_rep = n_rep,
-        censored_prop = mean(run_lengths >= max_run),
+        censored_prop = mean(
+            run_lengths >= max_run
+        ),
         run_lengths = run_lengths
     )
 }
@@ -455,6 +742,14 @@ estimate_arl0 <- function(
 
 # =============================================================================
 # 8. CALIBRATE THRESHOLD
+#
+# The supplied empirical copula is FIXED throughout the entire calibration.
+#
+# It is NOT refitted:
+#
+#   - across threshold iterations,
+#   - across ARL0 replications,
+#   - or across individual monitoring time points.
 # =============================================================================
 
 calibrate_threshold <- function(
@@ -466,7 +761,7 @@ calibrate_threshold <- function(
         side = "upper",
         mu0 = 0,
         sigma0 = 1,
-        transform_method = "lower_tail",
+        transform_method = "mid",
         use_empirical_copula = FALSE,
         copula = NULL,
         threshold_lower = 0.001,
@@ -475,17 +770,168 @@ calibrate_threshold <- function(
         tolerance_threshold = 1e-4,
         max_iter = 20L) {
 
-    if (isTRUE(use_empirical_copula) && is.null(copula)) {
+    # -------------------------------------------------------------------------
+    # Validate empirical-copula requirement
+    # -------------------------------------------------------------------------
+
+    if (
+        isTRUE(use_empirical_copula) &&
+        is.null(copula)
+    ) {
         stop(
             "use_empirical_copula = TRUE, but no reference empirical ",
-            "copula was supplied."
+            "copula was supplied.",
+            call. = FALSE
         )
     }
+
+    if (
+        isTRUE(use_empirical_copula) &&
+        !inherits(copula, "empirical_copula")
+    ) {
+        stop(
+            "copula must be an object of class 'empirical_copula'.",
+            call. = FALSE
+        )
+    }
+
+    # -------------------------------------------------------------------------
+    # Validate threshold interval
+    # -------------------------------------------------------------------------
+
+    if (
+        length(threshold_lower) != 1L ||
+        !is.finite(threshold_lower)
+    ) {
+        stop(
+            "threshold_lower must be a single finite numeric value.",
+            call. = FALSE
+        )
+    }
+
+    if (
+        length(threshold_upper) != 1L ||
+        !is.finite(threshold_upper)
+    ) {
+        stop(
+            "threshold_upper must be a single finite numeric value.",
+            call. = FALSE
+        )
+    }
+
+    if (threshold_lower >= threshold_upper) {
+        stop(
+            "threshold_lower must be smaller than threshold_upper.",
+            call. = FALSE
+        )
+    }
+
+    # -------------------------------------------------------------------------
+    # Validate target ARL
+    # -------------------------------------------------------------------------
+
+    if (
+        length(target_arl) != 1L ||
+        !is.finite(target_arl) ||
+        target_arl <= 0
+    ) {
+        stop(
+            "target_arl must be a single positive finite value.",
+            call. = FALSE
+        )
+    }
+
+    # -------------------------------------------------------------------------
+    # Validate tolerances
+    # -------------------------------------------------------------------------
+
+    if (
+        length(tolerance_arl) != 1L ||
+        !is.finite(tolerance_arl) ||
+        tolerance_arl < 0
+    ) {
+        stop(
+            "tolerance_arl must be a non-negative finite value.",
+            call. = FALSE
+        )
+    }
+
+    if (
+        length(tolerance_threshold) != 1L ||
+        !is.finite(tolerance_threshold) ||
+        tolerance_threshold <= 0
+    ) {
+        stop(
+            "tolerance_threshold must be a positive finite value.",
+            call. = FALSE
+        )
+    }
+
+    max_iter <- as.integer(max_iter)
+
+    if (
+        length(max_iter) != 1L ||
+        !is.finite(max_iter) ||
+        max_iter < 1L
+    ) {
+        stop(
+            "max_iter must be a positive integer.",
+            call. = FALSE
+        )
+    }
+
+    # -------------------------------------------------------------------------
+    # Standardize settings
+    # -------------------------------------------------------------------------
+
+    side <- match.arg(
+        side,
+        choices = c("upper", "lower")
+    )
+
+    transform_method <- match.arg(
+        transform_method,
+        choices = c("mid", "lower_tail")
+    )
+
+    # -------------------------------------------------------------------------
+    # Validate empirical copula dimension
+    # -------------------------------------------------------------------------
+
+    if (isTRUE(use_empirical_copula)) {
+
+        J <- length(stationary_models)
+
+        if (
+            is.null(copula$n_comp) ||
+            copula$n_comp != J
+        ) {
+            stop(
+                "Reference empirical copula dimension (",
+                copula$n_comp,
+                ") does not match the number of stationary models (",
+                J,
+                ").",
+                call. = FALSE
+            )
+        }
+    }
+
+    # -------------------------------------------------------------------------
+    # Bisection interval
+    # -------------------------------------------------------------------------
 
     low <- threshold_lower
     high <- threshold_upper
 
-    history <- vector("list", max_iter)
+    history <- vector(
+        "list",
+        max_iter
+    )
+
+    # -------------------------------------------------------------------------
+    # Threshold calibration
+    # -------------------------------------------------------------------------
 
     for (iter in seq_len(max_iter)) {
 
@@ -508,55 +954,94 @@ calibrate_threshold <- function(
         history[[iter]] <- list(
             iteration = iter,
             H = H_mid,
-            ARL0 = est$arl0
+            ARL0 = est$arl0,
+            SE_ARL0 = est$se_arl0
         )
 
         cat(
             sprintf(
-                "Calibration iteration %d: H = %.8f, ARL0 = %.4f\n",
+                paste0(
+                    "Calibration iteration %d: ",
+                    "H = %.8f, ARL0 = %.4f, SE = %.4f\n"
+                ),
                 iter,
                 H_mid,
-                est$arl0
+                est$arl0,
+                est$se_arl0
             )
         )
+
+        # ---------------------------------------------------------------------
+        # Convergence
+        # ---------------------------------------------------------------------
 
         if (
             abs(est$arl0 - target_arl) <= tolerance_arl ||
             abs(high - low) <= tolerance_threshold
         ) {
+
             return(
                 list(
                     H = H_mid,
                     arl0 = est$arl0,
+                    sd_arl0 = est$sd_arl0,
+                    se_arl0 = est$se_arl0,
                     target_arl = target_arl,
                     history = history[seq_len(iter)],
                     converged = TRUE,
-                    iterations = iter
+                    iterations = iter,
+                    transform_method = transform_method,
+                    use_empirical_copula = use_empirical_copula,
+                    copula = copula,
+                    side = side,
+                    mu0 = mu0,
+                    sigma0 = sigma0
                 )
             )
         }
 
+        # ---------------------------------------------------------------------
         # ARL increases monotonically with H.
+        # ---------------------------------------------------------------------
+
         if (est$arl0 < target_arl) {
+
             low <- H_mid
+
         } else {
+
             high <- H_mid
         }
     }
 
+    # -------------------------------------------------------------------------
+    # Maximum iterations reached
+    # -------------------------------------------------------------------------
+
     list(
         H = (low + high) / 2,
         arl0 = NA_real_,
+        sd_arl0 = NA_real_,
+        se_arl0 = NA_real_,
         target_arl = target_arl,
         history = history,
         converged = FALSE,
-        iterations = max_iter
+        iterations = max_iter,
+        transform_method = transform_method,
+        use_empirical_copula = use_empirical_copula,
+        copula = copula,
+        side = side,
+        mu0 = mu0,
+        sigma0 = sigma0
     )
 }
 
 
 # =============================================================================
 # 9. EVALUATE A FIXED THRESHOLD
+#
+# If empirical-copula evaluation is requested and no copula is supplied,
+# construct the reference copula ONCE before estimating ARL0.
 # =============================================================================
 
 evaluate_threshold <- function(
@@ -575,32 +1060,70 @@ evaluate_threshold <- function(
         threshold <- fit$H
     }
 
-    stationary_models <- .extract_stationary_models(fit)
+    stationary_models <- .extract_stationary_models(
+        fit
+    )
 
     weights <- fit$weights
 
     if (is.null(transform_method)) {
+
         transform_method <- fit$transform_method
+
+        if (is.null(transform_method)) {
+            transform_method <- "mid"
+        }
     }
 
-    if (!identical(distribution, "normal")) {
+    transform_method <- match.arg(
+        transform_method,
+        choices = c("mid", "lower_tail")
+    )
+
+    if (!identical(
+        tolower(distribution),
+        "normal"
+    )) {
         stop(
-            "Current evaluate_threshold() supports distribution = 'normal'."
+            "Current evaluate_threshold() supports ",
+            "distribution = 'normal'.",
+            call. = FALSE
         )
     }
 
+    side <- fit$side
+
+    if (is.null(side)) {
+        side <- "upper"
+    }
+
+    mu0 <- fit$mu0
+
+    if (is.null(mu0)) {
+        mu0 <- 0
+    }
+
+    sigma0 <- fit$sigma0
+
+    if (is.null(sigma0)) {
+        sigma0 <- 1
+    }
+
     # -------------------------------------------------------------------------
-    # Construct the fixed empirical copula once
+    # Construct the fixed empirical copula once if needed
     # -------------------------------------------------------------------------
 
-    if (isTRUE(use_empirical_copula) && is.null(copula)) {
+    if (
+        isTRUE(use_empirical_copula) &&
+        is.null(copula)
+    ) {
 
-        ref <- .fit_reference_empirical_copula(
+        ref <- fit_reference_empirical_copula(
             stationary_models = stationary_models,
             n_samples = copula_n_samples,
-            mu0 = fit$mu0,
-            sigma0 = fit$sigma0,
-            side = fit$side,
+            mu0 = mu0,
+            sigma0 = sigma0,
+            side = side,
             transform_method = transform_method,
             seed = copula_seed
         )
@@ -608,15 +1131,19 @@ evaluate_threshold <- function(
         copula <- ref$copula
     }
 
+    # -------------------------------------------------------------------------
+    # Evaluate the fixed threshold
+    # -------------------------------------------------------------------------
+
     result <- estimate_arl0(
         stationary_models = stationary_models,
         weights = weights,
         H = threshold,
         n_rep = n_rep,
         max_run = max_run,
-        side = fit$side,
-        mu0 = fit$mu0,
-        sigma0 = fit$sigma0,
+        side = side,
+        mu0 = mu0,
+        sigma0 = sigma0,
         transform_method = transform_method,
         use_empirical_copula = use_empirical_copula,
         copula = copula
@@ -627,6 +1154,9 @@ evaluate_threshold <- function(
     result$transform_method <- transform_method
     result$use_empirical_copula <- use_empirical_copula
     result$copula <- copula
+    result$side <- side
+    result$mu0 <- mu0
+    result$sigma0 <- sigma0
 
     result
 }
@@ -706,9 +1236,30 @@ print.evaluate_threshold <- function(x, ...) {
         )
     )
 
+    if (!is.null(x$copula)) {
+
+        cat(
+            sprintf(
+                "Copula observations: %d\n",
+                x$copula$n_obs
+            )
+        )
+
+        cat(
+            sprintf(
+                "Copula dimensions  : %d\n",
+                x$copula$n_comp
+            )
+        )
+    }
+
     invisible(x)
 }
 
+
+# =============================================================================
+# 11. LOAD MESSAGE
+# =============================================================================
 
 message(
     "06_arl_calibration.R loaded successfully."

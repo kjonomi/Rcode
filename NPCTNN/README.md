@@ -1,7 +1,4 @@
-# Nonparametric Copula-Tensor Neural Networks (NP-CTNN)
-
-Official repository for the paper:  
-**"Nonparametric Copula-Tensor Neural Networks: A Multi-Channel Representation for Unsupervised Clustering and Time-Series Forecasting"**
+# Nonparametric Copula-Tensor Neural Networks (NP-CTNN): A Multi-Channel Representation for Unsupervised Clustering and Time-Series Forecasting
 
 ---
 

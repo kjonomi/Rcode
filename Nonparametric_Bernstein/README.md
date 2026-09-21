@@ -83,7 +83,7 @@ The proposed methods are evaluated against:
 - **Neural S-learner**
 
 using both controlled Monte Carlo experiments and a real-data benchmark based
-on the **Criteo Uplift v2.1** dataset.
+on the **Criteo Uplift v2.1** dataset. https://huggingface.co/datasets/criteo/criteo-uplift/blob/main/criteo-research-uplift-v2.1.csv.gz
 
 ---
 

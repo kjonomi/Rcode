@@ -31,10 +31,6 @@
 # =============================================================================
 # 0. EMPIRICAL COPULA HELPERS
 # =============================================================================
-#
-# Non-parametric empirical copula / empirical CDF calculation using baseline data
-#
-# =============================================================================
 
 empirical_copula_transform <- function(
     x,
@@ -55,13 +51,7 @@ empirical_copula_transform <- function(
     n_ref <- length(reference_data)
 
     # Standard empirical CDF transformation scaled to avoid strict 0/1 boundary issues
-    u <- vapply(
-        x,
-        function(val) {
-            sum(reference_data <= val) / (n_ref + 1)
-        },
-        numeric(1)
-    )
+    u <- findInterval(x, sort(reference_data)) / (n_ref + 1)
 
     u
 }
@@ -77,41 +67,20 @@ validate_markov_grid <- function(
     state_max
 ) {
 
-    if (length(k) != 1L ||
-        !is.numeric(k) ||
-        !is.finite(k) ||
-        k < 0) {
-
-        stop(
-            "k must be a single non-negative finite numeric value."
-        )
+    if (length(k) != 1L || !is.numeric(k) || !is.finite(k) || k < 0) {
+        stop("k must be a single non-negative finite numeric value.")
     }
 
-    if (length(grid_width) != 1L ||
-        !is.numeric(grid_width) ||
-        !is.finite(grid_width) ||
-        grid_width <= 0) {
-
-        stop(
-            "grid_width must be a positive finite numeric value."
-        )
+    if (length(grid_width) != 1L || !is.numeric(grid_width) || !is.finite(grid_width) || grid_width <= 0) {
+        stop("grid_width must be a positive finite numeric value.")
     }
 
-    if (length(state_max) != 1L ||
-        !is.numeric(state_max) ||
-        !is.finite(state_max) ||
-        state_max <= 0) {
-
-        stop(
-            "state_max must be a positive finite numeric value."
-        )
+    if (length(state_max) != 1L || !is.numeric(state_max) || !is.finite(state_max) || state_max <= 0) {
+        stop("state_max must be a positive finite numeric value.")
     }
 
     if (state_max <= grid_width / 2) {
-
-        stop(
-            "state_max must exceed grid_width / 2."
-        )
+        stop("state_max must exceed grid_width / 2.")
     }
 
     invisible(TRUE)
@@ -130,55 +99,23 @@ construct_cusum_states <- function(
     delta <- grid_width
 
     if (state_max <= delta / 2) {
-
-        stop(
-            "state_max must exceed grid_width / 2."
-        )
+        stop("state_max must exceed grid_width / 2.")
     }
 
-    n_midpoints <- max(
-        1L,
-        ceiling(state_max / delta)
-    )
-
-    positive_midpoints <- seq_len(
-        n_midpoints
-    ) * delta
-
-    positive_midpoints[
-        length(positive_midpoints)
-    ] <- state_max
-
-    positive_midpoints <- sort(
-        unique(
-            positive_midpoints
-        )
-    )
+    n_midpoints <- max(1L, ceiling(state_max / delta))
+    positive_midpoints <- seq_len(n_midpoints) * delta
+    positive_midpoints[length(positive_midpoints)] <- state_max
+    positive_midpoints <- sort(unique(positive_midpoints))
 
     first_positive_midpoint <- delta / 4
-
-    states <- c(
-        0,
-        first_positive_midpoint,
-        positive_midpoints
-    )
-
-    states <- sort(
-        unique(states)
-    )
+    states <- sort(unique(c(0, first_positive_midpoint, positive_midpoints)))
 
     if (length(states) < 3L) {
-
-        stop(
-            "State grid must contain zero and at least two positive states."
-        )
+        stop("State grid must contain zero and at least two positive states.")
     }
 
     if (any(diff(states) <= 0)) {
-
-        stop(
-            "CUSUM state grid must be strictly increasing."
-        )
+        stop("CUSUM state grid must be strictly increasing.")
     }
 
     states
@@ -202,45 +139,26 @@ normal_cusum_transition_matrix <- function(
     )
 
     delta <- grid_width
-
     states <- construct_cusum_states(
         grid_width = delta,
         state_max = state_max
     )
 
     M <- length(states)
-
-    P <- matrix(
-        0,
-        nrow = M,
-        ncol = M
-    )
+    P <- matrix(0, nrow = M, ncol = M)
 
     for (i in seq_len(M)) {
-
         current_state <- states[i]
 
-        P[i, 1L] <- pnorm(
-            k - current_state
-        )
+        P[i, 1L] <- pnorm(k - current_state)
 
         lower_z <- k - current_state
-
-        upper_z <-
-            k -
-            current_state +
-            delta / 2
-
-        P[i, 2L] <-
-            pnorm(upper_z) -
-            pnorm(lower_z)
+        upper_z <- k - current_state + delta / 2
+        P[i, 2L] <- pnorm(upper_z) - pnorm(lower_z)
 
         if (M >= 3L) {
-
             for (j in 3L:M) {
-
                 midpoint <- states[j]
-
                 lower_boundary <- midpoint - delta / 2
                 upper_boundary <- midpoint + delta / 2
 
@@ -300,10 +218,6 @@ normal_cusum_transition_matrix <- function(
 # =============================================================================
 # 3B. EMPIRICAL COPULA CUSUM TRANSITION MATRIX
 # =============================================================================
-#
-# Empirical Copula-driven transition matrix constructed from baseline sample data.
-#
-# =============================================================================
 
 empirical_copula_cusum_transition_matrix <- function(
     k,
@@ -322,7 +236,6 @@ empirical_copula_cusum_transition_matrix <- function(
         stop("reference_data must be a non-empty numeric vector.")
     }
 
-    # Transform baseline reference data using empirical copula to normal scale
     u_ref <- empirical_copula_transform(reference_data, reference_data)
     z_ref <- qnorm(u_ref)
 
@@ -342,7 +255,6 @@ empirical_copula_cusum_transition_matrix <- function(
 
         lower_z <- k - current_state
         upper_z <- k - current_state + delta / 2
-
         P[i, 2L] <- ecdf_ref(upper_z) - ecdf_ref(lower_z)
 
         if (M >= 3L) {
@@ -364,7 +276,6 @@ empirical_copula_cusum_transition_matrix <- function(
 
         P[i, M] <- 1 - ecdf_ref(final_lower_z)
 
-        # Normalize row to ensure stochastic validity for discrete empirical samples
         row_s <- sum(P[i, ])
         if (row_s > 0) {
             P[i, ] <- P[i, ] / row_s
@@ -408,10 +319,38 @@ stationary_distribution <- function(
     }
 
     P <- P / row_sums
-
     M <- nrow(P)
-    pi_old <- rep(1 / M, M)
 
+    # Attempt direct eigensolver solve first for performance
+    pi_final <- tryCatch({
+        eigen_res <- eigen(t(P))
+        idx <- which.min(abs(eigen_res$values - 1))
+        if (abs(eigen_res$values[idx] - 1) < 1e-6) {
+            v <- Re(eigen_res$vectors[, idx])
+            v <- v / sum(v)
+            if (all(v >= -1e-10) && max(abs(as.numeric(v %*% P) - v)) < tol) {
+                pmax(v, 0) / sum(pmax(v, 0))
+            } else {
+                NULL
+            }
+        } else {
+            NULL
+        }
+    }, error = function(e) NULL)
+
+    if (!is.null(pi_final)) {
+        return(list(
+            pi = pi_final,
+            iterations = 1L,
+            converged = TRUE,
+            difference = 0,
+            stationarity_error = max(abs(as.numeric(pi_final %*% P) - pi_final)),
+            probability_error = abs(sum(pi_final) - 1)
+        ))
+    }
+
+    # Fall back to power iteration if eigensolver does not meet tolerance criteria
+    pi_old <- rep(1 / M, M)
     converged <- FALSE
     difference <- Inf
 

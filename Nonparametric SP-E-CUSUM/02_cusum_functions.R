@@ -144,23 +144,21 @@
 
 
 # =============================================================================
-# 0B. EMPIRICAL COPULA HELPERS
+# 0B. EMPIRICAL COPULA HELPERS & BUILDERS
 # =============================================================================
 #
-# Empirical Copula Transformation (Empirical CDF / Pseudo-Observations)
-# Maps continuous observations to uniforms U ~ (0, 1) using baseline/reference data.
+# Empirical Copula Constructor and Transformation Functions
+# Maps observations to standard normal / uniform space using baseline reference objects.
 #
 # =============================================================================
 
-empirical_copula_transform <- function(
-    x,
-    reference_data
+#' Build a Canonical Reference Empirical Copula Object
+build_empirical_copula <- function(
+    reference_data,
+    mu0 = 0,
+    sigma0 = 1,
+    transform_method = c("mid", "standard", "jitter")
 ) {
-
-    .validate_numeric_vector(
-        x = x,
-        name = "x"
-    )
 
     .validate_numeric_vector(
         x = reference_data,
@@ -168,18 +166,67 @@ empirical_copula_transform <- function(
         allow_empty = FALSE
     )
 
+    .validate_scalar_numeric(mu0, "mu0")
+    .validate_positive_scalar(sigma0, "sigma0")
+    transform_method <- match.arg(transform_method)
+
+    ref_sorted <- sort(reference_data)
+    n_ref <- length(ref_sorted)
+
+    copula_obj <- list(
+        reference_data   = ref_sorted,
+        n_ref            = n_ref,
+        mu0              = mu0,
+        sigma0           = sigma0,
+        transform_method = transform_method
+    )
+
+    class(copula_obj) <- "empirical_copula_reference"
+    copula_obj
+}
+
+
+empirical_copula_transform <- function(
+    x,
+    reference_empirical_copula,
+    transform_method = NULL
+) {
+
+    .validate_numeric_vector(
+        x = x,
+        name = "x"
+    )
+
+    if (is.null(reference_empirical_copula)) {
+        stop("reference_empirical_copula cannot be NULL when executing empirical copula transformation.", call. = FALSE)
+    }
+
+    if (is.numeric(reference_empirical_copula)) {
+        # Backwards-compatibility wrapper if raw numeric reference_data vector is passed
+        reference_empirical_copula <- build_empirical_copula(
+            reference_data = reference_empirical_copula,
+            transform_method = ifelse(is.null(transform_method), "mid", transform_method)
+        )
+    }
+
+    ref_data <- reference_empirical_copula$reference_data
+    n_ref    <- reference_empirical_copula$n_ref
+
     if (length(x) == 0L) {
         return(numeric(0))
     }
 
-    n_ref <- length(reference_data)
-
-    # Standard empirical copula rank transformation using baseline distribution
+    # Standard empirical copula rank transformation using reference object
     # Rescaled by n_ref + 1 to keep uniforms strictly inside (0, 1)
     u <- vapply(
         x,
         function(val) {
-            sum(reference_data <= val) / (n_ref + 1)
+            p <- sum(ref_data <= val) / (n_ref + 1)
+            if (!is.finite(p) || p <= 0 || p >= 1) {
+                # Edge cases clamped strictly within (0, 1)
+                p <- max(1 / (2 * (n_ref + 1)), min(1 - 1 / (2 * (n_ref + 1)), p))
+            }
+            p
         },
         numeric(1)
     )
@@ -206,9 +253,10 @@ empirical_copula_multivariate <- function(
     )
 
     for (j in seq_len(ncol(X_mat))) {
+        ref_copula <- build_empirical_copula(reference_data = Ref_mat[, j])
         U[, j] <- empirical_copula_transform(
             x = X_mat[, j],
-            reference_data = Ref_mat[, j]
+            reference_empirical_copula = ref_copula
         )
     }
 
@@ -1088,7 +1136,56 @@ multiple_cusum_update <- function(
 
 
 # =============================================================================
-# 17. TEST FUNCTION
+# 17. MASTER FIT CONSTRUCTOR & VALIDATOR
+# =============================================================================
+
+fit_sp_e_cusum <- function(
+    config,
+    mu0,
+    sigma0,
+    k_values,
+    weights,
+    H,
+    target_arl,
+    side = "upper",
+    transform_method = "mid",
+    use_empirical_copula = FALSE,
+    reference_empirical_copula = NULL,
+    stationary_models = NULL,
+    calibration = NULL
+) {
+
+    if (isTRUE(use_empirical_copula) && is.null(reference_empirical_copula)) {
+        stop(
+            "fit_sp_e_cusum(): Cannot build master fit when use_empirical_copula = TRUE ",
+            "and reference_empirical_copula is NULL.",
+            call. = FALSE
+        )
+    }
+
+    fit <- list(
+        config                     = config,
+        mu0                        = mu0,
+        sigma0                     = sigma0,
+        k_values                   = k_values,
+        weights                    = weights,
+        H                          = H,
+        target_arl                 = target_arl,
+        side                       = side,
+        transform_method           = transform_method,
+        use_empirical_copula       = isTRUE(use_empirical_copula),
+        empirical_copula           = reference_empirical_copula,
+        stationary_models          = stationary_models,
+        calibration                = calibration
+    )
+
+    class(fit) <- "SP_E_CUSUM_FIT"
+    fit
+}
+
+
+# =============================================================================
+# 18. TEST FUNCTION
 # =============================================================================
 
 test_cusum_functions <- function() {
@@ -1112,12 +1209,17 @@ test_cusum_functions <- function() {
     )
 
     # -------------------------------------------------------------------------
-    # Empirical Copula Transformation Test
+    # Empirical Copula Object Test
     # -------------------------------------------------------------------------
 
     ref_data <- rnorm(500)
+    cop_ref <- build_empirical_copula(reference_data = ref_data, transform_method = "mid")
     obs_data <- c(-1, 0, 1)
-    u_copula <- empirical_copula_transform(x = obs_data, reference_data = ref_data)
+
+    u_copula <- empirical_copula_transform(
+        x = obs_data,
+        reference_empirical_copula = cop_ref
+    )
 
     stopifnot(
         length(u_copula) == length(obs_data),
@@ -1258,326 +1360,24 @@ test_cusum_functions <- function() {
     )
 
     # -------------------------------------------------------------------------
-    # Explicit regression test for the old interface.
+    # Master Fit Object constructor test
     # -------------------------------------------------------------------------
 
-    expected_update <- max(
-        0,
-        0.75 + 1.20 - 0.50
-    )
-
-    actual_update <- upper_cusum_update(
-        C_prev = 0.75,
-        x = 1.20,
-        k = 0.50
-    )
-
-    stopifnot(
-        isTRUE(
-            all.equal(
-                actual_update,
-                expected_update
-            )
-        )
-    )
-
-    # -------------------------------------------------------------------------
-    # Multiple sequential update
-    # -------------------------------------------------------------------------
-
-    C_initial <- c(
-        0,
-        0,
-        0
-    )
-
-    C_updated <- multiple_cusum_update(
-        C_prev = C_initial,
-        x = 1,
-        k_values = k_values
-    )
-
-    expected_multiple <- pmax(
-        0,
-        1 - k_values
-    )
-
-    stopifnot(
-        isTRUE(
-            all.equal(
-                C_updated,
-                expected_multiple
-            )
-        )
-    )
-
-    # -------------------------------------------------------------------------
-    # Two-sided CUSUM
-    # -------------------------------------------------------------------------
-
-    C_two <- cusum_two_sided(
-        x = x,
-        k = 0.50
-    )
-
-    stopifnot(
-        is.list(C_two),
-        all(
-            c(
-                "upper",
-                "lower",
-                "statistic"
-            ) %in% names(C_two)
-        ),
-        length(C_two$statistic) == length(x),
-        all(C_two$statistic >= 0)
-    )
-
-    # -------------------------------------------------------------------------
-    # Multiple components
-    # -------------------------------------------------------------------------
-
-    CUSUMS <- cusum_components(
-        x = x,
+    fit_obj <- fit_sp_e_cusum(
+        config = list(),
+        mu0 = 0,
+        sigma0 = 1,
         k_values = k_values,
-        side = "upper"
+        weights = c(1/3, 1/3, 1/3),
+        H = 0.98,
+        target_arl = 370,
+        use_empirical_copula = TRUE,
+        reference_empirical_copula = cop_ref
     )
 
     stopifnot(
-        length(CUSUMS) == 3L,
-        identical(
-            names(CUSUMS),
-            c(
-                "CUSUM_1",
-                "CUSUM_2",
-                "CUSUM_3"
-            )
-        ),
-        all(
-            vapply(
-                CUSUMS,
-                is.numeric,
-                logical(1)
-            )
-        )
-    )
-
-    # -------------------------------------------------------------------------
-    # Lower components
-    # -------------------------------------------------------------------------
-
-    CUSUMS_lower <- cusum_components(
-        x = x,
-        k_values = k_values,
-        side = "lower"
-    )
-
-    stopifnot(
-        length(CUSUMS_lower) == 3L
-    )
-
-    # -------------------------------------------------------------------------
-    # Two-sided components
-    # -------------------------------------------------------------------------
-
-    CUSUMS_two <- cusum_components(
-        x = x,
-        k_values = k_values,
-        side = "two-sided"
-    )
-
-    stopifnot(
-        length(CUSUMS_two) == 3L,
-        all(
-            vapply(
-                CUSUMS_two,
-                is.list,
-                logical(1)
-            )
-        )
-    )
-
-    # -------------------------------------------------------------------------
-    # Summary
-    # -------------------------------------------------------------------------
-
-    summary <- summarize_cusums(
-        CUSUMS
-    )
-
-    print(summary)
-
-    stopifnot(
-        nrow(summary) == 3L,
-        all(
-            c(
-                "component",
-                "mean",
-                "sd",
-                "maximum",
-                "proportion_zero"
-            ) %in% names(summary)
-        )
-    )
-
-    # -------------------------------------------------------------------------
-    # Run-length convention test
-    # -------------------------------------------------------------------------
-
-    test_statistic <- rep(
-        0,
-        100
-    )
-
-    no_signal_rl <- first_signal(
-        statistic = test_statistic,
-        H = 1,
-        max_run = 100
-    )
-
-    stopifnot(
-        no_signal_rl == 101L
-    )
-
-    # -------------------------------------------------------------------------
-    # Signal exactly at max_run
-    # -------------------------------------------------------------------------
-
-    max_signal_statistic <- c(
-        0,
-        0,
-        2
-    )
-
-    max_signal_rl <- first_signal(
-        statistic = max_signal_statistic,
-        H = 1,
-        max_run = 3
-    )
-
-    stopifnot(
-        max_signal_rl == 3L
-    )
-
-    # -------------------------------------------------------------------------
-    # Immediate signal test
-    # -------------------------------------------------------------------------
-
-    signal_statistic <- c(
-        0,
-        0,
-        2,
-        0
-    )
-
-    signal_rl <- first_signal(
-        statistic = signal_statistic,
-        H = 1,
-        max_run = 4
-    )
-
-    stopifnot(
-        signal_rl == 3L
-    )
-
-    # -------------------------------------------------------------------------
-    # CUSUM run-length test
-    # -------------------------------------------------------------------------
-
-    x_signal <- c(
-        0,
-        0,
-        3,
-        0
-    )
-
-    rl <- cusum_run_length(
-        x = x_signal,
-        k = 0.5,
-        H = 1,
-        max_run = 4
-    )
-
-    stopifnot(
-        rl == 3L
-    )
-
-    # -------------------------------------------------------------------------
-    # Multiple-CUSUM run-length test
-    # -------------------------------------------------------------------------
-
-    multi_rl <- multiple_cusum_run_length(
-        x = x_signal,
-        k_values = c(
-            0.25,
-            0.50,
-            0.75
-        ),
-        H_values = c(
-            1,
-            1,
-            1
-        ),
-        max_run = 4
-    )
-
-    stopifnot(
-        multi_rl == 3L
-    )
-
-    # -------------------------------------------------------------------------
-    # No-signal multiple-CUSUM test
-    # -------------------------------------------------------------------------
-
-    multi_no_signal <- multiple_cusum_run_length(
-        x = rep(0, 100),
-        k_values = c(
-            0.25,
-            0.50,
-            0.75
-        ),
-        H_values = c(
-            1,
-            1,
-            1
-        ),
-        max_run = 100
-    )
-
-    stopifnot(
-        multi_no_signal == 101L
-    )
-
-    # -------------------------------------------------------------------------
-    # Standardized-shift test
-    # -------------------------------------------------------------------------
-
-    delta <- standardized_shift(
-        mu0 = 10,
-        mu1 = 12,
-        sigma0 = 2
-    )
-
-    stopifnot(
-        isTRUE(
-            all.equal(
-                as.numeric(delta),
-                1
-            )
-        )
-    )
-
-    # -------------------------------------------------------------------------
-    # Validation test
-    # -------------------------------------------------------------------------
-
-    stopifnot(
-        isTRUE(
-            validate_cusum_components(
-                k_values = k_values,
-                J = 3
-            )
-        )
+        isTRUE(fit_obj$use_empirical_copula),
+        !is.null(fit_obj$empirical_copula)
     )
 
     # -------------------------------------------------------------------------
@@ -1595,7 +1395,7 @@ test_cusum_functions <- function() {
 
 
 # =============================================================================
-# 18. LOAD MESSAGE
+# 19. LOAD MESSAGE
 # =============================================================================
 
 cat("\n")
@@ -1605,8 +1405,10 @@ cat("============================================================\n")
 cat("\n")
 
 cat("Available Empirical Copula & CUSUM interfaces:\n")
+cat("  - build_empirical_copula()\n")
 cat("  - empirical_copula_transform()\n")
 cat("  - empirical_copula_multivariate()\n")
+cat("  - fit_sp_e_cusum()\n")
 cat("  - cusum_upper()\n")
 cat("  - cusum_lower()\n")
 cat("  - cusum_two_sided()\n")

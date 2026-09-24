@@ -37,14 +37,8 @@ empirical_copula_transform <- function(
 
     n_ref <- length(reference_data)
 
-    # Scaled empirical CDF to keep probability strictly in (0, 1)
-    vapply(
-        x,
-        function(val) {
-            sum(reference_data <= val) / (n_ref + 1)
-        },
-        numeric(1)
-    )
+    # Scaled empirical CDF using findInterval to avoid strict 0/1 boundary issues
+    findInterval(x, sort(reference_data)) / (n_ref + 1)
 }
 
 
@@ -440,7 +434,7 @@ fit_sp_e_cusum_from_calibration <- function(
     config,
     calibration
 ) {
-    H <- calibration$H %||% calibration$threshold
+    H <- if (!is.null(calibration$H)) calibration$H else calibration$threshold
     if (is.null(H)) stop("The calibration object does not contain H or threshold.")
 
     fit_sp_e_cusum(config = config, H = H, calibration = calibration)
@@ -459,6 +453,10 @@ sp_e_cusum_transform <- function(
 
     if (!is.numeric(x)) stop("x must be numeric.")
     if (length(x) == 0L) return(numeric(0))
+
+    # Helper update functions if not available in parent global scope
+    upper_cusum_update <- function(C_prev, x, k) max(0, C_prev + x - k)
+    lower_cusum_update <- function(C_prev, x, k) max(0, C_prev - x - k)
 
     C_prev <- numeric(fit$n_components)
     transformed <- matrix(NA_real_, nrow = length(x), ncol = fit$n_components)
@@ -486,7 +484,7 @@ sp_e_cusum_transform <- function(
     list(
         cusum = transformed,
         signal = signal,
-        signal_time = if (any(signal)) which(signal)[1] else NA_integer_
+        signal_time = if (any(signal)) which(signal)[1L] else NA_integer_
     )
 }
 
@@ -496,7 +494,7 @@ sp_e_cusum_transform <- function(
 # =============================================================================
 
 create_oracle_sp_e_cusum_fit <- function(
-    config = CONFIG,
+    config = NULL,
     calibration = NULL
 ) {
     fit_sp_e_cusum(config = config, calibration = calibration)

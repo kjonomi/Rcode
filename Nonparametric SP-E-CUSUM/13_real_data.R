@@ -3,9 +3,13 @@
 # =============================================================================
 #
 # Stationary Probability-Scale Ensemble CUSUM
-# Real-Data Application with Empirical Copula Transform
+# Real-Data Application with Phase-I Empirical Probability-Scale Reference
 #
-# Updated to support integration with Scripts 09, 10, 11, and 12.
+# Integrated with:
+#   09_simulation_normal.R
+#   10_simulation_nonnormal.R
+#   11_phase1_estimation.R
+#   12_catboost_surrogate.R
 #
 # Main features
 # -------------
@@ -13,10 +17,12 @@
 # 2. Classical or robust Phase-I standardization
 # 3. Optional detrending
 # 4. Multiple reflected CUSUM components
-# 5. Empirical-CDF / empirical-copula probability-scale transformation
+# 5. Empirical-CDF probability-scale transformation
 # 6. Weighted probability-scale ensemble
 # 7. Optional threshold recalibration
 # 8. Optional optimized design from Script 12
+# 9. Common random numbers for threshold calibration
+# 10. Strict alarm rule E_t > H
 #
 # =============================================================================
 
@@ -48,7 +54,6 @@ check_real_data_packages <- function() {
       paste(missing, collapse = ", "),
       call. = FALSE
     )
-
   }
 
   invisible(TRUE)
@@ -186,14 +191,13 @@ REAL_DATA_CONFIG <- list(
 # 2. GENERAL HELPERS
 # =============================================================================
 
-`%||%` <- function(x, y) {
+real_data_or_null <- function(x, y) {
 
   if (is.null(x)) {
-    y
-  } else {
-    x
+    return(y)
   }
 
+  x
 }
 
 
@@ -213,7 +217,6 @@ normalize_real_weights <- function(
       "Invalid weights vector.",
       call. = FALSE
     )
-
   }
 
   total <- sum(weights)
@@ -227,7 +230,6 @@ normalize_real_weights <- function(
       "Weights must have a positive finite sum.",
       call. = FALSE
     )
-
   }
 
   weights / total
@@ -235,26 +237,22 @@ normalize_real_weights <- function(
 
 
 # =============================================================================
-# 3. EMPIRICAL COPULA ESTIMATION & TRANSFORM
+# 3. PHASE-I EMPIRICAL CUSUM REFERENCE MODELS
+# =============================================================================
+#
+# The Phase-I standardized observations are used to construct the reference
+# distributions of the CUSUM components.
+#
+# Each component is represented by an empirical CDF.
+#
+# These fixed Phase-I empirical CDFs are subsequently used for:
+#
+#   Phase-II probability transformation
+#   threshold recalibration
+#
 # =============================================================================
 
-#' Fit empirical-CDF models to Phase-I CUSUM statistics.
-#'
-#' Each CUSUM component is constructed from the Phase-I standardized
-#' observations. The resulting marginal CUSUM distributions are represented
-#' by empirical CDF functions.
-#'
-#' These empirical CDFs are then used to transform Phase-II CUSUM values
-#' to the probability scale.
-#'
-#' @param phase1_z Standardized Phase-I observations.
-#' @param k_values CUSUM reference values.
-#' @param side "upper" or "lower".
-#'
-#' @return A list of empirical CDF functions.
-# =============================================================================
-
-fit_empirical_copula_models <- function(
+real_data_fit_empirical_copula_models <- function(
     phase1_z,
     k_values,
     side = "upper") {
@@ -263,25 +261,45 @@ fit_empirical_copula_models <- function(
 
   k_values <- as.numeric(k_values)
 
-  if (length(phase1_z) == 0L) {
+  side <- match.arg(
+    tolower(side),
+    c(
+      "upper",
+      "lower"
+    )
+  )
+
+  if (length(phase1_z) < 1L) {
+
     stop(
       "phase1_z must contain at least one observation.",
       call. = FALSE
     )
   }
 
-  if (length(k_values) == 0L) {
+  if (length(k_values) < 1L) {
+
     stop(
-      "k_values must contain at least one component.",
+      "k_values must contain at least one value.",
       call. = FALSE
     )
   }
 
-  side <- tolower(side)
+  if (any(!is.finite(phase1_z))) {
 
-  if (!side %in% c("upper", "lower")) {
     stop(
-      "side must be 'upper' or 'lower'.",
+      "phase1_z contains nonfinite values.",
+      call. = FALSE
+    )
+  }
+
+  if (
+    any(!is.finite(k_values)) ||
+    any(k_values < 0)
+  ) {
+
+    stop(
+      "k_values must be finite and nonnegative.",
       call. = FALSE
     )
   }
@@ -290,47 +308,44 @@ fit_empirical_copula_models <- function(
 
   n <- length(phase1_z)
 
-  # ---------------------------------------------------------------------------
-  # Construct Phase-I CUSUM paths
-  # ---------------------------------------------------------------------------
-
-  c_matrix <- matrix(
+  cusum_matrix <- matrix(
     0,
     nrow = n,
     ncol = J
   )
 
-  for (j in seq_len(J)) {
+  # ---------------------------------------------------------------------------
+  # Construct Phase-I CUSUM paths.
+  #
+  # Lower-sided monitoring is represented by sign reversal.
+  # ---------------------------------------------------------------------------
 
-    k <- k_values[j]
+  z_reference <- phase1_z
+
+  if (side == "lower") {
+    z_reference <- -z_reference
+  }
+
+  for (j in seq_len(J)) {
 
     state <- 0
 
     for (t in seq_len(n)) {
 
-      if (side == "upper") {
+      state <- max(
+        0,
+        state +
+          z_reference[t] -
+          k_values[j]
+      )
 
-        state <- max(
-          0,
-          state + phase1_z[t] - k
-        )
-
-      } else {
-
-        state <- max(
-          0,
-          state - phase1_z[t] - k
-        )
-
-      }
-
-      c_matrix[t, j] <- state
+      cusum_matrix[t, j] <- state
     }
   }
 
 
   # ---------------------------------------------------------------------------
-  # Construct empirical marginal CDFs
+  # Empirical marginal CDFs
   # ---------------------------------------------------------------------------
 
   ecdf_models <- vector(
@@ -341,10 +356,10 @@ fit_empirical_copula_models <- function(
   for (j in seq_len(J)) {
 
     ecdf_models[[j]] <- stats::ecdf(
-      c_matrix[, j]
+      cusum_matrix[, j]
     )
-
   }
+
 
   attr(
     ecdf_models,
@@ -359,19 +374,30 @@ fit_empirical_copula_models <- function(
   attr(
     ecdf_models,
     "phase1_cusum"
-  ) <- c_matrix
+  ) <- cusum_matrix
 
   ecdf_models
 }
 
 
 # =============================================================================
-# 4. EMPIRICAL COPULA TRANSFORMATION
+# 4. EMPIRICAL PROBABILITY-SCALE TRANSFORMATION
 # =============================================================================
 
-apply_empirical_copula_transform <- function(
+real_data_apply_probability_transform <- function(
     c_values,
-    ecdf_models) {
+    ecdf_models,
+    method = "empirical_copula") {
+
+  method <- match.arg(
+    tolower(method),
+    c(
+      "mid",
+      "lower_tail",
+      "empirical",
+      "empirical_copula"
+    )
+  )
 
   c_values <- as.numeric(c_values)
 
@@ -383,17 +409,38 @@ apply_empirical_copula_transform <- function(
       "Length of c_values must equal length of ecdf_models.",
       call. = FALSE
     )
-
   }
 
   u_values <- numeric(J)
 
   for (j in seq_len(J)) {
 
-    u_values[j] <- ecdf_models[[j]](
-      c_values[j]
-    )
+    if (method == "mid") {
 
+      # Mid-probability representation.
+      #
+      # For a CDF F, the empirical mid transform is approximated here by
+      # averaging the empirical CDF value with its left-limit value.
+
+      F_current <- ecdf_models[[j]](
+        c_values[j]
+      )
+
+      F_left <- ecdf_models[[j]](
+        c_values[j] - .Machine$double.eps
+      )
+
+      u_values[j] <- (
+        F_current +
+          F_left
+      ) / 2
+
+    } else {
+
+      u_values[j] <- ecdf_models[[j]](
+        c_values[j]
+      )
+    }
   }
 
   u_values <- pmin(
@@ -411,6 +458,26 @@ apply_empirical_copula_transform <- function(
 # =============================================================================
 # 5. CUSUM UPDATE
 # =============================================================================
+#
+# This wrapper is deliberately named uniquely to avoid collision with the
+# generic upper_cusum_update() function loaded by Scripts 07--12.
+#
+# Active canonical function:
+#
+# upper_cusum_update(
+#     x,
+#     mu0,
+#     sigma0,
+#     k,
+#     c_prev = 0
+# )
+#
+# After Phase-I standardization:
+#
+#     mu0    = 0
+#     sigma0 = 1
+#
+# =============================================================================
 
 real_data_cusum_update <- function(
     C_prev,
@@ -418,59 +485,129 @@ real_data_cusum_update <- function(
     k,
     side = "upper") {
 
-  side <- tolower(side)
-
-  if (side == "upper") {
-
-    return(
-      max(
-        0,
-        C_prev + z - k
-      )
+  side <- match.arg(
+    tolower(side),
+    c(
+      "upper",
+      "lower"
     )
+  )
 
+  if (!is.finite(C_prev)) {
+
+    stop(
+      "C_prev must be finite.",
+      call. = FALSE
+    )
   }
+
+  if (!is.finite(z)) {
+
+    stop(
+      "z must be finite.",
+      call. = FALSE
+    )
+  }
+
+  if (
+    !is.finite(k) ||
+    k < 0
+  ) {
+
+    stop(
+      "k must be finite and nonnegative.",
+      call. = FALSE
+    )
+  }
+
+
+  # ---------------------------------------------------------------------------
+  # Reflect the lower-sided statistic to the upper-sided representation.
+  # ---------------------------------------------------------------------------
+
+  z_update <- z
 
   if (side == "lower") {
-
-    return(
-      max(
-        0,
-        C_prev - z - k
-      )
-    )
-
+    z_update <- -z_update
   }
 
-  stop(
-    "side must be 'upper' or 'lower'.",
-    call. = FALSE
+
+  # ---------------------------------------------------------------------------
+  # Use the canonical CUSUM update from the earlier modules when available.
+  # ---------------------------------------------------------------------------
+
+  if (
+    exists(
+      "upper_cusum_update",
+      mode = "function",
+      inherits = TRUE
+    )
+  ) {
+
+    return(
+      upper_cusum_update(
+        x = z_update,
+        mu0 = 0,
+        sigma0 = 1,
+        k = k,
+        c_prev = C_prev
+      )
+    )
+  }
+
+
+  # ---------------------------------------------------------------------------
+  # Safe fallback.
+  # ---------------------------------------------------------------------------
+
+  max(
+    0,
+    C_prev +
+      z_update -
+      k
   )
 }
 
 
 # =============================================================================
-# 6. SIMULATE NULL PATHS FOR THRESHOLD CALIBRATION
+# 6. GENERATE NULL PATHS FOR THRESHOLD CALIBRATION
 # =============================================================================
 
-generate_threshold_paths <- function(
+real_data_generate_threshold_paths <- function(
     n_rep,
     max_run,
-    distribution = "normal",
     seed = NULL) {
+
+  n_rep <- as.integer(n_rep)
+
+  max_run <- as.integer(max_run)
+
+  if (
+    length(n_rep) != 1L ||
+    !is.finite(n_rep) ||
+    n_rep < 1L
+  ) {
+
+    stop(
+      "n_rep must be a positive integer.",
+      call. = FALSE
+    )
+  }
+
+  if (
+    length(max_run) != 1L ||
+    !is.finite(max_run) ||
+    max_run < 1L
+  ) {
+
+    stop(
+      "max_run must be a positive integer.",
+      call. = FALSE
+    )
+  }
 
   if (!is.null(seed)) {
     set.seed(seed)
-  }
-
-  distribution <- tolower(distribution)
-
-  if (distribution != "normal") {
-    stop(
-      "Real-data threshold calibration currently supports only ",
-      "the standard Normal reference distribution.",
-      call. = FALSE
-    )
   }
 
   z <- stats::rnorm(
@@ -486,49 +623,43 @@ generate_threshold_paths <- function(
 
 
 # =============================================================================
-# 7. BUILD STATIONARY EMPIRICAL-COPULA MODELS FOR THRESHOLD CALIBRATION
-# =============================================================================
-#
-# For real-data monitoring, the empirical copula is estimated directly from
-# Phase-I observations. Threshold calibration must therefore use the same
-# probability-scale transformation.
-#
+# 7. CALCULATE ONE ENSEMBLE PATH
 # =============================================================================
 
-build_phase1_copula_models <- function(
-    phase1_z,
-    k_values,
-    side = "upper") {
-
-  fit_empirical_copula_models(
-    phase1_z = phase1_z,
-    k_values = k_values,
-    side = side
-  )
-}
-
-
-# =============================================================================
-# 8. CALCULATE ENSEMBLE PATH FOR A STANDARDIZED PATH
-# =============================================================================
-
-calculate_ensemble_path <- function(
+real_data_calculate_ensemble_path <- function(
     z_path,
     k_values,
     weights,
     copula_models,
-    side = "upper") {
+    side = "upper",
+    transform_method = "empirical_copula") {
 
   z_path <- as.numeric(z_path)
 
   k_values <- as.numeric(k_values)
 
+  J <- length(k_values)
+
+  if (J < 1L) {
+
+    stop(
+      "At least one k-value is required.",
+      call. = FALSE
+    )
+  }
+
   weights <- normalize_real_weights(
     weights,
-    J = length(k_values)
+    J = J
   )
 
-  J <- length(k_values)
+  if (length(copula_models) != J) {
+
+    stop(
+      "Length of copula_models must equal length of k_values.",
+      call. = FALSE
+    )
+  }
 
   n <- length(z_path)
 
@@ -548,9 +679,27 @@ calculate_ensemble_path <- function(
     ncol = J
   )
 
+
   for (t in seq_len(n)) {
 
     z <- z_path[t]
+
+    if (!is.finite(z)) {
+
+      stop(
+        paste0(
+          "Nonfinite observation at t = ",
+          t,
+          "."
+        ),
+        call. = FALSE
+      )
+    }
+
+
+    # -------------------------------------------------------------------------
+    # Update CUSUM components
+    # -------------------------------------------------------------------------
 
     for (j in seq_len(J)) {
 
@@ -560,22 +709,34 @@ calculate_ensemble_path <- function(
         k = k_values[j],
         side = side
       )
-
     }
 
-    probabilities <- apply_empirical_copula_transform(
+
+    # -------------------------------------------------------------------------
+    # Probability-scale transformation
+    # -------------------------------------------------------------------------
+
+    probabilities <- real_data_apply_probability_transform(
       c_values = cusum_states,
-      ecdf_models = copula_models
+      ecdf_models = copula_models,
+      method = transform_method
     )
 
+
+    # -------------------------------------------------------------------------
+    # Weighted ensemble
+    # -------------------------------------------------------------------------
+
     ensemble_path[t] <- sum(
-      weights * probabilities
+      weights *
+        probabilities
     )
 
     cusum_matrix[t, ] <- cusum_states
 
     probability_matrix[t, ] <- probabilities
   }
+
 
   list(
     ensemble = ensemble_path,
@@ -586,32 +747,44 @@ calculate_ensemble_path <- function(
 
 
 # =============================================================================
-# 9. ESTIMATE ARL0 FOR A FIXED THRESHOLD
+# 8. ESTIMATE ARL0 FOR A FIXED THRESHOLD
 # =============================================================================
 
-estimate_threshold_arl0 <- function(
+real_data_estimate_threshold_arl0 <- function(
     H,
     z_paths,
     k_values,
     weights,
     copula_models,
     side = "upper",
+    transform_method = "empirical_copula",
     max_run = ncol(z_paths)) {
 
   z_paths <- as.matrix(z_paths)
 
   n_paths <- nrow(z_paths)
 
-  run_lengths <- numeric(n_paths)
+  max_run <- min(
+    as.integer(max_run),
+    ncol(z_paths)
+  )
+
+  run_lengths <- numeric(
+    n_paths
+  )
 
   for (i in seq_len(n_paths)) {
 
-    path_result <- calculate_ensemble_path(
-      z_path = z_paths[i, seq_len(max_run)],
+    path_result <- real_data_calculate_ensemble_path(
+      z_path = z_paths[
+        i,
+        seq_len(max_run)
+      ],
       k_values = k_values,
       weights = weights,
       copula_models = copula_models,
-      side = side
+      side = side,
+      transform_method = transform_method
     )
 
     signal_idx <- which(
@@ -625,9 +798,7 @@ estimate_threshold_arl0 <- function(
     } else {
 
       run_lengths[i] <- max_run + 1L
-
     }
-
   }
 
   mean(run_lengths)
@@ -635,7 +806,7 @@ estimate_threshold_arl0 <- function(
 
 
 # =============================================================================
-# 10. THRESHOLD RECALIBRATION
+# 9. THRESHOLD RECALIBRATION
 # =============================================================================
 
 recalibrate_real_data_threshold <- function(
@@ -651,39 +822,49 @@ recalibrate_real_data_threshold <- function(
         H = config$threshold_upper,
         ARL0 = NA_real_,
         status = "recalibration_disabled",
-        iterations = 0L
+        iterations = 0L,
+        stationary_models = NULL
       )
     )
-
   }
 
-  if (!is.finite(config$target_arl0) ||
-      config$target_arl0 <= 0) {
+
+  target <- config$target_arl0 %||% 370
+
+  if (
+    !is.finite(target) ||
+    target <= 0
+  ) {
 
     stop(
       "target_arl0 must be positive and finite.",
       call. = FALSE
     )
-
   }
 
-  if (!is.finite(config$threshold_lower) ||
-      !is.finite(config$threshold_upper) ||
-      config$threshold_lower >= config$threshold_upper) {
+
+  threshold_lower <- config$threshold_lower
+
+  threshold_upper <- config$threshold_upper
+
+  if (
+    !is.finite(threshold_lower) ||
+    !is.finite(threshold_upper) ||
+    threshold_lower >= threshold_upper
+  ) {
 
     stop(
       "Invalid threshold calibration interval.",
       call. = FALSE
     )
-
   }
 
+
   # ---------------------------------------------------------------------------
-  # Use the Phase-I empirical CDFs as the stationary probability-scale
-  # reference distributions.
+  # Construct the fixed Phase-I probability-scale reference.
   # ---------------------------------------------------------------------------
 
-  copula_models <- build_phase1_copula_models(
+  copula_models <- real_data_fit_empirical_copula_models(
     phase1_z = phase1_z,
     k_values = k_values,
     side = config$side %||% "upper"
@@ -691,41 +872,39 @@ recalibrate_real_data_threshold <- function(
 
 
   # ---------------------------------------------------------------------------
-  # Generate common Monte Carlo paths.
+  # Common Monte Carlo paths.
   # ---------------------------------------------------------------------------
 
-  threshold_paths <- generate_threshold_paths(
+  threshold_paths <- real_data_generate_threshold_paths(
     n_rep = config$n_threshold_rep,
     max_run = config$max_threshold_run,
-    distribution = "normal",
     seed = config$threshold_seed
   )
 
 
   # ---------------------------------------------------------------------------
-  # Evaluate threshold.
+  # Fixed-H evaluator.
   # ---------------------------------------------------------------------------
 
   evaluate_H <- function(H) {
 
-    estimate_threshold_arl0(
+    real_data_estimate_threshold_arl0(
       H = H,
       z_paths = threshold_paths,
       k_values = k_values,
       weights = weights,
       copula_models = copula_models,
       side = config$side %||% "upper",
+      transform_method = config$transform_method %||%
+        "empirical_copula",
       max_run = config$max_threshold_run
     )
-
   }
 
 
-  lower <- config$threshold_lower
+  lower <- threshold_lower
 
-  upper <- config$threshold_upper
-
-  target <- config$target_arl0
+  upper <- threshold_upper
 
 
   arl_lower <- evaluate_H(
@@ -752,7 +931,6 @@ recalibrate_real_data_threshold <- function(
         stationary_models = copula_models
       )
     )
-
   }
 
 
@@ -767,7 +945,6 @@ recalibrate_real_data_threshold <- function(
         stationary_models = copula_models
       )
     )
-
   }
 
 
@@ -784,7 +961,8 @@ recalibrate_real_data_threshold <- function(
   for (iter in seq_len(config$threshold_max_iter)) {
 
     midpoint <- (
-      lower + upper
+      lower +
+        upper
     ) / 2
 
     arl_mid <- evaluate_H(
@@ -792,7 +970,9 @@ recalibrate_real_data_threshold <- function(
     )
 
 
-    # Update best threshold.
+    # -------------------------------------------------------------------------
+    # Track the best threshold.
+    # -------------------------------------------------------------------------
 
     if (
       abs(arl_mid - target) <
@@ -802,11 +982,12 @@ recalibrate_real_data_threshold <- function(
       best_H <- midpoint
 
       best_ARL <- arl_mid
-
     }
 
 
+    # -------------------------------------------------------------------------
     # ARL tolerance.
+    # -------------------------------------------------------------------------
 
     if (
       abs(arl_mid - target) / target <=
@@ -822,11 +1003,12 @@ recalibrate_real_data_threshold <- function(
           stationary_models = copula_models
         )
       )
-
     }
 
 
-    # H tolerance.
+    # -------------------------------------------------------------------------
+    # H interval tolerance.
+    # -------------------------------------------------------------------------
 
     if (
       abs(upper - lower) <=
@@ -842,11 +1024,17 @@ recalibrate_real_data_threshold <- function(
           stationary_models = copula_models
         )
       )
-
     }
 
 
+    # -------------------------------------------------------------------------
     # Bisection direction.
+    #
+    # Increasing H increases ARL0, so:
+    #
+    # ARL(H) < target -> increase H
+    # ARL(H) > target -> decrease H
+    # -------------------------------------------------------------------------
 
     if (arl_mid < target) {
 
@@ -855,9 +1043,7 @@ recalibrate_real_data_threshold <- function(
     } else {
 
       upper <- midpoint
-
     }
-
   }
 
 
@@ -872,7 +1058,7 @@ recalibrate_real_data_threshold <- function(
 
 
 # =============================================================================
-# 11. LOAD REAL DATA
+# 10. LOAD REAL DATA
 # =============================================================================
 
 load_real_data_vector <- function(
@@ -883,14 +1069,11 @@ load_real_data_vector <- function(
   # Direct data object
   # ---------------------------------------------------------------------------
 
-  if (
-    !is.null(data_object)
-  ) {
+  if (!is.null(data_object)) {
 
     return(
       as.numeric(data_object)
     )
-
   }
 
 
@@ -898,14 +1081,11 @@ load_real_data_vector <- function(
   # Configuration vector
   # ---------------------------------------------------------------------------
 
-  if (
-    !is.null(config$data_vector)
-  ) {
+  if (!is.null(config$data_vector)) {
 
     return(
       as.numeric(config$data_vector)
     )
-
   }
 
 
@@ -929,10 +1109,10 @@ load_real_data_vector <- function(
         "CSV file contains no columns.",
         call. = FALSE
       )
-
     }
 
-    var_name <- config$variable %||% names(df)[1L]
+    var_name <- config$variable %||%
+      names(df)[1L]
 
     if (!var_name %in% names(df)) {
 
@@ -942,13 +1122,13 @@ load_real_data_vector <- function(
         "' was not found in the CSV file.",
         call. = FALSE
       )
-
     }
 
     return(
-      as.numeric(df[[var_name]])
+      as.numeric(
+        df[[var_name]]
+      )
     )
-
   }
 
 
@@ -960,7 +1140,7 @@ load_real_data_vector <- function(
 
 
 # =============================================================================
-# 12. REAL DATA PROCESSING & MONITORING
+# 11. REAL-DATA ANALYSIS
 # =============================================================================
 
 run_real_data_analysis <- function(
@@ -980,43 +1160,51 @@ run_real_data_analysis <- function(
       "config must be a list.",
       call. = FALSE
     )
-
   }
 
+
   config$side <- tolower(
-    config$side %||% "upper"
+    config$side %||%
+      "upper"
   )
 
-  if (!config$side %in% c("upper", "lower")) {
+  if (
+    !config$side %in%
+    c(
+      "upper",
+      "lower"
+    )
+  ) {
 
     stop(
       "side must be 'upper' or 'lower'.",
       call. = FALSE
     )
-
   }
 
+
   config$transform_method <- tolower(
-    config$transform_method %||% "empirical_copula"
+    config$transform_method %||%
+      "empirical_copula"
   )
 
   if (
     !config$transform_method %in%
     c(
-      "empirical_copula",
-      "cdf",
-      "probability",
       "mid",
-      "lower_tail"
+      "lower_tail",
+      "empirical",
+      "empirical_copula"
     )
   ) {
 
     stop(
-      "Unsupported transform_method: ",
-      config$transform_method,
+      paste0(
+        "Unsupported transform_method: ",
+        config$transform_method
+      ),
       call. = FALSE
     )
-
   }
 
 
@@ -1029,7 +1217,6 @@ run_real_data_analysis <- function(
     set.seed(
       config$seed
     )
-
   }
 
 
@@ -1042,11 +1229,13 @@ run_real_data_analysis <- function(
     data_object = data_object
   )
 
-  x_raw <- as.numeric(x_raw)
+  x_raw <- as.numeric(
+    x_raw
+  )
 
 
   # ===========================================================================
-  # Filter missing observations
+  # Remove missing observations
   # ===========================================================================
 
   if (isTRUE(config$remove_missing)) {
@@ -1054,12 +1243,11 @@ run_real_data_analysis <- function(
     x_raw <- x_raw[
       !is.na(x_raw)
     ]
-
   }
 
 
   # ===========================================================================
-  # Filter infinite observations
+  # Remove infinite observations
   # ===========================================================================
 
   if (isTRUE(config$remove_infinite)) {
@@ -1067,21 +1255,30 @@ run_real_data_analysis <- function(
     x_raw <- x_raw[
       is.finite(x_raw)
     ]
-
   }
 
 
   # ===========================================================================
-  # Check data length
+  # Data-length validation
   # ===========================================================================
 
   n <- length(x_raw)
 
-  min_p1 <- config$min_phase1 %||% 50L
+  min_p1 <- as.integer(
+    config$min_phase1 %||%
+      50L
+  )
 
-  min_p2 <- config$min_phase2 %||% 20L
+  min_p2 <- as.integer(
+    config$min_phase2 %||%
+      20L
+  )
 
-  if (n < min_p1 + min_p2) {
+  if (
+    n <
+    min_p1 +
+      min_p2
+  ) {
 
     stop(
       sprintf(
@@ -1096,7 +1293,6 @@ run_real_data_analysis <- function(
       ),
       call. = FALSE
     )
-
   }
 
 
@@ -1105,7 +1301,8 @@ run_real_data_analysis <- function(
   # ===========================================================================
 
   n_phase1 <- floor(
-    config$phase1_prop * n
+    config$phase1_prop *
+      n
   )
 
   n_phase1 <- max(
@@ -1124,17 +1321,15 @@ run_real_data_analysis <- function(
       "Unable to construct the required Phase-I sample.",
       call. = FALSE
     )
-
   }
+
 
   phase1_raw <- x_raw[
     seq_len(n_phase1)
   ]
 
-  phase2_start <- n_phase1 + 1L
-
   phase2_raw <- x_raw[
-    phase2_start:n
+    (n_phase1 + 1L):n
   ]
 
 
@@ -1142,38 +1337,41 @@ run_real_data_analysis <- function(
   # Optional detrending
   # ===========================================================================
 
+  detrend_model <- NULL
+
   if (isTRUE(config$detrend)) {
 
     t_p1 <- seq_along(
       phase1_raw
     )
 
-    lm_p1 <- stats::lm(
+    detrend_model <- stats::lm(
       phase1_raw ~ t_p1
     )
 
     phase1_raw <- stats::residuals(
-      lm_p1
+      detrend_model
     )
 
     t_p2 <- seq_len(
       length(phase2_raw)
-    ) + n_phase1
+    ) +
+      n_phase1
 
     pred_p2 <- stats::predict(
-      lm_p1,
+      detrend_model,
       newdata = data.frame(
         t_p1 = t_p2
       )
     )
 
-    phase2_raw <- phase2_raw - pred_p2
-
+    phase2_raw <- phase2_raw -
+      pred_p2
   }
 
 
   # ===========================================================================
-  # Phase-I parameter estimation
+  # Phase-I location and scale estimation
   # ===========================================================================
 
   if (isTRUE(config$robust_estimation)) {
@@ -1199,7 +1397,6 @@ run_real_data_analysis <- function(
       phase1_raw,
       na.rm = TRUE
     )
-
   }
 
 
@@ -1213,7 +1410,6 @@ run_real_data_analysis <- function(
       "Invalid location or scale estimated from Phase-I data.",
       call. = FALSE
     )
-
   }
 
 
@@ -1222,16 +1418,20 @@ run_real_data_analysis <- function(
   # ===========================================================================
 
   z_phase1 <- (
-    phase1_raw - mu_hat
-  ) / sigma_hat
+    phase1_raw -
+      mu_hat
+  ) /
+    sigma_hat
 
   z_phase2 <- (
-    phase2_raw - mu_hat
-  ) / sigma_hat
+    phase2_raw -
+      mu_hat
+  ) /
+    sigma_hat
 
 
   # ===========================================================================
-  # Select component parameters
+  # Select CUSUM reference values
   # ===========================================================================
 
   if (
@@ -1253,17 +1453,15 @@ run_real_data_analysis <- function(
           0.75
         )
     )
-
   }
 
 
-  if (length(k_vals) == 0L) {
+  if (length(k_vals) < 1L) {
 
     stop(
       "At least one k-value is required.",
       call. = FALSE
     )
-
   }
 
   if (
@@ -1275,7 +1473,6 @@ run_real_data_analysis <- function(
       "k_values must be finite and nonnegative.",
       call. = FALSE
     )
-
   }
 
 
@@ -1301,7 +1498,6 @@ run_real_data_analysis <- function(
           length(k_vals)
         )
     )
-
   }
 
   J <- length(k_vals)
@@ -1313,10 +1509,10 @@ run_real_data_analysis <- function(
 
 
   # ===========================================================================
-  # Fit empirical copula models from Phase I
+  # Construct fixed Phase-I empirical probability-scale models
   # ===========================================================================
 
-  copula_models <- fit_empirical_copula_models(
+  copula_models <- real_data_fit_empirical_copula_models(
     phase1_z = z_phase1,
     k_values = k_vals,
     side = config$side
@@ -1329,12 +1525,12 @@ run_real_data_analysis <- function(
   #
   # Priority:
   #
-  # 1. Explicit optimized H when optimized design is requested
-  # 2. Recalibration when requested
+  # 1. Explicit optimized H
+  # 2. Phase-I threshold recalibration
   # 3. Default threshold
   #
   # ===========================================================================
-  
+
   if (
     isTRUE(config$use_optimized_design) &&
     !is.null(config$optimized_H)
@@ -1343,6 +1539,17 @@ run_real_data_analysis <- function(
     H <- as.numeric(
       config$optimized_H
     )
+
+    if (
+      length(H) != 1L ||
+      !is.finite(H)
+    ) {
+
+      stop(
+        "optimized_H must be one finite numeric value.",
+        call. = FALSE
+      )
+    }
 
     threshold_status <- "optimized"
 
@@ -1356,22 +1563,27 @@ run_real_data_analysis <- function(
     isTRUE(config$threshold_recalibration)
   ) {
 
-    threshold_calibration <- recalibrate_real_data_threshold(
-      phase1_z = z_phase1,
-      k_values = k_vals,
-      weights = weights,
-      config = config
-    )
+    threshold_calibration <-
+      recalibrate_real_data_threshold(
+        phase1_z = z_phase1,
+        k_values = k_vals,
+        weights = weights,
+        config = config
+      )
 
     H <- threshold_calibration$H
 
-    threshold_status <- threshold_calibration$status
+    threshold_status <-
+      threshold_calibration$status
 
-    threshold_arl0 <- threshold_calibration$ARL0
+    threshold_arl0 <-
+      threshold_calibration$ARL0
 
-    threshold_iterations <- threshold_calibration$iterations
+    threshold_iterations <-
+      threshold_calibration$iterations
 
-    threshold_models <- threshold_calibration$stationary_models %||%
+    threshold_models <-
+      threshold_calibration$stationary_models %||%
       copula_models
 
   } else {
@@ -1387,12 +1599,11 @@ run_real_data_analysis <- function(
     threshold_iterations <- 0L
 
     threshold_models <- copula_models
-
   }
 
 
   # ===========================================================================
-  # Monitor Phase II
+  # Phase-II monitoring
   # ===========================================================================
 
   n_phase2 <- length(
@@ -1429,19 +1640,32 @@ run_real_data_analysis <- function(
     z <- z_phase2[t]
 
 
+    if (!is.finite(z)) {
+
+      stop(
+        paste0(
+          "Nonfinite standardized Phase-II observation at t = ",
+          t,
+          "."
+        ),
+        call. = FALSE
+      )
+    }
+
+
     # -------------------------------------------------------------------------
     # Update CUSUM components
     # -------------------------------------------------------------------------
 
     for (j in seq_len(J)) {
 
-      cusum_states[j] <- real_data_cusum_update(
-        C_prev = cusum_states[j],
-        z = z,
-        k = k_vals[j],
-        side = config$side
-      )
-
+      cusum_states[j] <-
+        real_data_cusum_update(
+          C_prev = cusum_states[j],
+          z = z,
+          k = k_vals[j],
+          side = config$side
+        )
     }
 
 
@@ -1449,41 +1673,44 @@ run_real_data_analysis <- function(
     # Probability-scale transformation
     # -------------------------------------------------------------------------
 
-    u_transformed <- apply_empirical_copula_transform(
-      c_values = cusum_states,
-      ecdf_models = copula_models
-    )
+    u_transformed <-
+      real_data_apply_probability_transform(
+        c_values = cusum_states,
+        ecdf_models = copula_models,
+        method = config$transform_method
+      )
 
 
     # -------------------------------------------------------------------------
-    # Ensemble statistic
+    # Weighted ensemble
     # -------------------------------------------------------------------------
 
     ensemble_path[t] <- sum(
-      weights * u_transformed
+      weights *
+        u_transformed
     )
 
+    cusum_matrix[t, ] <-
+      cusum_states
 
-    cusum_matrix[t, ] <- cusum_states
-
-    probability_matrix[t, ] <- u_transformed
+    probability_matrix[t, ] <-
+      u_transformed
 
 
     # -------------------------------------------------------------------------
-    # Signal
+    # Strict alarm rule
     # -------------------------------------------------------------------------
 
     if (
       !signal_detected &&
+      is.finite(ensemble_path[t]) &&
       ensemble_path[t] > H
     ) {
 
       signal_detected <- TRUE
 
       signal_time <- t
-
     }
-
   }
 
 
@@ -1501,16 +1728,20 @@ run_real_data_analysis <- function(
 
     Threshold = H,
 
-    Target_ARL0 = config$target_arl0 %||% 370,
+    Target_ARL0 =
+      config$target_arl0 %||%
+      370,
 
-    Calibration_ARL0 = threshold_arl0,
+    Calibration_ARL0 =
+      threshold_arl0,
 
-    Calibration_Status = threshold_status,
+    Calibration_Status =
+      threshold_status,
 
-    Calibration_Iterations = threshold_iterations,
+    Calibration_Iterations =
+      threshold_iterations,
 
     stringsAsFactors = FALSE
-
   )
 
 
@@ -1524,73 +1755,108 @@ run_real_data_analysis <- function(
 
     ARL0 = threshold_arl0,
 
-    target_arl0 = config$target_arl0 %||% 370,
+    target_arl0 =
+      config$target_arl0 %||%
+      370,
 
-    threshold_source = threshold_status,
+    threshold_source =
+      threshold_status,
 
-    iterations = threshold_iterations,
+    iterations =
+      threshold_iterations,
 
-    recalibration = isTRUE(
-      config$threshold_recalibration
-    )
-
+    recalibration =
+      isTRUE(
+        config$threshold_recalibration
+      )
   )
 
 
   # ===========================================================================
-  # Publication table
-  # ===========================================================================
-
-  publication_table <- method_summary
-
-
-  # ===========================================================================
-  # Return results
+  # Return object
   # ===========================================================================
 
   result <- list(
 
+    # -------------------------------------------------------------------------
     # Raw data
+    # -------------------------------------------------------------------------
+
     data = x_raw,
 
     phase1_raw = phase1_raw,
 
     phase2_raw = phase2_raw,
 
+
+    # -------------------------------------------------------------------------
     # Standardized data
+    # -------------------------------------------------------------------------
+
     z_phase1 = z_phase1,
 
     z_phase2 = z_phase2,
 
+
+    # -------------------------------------------------------------------------
     # Phase-I estimates
+    # -------------------------------------------------------------------------
+
     phase1_parameters = list(
       mu = mu_hat,
       sigma = sigma_hat
     ),
 
+
+    # -------------------------------------------------------------------------
+    # Optional detrending model
+    # -------------------------------------------------------------------------
+
+    detrend_model = detrend_model,
+
+
+    # -------------------------------------------------------------------------
     # Design
+    # -------------------------------------------------------------------------
+
     k_values = k_vals,
 
     weights = weights,
 
     J = J,
 
-    # Empirical copula
+
+    # -------------------------------------------------------------------------
+    # Fixed Phase-I empirical reference
+    # -------------------------------------------------------------------------
+
     copula_models = copula_models,
 
+
+    # -------------------------------------------------------------------------
     # Monitoring paths
+    # -------------------------------------------------------------------------
+
     cusum_path = cusum_matrix,
 
     probability_path = probability_matrix,
 
     ensemble_path = ensemble_path,
 
+
+    # -------------------------------------------------------------------------
     # Signal
+    # -------------------------------------------------------------------------
+
     signal = signal_detected,
 
     signal_time = signal_time,
 
+
+    # -------------------------------------------------------------------------
     # Threshold
+    # -------------------------------------------------------------------------
+
     threshold = threshold_info,
 
     threshold_calibration = list(
@@ -1600,14 +1866,21 @@ run_real_data_analysis <- function(
       iterations = threshold_iterations
     ),
 
-    # Standardized output
+
+    # -------------------------------------------------------------------------
+    # Summary
+    # -------------------------------------------------------------------------
+
     method_summary = method_summary,
 
-    publication_table = publication_table,
+    publication_table = method_summary,
 
+
+    # -------------------------------------------------------------------------
     # Configuration
-    config = config
+    # -------------------------------------------------------------------------
 
+    config = config
   )
 
 
@@ -1625,7 +1898,6 @@ run_real_data_analysis <- function(
       recursive = TRUE,
       showWarnings = FALSE
     )
-
   }
 
 
@@ -1646,35 +1918,36 @@ run_real_data_analysis <- function(
       Ensemble = ensemble_path,
 
       Signal = ensemble_path > H
-
     )
 
 
     if (J >= 1L) {
 
-      monitoring_table$CUSUM1 <- cusum_matrix[, 1L]
+      monitoring_table$CUSUM1 <-
+        cusum_matrix[, 1L]
 
       monitoring_table$Probability1 <-
         probability_matrix[, 1L]
-
     }
+
 
     if (J >= 2L) {
 
-      monitoring_table$CUSUM2 <- cusum_matrix[, 2L]
+      monitoring_table$CUSUM2 <-
+        cusum_matrix[, 2L]
 
       monitoring_table$Probability2 <-
         probability_matrix[, 2L]
-
     }
+
 
     if (J >= 3L) {
 
-      monitoring_table$CUSUM3 <- cusum_matrix[, 3L]
+      monitoring_table$CUSUM3 <-
+        cusum_matrix[, 3L]
 
       monitoring_table$Probability3 <-
         probability_matrix[, 3L]
-
     }
 
 
@@ -1699,14 +1972,13 @@ run_real_data_analysis <- function(
 
 
     utils::write.csv(
-      publication_table,
+      method_summary,
       file = file.path(
         config$output_dir,
         "real_data_publication_table.csv"
       ),
       row.names = FALSE
     )
-
   }
 
 
@@ -1723,7 +1995,6 @@ run_real_data_analysis <- function(
         "real_data_analysis.rds"
       )
     )
-
   }
 
 
@@ -1776,7 +2047,10 @@ run_real_data_analysis <- function(
     cat(
       "k-values:     ",
       paste(
-        format(k_vals, digits = 6),
+        format(
+          k_vals,
+          digits = 6
+        ),
         collapse = ", "
       ),
       "\n",
@@ -1786,7 +2060,10 @@ run_real_data_analysis <- function(
     cat(
       "Weights:      ",
       paste(
-        format(weights, digits = 6),
+        format(
+          weights,
+          digits = 6
+        ),
         collapse = ", "
       ),
       "\n",
@@ -1828,7 +2105,6 @@ run_real_data_analysis <- function(
         "\n",
         sep = ""
       )
-
     }
 
     cat(
@@ -1853,13 +2129,11 @@ run_real_data_analysis <- function(
         "\n",
         sep = ""
       )
-
     }
 
     cat(
       "============================================================\n"
     )
-
   }
 
 
@@ -1870,7 +2144,7 @@ run_real_data_analysis <- function(
 
 
 # =============================================================================
-# 13. CONVENIENCE WRAPPER
+# 12. CONVENIENCE WRAPPER
 # =============================================================================
 
 run_sp_ecusum_real_data <- function(
@@ -1885,11 +2159,12 @@ run_sp_ecusum_real_data <- function(
 
 
 # =============================================================================
-# 14. SCRIPT COMPLETION MESSAGE
+# 13. SCRIPT COMPLETION MESSAGE
 # =============================================================================
 
 cat(
   "\n13_real_data.R loaded successfully ",
-  "with empirical copula transformation and threshold calibration.\n",
+  "with Phase-I empirical probability-scale reference ",
+  "and threshold calibration.\n",
   sep = ""
 )

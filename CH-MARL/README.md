@@ -22,3 +22,16 @@ CH-MARL is compared with:
 - **MAPPO** — Multi-Agent Proximal Policy Optimization
 - **CH-MARL** — Copula-Hierarchical Multi-Agent Reinforcement Learning
 
+
+The spatial initialization is informed by the **NYC taxi dataset** from the `seaborn-data` repository.
+
+**Dataset:** `taxis.csv`
+
+:contentReference[oaicite:0]{index=0}
+
+The data can be downloaded directly in R:
+
+```r
+data_url <- "https://raw.githubusercontent.com/mwaskom/seaborn-data/master/taxis.csv"
+
+taxi_data <- read.csv(data_url)

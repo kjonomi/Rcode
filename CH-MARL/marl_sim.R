@@ -70,10 +70,16 @@ tf$random$set_seed(SEED)
 # =============================================================================
 
 tf_shape_int32 <- function(...) {
-  tf$constant(
-    as.integer(c(...)),
-    dtype = tf$int32
-  )
+  args <- list(...)
+  # If any argument is a TensorFlow Tensor, use tf$stack
+  has_tf <- any(sapply(args, function(x) inherits(x, "python.builtin.object")))
+  
+  if (has_tf) {
+    tf_args <- lapply(args, function(x) tf$cast(x, tf$int32))
+    tf$stack(tf_args)
+  } else {
+    tf$constant(as.integer(unlist(args)), dtype = tf$int32)
+  }
 }
 
 normal_cdf_tf <- function(x) {
@@ -420,6 +426,11 @@ run_marl_model <- function(
     seed = SEED) {
 
   model_name <- match.arg(model_name)
+
+  # ---------------------------------------------------------------------------
+  # Reproducibility
+  # ---------------------------------------------------------------------------
+
   set.seed(seed)
   tf$random$set_seed(as.integer(seed))
 
@@ -428,32 +439,140 @@ run_marl_model <- function(
   joint_state_dim <- n_agents * phase_dim
   joint_action_dim <- n_agents * action_dim
 
+  # ---------------------------------------------------------------------------
+  # Environment
+  # ---------------------------------------------------------------------------
+
   agents_template <- define_heterogeneous_agents(n_agents)
 
+  # ---------------------------------------------------------------------------
   # Model Construction
-  manager <- if (model_name == "CH-MARL") define_manager_model(joint_state_dim) else NULL
-  copula_net <- if (model_name == "CH-MARL") define_copula_network(joint_state_dim) else NULL
+  # ---------------------------------------------------------------------------
 
-  worker_input_dim <- if (model_name == "CH-MARL") phase_dim + MANAGER_GOAL_DIM else phase_dim
-  workers <- lapply(seq_len(n_agents), function(i) define_stochastic_worker(worker_input_dim, action_dim))
-
-  if (model_name == "IPPO") {
-    critics <- lapply(seq_len(n_agents), function(i) define_critic_model(phase_dim + action_dim))
-    target_critics <- lapply(seq_len(n_agents), function(i) {
-      tc <- define_critic_model(phase_dim + action_dim)
-      tc$set_weights(critics[[i]]$get_weights())
-      tc
-    })
+  manager <- if (model_name == "CH-MARL") {
+    define_manager_model(joint_state_dim)
   } else {
-    critic <- define_critic_model(joint_state_dim + joint_action_dim)
-    target_critic <- define_critic_model(joint_state_dim + joint_action_dim)
-    target_critic$set_weights(critic$get_weights())
+    NULL
   }
 
-  actor_optimizer <- optimizer_adam(learning_rate = ACTOR_LR)
-  critic_optimizer <- optimizer_adam(learning_rate = CRITIC_LR)
+  copula_net <- if (model_name == "CH-MARL") {
+    define_copula_network(joint_state_dim)
+  } else {
+    NULL
+  }
 
-  replay <- create_replay_buffer(REPLAY_CAPACITY)
+  worker_input_dim <- if (model_name == "CH-MARL") {
+    phase_dim + MANAGER_GOAL_DIM
+  } else {
+    phase_dim
+  }
+
+  workers <- lapply(
+    seq_len(n_agents),
+    function(i) {
+      define_stochastic_worker(
+        input_dim = worker_input_dim,
+        action_dim = action_dim
+      )
+    }
+  )
+
+  # ---------------------------------------------------------------------------
+  # Critic Construction
+  #
+  # IMPORTANT:
+  # IPPO has one independent critic per agent. Therefore each critic must
+  # have its own optimizer in Keras 3.
+  # ---------------------------------------------------------------------------
+
+  if (model_name == "IPPO") {
+
+    critics <- lapply(
+      seq_len(n_agents),
+      function(i) {
+        define_critic_model(
+          phase_dim + action_dim
+        )
+      }
+    )
+
+    target_critics <- lapply(
+      seq_len(n_agents),
+      function(i) {
+
+        tc <- define_critic_model(
+          phase_dim + action_dim
+        )
+
+        tc$set_weights(
+          critics[[i]]$get_weights()
+        )
+
+        tc
+      }
+    )
+
+  } else {
+
+    critic <- define_critic_model(
+      joint_state_dim + joint_action_dim
+    )
+
+    target_critic <- define_critic_model(
+      joint_state_dim + joint_action_dim
+    )
+
+    target_critic$set_weights(
+      critic$get_weights()
+    )
+  }
+
+  # ---------------------------------------------------------------------------
+  # Optimizers
+  #
+  # Keras 3 optimizers track the variables with which they were first built.
+  # Therefore:
+  #
+  #   CH-MARL/MAPPO : one critic -> one critic optimizer
+  #   IPPO          : eight critics -> eight critic optimizers
+  #
+  # The actor optimizer is shared because all actor variables are passed
+  # together in a single apply_gradients() call.
+  # ---------------------------------------------------------------------------
+
+  actor_optimizer <- optimizer_adam(
+    learning_rate = ACTOR_LR
+  )
+
+  if (model_name == "IPPO") {
+
+    critic_optimizers <- lapply(
+      seq_len(n_agents),
+      function(i) {
+        optimizer_adam(
+          learning_rate = CRITIC_LR
+        )
+      }
+    )
+
+  } else {
+
+    critic_optimizer <- optimizer_adam(
+      learning_rate = CRITIC_LR
+    )
+  }
+
+  # ---------------------------------------------------------------------------
+  # Replay Buffer
+  # ---------------------------------------------------------------------------
+
+  replay <- create_replay_buffer(
+    REPLAY_CAPACITY
+  )
+
+  # ---------------------------------------------------------------------------
+  # Training History
+  # ---------------------------------------------------------------------------
 
   history <- tibble(
     Model = character(),
@@ -467,50 +586,192 @@ run_marl_model <- function(
     MeanRho = numeric()
   )
 
-  sample_actions_and_eval <- function(joint_states_tf, training = TRUE) {
+  # ---------------------------------------------------------------------------
+  # Policy Sampling and Evaluation
+  # ---------------------------------------------------------------------------
+
+  sample_actions_and_eval <- function(
+      joint_states_tf,
+      training = TRUE) {
+
     batch_n <- tf$shape(joint_states_tf)[1L]
 
-    manager_goals <- if (!is.null(manager)) manager(joint_states_tf, training = training) else NULL
+    # -------------------------------------------------------------------------
+    # CH-MARL manager
+    # -------------------------------------------------------------------------
 
-    worker_mu <- vector("list", n_agents)
-    worker_log_std <- vector("list", n_agents)
-
-    for (i in seq_len(n_agents)) {
-      idx_start <- phase_dim * (i - 1L) + 1L
-      idx_end <- phase_dim * i
-      agent_state <- joint_states_tf[, idx_start:idx_end]
-
-      w_input <- if (!is.null(manager_goals)) tf$concat(list(agent_state, manager_goals), axis = 1L) else agent_state
-      w_out <- workers[[i]](w_input, training = training)
-      worker_mu[[i]] <- w_out[[1]]
-      worker_log_std[[i]] <- tf$clip_by_value(w_out[[2]], -5.0, 2.0)
+    manager_goals <- if (!is.null(manager)) {
+      manager(
+        joint_states_tf,
+        training = training
+      )
+    } else {
+      NULL
     }
 
-    joint_mu <- tf$concat(worker_mu, axis = 1L)
-    joint_log_std <- tf$concat(worker_log_std, axis = 1L)
-    joint_std <- tf$exp(joint_log_std)
+    # -------------------------------------------------------------------------
+    # Individual workers
+    # -------------------------------------------------------------------------
+
+    worker_mu <- vector(
+      "list",
+      n_agents
+    )
+
+    worker_log_std <- vector(
+      "list",
+      n_agents
+    )
+
+    for (i in seq_len(n_agents)) {
+
+      idx_start <- phase_dim * (i - 1L) + 1L
+      idx_end <- phase_dim * i
+
+      agent_state <- joint_states_tf[
+        ,
+        idx_start:idx_end
+      ]
+
+      w_input <- if (!is.null(manager_goals)) {
+
+        tf$concat(
+          list(
+            agent_state,
+            manager_goals
+          ),
+          axis = 1L
+        )
+
+      } else {
+
+        agent_state
+      }
+
+      w_out <- workers[[i]](
+        w_input,
+        training = training
+      )
+
+      worker_mu[[i]] <- w_out[[1]]
+
+      worker_log_std[[i]] <-
+        tf$clip_by_value(
+          w_out[[2]],
+          -5.0,
+          2.0
+        )
+    }
+
+    # -------------------------------------------------------------------------
+    # Joint policy parameters
+    # -------------------------------------------------------------------------
+
+    joint_mu <- tf$concat(
+      worker_mu,
+      axis = 1L
+    )
+
+    joint_log_std <- tf$concat(
+      worker_log_std,
+      axis = 1L
+    )
+
+    joint_std <- tf$exp(
+      joint_log_std
+    )
+
+    # -------------------------------------------------------------------------
+    # CH-MARL: correlated action sampling
+    # -------------------------------------------------------------------------
 
     if (model_name == "CH-MARL") {
-      rho_raw <- copula_net(joint_states_tf, training = training)
-      R <- build_equicorrelation(rho_raw, d = joint_action_dim)
+
+      rho_raw <- copula_net(
+        joint_states_tf,
+        training = training
+      )
+
+      R <- build_equicorrelation(
+        rho_raw,
+        d = joint_action_dim
+      )
+
       L <- tf$linalg$cholesky(R)
 
-      e <- tf$random$normal(shape = tf$shape(joint_mu), dtype = tf$float32)
-      e_exp <- tf$expand_dims(e, axis = -1L)
-      z_corr <- tf$squeeze(tf$linalg$matmul(L, e_exp), axis = -1L)
+      e <- tf$random$normal(
+        shape = tf$shape(joint_mu),
+        dtype = tf$float32
+      )
 
-      u <- normal_cdf_tf(z_corr)
-      base_z <- normal_quantile_tf(u)
-      pre_tanh <- joint_mu + joint_std * base_z
-      actions <- tf$math$tanh(pre_tanh)
-      log_prob <- joint_log_policy(actions, joint_mu, joint_log_std, R)
+      e_exp <- tf$expand_dims(
+        e,
+        axis = -1L
+      )
+
+      z_corr <- tf$squeeze(
+        tf$linalg$matmul(
+          L,
+          e_exp
+        ),
+        axis = -1L
+      )
+
+      u <- normal_cdf_tf(
+        z_corr
+      )
+
+      base_z <- normal_quantile_tf(
+        u
+      )
+
+      pre_tanh <-
+        joint_mu + joint_std * base_z
+
+      actions <- tf$math$tanh(
+        pre_tanh
+      )
+
+      log_prob <- joint_log_policy(
+        actions,
+        joint_mu,
+        joint_log_std,
+        R
+      )
+
     } else {
-      rho_raw <- tf$zeros(shape = tf_shape_int32(batch_n, 1L))
+
+      # -----------------------------------------------------------------------
+      # IPPO / MAPPO: independent Gaussian action sampling
+      # -----------------------------------------------------------------------
+
+      rho_raw <- tf$zeros(
+        shape = tf_shape_int32(
+          batch_n,
+          1L
+        )
+      )
+
       R <- NULL
-      e <- tf$random$normal(shape = tf$shape(joint_mu), dtype = tf$float32)
-      pre_tanh <- joint_mu + joint_std * e
-      actions <- tf$math$tanh(pre_tanh)
-      log_prob <- joint_log_policy(actions, joint_mu, joint_log_std, NULL)
+
+      e <- tf$random$normal(
+        shape = tf$shape(joint_mu),
+        dtype = tf$float32
+      )
+
+      pre_tanh <-
+        joint_mu + joint_std * e
+
+      actions <- tf$math$tanh(
+        pre_tanh
+      )
+
+      log_prob <- joint_log_policy(
+        actions,
+        joint_mu,
+        joint_log_std,
+        NULL
+      )
     }
 
     list(
@@ -522,8 +783,19 @@ run_marl_model <- function(
     )
   }
 
+  # ===========================================================================
+  # TRAINING LOOP
+  # ===========================================================================
+
   for (episode in seq_len(n_episodes)) {
-    agents <- lapply(agents_template, function(a) { a$pos <- as.numeric(a$pos); a })
+
+    agents <- lapply(
+      agents_template,
+      function(a) {
+        a$pos <- as.numeric(a$pos)
+        a
+      }
+    )
 
     episode_rewards <- numeric(0)
     episode_critic_losses <- numeric(0)
@@ -531,127 +803,527 @@ run_marl_model <- function(
     episode_entropy <- numeric(0)
     episode_rho <- numeric(0)
 
-    for (step in seq_len(max_steps)) {
-      joint_state <- as.numeric(unlist(lapply(agents, function(a) phase_embed(a$pos))))
-      joint_state_tf <- tf$constant(matrix(joint_state, nrow = 1L), dtype = tf$float32)
+    # -------------------------------------------------------------------------
+    # Episode steps
+    # -------------------------------------------------------------------------
 
-      policy_sample <- sample_actions_and_eval(joint_state_tf, training = TRUE)
-      joint_action <- as.numeric(as.matrix(policy_sample$actions))
+    for (step in seq_len(max_steps)) {
+
+      # -----------------------------------------------------------------------
+      # Current joint state
+      # -----------------------------------------------------------------------
+
+      joint_state <- as.numeric(
+        unlist(
+          lapply(
+            agents,
+            function(a) {
+              phase_embed(a$pos)
+            }
+          )
+        )
+      )
+
+      joint_state_tf <- tf$constant(
+        matrix(
+          joint_state,
+          nrow = 1L
+        ),
+        dtype = tf$float32
+      )
+
+      # -----------------------------------------------------------------------
+      # Policy action
+      # -----------------------------------------------------------------------
+
+      policy_sample <-
+        sample_actions_and_eval(
+          joint_state_tf,
+          training = TRUE
+        )
+
+      joint_action <-
+        as.numeric(
+          as.matrix(
+            policy_sample$actions
+          )
+        )
+
+      # -----------------------------------------------------------------------
+      # Environment transition
+      # -----------------------------------------------------------------------
 
       env_out <- env_step_dynamic(
         agents = agents,
-        actions = matrix(joint_action, nrow = n_agents, byrow = TRUE),
+        actions = matrix(
+          joint_action,
+          nrow = n_agents,
+          byrow = TRUE
+        ),
         step_number = step
       )
 
-      next_joint_state <- as.numeric(unlist(lapply(env_out$agents, function(a) phase_embed(a$pos))))
-      global_reward <- mean(env_out$rewards)
+      next_joint_state <- as.numeric(
+        unlist(
+          lapply(
+            env_out$agents,
+            function(a) {
+              phase_embed(a$pos)
+            }
+          )
+        )
+      )
 
-      replay$add(joint_state, joint_action, global_reward, next_joint_state, all(env_out$dones))
-      episode_rewards <- c(episode_rewards, global_reward)
+      global_reward <-
+        mean(env_out$rewards)
+
+      # -----------------------------------------------------------------------
+      # Store transition
+      # -----------------------------------------------------------------------
+
+      replay$add(
+        joint_state,
+        joint_action,
+        global_reward,
+        next_joint_state,
+        all(env_out$dones)
+      )
+
+      episode_rewards <-
+        c(
+          episode_rewards,
+          global_reward
+        )
+
+      # -----------------------------------------------------------------------
+      # Initialize diagnostics
+      # -----------------------------------------------------------------------
 
       c_loss_val <- NA_real_
       a_loss_val <- NA_real_
       ent_val <- NA_real_
       rho_val <- NA_real_
 
+      # =======================================================================
+      # PARAMETER UPDATES
+      # =======================================================================
+
       if (replay$size >= BATCH_SIZE) {
-        batch <- replay$sample(BATCH_SIZE)
-        b_states <- tf$constant(batch$states, dtype = tf$float32)
-        b_actions <- tf$constant(batch$actions, dtype = tf$float32)
-        b_rewards <- tf$constant(as.numeric(batch$rewards), dtype = tf$float32)
-        b_next_states <- tf$constant(batch$next_states, dtype = tf$float32)
-        b_dones <- tf$constant(as.numeric(batch$dones), dtype = tf$float32)
 
-        # -------------------------------------------------------------------
+        batch <- replay$sample(
+          BATCH_SIZE
+        )
+
+        b_states <- tf$constant(
+          batch$states,
+          dtype = tf$float32
+        )
+
+        b_actions <- tf$constant(
+          batch$actions,
+          dtype = tf$float32
+        )
+
+        b_rewards <- tf$constant(
+          as.numeric(batch$rewards),
+          dtype = tf$float32
+        )
+
+        b_next_states <- tf$constant(
+          batch$next_states,
+          dtype = tf$float32
+        )
+
+        b_dones <- tf$constant(
+          as.numeric(batch$dones),
+          dtype = tf$float32
+        )
+
+        # =====================================================================
         # CRITIC UPDATE
-        # -------------------------------------------------------------------
+        # =====================================================================
+
         if (model_name == "IPPO") {
+
           total_c_loss <- 0.0
+
+          # -------------------------------------------------------------------
+          # Each IPPO critic has its OWN optimizer.
+          # -------------------------------------------------------------------
+
           for (i in seq_len(n_agents)) {
-            s_idx <- (phase_dim * (i - 1L) + 1L):(phase_dim * i)
-            a_idx <- (action_dim * (i - 1L) + 1L):(action_dim * i)
 
-            with(tf$GradientTape() %as% critic_tape, {
-              c_in <- tf$concat(list(b_states[, s_idx], b_actions[, a_idx]), axis = 1L)
-              q_curr <- tf$squeeze(critics[[i]](c_in, training = TRUE), axis = -1L)
+            s_idx <-
+              (phase_dim * (i - 1L) + 1L):
+              (phase_dim * i)
 
-              next_pol <- sample_actions_and_eval(b_next_states, training = FALSE)
-              next_c_in <- tf$concat(list(b_next_states[, s_idx], next_pol$actions[, a_idx]), axis = 1L)
-              q_next <- tf$squeeze(target_critics[[i]](next_c_in, training = FALSE), axis = -1L)
+            a_idx <-
+              (action_dim * (i - 1L) + 1L):
+              (action_dim * i)
 
-              target <- b_rewards + gamma * (1.0 - b_dones) * (q_next - entropy_coef * next_pol$log_prob)
-              c_loss <- tf$reduce_mean(tf$square(q_curr - tf$stop_gradient(target)))
-            })
+            with(
+              tf$GradientTape() %as% critic_tape,
+              {
 
-            grads <- critic_tape$gradient(c_loss, critics[[i]]$trainable_variables)
-            critic_optimizer$apply_gradients(Map(list, grads, critics[[i]]$trainable_variables))
-            soft_update(critics[[i]], target_critics[[i]], tau = TAU)
-            total_c_loss <- total_c_loss + as.numeric(c_loss)
+                # Current Q estimate
+                c_in <- tf$concat(
+                  list(
+                    b_states[, s_idx],
+                    b_actions[, a_idx]
+                  ),
+                  axis = 1L
+                )
+
+                q_curr <- tf$squeeze(
+                  critics[[i]](
+                    c_in,
+                    training = TRUE
+                  ),
+                  axis = -1L
+                )
+
+                # Next policy
+                next_pol <-
+                  sample_actions_and_eval(
+                    b_next_states,
+                    training = FALSE
+                  )
+
+                next_c_in <- tf$concat(
+                  list(
+                    b_next_states[, s_idx],
+                    next_pol$actions[, a_idx]
+                  ),
+                  axis = 1L
+                )
+
+                q_next <- tf$squeeze(
+                  target_critics[[i]](
+                    next_c_in,
+                    training = FALSE
+                  ),
+                  axis = -1L
+                )
+
+                # TD target
+                target <-
+                  b_rewards +
+                  gamma *
+                  (1.0 - b_dones) *
+                  (
+                    q_next -
+                    entropy_coef *
+                    next_pol$log_prob
+                  )
+
+                c_loss <-
+                  tf$reduce_mean(
+                    tf$square(
+                      q_curr -
+                      tf$stop_gradient(target)
+                    )
+                  )
+              }
+            )
+
+            # ---------------------------------------------------------------
+            # CRITICAL FIX:
+            # critic_optimizers[[i]] corresponds exclusively to
+            # critics[[i]].
+            # ---------------------------------------------------------------
+
+            grads <- critic_tape$gradient(
+              c_loss,
+              critics[[i]]$trainable_variables
+            )
+
+            critic_optimizers[[i]]$apply_gradients(
+              Map(
+                list,
+                grads,
+                critics[[i]]$trainable_variables
+              )
+            )
+
+            # Soft target update
+            soft_update(
+              critics[[i]],
+              target_critics[[i]],
+              tau = TAU
+            )
+
+            total_c_loss <-
+              total_c_loss +
+              as.numeric(c_loss)
           }
-          c_loss_val <- total_c_loss / n_agents
+
+          c_loss_val <-
+            total_c_loss / n_agents
+
         } else {
-          with(tf$GradientTape() %as% critic_tape, {
-            c_in <- tf$concat(list(b_states, b_actions), axis = 1L)
-            q_curr <- tf$squeeze(critic(c_in, training = TRUE), axis = -1L)
 
-            next_pol <- sample_actions_and_eval(b_next_states, training = FALSE)
-            next_c_in <- tf$concat(list(b_next_states, next_pol$actions), axis = 1L)
-            q_next <- tf$squeeze(target_critic(next_c_in, training = FALSE), axis = -1L)
+          # -------------------------------------------------------------------
+          # MAPPO / CH-MARL: one centralized critic
+          # -------------------------------------------------------------------
 
-            target <- b_rewards + gamma * (1.0 - b_dones) * (q_next - entropy_coef * next_pol$log_prob)
-            c_loss <- tf$reduce_mean(tf$square(q_curr - tf$stop_gradient(target)))
-          })
+          with(
+            tf$GradientTape() %as% critic_tape,
+            {
 
-          grads <- critic_tape$gradient(c_loss, critic$trainable_variables)
-          critic_optimizer$apply_gradients(Map(list, grads, critic$trainable_variables))
-          soft_update(critic, target_critic, tau = TAU)
-          c_loss_val <- as.numeric(c_loss)
+              c_in <- tf$concat(
+                list(
+                  b_states,
+                  b_actions
+                ),
+                axis = 1L
+              )
+
+              q_curr <- tf$squeeze(
+                critic(
+                  c_in,
+                  training = TRUE
+                ),
+                axis = -1L
+              )
+
+              next_pol <-
+                sample_actions_and_eval(
+                  b_next_states,
+                  training = FALSE
+                )
+
+              next_c_in <- tf$concat(
+                list(
+                  b_next_states,
+                  next_pol$actions
+                ),
+                axis = 1L
+              )
+
+              q_next <- tf$squeeze(
+                target_critic(
+                  next_c_in,
+                  training = FALSE
+                ),
+                axis = -1L
+              )
+
+              target <-
+                b_rewards +
+                gamma *
+                (1.0 - b_dones) *
+                (
+                  q_next -
+                  entropy_coef *
+                  next_pol$log_prob
+                )
+
+              c_loss <-
+                tf$reduce_mean(
+                  tf$square(
+                    q_curr -
+                    tf$stop_gradient(target)
+                  )
+                )
+            }
+          )
+
+          grads <- critic_tape$gradient(
+            c_loss,
+            critic$trainable_variables
+          )
+
+          critic_optimizer$apply_gradients(
+            Map(
+              list,
+              grads,
+              critic$trainable_variables
+            )
+          )
+
+          soft_update(
+            critic,
+            target_critic,
+            tau = TAU
+          )
+
+          c_loss_val <-
+            as.numeric(c_loss)
         }
 
-        # -------------------------------------------------------------------
+        # =====================================================================
         # ACTOR UPDATE
-        # -------------------------------------------------------------------
-        actor_vars <- c()
-        if (!is.null(manager)) actor_vars <- c(actor_vars, manager$trainable_variables)
-        for (w in workers) actor_vars <- c(actor_vars, w$trainable_variables)
-        if (!is.null(copula_net)) actor_vars <- c(actor_vars, copula_net$trainable_variables)
+        # =====================================================================
 
-        with(tf$GradientTape() %as% actor_tape, {
-          curr_pol <- sample_actions_and_eval(b_states, training = TRUE)
+        actor_vars <- list()
 
-          if (model_name == "IPPO") {
-            q_actor <- tf$zeros(shape = tf_shape_int32(BATCH_SIZE))
-            for (i in seq_len(n_agents)) {
-              s_idx <- (phase_dim * (i - 1L) + 1L):(phase_dim * i)
-              a_idx <- (action_dim * (i - 1L) + 1L):(action_dim * i)
-              c_in <- tf$concat(list(b_states[, s_idx], curr_pol$actions[, a_idx]), axis = 1L)
-              q_actor <- q_actor + tf$squeeze(critics[[i]](c_in, training = FALSE), axis = -1L)
+        if (!is.null(manager)) {
+          actor_vars <-
+            c(
+              actor_vars,
+              manager$trainable_variables
+            )
+        }
+
+        for (w in workers) {
+          actor_vars <-
+            c(
+              actor_vars,
+              w$trainable_variables
+            )
+        }
+
+        if (!is.null(copula_net)) {
+          actor_vars <-
+            c(
+              actor_vars,
+              copula_net$trainable_variables
+            )
+        }
+
+        with(
+          tf$GradientTape() %as% actor_tape,
+          {
+
+            curr_pol <-
+              sample_actions_and_eval(
+                b_states,
+                training = TRUE
+              )
+
+            if (model_name == "IPPO") {
+
+              q_actor <- tf$zeros(
+                shape = tf_shape_int32(
+                  BATCH_SIZE
+                )
+              )
+
+              for (i in seq_len(n_agents)) {
+
+                s_idx <-
+                  (phase_dim * (i - 1L) + 1L):
+                  (phase_dim * i)
+
+                a_idx <-
+                  (action_dim * (i - 1L) + 1L):
+                  (action_dim * i)
+
+                c_in <- tf$concat(
+                  list(
+                    b_states[, s_idx],
+                    curr_pol$actions[, a_idx]
+                  ),
+                  axis = 1L
+                )
+
+                q_actor <-
+                  q_actor +
+                  tf$squeeze(
+                    critics[[i]](
+                      c_in,
+                      training = FALSE
+                    ),
+                    axis = -1L
+                  )
+              }
+
+              q_actor <-
+                q_actor / n_agents
+
+            } else {
+
+              c_in <- tf$concat(
+                list(
+                  b_states,
+                  curr_pol$actions
+                ),
+                axis = 1L
+              )
+
+              q_actor <- tf$squeeze(
+                critic(
+                  c_in,
+                  training = FALSE
+                ),
+                axis = -1L
+              )
             }
-            q_actor <- q_actor / n_agents
-          } else {
-            c_in <- tf$concat(list(b_states, curr_pol$actions), axis = 1L)
-            q_actor <- tf$squeeze(critic(c_in, training = FALSE), axis = -1L)
+
+            a_loss <-
+              tf$reduce_mean(
+                entropy_coef *
+                curr_pol$log_prob -
+                q_actor
+              )
           }
+        )
 
-          a_loss <- tf$reduce_mean(entropy_coef * curr_pol$log_prob - q_actor)
-        })
+        a_grads <- actor_tape$gradient(
+          a_loss,
+          actor_vars
+        )
 
-        a_grads <- actor_tape$gradient(a_loss, actor_vars)
-        actor_optimizer$apply_gradients(Map(list, a_grads, actor_vars))
+        actor_optimizer$apply_gradients(
+          Map(
+            list,
+            a_grads,
+            actor_vars
+          )
+        )
 
-        a_loss_val <- as.numeric(a_loss)
-        ent_val <- as.numeric(tf$reduce_mean(-curr_pol$log_prob))
-        rho_val <- as.numeric(tf$reduce_mean(curr_pol$rho_raw))
+        a_loss_val <-
+          as.numeric(a_loss)
+
+        ent_val <-
+          as.numeric(
+            tf$reduce_mean(
+              -curr_pol$log_prob
+            )
+          )
+
+        rho_val <-
+          as.numeric(
+            tf$reduce_mean(
+              curr_pol$rho_raw
+            )
+          )
       }
 
-      episode_critic_losses <- c(episode_critic_losses, c_loss_val)
-      episode_actor_losses <- c(episode_actor_losses, a_loss_val)
-      episode_entropy <- c(episode_entropy, ent_val)
-      episode_rho <- c(episode_rho, rho_val)
+      # -----------------------------------------------------------------------
+      # Store step-level diagnostics
+      # -----------------------------------------------------------------------
+
+      episode_critic_losses <-
+        c(
+          episode_critic_losses,
+          c_loss_val
+        )
+
+      episode_actor_losses <-
+        c(
+          episode_actor_losses,
+          a_loss_val
+        )
+
+      episode_entropy <-
+        c(
+          episode_entropy,
+          ent_val
+        )
+
+      episode_rho <-
+        c(
+          episode_rho,
+          rho_val
+        )
 
       agents <- env_out$agents
     }
+
+    # -------------------------------------------------------------------------
+    # Store episode history
+    # -------------------------------------------------------------------------
 
     history <- bind_rows(
       history,
@@ -660,7 +1332,9 @@ run_marl_model <- function(
         Episode = episode,
         Step = seq_len(max_steps),
         Reward = episode_rewards,
-        MeanReward = cumsum(episode_rewards) / seq_along(episode_rewards),
+        MeanReward =
+          cumsum(episode_rewards) /
+          seq_along(episode_rewards),
         CriticLoss = episode_critic_losses,
         ActorLoss = episode_actor_losses,
         Entropy = episode_entropy,
@@ -668,25 +1342,32 @@ run_marl_model <- function(
       )
     )
 
-    message(sprintf("[%s] Episode %02d/%02d | Mean Reward: %.4f", model_name, episode, n_episodes, mean(episode_rewards)))
+    message(
+      sprintf(
+        "[%s] Episode %02d/%02d | Mean Reward: %.4f",
+        model_name,
+        episode,
+        n_episodes,
+        mean(episode_rewards)
+      )
+    )
   }
 
   history
 }
 
-
 # =============================================================================
 # 11. EXECUTE TRAININGS & COMPARATIVE SUMMARY
 # =============================================================================
-
-message("Training Proposed Copula-Hierarchical MARL...")
-res_chmarl <- run_marl_model("CH-MARL")
 
 message("Training IPPO Baseline...")
 res_ippo   <- run_marl_model("IPPO")
 
 message("Training MAPPO Baseline...")
 res_mappo  <- run_marl_model("MAPPO")
+
+message("Training Proposed Copula-Hierarchical MARL...")
+res_chmarl <- run_marl_model("CH-MARL")
 
 all_results <- bind_rows(res_chmarl, res_ippo, res_mappo)
 

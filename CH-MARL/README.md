@@ -54,8 +54,8 @@ The empirical design uses taxi mobility observations to determine the spatial co
 ## 2. Empirical Taxi Data
 
 The spatial initialization of the navigation benchmark is informed by the `taxis.csv` dataset from the `seaborn-data` repository. The taxi dataset is publicly available through the
-\texttt{seaborn-data} repository at
-\url{https://raw.githubusercontent.com/mwaskom/seaborn-data/master/taxis.csv}.
+seaborn-data repository at
+https://raw.githubusercontent.com/mwaskom/seaborn-data/master/taxis.csv 
 
 The required variables are:
 

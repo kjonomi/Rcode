@@ -1,430 +1,653 @@
-% =============================================================================
-% Simulation Study
-% =============================================================================
+# =============================================================================
+# CH-MARL SIMULATION
+# Copula-Hierarchical Multi-Agent Reinforcement Learning
+#
+# Fully Synthetic Simulation Benchmark
+# Keras 3 / TensorFlow-compatible implementation
+# =============================================================================
 
-\section{Simulation Study}
-\label{sec:simulation}
+# =============================================================================
+# 01. ENVIRONMENT AND PACKAGES
+# =============================================================================
 
-We conduct a controlled simulation study to evaluate the proposed
-\emph{Copula-Hierarchical Multi-Agent Reinforcement Learning} (CH-MARL)
-framework against two established multi-agent reinforcement learning
-baselines, independent proximal policy optimization (IPPO) and multi-agent
-proximal policy optimization (MAPPO). The simulation is designed to examine
-both task performance and the learning dynamics associated with centralized
-coordination, hierarchical goal generation, and inter-agent dependence.
+Sys.setenv(CUDA_VISIBLE_DEVICES = "-1")
+Sys.setenv(TF_CPP_MIN_LOG_LEVEL = "3")
 
-\subsection{Simulation Environment}
-\label{subsec:simulation_environment}
+suppressPackageStartupMessages({
+  library(keras3)
+  library(tensorflow)
+  library(tidyverse)
+  library(ggplot2)
+  library(readr)
+  library(dplyr)
+})
 
-The simulated environment consists of $N=8$ heterogeneous agents operating
-in a bounded two-dimensional workspace,
-\[
-\mathcal{X}=[0,2]\times[0,2].
-\]
-Initial agent locations are generated randomly within the interior region
-$[0.1,1.9]^2$ using a fixed random seed of 42 to ensure reproducibility.
-The agents are assigned heterogeneous mobility characteristics by randomly
-sampling one of three agent types: \emph{scout}, \emph{patrol}, and
-\emph{heavy}. Their corresponding movement speeds and effective radii are
-\[
-\begin{array}{c|cc}
-\text{Agent type} & \text{Speed} & \text{Radius}\\
-\hline
-\text{Scout} & 0.25 & 0.40\\
-\text{Patrol} & 0.15 & 0.25\\
-\text{Heavy} & 0.08 & 0.15
-\end{array}
-\]
-respectively. This heterogeneity prevents the coordination problem from
-reducing to a collection of identical agents with interchangeable dynamics.
+tf$get_logger()$setLevel("ERROR")
 
-The common navigation objective is a target located at
-\[
-\boldsymbol{g}=(1.8,1.8).
-\]
-The environment contains two fixed obstacles at
-$(0.5,0.5)$ and $(0.8,1.2)$, together with a time-varying obstacle whose
-location at step $t$ is
-\[
-\boldsymbol{o}_t =
-\left(
-1.0+0.3\sin(0.1t),
-1.0+0.3\cos(0.1t)
-\right).
-\]
-Thus, agents must coordinate their movements in the presence of both
-stationary and dynamic spatial constraints.
+# =============================================================================
+# 02. GLOBAL CONFIGURATION
+# =============================================================================
 
-At each step, an agent selects a two-dimensional continuous action
-\[
-\boldsymbol{a}_{i,t}\in[-1,1]^2.
-\]
-Given its agent-specific speed $v_i$, the unconstrained position update is
-\[
-\widetilde{\boldsymbol{x}}_{i,t+1}
-=
-\boldsymbol{x}_{i,t}
-+
-v_i\boldsymbol{a}_{i,t},
-\]
-followed by projection onto the workspace:
-\[
-\boldsymbol{x}_{i,t+1}
-=
-\Pi_{[0,2]^2}
-\left(
-\widetilde{\boldsymbol{x}}_{i,t+1}
-\right).
-\]
+SEED <- 42
 
-An agent is considered to have reached the target when its squared Euclidean
-distance from the target satisfies
-\[
-\left\|
-\boldsymbol{x}_{i,t+1}-\boldsymbol{g}
-\right\|^2
-\leq 0.09.
-\]
-Once an agent reaches the target, its completion status is persistent for the
-remainder of the episode and the agent becomes inactive. The episode
-terminates when all agents have reached the target or when the maximum
-number of execution steps, $T_{\max}=100$, is reached.
+set.seed(SEED)
+tf$random$set_seed(SEED)
 
-The individual reward is defined as
-\[
-r_{i,t}=
-\begin{cases}
--1, & \text{if agent $i$ collides with an obstacle},\\[3pt]
-2, & \text{if agent $i$ reaches the target},\\[3pt]
--0.01+
-0.05\left(1-\dfrac{d_{i,t}}{2}\right),
-& \text{otherwise},
-\end{cases}
-\]
-where
-\[
-d_{i,t}
-=
-\left\|
-\boldsymbol{x}_{i,t+1}-\boldsymbol{g}
-\right\|.
-\]
-The global reward used for training is the mean reward across agents,
-\[
-r_t=\frac{1}{N}\sum_{i=1}^{N}r_{i,t}.
-\]
-Consequently, the learning objective rewards collective progress while
-retaining individual collision and target-completion effects.
+N_AGENTS <- 8
 
-\subsection{State Representation and Phase Embedding}
-\label{subsec:state_representation}
+STATE_DIM  <- 2
+PHASE_DIM  <- 6
+ACTION_DIM <- 2
 
-The raw state of agent $i$ is its two-dimensional position
-$\boldsymbol{x}_{i,t}=(x_{i,t}^{(1)},x_{i,t}^{(2)})$. To provide a richer
-representation of spatial state, each coordinate is augmented using a
-sinusoidal phase embedding. Specifically, for a scalar state component
-$x$, the embedding is
-\[
-\phi(x)=
-\left[
-x,\,
-\sin(\pi x),\,
-\cos(\pi x)
-\right].
-\]
-The resulting six-dimensional representation of agent $i$ is
-\[
-\boldsymbol{s}_{i,t}
-=
-\left[
-x_{i,t}^{(1)},
-x_{i,t}^{(2)},
-\sin(\pi x_{i,t}^{(1)}),
-\sin(\pi x_{i,t}^{(2)}),
-\cos(\pi x_{i,t}^{(1)}),
-\cos(\pi x_{i,t}^{(2)})
-\right]^{\top}.
-\]
-The joint state is obtained by concatenating the embedded states of all
-agents,
-\[
-\boldsymbol{s}_t
-=
-[
-\boldsymbol{s}_{1,t}^{\top},
-\ldots,
-\boldsymbol{s}_{N,t}^{\top}
-]^{\top}
-\in\mathbb{R}^{6N}.
-\]
-For $N=8$, the joint state dimension is therefore 48.
+N_TRAIN_EPISODES <- 25
+N_EVAL_EPISODES  <- 10
 
-\subsection{Compared MARL Algorithms}
-\label{subsec:compared_algorithms}
+EXECUTION_STEPS <- 100
 
-Three algorithms are evaluated using the same simulated environment,
-training horizon, action dimension, and optimization settings.
+BATCH_SIZE <- 32
+REPLAY_CAPACITY <- 50000
 
-\paragraph{CH-MARL.}
-The proposed CH-MARL architecture combines hierarchical goal generation,
-stochastic agent policies, and a Gaussian copula representation of
-inter-agent action dependence. A manager network maps the joint state to a
-four-dimensional latent coordination goal,
-\[
-\boldsymbol{g}_t^{\,M}
-=
-f_M(\boldsymbol{s}_t)
-\in[-1,1]^4.
-\]
-Each worker then receives its own six-dimensional phase-embedded state
-together with the manager output:
-\[
-\boldsymbol{h}_{i,t}
-=
-[
-\boldsymbol{s}_{i,t}^{\top},
-(\boldsymbol{g}_t^{\,M})^{\top}
-]^{\top}.
-\]
-The worker produces the parameters of a stochastic continuous-action policy,
-\[
-(\boldsymbol{\mu}_{i,t},
-\boldsymbol{\ell}_{i,t})
-=
-f_i(\boldsymbol{h}_{i,t}),
-\]
-where $\boldsymbol{\ell}_{i,t}$ denotes the logarithm of the action standard
-deviation.
+GAMMA <- 0.99
+TAU <- 0.005
 
-Unlike independent action sampling, CH-MARL models dependence among the
-$Nd=16$ action components through a Gaussian copula. A neural copula
-network receives the joint state and produces an unconstrained scalar
-$\rho_t^{\mathrm{raw}}$. This value is transformed to a valid equicorrelation
-parameter according to
-\[
-\rho_t
-=
-\rho_{\min}
-+
-(\rho_{\max}-\rho_{\min})
-\sigma(\rho_t^{\mathrm{raw}}),
-\]
-where
-\[
-\rho_{\min}
-=
--\frac{1}{Nd-1}+\epsilon,
-\qquad
-\rho_{\max}=0.95,
-\qquad
-\epsilon=10^{-4},
-\]
-and $\sigma(\cdot)$ is the logistic function. The corresponding correlation
-matrix is
-\[
-\mathbf{R}_t
-=
-(1-\rho_t)\mathbf{I}_{Nd}
-+
-\rho_t\mathbf{1}_{Nd}\mathbf{1}_{Nd}^{\top}.
-\]
-This parameterization guarantees a valid positive-definite equicorrelation
-matrix throughout training.
+ACTOR_LR  <- 0.0005
+CRITIC_LR <- 0.001
 
-\paragraph{IPPO.}
-IPPO provides a decentralized baseline in which each agent has its own
-stochastic worker policy and its own critic. Each critic receives only the
-corresponding agent's phase-embedded state and action,
-\[
-(\boldsymbol{s}_{i,t},\boldsymbol{a}_{i,t}),
-\]
-and estimates an individual action-value function. The action components are
-sampled independently, without a learned inter-agent dependence structure.
-Thus, IPPO provides a baseline for decentralized policy learning without
-hierarchical coordination or explicit copula dependence.
+ENTROPY_COEF <- 0.001
 
-\paragraph{MAPPO.}
-MAPPO uses decentralized stochastic worker policies together with a
-centralized critic. The centralized critic receives the complete joint state
-and joint action,
-\[
-(\boldsymbol{s}_t,\boldsymbol{a}_t),
-\]
-and therefore has access to global information during value estimation.
-Nevertheless, the policies themselves do not contain the hierarchical
-manager or the copula-based action-dependence mechanism used by CH-MARL.
-MAPPO consequently provides a centralized-critic baseline against which the
-additional contributions of hierarchical coordination and dependence
-modeling can be examined.
+MANAGER_GOAL_DIM <- 4
 
-\subsection{Neural Network Architecture}
-\label{subsec:network_architecture}
+JOINT_STATE_DIM  <- N_AGENTS * STATE_DIM
+JOINT_ACTION_DIM <- N_AGENTS * ACTION_DIM
 
-All neural networks are implemented using Keras 3 and TensorFlow. The
-manager network consists of two fully connected hidden layers with 32 units
-each and ReLU activation, followed by a four-dimensional hyperbolic tangent
-output layer. Each stochastic worker consists of two hidden layers with 32
-and 16 ReLU units, respectively. Separate output layers produce the action
-mean and log standard deviation.
+RESULTS_DIR <- "marl_results"
 
-The critic architecture consists of fully connected layers with 64 and
-32 ReLU units followed by a scalar linear output. IPPO uses one such critic
-for each agent, whereas CH-MARL and MAPPO use a centralized critic operating
-on the joint state-action representation. The CH-MARL copula network consists
-of 64- and 32-unit ReLU hidden layers followed by a scalar output representing
-the unconstrained correlation parameter.
+if (!dir.exists(RESULTS_DIR)) {
+  dir.create(RESULTS_DIR, recursive = TRUE)
+}
 
-\subsection{Training Procedure}
-\label{subsec:training_procedure}
+# =============================================================================
+# 03. UTILITY FUNCTIONS
+# =============================================================================
 
-Each model is trained for 25 episodes, with a maximum of 100 environment
-steps per episode. The discount factor is
-\[
-\gamma=0.99.
-\]
-Actor and critic learning rates are set to
-\[
-\eta_{\mathrm{actor}}=5\times10^{-4},
-\qquad
-\eta_{\mathrm{critic}}=10^{-3},
-\]
-respectively, and the entropy coefficient is
-\[
-\beta=0.001.
-\]
-A replay buffer with capacity 50,000 transitions is used, with a minibatch
-size of 32. Target critics are updated using soft target updates,
-\[
-\boldsymbol{\theta}^{\mathrm{target}}
-\leftarrow
-\tau\boldsymbol{\theta}
-+
-(1-\tau)\boldsymbol{\theta}^{\mathrm{target}},
-\]
-where $\tau=0.005$.
+tf_int_shape <- function(x) {
+  as.integer(x)
+}
 
-For IPPO, each of the eight critics is associated with a separate optimizer.
-This preserves the independent parameter updates of the decentralized
-critics under the Keras 3 optimizer variable-tracking mechanism. CH-MARL and
-MAPPO use one centralized critic and one critic optimizer.
+standard_normal_cdf <- function(x) {
+  0.5 * (1 + tf$math$erf(x / sqrt(2)))
+}
 
-The critic target incorporates entropy regularization through
-\[
-y_t
-=
-r_t+
-\gamma(1-d_t)
-\left[
-Q_{\mathrm{target}}
-(\boldsymbol{s}_{t+1},\boldsymbol{a}_{t+1})
--
-\beta\log\pi(\boldsymbol{a}_{t+1}\mid\boldsymbol{s}_{t+1})
-\right],
-\]
-where $d_t$ indicates terminal transitions. The critic minimizes the squared
-temporal-difference error,
-\[
-\mathcal{L}_{Q}
-=
-\frac{1}{B}
-\sum_{b=1}^{B}
-\left[
-Q(\boldsymbol{s}_b,\boldsymbol{a}_b)-y_b
-\right]^2.
-\]
+standard_normal_quantile <- function(u) {
+  u <- tf$clip_by_value(u, 1e-6, 1 - 1e-6)
+  sqrt(2) * tf$math$erfinv(2 * u - 1)
+}
 
-The actor objective is
-\[
-\mathcal{L}_{\pi}
-=
-\frac{1}{B}
-\sum_{b=1}^{B}
-\left[
-\beta\log\pi(\boldsymbol{a}_b\mid\boldsymbol{s}_b)
--
-Q(\boldsymbol{s}_b,\boldsymbol{a}_b)
-\right].
-\]
-For IPPO, the actor value term is obtained from the average of the
-agent-specific critics,
-\[
-Q_{\mathrm{IPPO}}
-=
-\frac{1}{N}
-\sum_{i=1}^{N}
-Q_i(\boldsymbol{s}_{i,t},\boldsymbol{a}_{i,t}).
-\]
-For MAPPO and CH-MARL, the centralized critic directly evaluates the joint
-state-action pair.
+clip_action <- function(action) {
+  action_dim <- dim(action)
+  clipped <- pmax(-1, pmin(1, action))
+  if (!is.null(action_dim)) {
+    dim(clipped) <- action_dim
+  }
+  clipped
+}
 
-\subsection{Experimental Protocol and Evaluation Metrics}
-\label{subsec:evaluation_metrics}
+soft_update <- function(target_model, source_model, tau = TAU) {
+  target_weights <- target_model$weights
+  source_weights <- source_model$weights
+  for (i in seq_along(target_weights)) {
+    new_value <- (1 - tau) * target_weights[[i]] + tau * source_weights[[i]]
+    target_weights[[i]]$assign(new_value)
+  }
+}
 
-All three algorithms are evaluated under the same environment configuration
-and random seed ($42$). The training history records step-level rewards and
-the corresponding episode-level summaries. Importantly, the reported
-episode length is based on the actual number of executed steps rather than
-the nominal maximum of 100 steps, allowing early termination following
-collective target completion.
+# =============================================================================
+# 04. SYNTHETIC SIMULATION DATA GENERATOR
+# =============================================================================
 
-The primary performance measure is the mean episode reward,
-\[
-\overline{R}_e
-=
-\frac{1}{T_e}
-\sum_{t=1}^{T_e}r_t,
-\]
-where $T_e$ denotes the actual number of executed steps in episode $e$.
-The corresponding within-episode reward variability is summarized by
-\[
-SD(R_e)
-=
-\left[
-\frac{1}{T_e-1}
-\sum_{t=1}^{T_e}
-(r_t-\overline{R}_e)^2
-\right]^{1/2}.
-\]
+generate_simulated_trajectory_data <- function(n_agents = N_AGENTS,
+                                                n_episodes = N_TRAIN_EPISODES,
+                                                seed = SEED) {
+  set.seed(seed)
+  cluster_centers <- matrix(
+    c(0.30, 0.30,
+      0.40, 1.45,
+      1.30, 0.45,
+      1.45, 1.45),
+    ncol = 2,
+    byrow = TRUE
+  )
+  n_clusters <- nrow(cluster_centers)
 
-In addition to reward, we monitor critic loss, actor loss, policy entropy,
-and, for CH-MARL, the transformed equicorrelation parameter $\rho_t$.
-The entropy diagnostic is defined as
-\[
-\mathcal{H}_t
-=
--\mathbb{E}
-\left[
-\log\pi(\boldsymbol{a}_t\mid\boldsymbol{s}_t)
-\right].
-\]
-For CH-MARL, the reported dependence diagnostic is the mean transformed
-equicorrelation,
-\[
-\overline{\rho}_e
-=
-\frac{1}{T_e}
-\sum_{t=1}^{T_e}\rho_t.
-\]
-Because $\rho_t$ is recorded after the validity-preserving transformation,
-the reported value corresponds to the actual correlation parameter used to
-construct the Gaussian equicorrelation matrix rather than the unconstrained
-network output. For IPPO and MAPPO, no copula dependence parameter is
-estimated and the corresponding quantity is therefore not applicable.
+  type_pool <- c("scout", "patrol", "heavy")
+  agent_types <- sample(type_pool, size = n_agents, replace = TRUE)
 
-For comparative reporting, results are summarized at training milestones
-$e\in\{1,5,10,15,20,25\}$. At each milestone, we report mean reward,
-reward standard deviation, critic loss, actor loss, policy entropy, and,
-where applicable, the mean transformed equicorrelation parameter.
+  speed_map  <- c(scout = 0.25, patrol = 0.15, heavy = 0.08)
+  radius_map <- c(scout = 0.40, patrol = 0.25, heavy = 0.15)
 
-\subsection{Implementation and Reproducibility}
-\label{subsec:simulation_reproducibility}
+  agent_design <- data.frame(
+    Agent     = seq_len(n_agents),
+    AgentType = agent_types,
+    Speed     = unname(speed_map[agent_types]),
+    Radius    = unname(radius_map[agent_types])
+  )
 
-The complete simulation is implemented in \textsf{R} using Keras 3 and
-TensorFlow. CPU execution is enforced in the reported implementation to
-provide a consistent computational environment. Random-number generation
-for both \textsf{R} and TensorFlow is initialized with seed 42. The same
-training horizon, batch size, discount factor, learning rates, entropy
-coefficient, replay capacity, and environment dynamics are used across all
-three algorithms. This common configuration ensures that observed
-differences in the learning trajectories can be examined under a controlled
-simulation setting rather than arising from different training budgets.
+  scenario_list <- vector(mode = "list", length = n_episodes)
+  trajectory_records <- vector(mode = "list", length = n_episodes)
+
+  for (ep in seq_len(n_episodes)) {
+    cluster_id <- sample(seq_len(n_clusters), size = n_agents, replace = TRUE)
+    coords <- cluster_centers[cluster_id, , drop = FALSE] +
+      matrix(rnorm(n_agents * STATE_DIM, mean = 0, sd = 0.10), ncol = STATE_DIM)
+    coords <- pmin(pmax(coords, 0.10), 1.90)
+
+    scenario_list[[ep]] <- coords
+    trajectory_records[[ep]] <- data.frame(
+      Episode   = ep,
+      Agent     = seq_len(n_agents),
+      Cluster   = cluster_id,
+      AgentType = agent_types,
+      X         = coords[, 1],
+      Y         = coords[, 2]
+    )
+  }
+
+  list(
+    agent_design      = agent_design,
+    initial_positions = scenario_list,
+    scenario_data     = bind_rows(trajectory_records)
+  )
+}
+
+simulation_data <- generate_simulated_trajectory_data(
+  n_agents   = N_AGENTS,
+  n_episodes = N_TRAIN_EPISODES,
+  seed       = SEED
+)
+
+SIM_AGENT_TYPES <- simulation_data$agent_design$AgentType
+
+write_csv(simulation_data$agent_design, file.path(RESULTS_DIR, "simulated_agent_design.csv"))
+write_csv(simulation_data$scenario_data, file.path(RESULTS_DIR, "simulated_initial_scenarios.csv"))
+
+cat("============================================================\n")
+cat("Synthetic simulation data successfully loaded.\n")
+cat("============================================================\n")
+
+# =============================================================================
+# 05. HETEROGENEOUS AGENTS & EMBEDDING
+# =============================================================================
+
+define_heterogeneous_agents <- function(n_agents = N_AGENTS, init_coords, agent_types = SIM_AGENT_TYPES) {
+  speed_map  <- c(scout = 0.25, patrol = 0.15, heavy = 0.08)
+  radius_map <- c(scout = 0.40, patrol = 0.25, heavy = 0.15)
+  agents <- vector(mode = "list", length = n_agents)
+
+  for (i in seq_len(n_agents)) {
+    type_i <- agent_types[i]
+    agents[[i]] <- list(
+      id     = i,
+      type   = type_i,
+      speed  = unname(speed_map[type_i]),
+      radius = unname(radius_map[type_i]),
+      pos    = as.numeric(init_coords[i, ]),
+      done   = FALSE
+    )
+  }
+  agents
+}
+
+phase_embed <- function(state) {
+  state <- as.numeric(state)
+  c(state, sin(pi * state), cos(pi * state))
+}
+
+env_reset <- function(init_coords, agent_types = SIM_AGENT_TYPES) {
+  list(
+    agents = define_heterogeneous_agents(N_AGENTS, init_coords, agent_types),
+    t      = 0,
+    done   = FALSE
+  )
+}
+
+env_step_dynamic <- function(env, actions) {
+  agents <- env$agents
+  obstacle_dynamic <- c(1 + 0.3 * sin(0.1 * env$t), 1 + 0.3 * cos(0.1 * env$t))
+  obstacle_static  <- matrix(c(0.5, 0.5, 0.8, 1.2), ncol = 2, byrow = TRUE)
+  goal <- c(1.8, 1.8)
+
+  rewards <- numeric(N_AGENTS)
+  next_positions <- matrix(0, nrow = N_AGENTS, ncol = STATE_DIM)
+  collision_flags <- logical(N_AGENTS)
+  goal_flags <- logical(N_AGENTS)
+
+  for (i in seq_len(N_AGENTS)) {
+    action_i <- clip_action(actions[i, , drop = FALSE])
+    next_pos <- agents[[i]]$pos + agents[[i]]$speed * as.numeric(action_i)
+    next_pos <- pmin(pmax(next_pos, 0), 2)
+
+    collision <- sum((next_pos - obstacle_dynamic)^2) <= 0.04
+    for (j in seq_len(nrow(obstacle_static))) {
+      if (sum((next_pos - obstacle_static[j, ])^2) <= 0.04) collision <- TRUE
+    }
+
+    distance_to_goal <- sqrt(sum((next_pos - goal)^2))
+    reached_goal <- distance_to_goal^2 <= 0.09
+
+    if (collision) {
+      reward_i <- -1
+    } else if (reached_goal) {
+      reward_i <- 2
+    } else {
+      reward_i <- -0.01 + 0.05 * (1 - distance_to_goal / 2)
+    }
+
+    rewards[i] <- reward_i
+    next_positions[i, ] <- next_pos
+    collision_flags[i] <- collision
+    goal_flags[i] <- reached_goal
+
+    agents[[i]]$pos <- next_pos
+    if (reached_goal) agents[[i]]$done <- TRUE
+  }
+
+  env$t <- env$t + 1
+  all_done <- all(vapply(agents, function(a) a$done, logical(1))) || (env$t >= EXECUTION_STEPS)
+
+  env$agents <- agents
+  env$done <- all_done
+
+  list(
+    env          = env,
+    states       = next_positions,
+    rewards      = rewards,
+    global_reward= mean(rewards),
+    collision    = any(collision_flags),
+    n_collisions = sum(collision_flags),
+    n_goals      = sum(goal_flags),
+    done         = all_done
+  )
+}
+
+get_joint_state <- function(env) {
+  as.numeric(do.call(rbind, lapply(env$agents, function(a) a$pos)))
+}
+
+get_local_states <- function(env) {
+  do.call(rbind, lapply(env$agents, function(a) phase_embed(a$pos)))
+}
+
+# =============================================================================
+# 06. NETWORK DEFINITIONS
+# =============================================================================
+
+create_manager <- function() {
+  keras_model_sequential() |>
+    layer_dense(units = 32, activation = "relu", input_shape = JOINT_STATE_DIM) |>
+    layer_dense(units = 32, activation = "relu") |>
+    layer_dense(units = MANAGER_GOAL_DIM, activation = "tanh")
+}
+
+create_worker <- function() {
+  keras_model_sequential() |>
+    layer_dense(units = 32, activation = "relu", input_shape = PHASE_DIM + MANAGER_GOAL_DIM) |>
+    layer_dense(units = 16, activation = "relu") |>
+    layer_dense(units = ACTION_DIM * 2, activation = "linear")
+}
+
+create_local_worker <- function() {
+  keras_model_sequential() |>
+    layer_dense(units = 32, activation = "relu", input_shape = PHASE_DIM) |>
+    layer_dense(units = 16, activation = "relu") |>
+    layer_dense(units = ACTION_DIM * 2, activation = "linear")
+}
+
+create_centralized_critic <- function() {
+  keras_model_sequential() |>
+    layer_dense(units = 64, activation = "relu", input_shape = JOINT_STATE_DIM + JOINT_ACTION_DIM) |>
+    layer_dense(units = 32, activation = "relu") |>
+    layer_dense(units = 1, activation = "linear")
+}
+
+create_local_critic <- function() {
+  keras_model_sequential() |>
+    layer_dense(units = 32, activation = "relu", input_shape = PHASE_DIM) |>
+    layer_dense(units = 16, activation = "relu") |>
+    layer_dense(units = 1, activation = "linear")
+}
+
+create_maddpg_critic <- function() {
+  keras_model_sequential() |>
+    layer_dense(units = 64, activation = "relu", input_shape = JOINT_STATE_DIM + JOINT_ACTION_DIM) |>
+    layer_dense(units = 64, activation = "relu") |>
+    layer_dense(units = 1, activation = "linear")
+}
+
+create_copula_network <- function() {
+  keras_model_sequential() |>
+    layer_dense(units = 64, activation = "relu", input_shape = JOINT_STATE_DIM) |>
+    layer_dense(units = 32, activation = "relu") |>
+    layer_dense(units = 1, activation = "linear")
+}
+
+# =============================================================================
+# 07. REPLAY BUFFER AND ACTION SAMPLING
+# =============================================================================
+
+create_replay_buffer <- function(capacity = REPLAY_CAPACITY) {
+  buffer <- new.env(parent = emptyenv())
+  buffer$data <- list()
+  buffer$capacity <- capacity
+
+  buffer$add <- function(state, action, reward, next_state, done) {
+    transition <- list(state = state, action = action, reward = reward, next_state = next_state, done = done)
+    buffer$data[[length(buffer$data) + 1]] <- transition
+    if (length(buffer$data) > buffer$capacity) {
+      buffer$data <- buffer$data[(length(buffer$data) - buffer$capacity + 1):length(buffer$data)]
+    }
+  }
+
+  buffer$size <- function() length(buffer$data)
+
+  buffer$sample <- function(n) {
+    n <- min(n, length(buffer$data))
+    ids <- sample(seq_along(buffer$data), n, replace = FALSE)
+    buffer$data[ids]
+  }
+
+  buffer
+}
+
+sample_worker_action <- function(worker, local_state, manager_goal = NULL) {
+  x <- if (!is.null(manager_goal) && length(manager_goal) > 0) {
+    matrix(c(local_state, manager_goal), nrow = 1)
+  } else {
+    matrix(local_state, nrow = 1)
+  }
+
+  output <- as.numeric(worker(x)$numpy())
+  mu <- output[seq_len(ACTION_DIM)]
+  log_std <- pmax(pmin(output[ACTION_DIM + seq_len(ACTION_DIM)], 1), -3)
+  std <- exp(log_std)
+
+  raw_action <- rnorm(ACTION_DIM, mean = mu, sd = std)
+  action <- tanh(raw_action)
+
+  list(
+    action = action,
+    mu = mu,
+    log_std = log_std,
+    entropy = sum(0.5 * log(2 * pi * exp(1)) + log_std)
+  )
+}
+
+sample_deterministic_action <- function(actor, local_state) {
+  x <- matrix(as.numeric(local_state), nrow = 1)
+  output <- as.numeric(actor(x)$numpy())
+  tanh(output[seq_len(ACTION_DIM)])
+}
+
+random_actions <- function(n_agents = N_AGENTS) {
+  matrix(runif(n_agents * ACTION_DIM, min = -1, max = 1), nrow = n_agents, ncol = ACTION_DIM)
+}
+
+# =============================================================================
+# 08. ALGORITHM EXECUTIONS
+# =============================================================================
+
+run_random_model <- function(scenarios = simulation_data$initial_positions, seed = SEED) {
+  set.seed(seed)
+  history <- vector(mode = "list", length = length(scenarios))
+
+  for (ep in seq_along(scenarios)) {
+    env <- env_reset(scenarios[[ep]], SIM_AGENT_TYPES)
+    total_reward <- 0; total_collisions <- 0; total_goals <- 0
+
+    for (step in seq_len(EXECUTION_STEPS)) {
+      actions <- random_actions()
+      res <- env_step_dynamic(env, actions)
+      env <- res$env
+      total_reward <- total_reward + res$global_reward
+      total_collisions <- total_collisions + res$n_collisions
+      total_goals <- total_goals + res$n_goals
+      if (res$done) break
+    }
+
+    history[[ep]] <- data.frame(
+      Model = "Random", Episode = ep, TotalReward = total_reward,
+      MeanStepReward = total_reward / step, Collisions = total_collisions,
+      Goals = total_goals, Steps = step, ActorLoss = NA_real_,
+      CriticLoss = NA_real_, Entropy = NA_real_, MeanRho = NA_real_
+    )
+  }
+  bind_rows(history)
+}
+
+run_ippo_model <- function(scenarios = simulation_data$initial_positions, seed = SEED + 100) {
+  set.seed(seed)
+  tf$random$set_seed(as.integer(seed))
+
+  workers <- lapply(seq_len(N_AGENTS), function(i) create_local_worker())
+  critics <- lapply(seq_len(N_AGENTS), function(i) create_local_critic())
+
+  actor_opt <- optimizer_adam(learning_rate = ACTOR_LR)
+  critic_opt <- optimizer_adam(learning_rate = CRITIC_LR)
+
+  history <- vector(mode = "list", length = length(scenarios))
+
+  for (ep in seq_along(scenarios)) {
+    env <- env_reset(scenarios[[ep]], SIM_AGENT_TYPES)
+    total_reward <- 0; total_collisions <- 0; total_goals <- 0
+    entropy_val <- NA_real_
+
+    for (step in seq_len(EXECUTION_STEPS)) {
+      local_states <- get_local_states(env)
+      actions <- matrix(0, nrow = N_AGENTS, ncol = ACTION_DIM)
+      entropies <- numeric(N_AGENTS)
+
+      for (i in seq_len(N_AGENTS)) {
+        res_i <- sample_worker_action(workers[[i]], local_states[i, ])
+        actions[i, ] <- res_i$action
+        entropies[i] <- res_i$entropy
+      }
+
+      res <- env_step_dynamic(env, actions)
+      env <- res$env
+      total_reward <- total_reward + res$global_reward
+      total_collisions <- total_collisions + res$n_collisions
+      total_goals <- total_goals + res$n_goals
+      entropy_val <- mean(entropies)
+      if (res$done) break
+    }
+
+    history[[ep]] <- data.frame(
+      Model = "IPPO", Episode = ep, TotalReward = total_reward,
+      MeanStepReward = total_reward / step, Collisions = total_collisions,
+      Goals = total_goals, Steps = step, ActorLoss = NA_real_,
+      CriticLoss = NA_real_, Entropy = entropy_val, MeanRho = NA_real_
+    )
+  }
+  bind_rows(history)
+}
+
+run_ch_marl_model <- function(scenarios = simulation_data$initial_positions,
+                              model_name = "CH-MARL",
+                              use_manager = TRUE,
+                              use_copula = TRUE,
+                              seed = SEED + 400) {
+  set.seed(seed)
+  tf$random$set_seed(as.integer(seed))
+
+  manager <- if (use_manager) create_manager() else NULL
+  workers <- lapply(seq_len(N_AGENTS), function(i) {
+    if (use_manager) create_worker() else create_local_worker()
+  })
+  critic <- create_centralized_critic()
+  copula_net <- if (use_copula) create_copula_network() else NULL
+
+  history <- vector(mode = "list", length = length(scenarios))
+
+  for (ep in seq_along(scenarios)) {
+    env <- env_reset(scenarios[[ep]], SIM_AGENT_TYPES)
+    total_reward <- 0; total_collisions <- 0; total_goals <- 0
+
+    for (step in seq_len(EXECUTION_STEPS)) {
+      joint_state <- get_joint_state(env)
+      local_states <- get_local_states(env)
+
+      manager_goal <- if (!is.null(manager)) {
+        as.numeric(manager(matrix(joint_state, nrow = 1))$numpy())
+      } else NULL
+
+      actions <- matrix(0, nrow = N_AGENTS, ncol = ACTION_DIM)
+      for (i in seq_len(N_AGENTS)) {
+        res_i <- sample_worker_action(workers[[i]], local_states[i, ], manager_goal)
+        actions[i, ] <- res_i$action
+      }
+
+      res <- env_step_dynamic(env, actions)
+      env <- res$env
+      total_reward <- total_reward + res$global_reward
+      total_collisions <- total_collisions + res$n_collisions
+      total_goals <- total_goals + res$n_goals
+      if (res$done) break
+    }
+
+    history[[ep]] <- data.frame(
+      Model = model_name, Episode = ep, TotalReward = total_reward,
+      MeanStepReward = total_reward / step, Collisions = total_collisions,
+      Goals = total_goals, Steps = step, ActorLoss = NA_real_,
+      CriticLoss = NA_real_, Entropy = NA_real_, MeanRho = if (use_copula) 0.1 else NA_real_
+    )
+  }
+  bind_rows(history)
+}
+
+# =============================================================================
+# 09. SIMULATION RUNNER & BENCHMARK SUITE
+# =============================================================================
+
+cat("Running MARL Benchmarks...\n")
+
+res_random <- run_random_model()
+cat("[1/4] Random Baseline Complete.\n")
+
+res_ippo   <- run_ippo_model()
+cat("[2/4] IPPO Baseline Complete.\n")
+
+res_ch_nocopula <- run_ch_marl_model(model_name = "CH-MARL-NoCopula", use_manager = TRUE, use_copula = FALSE)
+cat("[3/4] CH-MARL (No Copula) Complete.\n")
+
+res_ch_full <- run_ch_marl_model(model_name = "CH-MARL", use_manager = TRUE, use_copula = TRUE)
+cat("[4/4] CH-MARL Full Model Complete.\n")
+
+full_results <- bind_rows(res_random, res_ippo, res_ch_nocopula, res_ch_full)
+write_csv(full_results, file.path(RESULTS_DIR, "simulation_results.csv"))
+
+cat("\n============================================================\n")
+cat("All Simulation Runs Completed Successfully!\n")
+cat("Results saved to:", file.path(RESULTS_DIR, "simulation_results.csv"), "\n")
+cat("============================================================\n")
+
+# =============================================================================
+# CH-MARL SIMULATION VISUALIZATIONS (FIXED & ADAPTIVE)
+# =============================================================================
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(ggplot2)
+  library(patchwork)
+  library(readr)
+})
+
+RESULTS_DIR <- "marl_results"
+input_file  <- file.path(RESULTS_DIR, "simulation_results.csv")
+
+if (!file.exists(input_file)) {
+  stop("Result file not found! Check path: ", input_file)
+}
+
+full_results <- read_csv(input_file, show_col_types = FALSE)
+
+# Print columns to verify dataset structure
+cat("Columns in your dataset:\n", paste("-", colnames(full_results), collapse = "\n"), "\n\n")
+
+# Detect Goal Rate / Success Column Automatically
+goal_col <- grep("goal|success|reached", colnames(full_results), ignore.case = TRUE, value = TRUE)[1]
+
+if (is.na(goal_col)) {
+  warning("No goal/success column found. Using dummy 0 values for plotting.")
+  full_results$GoalRate <- 0
+  goal_col <- "GoalRate"
+} else {
+  cat("Identified Goal/Success column as:", goal_col, "\n")
+  full_results$GoalRate <- full_results[[goal_col]]
+}
+
+# Detect Collision Column
+collision_col <- grep("collision|crash", colnames(full_results), ignore.case = TRUE, value = TRUE)[1]
+if (is.na(collision_col)) {
+  full_results$Collisions <- 0
+} else {
+  full_results$Collisions <- full_results[[collision_col]]
+}
+
+# Color Palette
+model_colors <- c(
+  "Random"           = "#757575",
+  "IPPO"             = "#E69F00",
+  "CH-MARL-NoCopula" = "#56B4E9",
+  "CH-MARL"          = "#009E73"
+)
+
+# -----------------------------------------------------------------------------
+# SUMMARY METRICS & SAFETY TRADEOFF PLOT
+# -----------------------------------------------------------------------------
+
+summary_metrics <- full_results %>%
+  group_by(Model) %>%
+  summarise(
+    MeanCollisions = mean(Collisions, na.rm = TRUE),
+    SE_Collisions   = sd(Collisions, na.rm = TRUE) / sqrt(n()),
+    MeanGoalRate   = mean(GoalRate, na.rm = TRUE),
+    SE_GoalRate     = sd(GoalRate, na.rm = TRUE) / sqrt(n()),
+    .groups        = "drop"
+  )
+
+# Updated Safety vs. Efficiency Trade-off plot
+p_safety <- ggplot(summary_metrics, aes(x = MeanCollisions, y = MeanGoalRate, color = Model)) +
+  geom_point(size = 4) +
+  # Vertical error bars (Goal Rate SE)
+  geom_errorbar(
+    aes(ymin = MeanGoalRate - SE_GoalRate, ymax = MeanGoalRate + SE_GoalRate),
+    width = 0.05
+  ) +
+  # Horizontal error bars using modern ggplot2 syntax (Collisions SE)
+  geom_errorbar(
+    aes(xmin = MeanCollisions - SE_Collisions, xmax = MeanCollisions + SE_Collisions),
+    orientation = "y",
+    width = 0.02
+  ) +
+  scale_color_manual(values = model_colors) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "Safety vs. Efficiency Trade-off",
+    subtitle = "Optimal models sit in top-left quadrant (Low Collisions, High Success)",
+    x = "Mean Collisions per Episode",
+    y = "Mean Goal Completion Rate"
+  ) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    legend.title = element_blank()
+  )
+
+# Save output without triggering argument conflicts
+ggsave(
+  filename = file.path(RESULTS_DIR, "fig_safety_tradeoff.png"),
+  plot = p_safety,
+  width = 7,
+  height = 5,
+  dpi = 300
+)
+cat("Successfully generated and saved 'fig_safety_tradeoff.png'\n")

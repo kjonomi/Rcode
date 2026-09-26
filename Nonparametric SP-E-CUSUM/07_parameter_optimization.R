@@ -731,6 +731,369 @@ weights_to_logits <- function(
     )
 }
 
+# =============================================================================
+# 3A. PARAMETER VECTOR ENCODING, DECODING, AND BOUNDS
+# =============================================================================
+#
+# Candidate vector:
+#
+#     x = (k_1, ..., k_J, eta_1, ..., eta_{J-1})
+#
+# where
+#
+#     w = softmax(eta_1, ..., eta_{J-1}, 0).
+#
+# Thus the candidate dimension is
+#
+#     J + (J - 1) = 2J - 1.
+#
+# The final weight is represented by the fixed zero logit.
+#
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# Check candidate k-values
+# -----------------------------------------------------------------------------
+
+check_k_values <- function(
+    k_values,
+    config = OPTIM_CONFIG
+) {
+
+    k_values <- as.numeric(k_values)
+
+    J <- as.integer(config$J)
+
+    if (
+        length(k_values) != J
+    ) {
+        return(FALSE)
+    }
+
+    if (
+        any(!is.finite(k_values))
+    ) {
+        return(FALSE)
+    }
+
+    if (
+        any(
+            k_values < config$k_lower |
+            k_values > config$k_upper
+        )
+    ) {
+        return(FALSE)
+    }
+
+    # -------------------------------------------------------------------------
+    # Optional ordering/separation constraint
+    # -------------------------------------------------------------------------
+
+    if (
+        isTRUE(config$enforce_sorted_k) &&
+        J > 1L
+    ) {
+
+        if (
+            any(
+                diff(k_values) <
+                config$min_k_separation
+            )
+        ) {
+            return(FALSE)
+        }
+    }
+
+    TRUE
+}
+
+
+# -----------------------------------------------------------------------------
+# Decode optimization parameter vector
+# -----------------------------------------------------------------------------
+#
+# First J elements:
+#
+#     k_1, ..., k_J
+#
+# Remaining J - 1 elements:
+#
+#     eta_1, ..., eta_{J-1}
+#
+# The final logit is fixed at zero and the ensemble weights are obtained
+# through softmax_weights().
+#
+# -----------------------------------------------------------------------------
+
+decode_parameter_vector <- function(
+    x,
+    config = OPTIM_CONFIG
+) {
+
+    x <- as.numeric(x)
+
+    J <- as.integer(config$J)
+
+    expected_length <-
+        J +
+        max(0L, J - 1L)
+
+    if (
+        length(x) != expected_length
+    ) {
+        stop(
+            paste0(
+                "Candidate parameter vector must contain ",
+                expected_length,
+                " elements for J = ",
+                J,
+                "."
+            ),
+            call. = FALSE
+        )
+    }
+
+    if (
+        any(!is.finite(x))
+    ) {
+        stop(
+            "Candidate parameter vector contains non-finite values.",
+            call. = FALSE
+        )
+    }
+
+    # -------------------------------------------------------------------------
+    # k-values
+    # -------------------------------------------------------------------------
+
+    k_values <-
+        x[
+            seq_len(J)
+        ]
+
+    # -------------------------------------------------------------------------
+    # Weight logits
+    # -------------------------------------------------------------------------
+
+    if (
+        J == 1L
+    ) {
+
+        weights <-
+            1
+
+    } else {
+
+        logits <-
+            x[
+                (J + 1L):(2L * J - 1L)
+            ]
+
+        weights <-
+            softmax_weights(
+                logits
+            )
+    }
+
+    # -------------------------------------------------------------------------
+    # Validate decoded candidate
+    # -------------------------------------------------------------------------
+
+    if (
+        !check_k_values(
+            k_values,
+            config
+        )
+    ) {
+        stop(
+            "Decoded k-values violate the optimization constraints.",
+            call. = FALSE
+        )
+    }
+
+    if (
+        !check_ensemble_weights(
+            weights,
+            config
+        )
+    ) {
+        stop(
+            "Decoded ensemble weights violate the optimization constraints.",
+            call. = FALSE
+        )
+    }
+
+    list(
+        k_values = k_values,
+        weights = weights
+    )
+}
+
+
+# -----------------------------------------------------------------------------
+# Construct DEoptim parameter bounds
+# -----------------------------------------------------------------------------
+#
+# Parameter vector:
+#
+#     (k_1, ..., k_J, eta_1, ..., eta_{J-1})
+#
+# k-values use the configured [k_lower, k_upper] interval.
+#
+# Weight logits require finite bounds because DEoptim requires finite lower
+# and upper vectors. With the canonical configuration
+#
+#     weight_lower = 0
+#     weight_upper = 1
+#
+# there is no finite logit bound implied by the weight constraints themselves.
+# Therefore a numerically stable default logit interval is used.
+#
+# If a strictly positive weight_lower is supplied, a corresponding finite
+# log-ratio bound is derived from the configured weight limits.
+#
+# -----------------------------------------------------------------------------
+
+make_parameter_bounds <- function(
+    config = OPTIM_CONFIG
+) {
+
+    J <- as.integer(config$J)
+
+    if (
+        J < 1L
+    ) {
+        stop(
+            "J must be a positive integer.",
+            call. = FALSE
+        )
+    }
+
+    # -------------------------------------------------------------------------
+    # k-value bounds
+    # -------------------------------------------------------------------------
+
+    k_lower <-
+        rep(
+            config$k_lower,
+            J
+        )
+
+    k_upper <-
+        rep(
+            config$k_upper,
+            J
+        )
+
+    # -------------------------------------------------------------------------
+    # Weight-logit bounds
+    # -------------------------------------------------------------------------
+    #
+    # The final logit is fixed at zero.
+    # Therefore only J - 1 logits are optimized.
+    # -------------------------------------------------------------------------
+
+    n_logits <-
+        max(
+            0L,
+            J - 1L
+        )
+
+    if (
+        n_logits == 0L
+    ) {
+
+        return(
+            list(
+                lower = k_lower,
+                upper = k_upper
+            )
+        )
+    }
+
+    # -------------------------------------------------------------------------
+    # Canonical case: weight_lower = 0
+    #
+    # No finite logit bound follows mathematically from [0, 1].
+    # Use a sufficiently wide numerical interval.
+    # -------------------------------------------------------------------------
+
+    if (
+        isTRUE(
+            config$weight_lower <= 0
+        )
+    ) {
+
+        logit_lower <-
+            -20
+
+        logit_upper <-
+            20
+
+    } else {
+
+        # ---------------------------------------------------------------------
+        # Positive lower weight bound.
+        #
+        # Relative to the reference logit 0:
+        #
+        #     eta = log(w_j / w_J)
+        #
+        # so the configured weight bounds imply
+        #
+        #     log(weight_lower / weight_upper)
+        #
+        # and
+        #
+        #     log(weight_upper / weight_lower).
+        # ---------------------------------------------------------------------
+
+        logit_lower <-
+            log(
+                config$weight_lower /
+                config$weight_upper
+            )
+
+        logit_upper <-
+            log(
+                config$weight_upper /
+                config$weight_lower
+            )
+
+        if (
+            !is.finite(logit_lower) ||
+            !is.finite(logit_upper) ||
+            logit_lower >= logit_upper
+        ) {
+
+            stop(
+                "Unable to construct finite ensemble-weight logit bounds.",
+                call. = FALSE
+            )
+        }
+    }
+
+    list(
+        lower =
+            c(
+                k_lower,
+                rep(
+                    logit_lower,
+                    n_logits
+                )
+            ),
+
+        upper =
+            c(
+                k_upper,
+                rep(
+                    logit_upper,
+                    n_logits
+                )
+            )
+    )
+}
 
 # =============================================================================
 # 4. FIXED MASTER EMPIRICAL COPULA

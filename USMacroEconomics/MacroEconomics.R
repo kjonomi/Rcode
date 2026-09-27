@@ -688,6 +688,23 @@ fig_counterfactual <- ggplot(data.frame(
 print(fig_counterfactual)
 ggsave("Figure_4_Counterfactual_Policy_Simulations.png", fig_counterfactual, width = 8, height = 5, dpi = 300)
 
+fig_propensity <- ggplot(macro_data, aes(x = propensity_score, fill = factor(Monetary_Tightening))) +
+  geom_density(alpha = 0.5) +
+  theme_minimal(base_size = 12) +
+  labs(title = "Propensity-Score Overlap", x = "Estimated Probability of Monetary Tightening", y = "Density", fill = "Tightening") +
+  theme(legend.position = "bottom")
+
+print(fig_propensity)
+ggsave("Figure_5_Propensity_Score_Overlap.png", fig_propensity, width = 7, height = 5, dpi = 300)
+
+fig_events <- ggplot(macro_data, aes(x = economic_event)) +
+  geom_bar() +
+  theme_minimal(base_size = 12) +
+  labs(title = "Economic Event Distribution", x = "Economic Event", y = "Number of Monthly Observations")
+
+print(fig_events)
+ggsave("Figure_6_Economic_Event_Distribution.png", fig_events, width = 7, height = 5, dpi = 300)
+
 cat("\nPipeline completed successfully.\n")
 
 # ------------------------------------------------------------------------------

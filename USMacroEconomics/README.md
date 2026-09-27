@@ -1,54 +1,78 @@
-# Copula-Deep Learning and Causal Survival Analysis for U.S. Macroeconomic Data
+# Copula-Based Survival Learning for U.S. Recession Timing
 
-This repository implements a copula-enhanced deep learning framework for analyzing U.S. macroeconomic dynamics, monetary-policy tightening, and time to recession.
+This repository contains the R code and empirical results for the paper:
+
+**Copula-Based Survival Learning for U.S. Recession Timing:  
+Dependence-Aware Prediction with Cox Models and Random Survival Forests**
+
+## Overview
+
+The study develops a dependence-aware survival-learning framework for
+predicting the timing of U.S. recessions. The framework combines a regular
+vine copula representation of macroeconomic dependence with two survival
+models:
+
+- Cox Proportional Hazards (Cox PH)
+- Random Survival Forest (RSF)
+
+Four specifications are evaluated:
+
+1. Standard Cox PH
+2. Standard RSF
+3. Vine Copula Cox
+4. Vine Copula RSF
 
 ## Data
 
-The analysis uses actual monthly U.S. economic data obtained from the **Federal Reserve Economic Data (FRED)**, including:
+The analysis uses actual monthly U.S. macroeconomic data from the
+**Federal Reserve Bank of St. Louis FRED database**, covering **January 1980
+through August 2026**.
 
-- Industrial Production (`INDPRO`)
-- Consumer Price Index (`CPIAUCSL`)
-- Unemployment Rate (`UNRATE`)
-- Federal Funds Rate (`FEDFUNDS`)
-- 10-Year Treasury Yield (`GS10`)
-- 2-Year Treasury Yield (`GS2`)
-- VIX (`VIXCLS`)
-- Housing Starts (`HOUST`)
-- BAA Corporate Bond Spread (`BAA10Y`)
-- NBER Recession Indicator (`USREC`)
-
-Data are downloaded directly from FRED within the R script.
+The data include industrial production, inflation, unemployment, the federal
+funds rate, Treasury yields, VIX, housing starts, corporate credit spreads,
+and the NBER recession indicator.
 
 ## Methodology
 
-The pipeline includes:
+The recession outcome is defined as the number of months until the next
+observed recession, with observations without a subsequent recession treated
+as right censored.
 
-1. Economic feature construction and transformations
-2. Monetary-policy tightening treatment definition
-3. Inverse Probability of Treatment Weighting (IPTW)
-4. Copula selection using Maximum Pseudo-Likelihood
-5. Copula-enhanced LSTM prediction
-6. Time-to-recession analysis
-7. Competing economic risks
-8. Leakage-free predictive evaluation
-9. High-resolution graphical outputs
+A chronological rolling out-of-sample design is used:
 
-Candidate copulas include **Clayton, Frank, and Gaussian** copulas.
+- Initial training window: 300 months
+- Test horizon: 12 months
+- Vine copula estimated using training data only
+- Evaluation metric: Harrell's $C$-index
 
-## Requirements
+Monetary tightening is represented by an observed binary indicator equal to
+one when the federal funds rate increases by at least 0.50 percentage points
+over three months.
 
-R packages:
+## Main Results
 
-```r
-MASS
-Matrix
-copula
-keras3
-dplyr
-survival
-nnet
-ggplot2
-gridExtra
-knitr
-zoo
-httr
+Mean out-of-sample Harrell's $C$-indices:
+
+| Model | Mean C-index |
+|---|---:|
+| Standard Cox PH | 0.5818 |
+| Standard RSF | 0.7067 |
+| Vine Copula Cox | 0.5874 |
+| Vine Copula RSF | 0.7143 |
+
+## Output
+
+The analysis produces:
+
+- `macro_data.csv`
+- `model_performance_summary.csv`
+- `rolling_fold_cindex_results.csv`
+- `figure1_cindex_boxplot.pdf`
+- `figure2_performance_stability.pdf`
+
+## Reproducibility
+
+Set the working directory to the repository folder and run the main R script.
+The analysis uses `set.seed(2026)` for reproducibility.
+
+The code is intended for research and academic replication.

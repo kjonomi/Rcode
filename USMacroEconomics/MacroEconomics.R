@@ -1,3 +1,153 @@
+# ==============================================================================
+# COPULA-DEEP LEARNING & CAUSAL SURVIVAL ANALYSIS
+# ACTUAL U.S. MACROECONOMIC DATA (WITH ALL ADVANCED EXTENSIONS)
+#
+# Monthly U.S. economic application using FRED data
+# Revised September 2026
+# ==============================================================================
+
+Sys.setenv(TF_CPP_MIN_LOG_LEVEL = "2")
+
+# ------------------------------------------------------------------------------
+# 0. PACKAGES (ORDER MATTERS: LOAD MASS BEFORE DPLYR TO PREVENT MASKING)
+# ------------------------------------------------------------------------------
+
+required_packages <- c(
+  "MASS",
+  "Matrix",
+  "copula",
+  "rvinecopulib",
+  "keras3",
+  "dplyr",
+  "survival",
+  "nnet",
+  "ggplot2",
+  "gridExtra",
+  "knitr",
+  "zoo",
+  "httr"
+)
+
+new_packages <- required_packages[
+  !(required_packages %in% installed.packages()[, "Package"])
+]
+
+if (length(new_packages) > 0) {
+  install.packages(new_packages)
+}
+
+library(MASS)          # Load MASS first
+library(Matrix)
+library(copula)
+library(rvinecopulib)
+library(keras3)
+library(dplyr)         # Load dplyr second so dplyr::select overrides MASS::select
+library(survival)
+library(nnet)
+library(ggplot2)
+library(gridExtra)
+library(knitr)
+library(zoo)
+library(httr)
+
+set.seed(2026)
+
+# ------------------------------------------------------------------------------
+# 1. FRED DATA DOWNLOAD
+# ------------------------------------------------------------------------------
+
+fred_csv <- function(series_id) {
+  url <- paste0(
+    "https://fred.stlouisfed.org/graph/fredgraph.csv?id=",
+    series_id
+  )
+
+  x <- read.csv(
+    url,
+    stringsAsFactors = FALSE
+  )
+
+  names(x) <- c("Date", series_id)
+  x$Date <- as.Date(x$Date)
+  x[[series_id]] <- as.numeric(x[[series_id]])
+
+  x
+}
+
+# ------------------------------------------------------------------------------
+# 2. ACTUAL U.S. MACROECONOMIC SERIES
+# ------------------------------------------------------------------------------
+
+indpro   <- fred_csv("INDPRO")    # Industrial Production
+cpi      <- fred_csv("CPIAUCSL")  # Consumer Price Index
+unrate   <- fred_csv("UNRATE")    # Unemployment Rate
+fedfunds <- fred_csv("FEDFUNDS")  # Federal Funds Rate
+gs10     <- fred_csv("GS10")      # 10-Year Treasury Yield
+gs2      <- fred_csv("GS2")       # 2-Year Treasury Yield
+vix      <- fred_csv("VIXCLS")    # VIX
+housing  <- fred_csv("HOUST")     # Housing Starts
+baa10y   <- fred_csv("BAA10Y")    # BAA Corporate Bond Spread
+recession <- fred_csv("USREC")    # NBER recession indicator
+
+# ------------------------------------------------------------------------------
+# 3. CONVERT TO MONTHLY FREQUENCY
+# ------------------------------------------------------------------------------
+
+monthly_mean <- function(df, value_name) {
+  df %>%
+    mutate(
+      Month = as.Date(
+        as.yearmon(Date),
+        frac = 0
+      )
+    ) %>%
+    group_by(Month) %>%
+    summarise(
+      !!value_name := mean(
+        .data[[value_name]],
+        na.rm = TRUE
+      ),
+      .groups = "drop"
+    )
+}
+
+indpro_m   <- monthly_mean(indpro, "INDPRO")
+cpi_m      <- monthly_mean(cpi, "CPIAUCSL")
+unrate_m   <- monthly_mean(unrate, "UNRATE")
+fedfunds_m <- monthly_mean(fedfunds, "FEDFUNDS")
+gs10_m     <- monthly_mean(gs10, "GS10")
+gs2_m      <- monthly_mean(gs2, "GS2")
+vix_m      <- monthly_mean(vix, "VIXCLS")
+housing_m  <- monthly_mean(housing, "HOUST")
+baa10y_m   <- monthly_mean(baa10y, "BAA10Y")
+
+recession_m <- recession %>%
+  mutate(
+    Month = as.Date(as.yearmon(Date), frac = 0)
+  ) %>%
+  group_by(Month) %>%
+  summarise(
+    USREC = max(USREC, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# ------------------------------------------------------------------------------
+# 4. MERGE ACTUAL MACROECONOMIC DATA
+# ------------------------------------------------------------------------------
+
+macro_data <- indpro_m %>%
+  left_join(cpi_m, by = "Month") %>%
+  left_join(unrate_m, by = "Month") %>%
+  left_join(fedfunds_m, by = "Month") %>%
+  left_join(gs10_m, by = "Month") %>%
+  left_join(gs2_m, by = "Month") %>%
+  left_join(vix_m, by = "Month") %>%
+  left_join(housing_m, by = "Month") %>%
+  left_join(baa10y_m, by = "Month") %>%
+  left_join(recession_m, by = "Month")
+
+# Write & Read back for persistence check
+write.csv(macro_data, file = "macro_data.csv", row.names = FALSE)
 macro_data_read <- read.csv("macro_data.csv", stringsAsFactors = FALSE)
 macro_data_read$Month <- as.Date(macro_data_read$Month)
 macro_data <- macro_data_read

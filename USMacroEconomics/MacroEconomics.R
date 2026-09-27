@@ -338,7 +338,7 @@ macro_data$months_to_recession <- sapply(macro_data$Month, next_recession)
 
 macro_data$censored <- ifelse(is.na(macro_data$months_to_recession), 0, 1)
 
-MAX_MONTHS <- 60
+MAX_MONTHS <- 120
 
 macro_data$observed_months <- pmin(
   ifelse(is.na(macro_data$months_to_recession), MAX_MONTHS, macro_data$months_to_recession),
@@ -359,22 +359,29 @@ macro_data$economic_event <- factor(
   levels = 0:3,
   labels = c("No_Event", "Recession", "Inflation_Shock", "Financial_Stress")
 )
-
 # ------------------------------------------------------------------------------
 # 14. ADVANCED VINE COPULA MODELING (rvinecopulib)
 # ------------------------------------------------------------------------------
 
-cat("\n--- Fitting High-Dimensional R-Vine Copula ---\n")
+cat("\n--- Fitting High-Dimensional R-Vine Copula (Parametric + Nonparametric) ---\n")
 
 feature_matrix <- as.matrix(macro_data[, economic_features])
 pseudo_obs     <- pobs(feature_matrix)
 
 # Fit regularized R-vine copula across all macro dimensions
+# Setting family_set = "all" evaluates both parametric and nonparametric copulas
 vine_fit <- vinecop(
   data = pseudo_obs,
-  family_set = "parametric",
+  family_set = "all",
   structure = NA,
   selcrit = "aic"
+)
+
+# Extract best fitted copula description for Section 21 output
+best_copula_name <- sprintf(
+  "Regularized R-Vine Copula (%d pair-copulas across %d trees)",
+  dim(vine_fit$pair_copulas)[1] * dim(vine_fit$pair_copulas)[2],
+  dim(vine_fit$pair_copulas)[1]
 )
 
 cat("Vine Copula structure fit complete. Simulating pseudo-observations...\n")
@@ -606,13 +613,22 @@ cat("ACTUAL U.S. MACROECONOMIC DATA ANALYSIS (RESULTS)\n")
 cat("============================================================\n")
 
 cat("\nObservations:", nrow(macro_data), "\n")
-cat("Copula Selected: High-Dimensional R-Vine Copula (rvinecopulib)\n")
+cat("Copula Selected:", best_copula_name, "\n")
 
 cat("\nPredictive Performance\n")
-print(kable(performance_metrics, caption = "DeepSurv LSTM Performance Metrics"))
+print(knitr::kable(
+  performance_metrics, 
+  caption = "DeepSurv LSTM Performance Metrics",
+  col.names = c("Metric", "Value"),
+  align = c("l", "r")
+))
 
 cat("\nMonetary Policy Regime Summary\n")
-print(kable(policy_summary, digits = 4, caption = "Macroeconomic Characteristics by Monetary Tightening Regime"))
+print(knitr::kable(
+  policy_summary, 
+  digits = 4, 
+  caption = "Macroeconomic Characteristics by Monetary Tightening Regime"
+))
 
 cat("\n============================================================\n")
 cat("CAUSAL POLICY COUNTERFACTUAL RESULTS\n")
@@ -674,15 +690,13 @@ ggsave("Figure_4_Counterfactual_Policy_Simulations.png", fig_counterfactual, wid
 
 cat("\nPipeline completed successfully.\n")
 
-# ==============================================================================
+# ------------------------------------------------------------------------------
 # 23. EXPORT ALL OUTPUT TABLES TO CSV FILES
-# ==============================================================================
+# ------------------------------------------------------------------------------
 
 cat("\n--- Exporting Analysis Results to CSV Files ---\n")
 
-# ------------------------------------------------------------------------------
 # CSV 1: MODEL PERFORMANCE METRICS
-# ------------------------------------------------------------------------------
 write.csv(
   performance_metrics,
   file = "Table_1_Performance_Metrics.csv",
@@ -690,9 +704,7 @@ write.csv(
 )
 cat("Saved: Table_1_Performance_Metrics.csv\n")
 
-# ------------------------------------------------------------------------------
 # CSV 2: POLICY REGIME MACROECONOMIC SUMMARY
-# ------------------------------------------------------------------------------
 csv_policy_summary <- policy_summary %>%
   mutate(
     Monetary_Tightening = ifelse(
@@ -709,9 +721,7 @@ write.csv(
 )
 cat("Saved: Table_2_Policy_Regime_Summary.csv\n")
 
-# ------------------------------------------------------------------------------
 # CSV 3: CAUSAL POLICY SIMULATION RESULTS (ATE / ATT)
-# ------------------------------------------------------------------------------
 causal_effects_df <- data.frame(
   Estimand = c(
     "Average Treatment Effect (ATE)",
@@ -731,9 +741,7 @@ write.csv(
 )
 cat("Saved: Table_3_Causal_Counterfactual_Estimates.csv\n")
 
-# ------------------------------------------------------------------------------
 # CSV 4: FULL DATASET WITH PREDICTIONS & COUNTERFACTUALS
-# ------------------------------------------------------------------------------
 macro_predictions_export <- macro_data %>%
   dplyr::select(
     Month,

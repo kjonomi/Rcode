@@ -1,172 +1,3 @@
-# ==============================================================================
-# COPULA-DEEP LEARNING & CAUSAL SURVIVAL ANALYSIS
-# ACTUAL U.S. MACROECONOMIC DATA (WITH ALL ADVANCED EXTENSIONS)
-#
-# Monthly U.S. economic application using FRED data
-# Revised September 2026
-# ==============================================================================
-
-Sys.setenv(TF_CPP_MIN_LOG_LEVEL = "2")
-
-# ------------------------------------------------------------------------------
-# 0. PACKAGES (ORDER MATTERS: LOAD MASS BEFORE DPLYR TO PREVENT MASKING)
-# ------------------------------------------------------------------------------
-
-required_packages <- c(
-  "MASS",
-  "Matrix",
-  "copula",
-  "rvinecopulib",
-  "keras3",
-  "dplyr",
-  "survival",
-  "nnet",
-  "ggplot2",
-  "gridExtra",
-  "knitr",
-  "zoo",
-  "httr"
-)
-
-new_packages <- required_packages[
-  !(required_packages %in% installed.packages()[, "Package"])
-]
-
-if (length(new_packages) > 0) {
-  install.packages(new_packages)
-}
-
-library(MASS)          # Load MASS first
-library(Matrix)
-library(copula)
-library(rvinecopulib)
-library(keras3)
-library(dplyr)         # Load dplyr second so dplyr::select overrides MASS::select
-library(survival)
-library(nnet)
-library(ggplot2)
-library(gridExtra)
-library(knitr)
-library(zoo)
-library(httr)
-
-set.seed(2026)
-
-# ------------------------------------------------------------------------------
-# 1. FRED DATA DOWNLOAD
-# ------------------------------------------------------------------------------
-
-fred_csv <- function(series_id) {
-  url <- paste0(
-    "https://fred.stlouisfed.org/graph/fredgraph.csv?id=",
-    series_id
-  )
-
-  x <- read.csv(
-    url,
-    stringsAsFactors = FALSE
-  )
-
-  names(x) <- c("Date", series_id)
-  x$Date <- as.Date(x$Date)
-  x[[series_id]] <- as.numeric(x[[series_id]])
-
-  x
-}
-
-# ------------------------------------------------------------------------------
-# 2. ACTUAL U.S. MACROECONOMIC SERIES
-# ------------------------------------------------------------------------------
-
-# Industrial Production
-indpro <- fred_csv("INDPRO")
-
-# Consumer Price Index
-cpi <- fred_csv("CPIAUCSL")
-
-# Unemployment Rate
-unrate <- fred_csv("UNRATE")
-
-# Federal Funds Rate
-fedfunds <- fred_csv("FEDFUNDS")
-
-# 10-Year Treasury Yield
-gs10 <- fred_csv("GS10")
-
-# 2-Year Treasury Yield
-gs2 <- fred_csv("GS2")
-
-# VIX
-vix <- fred_csv("VIXCLS")
-
-# Housing Starts
-housing <- fred_csv("HOUST")
-
-# BAA Corporate Bond Spread
-baa10y <- fred_csv("BAA10Y")
-
-# NBER recession indicator
-recession <- fred_csv("USREC")
-
-# ------------------------------------------------------------------------------
-# 3. CONVERT TO MONTHLY FREQUENCY
-# ------------------------------------------------------------------------------
-
-monthly_mean <- function(df, value_name) {
-  df %>%
-    mutate(
-      Month = as.Date(
-        as.yearmon(Date),
-        frac = 0
-      )
-    ) %>%
-    group_by(Month) %>%
-    summarise(
-      !!value_name := mean(
-        .data[[value_name]],
-        na.rm = TRUE
-      ),
-      .groups = "drop"
-    )
-}
-
-indpro_m   <- monthly_mean(indpro, "INDPRO")
-cpi_m      <- monthly_mean(cpi, "CPIAUCSL")
-unrate_m   <- monthly_mean(unrate, "UNRATE")
-fedfunds_m <- monthly_mean(fedfunds, "FEDFUNDS")
-gs10_m     <- monthly_mean(gs10, "GS10")
-gs2_m      <- monthly_mean(gs2, "GS2")
-vix_m      <- monthly_mean(vix, "VIXCLS")
-housing_m  <- monthly_mean(housing, "HOUST")
-baa10y_m   <- monthly_mean(baa10y, "BAA10Y")
-
-recession_m <- recession %>%
-  mutate(
-    Month = as.Date(as.yearmon(Date), frac = 0)
-  ) %>%
-  group_by(Month) %>%
-  summarise(
-    USREC = max(USREC, na.rm = TRUE),
-    .groups = "drop"
-  )
-
-# ------------------------------------------------------------------------------
-# 4. MERGE ACTUAL MACROECONOMIC DATA
-# ------------------------------------------------------------------------------
-
-macro_data <- indpro_m %>%
-  left_join(cpi_m, by = "Month") %>%
-  left_join(unrate_m, by = "Month") %>%
-  left_join(fedfunds_m, by = "Month") %>%
-  left_join(gs10_m, by = "Month") %>%
-  left_join(gs2_m, by = "Month") %>%
-  left_join(vix_m, by = "Month") %>%
-  left_join(housing_m, by = "Month") %>%
-  left_join(baa10y_m, by = "Month") %>%
-  left_join(recession_m, by = "Month")
-
-# Write & Read back for persistence check
-write.csv(macro_data, file = "macro_data.csv", row.names = FALSE)
 macro_data_read <- read.csv("macro_data.csv", stringsAsFactors = FALSE)
 macro_data_read$Month <- as.Date(macro_data_read$Month)
 macro_data <- macro_data_read
@@ -338,7 +169,7 @@ macro_data$months_to_recession <- sapply(macro_data$Month, next_recession)
 
 macro_data$censored <- ifelse(is.na(macro_data$months_to_recession), 0, 1)
 
-MAX_MONTHS <- 120
+MAX_MONTHS <- 240
 
 macro_data$observed_months <- pmin(
   ifelse(is.na(macro_data$months_to_recession), MAX_MONTHS, macro_data$months_to_recession),
@@ -359,6 +190,7 @@ macro_data$economic_event <- factor(
   levels = 0:3,
   labels = c("No_Event", "Recession", "Inflation_Shock", "Financial_Stress")
 )
+
 # ------------------------------------------------------------------------------
 # 14. ADVANCED VINE COPULA MODELING (rvinecopulib)
 # ------------------------------------------------------------------------------
@@ -369,7 +201,6 @@ feature_matrix <- as.matrix(macro_data[, economic_features])
 pseudo_obs     <- pobs(feature_matrix)
 
 # Fit regularized R-vine copula across all macro dimensions
-# Setting family_set = "all" evaluates both parametric and nonparametric copulas
 vine_fit <- vinecop(
   data = pseudo_obs,
   family_set = "all",
@@ -517,31 +348,41 @@ oos_cindex <- concordance(
 cat(sprintf("Out-of-Sample Rolling C-Index (2010-2026): %6.4f\n", oos_cindex))
 
 # ------------------------------------------------------------------------------
-# 18. COMPETING-RISK MODEL
+# 18. CAUSE-SPECIFIC COX PROPORTIONAL HAZARDS COMPETING-RISK MODEL
 # ------------------------------------------------------------------------------
 
-competing_risk_model <- multinom(
-  economic_event ~
-    IP_Growth +
-    CPI_Inflation +
-    UNRATE +
-    FedFunds_Change +
-    Term_Spread +
-    VIXCLS +
-    Credit_Spread +
-    predicted_survival_months,
-  data = macro_data,
-  weights = iptw_weight,
-  trace = FALSE
-)
+cat("\n--- Fitting Cause-Specific Cox Proportional Hazards Models ---\n")
 
-event_predictions <- predict(competing_risk_model, type = "probs")
+# Fit cause-specific Cox proportional hazard models for each distinct competing event
+event_levels <- c("Recession", "Inflation_Shock", "Financial_Stress")
+cause_models <- list()
 
-if (is.vector(event_predictions)) {
-  event_predictions <- matrix(event_predictions, ncol = 1)
+for (ev in event_levels) {
+  # Event-specific indicator (1 if specific event occurs, 0 otherwise)
+  status_ev <- as.numeric(macro_data$economic_event == ev)
+  
+  surv_obj <- Surv(time = macro_data$observed_months, event = status_ev)
+  
+  fit_ev <- coxph(
+    surv_obj ~ IP_Growth + CPI_Inflation + UNRATE + FedFunds_Change + 
+               Term_Spread + VIXCLS + Credit_Spread,
+    data = macro_data,
+    weights = iptw_weight
+  )
+  
+  cause_models[[ev]] <- fit_ev
+  
+  # Predict relative risk / cumulative hazard score for each event type
+  hazard_score <- predict(fit_ev, type = "risk")
+  
+  # Convert hazard score to cumulative event probability: P = 1 - exp(-hazard_score)
+  macro_data[[paste0("P_", ev)]] <- pmin(pmax(1 - exp(-hazard_score / 10), 0), 1)
 }
 
-colnames(event_predictions) <- paste0("P_", colnames(event_predictions))
+# Calculate No_Event probability as the residual non-event likelihood
+macro_data$P_No_Event <- pmax(1 - (macro_data$P_Recession + macro_data$P_Inflation_Shock + macro_data$P_Financial_Stress), 0)
+
+event_predictions <- macro_data[, c("P_No_Event", "P_Recession", "P_Inflation_Shock", "P_Financial_Stress")]
 
 # ------------------------------------------------------------------------------
 # 19. CAUSAL COUNTERFACTUAL POLICY SIMULATION (ATE / ATT)
@@ -774,7 +615,11 @@ macro_predictions_export <- macro_data %>%
     iptw_weight,
     observed_months,
     predicted_risk_score,
-    predicted_survival_months
+    predicted_survival_months,
+    P_No_Event,
+    P_Recession,
+    P_Inflation_Shock,
+    P_Financial_Stress
   ) %>%
   mutate(
     counterfactual_neutral_months = months_control,

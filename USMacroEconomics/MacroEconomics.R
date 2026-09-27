@@ -1,6 +1,6 @@
 # ==============================================================================
 # COPULA-DEEP LEARNING & CAUSAL SURVIVAL ANALYSIS
-# ACTUAL U.S. MACROECONOMIC DATA
+# ACTUAL U.S. MACROECONOMIC DATA (WITH ALL ADVANCED EXTENSIONS)
 #
 # Monthly U.S. economic application using FRED data
 # Revised September 2026
@@ -9,13 +9,14 @@
 Sys.setenv(TF_CPP_MIN_LOG_LEVEL = "2")
 
 # ------------------------------------------------------------------------------
-# 0. PACKAGES
+# 0. PACKAGES (ORDER MATTERS: LOAD MASS BEFORE DPLYR TO PREVENT MASKING)
 # ------------------------------------------------------------------------------
 
 required_packages <- c(
   "MASS",
   "Matrix",
   "copula",
+  "rvinecopulib",
   "keras3",
   "dplyr",
   "survival",
@@ -35,11 +36,12 @@ if (length(new_packages) > 0) {
   install.packages(new_packages)
 }
 
-library(MASS)
+library(MASS)          # Load MASS first
 library(Matrix)
 library(copula)
+library(rvinecopulib)
 library(keras3)
-library(dplyr)
+library(dplyr)         # Load dplyr second so dplyr::select overrides MASS::select
 library(survival)
 library(nnet)
 library(ggplot2)
@@ -55,7 +57,6 @@ set.seed(2026)
 # ------------------------------------------------------------------------------
 
 fred_csv <- function(series_id) {
-
   url <- paste0(
     "https://fred.stlouisfed.org/graph/fredgraph.csv?id=",
     series_id
@@ -67,9 +68,7 @@ fred_csv <- function(series_id) {
   )
 
   names(x) <- c("Date", series_id)
-
   x$Date <- as.Date(x$Date)
-
   x[[series_id]] <- as.numeric(x[[series_id]])
 
   x
@@ -113,11 +112,7 @@ recession <- fred_csv("USREC")
 # 3. CONVERT TO MONTHLY FREQUENCY
 # ------------------------------------------------------------------------------
 
-# Some FRED series have daily observations.
-# Convert these to monthly averages.
-
 monthly_mean <- function(df, value_name) {
-
   df %>%
     mutate(
       Month = as.Date(
@@ -135,15 +130,15 @@ monthly_mean <- function(df, value_name) {
     )
 }
 
-indpro_m <- monthly_mean(indpro, "INDPRO")
-cpi_m <- monthly_mean(cpi, "CPIAUCSL")
-unrate_m <- monthly_mean(unrate, "UNRATE")
+indpro_m   <- monthly_mean(indpro, "INDPRO")
+cpi_m      <- monthly_mean(cpi, "CPIAUCSL")
+unrate_m   <- monthly_mean(unrate, "UNRATE")
 fedfunds_m <- monthly_mean(fedfunds, "FEDFUNDS")
-gs10_m <- monthly_mean(gs10, "GS10")
-gs2_m <- monthly_mean(gs2, "GS2")
-vix_m <- monthly_mean(vix, "VIXCLS")
-housing_m <- monthly_mean(housing, "HOUST")
-baa10y_m <- monthly_mean(baa10y, "BAA10Y")
+gs10_m     <- monthly_mean(gs10, "GS10")
+gs2_m      <- monthly_mean(gs2, "GS2")
+vix_m      <- monthly_mean(vix, "VIXCLS")
+housing_m  <- monthly_mean(housing, "HOUST")
+baa10y_m   <- monthly_mean(baa10y, "BAA10Y")
 
 recession_m <- recession %>%
   mutate(
@@ -170,6 +165,12 @@ macro_data <- indpro_m %>%
   left_join(baa10y_m, by = "Month") %>%
   left_join(recession_m, by = "Month")
 
+# Write & Read back for persistence check
+write.csv(macro_data, file = "macro_data.csv", row.names = FALSE)
+macro_data_read <- read.csv("macro_data.csv", stringsAsFactors = FALSE)
+macro_data_read$Month <- as.Date(macro_data_read$Month)
+macro_data <- macro_data_read
+
 # ------------------------------------------------------------------------------
 # 5. SAMPLE PERIOD
 # ------------------------------------------------------------------------------
@@ -185,98 +186,41 @@ macro_data <- macro_data %>%
 # ------------------------------------------------------------------------------
 
 macro_data <- macro_data %>%
-
   mutate(
-
-    # Industrial production growth
-    IP_Growth = 100 * (
-      log(INDPRO) -
-      lag(log(INDPRO), 12)
-    ),
-
-    # CPI inflation
-    CPI_Inflation = 100 * (
-      log(CPIAUCSL) -
-      lag(log(CPIAUCSL), 12)
-    ),
-
-    # Monthly change in unemployment
-    Unemployment_Change =
-      UNRATE - lag(UNRATE),
-
-    # Monetary-policy change
-    FedFunds_Change =
-      FEDFUNDS - lag(FEDFUNDS),
-
-    # Three-month monetary tightening
-    FedFunds_3M_Change =
-      FEDFUNDS - lag(FEDFUNDS, 3),
-
-    # Yield curve
-    Term_Spread =
-      GS10 - GS2,
-
-    # Change in term spread
-    Term_Spread_Change =
-      Term_Spread - lag(Term_Spread),
-
-    # VIX change
-    VIX_Change =
-      VIXCLS - lag(VIXCLS),
-
-    # Housing growth
-    Housing_Growth = 100 * (
-      log(HOUST) -
-      lag(log(HOUST), 12)
-    ),
-
-    # Corporate credit spread
+    IP_Growth = 100 * (log(INDPRO) - lag(log(INDPRO), 12)),
+    CPI_Inflation = 100 * (log(CPIAUCSL) - lag(log(CPIAUCSL), 12)),
+    Unemployment_Change = UNRATE - lag(UNRATE),
+    FedFunds_Change = FEDFUNDS - lag(FEDFUNDS),
+    FedFunds_3M_Change = FEDFUNDS - lag(FEDFUNDS, 3),
+    Term_Spread = GS10 - GS2,
+    Term_Spread_Change = Term_Spread - lag(Term_Spread),
+    VIX_Change = VIXCLS - lag(VIXCLS),
+    Housing_Growth = 100 * (log(HOUST) - lag(log(HOUST), 12)),
     Credit_Spread = BAA10Y,
-
-    # Change in credit spread
-    Credit_Spread_Change =
-      BAA10Y - lag(BAA10Y)
+    Credit_Spread_Change = BAA10Y - lag(BAA10Y)
   )
 
 # ------------------------------------------------------------------------------
 # 7. ECONOMIC TREATMENT
 # ------------------------------------------------------------------------------
 
-# Treatment = monetary-policy tightening.
-#
-# A month is classified as treated when the federal funds rate
-# has increased by at least 50 basis points over the preceding
-# three months.
-
 macro_data <- macro_data %>%
-
   mutate(
-    Monetary_Tightening = ifelse(
-      FedFunds_3M_Change >= 0.50,
-      1,
-      0
-    )
+    Monetary_Tightening = ifelse(FedFunds_3M_Change >= 0.50, 1, 0)
   )
 
 # ------------------------------------------------------------------------------
-# 8. ECONOMIC SHOCK VARIABLES
+# 8. ECONOMIC SHOCK VARIABLES (zoo::rollapply)
 # ------------------------------------------------------------------------------
 
-# Inflation shock:
-# inflation is at least 2 percentage points above a rolling
-# 36-month median.
-
 macro_data <- macro_data %>%
-
   mutate(
-
-    Inflation_Benchmark =
-      zoo::rollmedian(
-        CPI_Inflation,
-        k = 36,
-        fill = NA,
-        align = "right"
-      ),
+    Inflation_Benchmark = zoo::rollmedian(
+      CPI_Inflation,
+      k = 36,
+      fill = NA,
+      align = "right"
+    ),
 
     Inflation_Shock = ifelse(
       CPI_Inflation >= Inflation_Benchmark + 2,
@@ -284,37 +228,31 @@ macro_data <- macro_data %>%
       0
     ),
 
-    # Financial stress:
-    # corporate spread or VIX is unusually elevated.
+    Credit_Threshold = zoo::rollapply(
+      Credit_Spread,
+      width = 36,
+      FUN = function(x) quantile(x, probs = 0.75, na.rm = TRUE),
+      fill = NA,
+      align = "right"
+    ),
 
-    Credit_Threshold =
-      zoo::rollquantile(
-        Credit_Spread,
-        k = 36,
-        probs = 0.75,
-        fill = NA,
-        align = "right"
-      ),
-
-    VIX_Threshold =
-      zoo::rollquantile(
-        VIXCLS,
-        k = 36,
-        probs = 0.75,
-        fill = NA,
-        align = "right"
-      ),
+    VIX_Threshold = zoo::rollapply(
+      VIXCLS,
+      width = 36,
+      FUN = function(x) quantile(x, probs = 0.75, na.rm = TRUE),
+      fill = NA,
+      align = "right"
+    ),
 
     Financial_Stress = ifelse(
-      Credit_Spread >= Credit_Threshold |
-      VIXCLS >= VIX_Threshold,
+      Credit_Spread >= Credit_Threshold | VIXCLS >= VIX_Threshold,
       1,
       0
     )
   )
 
 # ------------------------------------------------------------------------------
-# 9. CLEAN COMPLETE CASE SAMPLE
+# 9. CLEAN COMPLETE CASE SAMPLE (EXPLICIT DPLYR SELECT)
 # ------------------------------------------------------------------------------
 
 economic_features <- c(
@@ -333,20 +271,16 @@ economic_features <- c(
 macro_data <- macro_data %>%
   filter(
     complete.cases(
-      select(
+      dplyr::select(
         .,
-        all_of(economic_features),
+        dplyr::all_of(economic_features),
         Monetary_Tightening,
         USREC
       )
     )
   )
 
-cat(
-  "\nActual U.S. macroeconomic observations:",
-  nrow(macro_data),
-  "\n"
-)
+cat("\nActual U.S. macroeconomic observations:", nrow(macro_data), "\n")
 
 # ------------------------------------------------------------------------------
 # 10. PROPENSITY SCORE / IPTW
@@ -366,917 +300,468 @@ psm_model <- glm(
   data = macro_data
 )
 
-macro_data$propensity_score <-
-  predict(
-    psm_model,
-    type = "response"
-  )
+# Bound propensity scores away from 0/1 to ensure numerical stability
+macro_data$propensity_score <- pmin(pmax(predict(psm_model, type = "response"), 1e-5), 1 - 1e-5)
 
-p_treatment <-
-  mean(
-    macro_data$Monetary_Tightening
-  )
+p_treatment <- mean(macro_data$Monetary_Tightening)
 
-macro_data$iptw_weight <-
-
-  ifelse(
-    macro_data$Monetary_Tightening == 1,
-
-    p_treatment /
-      macro_data$propensity_score,
-
-    (1 - p_treatment) /
-      (1 - macro_data$propensity_score)
-  )
+macro_data$iptw_weight <- ifelse(
+  macro_data$Monetary_Tightening == 1,
+  p_treatment / macro_data$propensity_score,
+  (1 - p_treatment) / (1 - macro_data$propensity_score)
+)
 
 # Stabilized-weight trimming
-q_upper <-
-  quantile(
-    macro_data$iptw_weight,
-    0.99,
-    na.rm = TRUE
-  )
-
-macro_data$iptw_weight <-
-  pmin(
-    macro_data$iptw_weight,
-    q_upper
-  )
+q_upper <- quantile(macro_data$iptw_weight, 0.99, na.rm = TRUE)
+macro_data$iptw_weight <- pmin(macro_data$iptw_weight, q_upper)
 
 # ------------------------------------------------------------------------------
 # 11. TIME TO NEXT RECESSION
 # ------------------------------------------------------------------------------
 
-# For each month, calculate the number of months until the
-# next NBER recession begins.
-
-recession_dates <-
-  macro_data$Month[
-    macro_data$USREC == 1
-  ]
+recession_dates <- macro_data$Month[macro_data$USREC == 1]
 
 next_recession <- function(current_date) {
-
-  future_dates <-
-    recession_dates[
-      recession_dates >= current_date
-    ]
-
-  if (length(future_dates) == 0) {
-    return(NA_real_)
-  }
-
+  future_dates <- recession_dates[recession_dates >= current_date]
+  if (length(future_dates) == 0) return(NA_real_)
+  
   as.numeric(
-    round(
-      12 *
-        (as.yearmon(future_dates[1]) -
-         as.yearmon(current_date))
-    )
+    round(12 * (as.yearmon(future_dates[1]) - as.yearmon(current_date)))
   )
 }
 
-macro_data$months_to_recession <-
-  sapply(
-    macro_data$Month,
-    next_recession
-  )
+macro_data$months_to_recession <- sapply(macro_data$Month, next_recession)
 
 # ------------------------------------------------------------------------------
 # 12. CENSORING
 # ------------------------------------------------------------------------------
 
-macro_data$censored <-
-  ifelse(
-    is.na(macro_data$months_to_recession),
-    0,
-    1
-  )
+macro_data$censored <- ifelse(is.na(macro_data$months_to_recession), 0, 1)
 
-# Censor at 60 months
 MAX_MONTHS <- 60
 
-macro_data$observed_months <-
-  pmin(
-    ifelse(
-      is.na(macro_data$months_to_recession),
-      MAX_MONTHS,
-      macro_data$months_to_recession
-    ),
-    MAX_MONTHS
-  )
+macro_data$observed_months <- pmin(
+  ifelse(is.na(macro_data$months_to_recession), MAX_MONTHS, macro_data$months_to_recession),
+  MAX_MONTHS
+)
 
 # ------------------------------------------------------------------------------
 # 13. COMPETING ECONOMIC RISKS
 # ------------------------------------------------------------------------------
 
-# 0 = no event / censored
-# 1 = recession
-# 2 = inflation shock
-# 3 = financial stress
-
 macro_data$economic_event <- 0
+macro_data$economic_event[macro_data$USREC == 1] <- 1
+macro_data$economic_event[macro_data$USREC == 0 & macro_data$Inflation_Shock == 1] <- 2
+macro_data$economic_event[macro_data$USREC == 0 & macro_data$Inflation_Shock == 0 & macro_data$Financial_Stress == 1] <- 3
 
-macro_data$economic_event[
-  macro_data$USREC == 1
-] <- 1
-
-macro_data$economic_event[
-  macro_data$USREC == 0 &
-  macro_data$Inflation_Shock == 1
-] <- 2
-
-macro_data$economic_event[
-  macro_data$USREC == 0 &
-  macro_data$Inflation_Shock == 0 &
-  macro_data$Financial_Stress == 1
-] <- 3
-
-macro_data$economic_event <-
-  factor(
-    macro_data$economic_event,
-    levels = 0:3,
-    labels = c(
-      "No_Event",
-      "Recession",
-      "Inflation_Shock",
-      "Financial_Stress"
-    )
-  )
-
-# ------------------------------------------------------------------------------
-# 14. COPULA MODELING
-# ------------------------------------------------------------------------------
-
-feature_matrix <-
-  as.matrix(
-    macro_data[
-      ,
-      economic_features
-    ]
-  )
-
-# Tiny jitter for tied economic observations
-jittered_matrix <-
-  apply(
-    feature_matrix,
-    2,
-    function(x)
-      x + rnorm(
-        length(x),
-        0,
-        1e-8
-      )
-  )
-
-pseudo_obs <-
-  pobs(
-    jittered_matrix
-  )
-
-d <-
-  length(
-    economic_features
-  )
-
-candidate_copulas <- list(
-
-  Clayton =
-    claytonCopula(
-      dim = d
-    ),
-
-  Frank =
-    frankCopula(
-      dim = d
-    ),
-
-  Gaussian =
-    normalCopula(
-      dim = d,
-      dispstr = "un"
-    )
+macro_data$economic_event <- factor(
+  macro_data$economic_event,
+  levels = 0:3,
+  labels = c("No_Event", "Recession", "Inflation_Shock", "Financial_Stress")
 )
 
-copula_fits <- list()
-aic_values <- c()
+# ------------------------------------------------------------------------------
+# 14. ADVANCED VINE COPULA MODELING (rvinecopulib)
+# ------------------------------------------------------------------------------
 
-cat(
-  "\nFitting economic copulas...\n"
+cat("\n--- Fitting High-Dimensional R-Vine Copula ---\n")
+
+feature_matrix <- as.matrix(macro_data[, economic_features])
+pseudo_obs     <- pobs(feature_matrix)
+
+# Fit regularized R-vine copula across all macro dimensions
+vine_fit <- vinecop(
+  data = pseudo_obs,
+  family_set = "parametric",
+  structure = NA,
+  selcrit = "aic"
 )
 
-for (name in names(candidate_copulas)) {
+cat("Vine Copula structure fit complete. Simulating pseudo-observations...\n")
 
-  fit <- tryCatch(
+# Draw simulated dependence features from vine copula
+vine_sim_u <- rvinecop(n = nrow(macro_data), vinecop = vine_fit)
+colnames(vine_sim_u) <- paste0("Vine_Copula_", economic_features)
 
-    {
+# Combine original features + vine copula representations + treatment indicator
+combined_features <- cbind(
+  feature_matrix,
+  vine_sim_u,
+  Monetary_Tightening = macro_data$Monetary_Tightening
+)
 
-      fitCopula(
-        candidate_copulas[[name]],
-        pseudo_obs,
-        method = "mpl"
-      )
+scaled_features <- scale(combined_features)
+n_features      <- ncol(scaled_features)
 
-    },
+# Format for 3D Recurrent Input [Samples, Timesteps=1, Features]
+X_dl_input <- array(
+  scaled_features,
+  dim = c(nrow(macro_data), 1, n_features)
+)
 
-    error = function(e) {
+# ------------------------------------------------------------------------------
+# 15 & 16. DEEPSURV: COX PARTIAL LIKELIHOOD LOSS IN KERAS 3 (op_*)
+# ------------------------------------------------------------------------------
 
-      tryCatch(
+cat("\n--- Constructing DeepSurv (Cox Partial Likelihood) Neural Network ---\n")
 
-        {
-
-          fitCopula(
-            candidate_copulas[[name]],
-            pseudo_obs,
-            method = "itau"
-          )
-
-        },
-
-        error = function(e2)
-          NULL
-      )
-    }
-  )
-
-  if (!is.null(fit)) {
-
-    copula_fits[[name]] <-
-      fit
-
-    loglik_val <-
-      tryCatch(
-        loglikCopula(
-          fit@copula,
-          pseudo_obs
-        ),
-        error = function(e)
-          NA
-      )
-
-    if (
-      !is.na(loglik_val) &&
-      is.finite(loglik_val)
-    ) {
-
-      k_param <-
-        length(
-          fit@estimate
-        )
-
-      aic_values[name] <-
-        2 * k_param -
-        2 * as.numeric(
-          loglik_val
-        )
-
-      cat(
-        sprintf(
-          " -> %-10s | AIC = %8.2f\n",
-          name,
-          aic_values[name]
-        )
-      )
-    }
-  }
+# Custom Cox Partial Likelihood Loss using Keras 3 backend operations (op_*)
+custom_cox_loss <- function(y_true, y_pred) {
+  time   <- y_true[, 1, drop = FALSE]
+  status <- y_true[, 2, drop = FALSE]
+  
+  theta     <- y_pred
+  exp_theta <- op_exp(theta)
+  
+  # Cumulative risk sum
+  risk_sum <- op_cumsum(exp_theta)
+  log_risk <- op_log(risk_sum + 1e-7)
+  
+  # Negative log partial likelihood
+  loss <- -op_sum(status * (theta - log_risk)) / (op_sum(status) + 1e-7)
+  return(loss)
 }
 
-valid_aics <-
-  aic_values[
-    !is.na(aic_values)
-  ]
+# Build LSTM architecture for Survival Hazard Estimation
+build_deepsurv_lstm <- function(input_dim) {
+  model <- keras_model_sequential() %>%
+    layer_lstm(
+      units = 32,
+      return_sequences = FALSE,
+      input_shape = c(1, input_dim)
+    ) %>%
+    layer_dropout(rate = 0.20) %>%
+    layer_dense(units = 16, activation = "relu") %>%
+    layer_dense(units = 1, activation = "linear")
+  
+  model %>% compile(
+    optimizer = optimizer_adam(learning_rate = 0.002),
+    loss = custom_cox_loss
+  )
+  return(model)
+}
 
-best_copula_name <-
-  if (
-    length(valid_aics) > 0
-  ) {
-
-    names(
-      which.min(
-        valid_aics
-      )
-    )
-
-  } else {
-
-    "Gaussian"
-  }
-
-best_fitted_copula <-
-  copula_fits[
-    [best_copula_name]
-  ]
-
-cat(
-  "\nSelected economic copula:",
-  best_copula_name,
-  "\n"
+# Target matrix for survival: [observed_months, event_indicator]
+Y_survival <- cbind(
+  macro_data$observed_months,
+  macro_data$censored
 )
 
-# ------------------------------------------------------------------------------
-# 15. COPULA FEATURES
-# ------------------------------------------------------------------------------
+deepsurv_model <- build_deepsurv_lstm(n_features)
 
-copula_simulated_features <-
-  rCopula(
-    nrow(macro_data),
-    best_fitted_copula@copula
-  )
-
-colnames(
-  copula_simulated_features
-) <-
-  paste0(
-    "Copula_",
-    economic_features
-  )
-
-combined_features <-
-  cbind(
-    feature_matrix,
-    copula_simulated_features,
-    Monetary_Tightening =
-      macro_data$Monetary_Tightening
-  )
-
-scaled_features <-
-  scale(
-    combined_features
-  )
-
-X_dl_input <-
-  array(
-    scaled_features,
-    dim = c(
-      nrow(macro_data),
-      1,
-      ncol(scaled_features)
-    )
-  )
-
-Y_duration <-
-  matrix(
-    macro_data$observed_months,
-    ncol = 1
-  )
-
-W_weights <-
-  as.numeric(
-    macro_data$iptw_weight
-  )
-
-# ------------------------------------------------------------------------------
-# 16. COPULA-ENHANCED LSTM
-# ------------------------------------------------------------------------------
-
-k_model <-
-  keras_model_sequential() %>%
-
-  layer_lstm(
-    units = 64,
-    return_sequences = TRUE,
-    input_shape =
-      c(
-        1,
-        ncol(scaled_features)
-      )
-  ) %>%
-
-  layer_dropout(
-    rate = 0.20
-  ) %>%
-
-  layer_lstm(
-    units = 32,
-    return_sequences = FALSE
-  ) %>%
-
-  layer_dense(
-    units = 16,
-    activation = "relu"
-  ) %>%
-
-  layer_dense(
-    units = 1,
-    activation = "linear"
-  )
-
-k_model %>%
-
-  compile(
-    optimizer =
-      optimizer_adam(
-        learning_rate = 0.005
-      ),
-
-    loss =
-      loss_mean_squared_error(),
-
-    metrics = c("mae")
-  )
-
-cat(
-  "\nFitting copula-enhanced LSTM...\n"
+cat("Training DeepSurv LSTM model on full sample...\n")
+deepsurv_model %>% fit(
+  x = X_dl_input,
+  y = Y_survival,
+  sample_weight = as.numeric(macro_data$iptw_weight),
+  epochs = 30,
+  batch_size = 32,
+  verbose = 0
 )
 
-history <-
-  k_model %>%
+# Predict log risk scores
+macro_data$predicted_risk_score <- as.numeric(predict(deepsurv_model, X_dl_input))
+# Scale relative risk to predicted expected survival time in months
+macro_data$predicted_survival_months <- exp(-macro_data$predicted_risk_score) * mean(macro_data$observed_months)
 
-  fit(
-    x = X_dl_input,
-    y = Y_duration,
-    sample_weight = W_weights,
-    epochs = 25,
+# ------------------------------------------------------------------------------
+# 17. TIME-SERIES ROLLING OUT-OF-SAMPLE BACKTESTING
+# ------------------------------------------------------------------------------
+
+cat("\n--- Running Time-Series Rolling Out-of-Sample Backtest ---\n")
+
+start_year <- 2010
+sample_years <- as.numeric(format(macro_data$Month, "%Y"))
+split_indices <- which(sample_years >= start_year)
+
+oos_predictions <- numeric(length(split_indices))
+actual_months   <- macro_data$observed_months[split_indices]
+actual_censored <- macro_data$censored[split_indices]
+
+# Expanding window iteration
+for (i in seq_along(split_indices)) {
+  idx <- split_indices[i]
+  
+  # Train strictly on historical past [1 : idx-1]
+  train_X <- X_dl_input[1:(idx - 1), , , drop = FALSE]
+  train_Y <- Y_survival[1:(idx - 1), ]
+  train_W <- macro_data$iptw_weight[1:(idx - 1)]
+  
+  test_X  <- X_dl_input[idx, , , drop = FALSE]
+  
+  temp_model <- build_deepsurv_lstm(n_features)
+  temp_model %>% fit(
+    x = train_X,
+    y = train_Y,
+    sample_weight = as.numeric(train_W),
+    epochs = 15,
     batch_size = 32,
     verbose = 0
   )
+  
+  oos_predictions[i] <- as.numeric(predict(temp_model, test_X))
+}
 
-# ------------------------------------------------------------------------------
-# 17. PREDICTED TIME TO RECESSION
-# ------------------------------------------------------------------------------
+# Out-of-Sample Concordance Index
+oos_cindex <- concordance(
+  Surv(actual_months, actual_censored) ~ oos_predictions
+)$concordance
 
-macro_data$predicted_survival_months <-
-  as.numeric(
-    k_model(
-      X_dl_input,
-      training = FALSE
-    )
-  )
-
-macro_data$predicted_survival_months <-
-  pmax(
-    macro_data$predicted_survival_months,
-    0
-  )
+cat(sprintf("Out-of-Sample Rolling C-Index (2010-2026): %6.4f\n", oos_cindex))
 
 # ------------------------------------------------------------------------------
 # 18. COMPETING-RISK MODEL
 # ------------------------------------------------------------------------------
 
-competing_risk_model <-
+competing_risk_model <- multinom(
+  economic_event ~
+    IP_Growth +
+    CPI_Inflation +
+    UNRATE +
+    FedFunds_Change +
+    Term_Spread +
+    VIXCLS +
+    Credit_Spread +
+    predicted_survival_months,
+  data = macro_data,
+  weights = iptw_weight,
+  trace = FALSE
+)
 
-  multinom(
+event_predictions <- predict(competing_risk_model, type = "probs")
 
-    economic_event ~
-
-      IP_Growth +
-      CPI_Inflation +
-      UNRATE +
-      FedFunds_Change +
-      Term_Spread +
-      VIXCLS +
-      Credit_Spread +
-      predicted_survival_months,
-
-    data = macro_data,
-
-    weights =
-      iptw_weight,
-
-    trace = FALSE
-  )
-
-event_predictions <-
-  predict(
-    competing_risk_model,
-    type = "probs"
-  )
-
-if (
-  is.vector(event_predictions)
-) {
-
-  event_predictions <-
-    matrix(
-      event_predictions,
-      ncol = 1
-    )
+if (is.vector(event_predictions)) {
+  event_predictions <- matrix(event_predictions, ncol = 1)
 }
 
-colnames(event_predictions) <-
-  paste0(
-    "P_",
-    colnames(event_predictions)
-  )
-
-economic_results <-
-  cbind(
-
-    macro_data[
-      ,
-      c(
-        "Month",
-        "Monetary_Tightening",
-        "USREC",
-        "economic_event",
-        "observed_months"
-      )
-    ],
-
-    Predicted_Months =
-      round(
-        macro_data$predicted_survival_months,
-        2
-      ),
-
-    round(
-      event_predictions,
-      4
-    )
-  )
+colnames(event_predictions) <- paste0("P_", colnames(event_predictions))
 
 # ------------------------------------------------------------------------------
-# 19. PREDICTIVE PERFORMANCE
+# 19. CAUSAL COUNTERFACTUAL POLICY SIMULATION (ATE / ATT)
 # ------------------------------------------------------------------------------
 
-mse_val <-
-  mean(
-    (
-      macro_data$observed_months -
-      macro_data$predicted_survival_months
-    )^2,
-    na.rm = TRUE
-  )
+cat("\n--- Simulating Counterfactual Policy Regimes ---\n")
 
-mae_val <-
-  mean(
-    abs(
-      macro_data$observed_months -
-      macro_data$predicted_survival_months
-    ),
-    na.rm = TRUE
-  )
+features_treated <- scaled_features
+features_control <- scaled_features
 
-cor_val <-
-  cor(
-    macro_data$observed_months,
-    macro_data$predicted_survival_months,
-    use = "complete.obs"
-  )
+tightening_col_idx <- which(colnames(combined_features) == "Monetary_Tightening")
 
-cindex_val <-
-  concordance(
-    Surv(
-      observed_months,
-      censored
-    ) ~
-      predicted_survival_months,
-    data = macro_data
-  )$concordance
+# Synthetic Regime 1: Forced Tightening (Treatment = 1)
+features_treated[, tightening_col_idx] <- (1 - mean(combined_features[, "Monetary_Tightening"])) / sd(combined_features[, "Monetary_Tightening"])
 
-performance_metrics <-
-  data.frame(
+# Synthetic Regime 0: Forced Neutral Stance (Treatment = 0)
+features_control[, tightening_col_idx] <- (0 - mean(combined_features[, "Monetary_Tightening"])) / sd(combined_features[, "Monetary_Tightening"])
 
-    Metric = c(
-      "MSE",
-      "MAE",
-      "Pearson Correlation",
-      "C-index"
-    ),
+X_treated <- array(features_treated, dim = c(nrow(macro_data), 1, n_features))
+X_control <- array(features_control, dim = c(nrow(macro_data), 1, n_features))
 
-    Value = round(
-      c(
-        mse_val,
-        mae_val,
-        cor_val,
-        cindex_val
-      ),
-      4
-    )
-  )
+risk_treated <- as.numeric(predict(deepsurv_model, X_treated))
+risk_control <- as.numeric(predict(deepsurv_model, X_control))
+
+months_treated <- exp(-risk_treated) * mean(macro_data$observed_months)
+months_control <- exp(-risk_control) * mean(macro_data$observed_months)
+
+individual_te <- months_treated - months_control
+ATE <- mean(individual_te)
+ATT <- mean(individual_te[macro_data$Monetary_Tightening == 1])
 
 # ------------------------------------------------------------------------------
-# 20. SUMMARY BY MONETARY-POLICY REGIME
+# 20. PERFORMANCE METRICS & SUMMARY
 # ------------------------------------------------------------------------------
 
-policy_summary <-
+mse_val <- mean((macro_data$observed_months - macro_data$predicted_survival_months)^2, na.rm = TRUE)
+mae_val <- mean(abs(macro_data$observed_months - macro_data$predicted_survival_months), na.rm = TRUE)
+cor_val <- cor(macro_data$observed_months, macro_data$predicted_survival_months, use = "complete.obs")
 
-  macro_data %>%
+in_sample_cindex <- concordance(
+  Surv(observed_months, censored) ~ predicted_survival_months,
+  data = macro_data
+)$concordance
 
-  group_by(
-    Monetary_Tightening
-  ) %>%
+performance_metrics <- data.frame(
+  Metric = c("MSE", "MAE", "Pearson Correlation", "In-Sample C-index", "Rolling OOS C-index"),
+  Value  = round(c(mse_val, mae_val, cor_val, in_sample_cindex, oos_cindex), 4)
+)
 
+policy_summary <- macro_data %>%
+  group_by(Monetary_Tightening) %>%
   summarise(
-
-    N =
-      n(),
-
-    Mean_IP_Growth =
-      mean(
-        IP_Growth,
-        na.rm = TRUE
-      ),
-
-    Mean_Inflation =
-      mean(
-        CPI_Inflation,
-        na.rm = TRUE
-      ),
-
-    Mean_Unemployment =
-      mean(
-        UNRATE,
-        na.rm = TRUE
-      ),
-
-    Mean_Term_Spread =
-      mean(
-        Term_Spread,
-        na.rm = TRUE
-      ),
-
-    Mean_VIX =
-      mean(
-        VIXCLS,
-        na.rm = TRUE
-      ),
-
-    Mean_Predicted_Months =
-      mean(
-        predicted_survival_months,
-        na.rm = TRUE
-      ),
-
-    .groups = "drop"
+    N                     = n(),
+    Mean_IP_Growth        = mean(IP_Growth, na.rm = TRUE),
+    Mean_Inflation        = mean(CPI_Inflation, na.rm = TRUE),
+    Mean_Unemployment     = mean(UNRATE, na.rm = TRUE),
+    Mean_Term_Spread      = mean(Term_Spread, na.rm = TRUE),
+    Mean_VIX              = mean(VIXCLS, na.rm = TRUE),
+    Mean_Predicted_Months = mean(predicted_survival_months, na.rm = TRUE),
+    .groups               = "drop"
   )
 
 # ------------------------------------------------------------------------------
 # 21. OUTPUT
 # ------------------------------------------------------------------------------
 
-cat(
-  "\n============================================================\n"
-)
+cat("\n============================================================\n")
+cat("ACTUAL U.S. MACROECONOMIC DATA ANALYSIS (RESULTS)\n")
+cat("============================================================\n")
 
-cat(
-  "ACTUAL U.S. MACROECONOMIC DATA ANALYSIS\n"
-)
+cat("\nObservations:", nrow(macro_data), "\n")
+cat("Copula Selected: High-Dimensional R-Vine Copula (rvinecopulib)\n")
 
-cat(
-  "============================================================\n"
-)
+cat("\nPredictive Performance\n")
+print(kable(performance_metrics, caption = "DeepSurv LSTM Performance Metrics"))
 
-cat(
-  "\nObservations:",
-  nrow(macro_data),
-  "\n"
-)
+cat("\nMonetary Policy Regime Summary\n")
+print(kable(policy_summary, digits = 4, caption = "Macroeconomic Characteristics by Monetary Tightening Regime"))
 
-cat(
-  "Selected Copula:",
-  best_copula_name,
-  "\n"
-)
-
-cat(
-  "\nPredictive Performance\n"
-)
-
-print(
-  kable(
-    performance_metrics,
-    caption =
-      "Copula-Enhanced LSTM Performance"
-  )
-)
-
-cat(
-  "\nMonetary Policy Regime Summary\n"
-)
-
-print(
-  kable(
-    policy_summary,
-    digits = 4,
-    caption =
-      "Macroeconomic Characteristics by Monetary Tightening Regime"
-  )
-)
+cat("\n============================================================\n")
+cat("CAUSAL POLICY COUNTERFACTUAL RESULTS\n")
+cat("============================================================\n")
+cat(sprintf("Average Treatment Effect (ATE): %6.2f Months to Recession\n", ATE))
+cat(sprintf("Average Treatment Effect on Treated (ATT): %6.2f Months to Recession\n", ATT))
 
 # ------------------------------------------------------------------------------
-# 22. FIGURE 1: MACROECONOMIC VARIABLES
+# 22. FIGURES
 # ------------------------------------------------------------------------------
 
-fig_macro <-
-
-  ggplot(
-    macro_data,
-    aes(
-      x = Month,
-      y = CPI_Inflation
-    )
-  ) +
-
-  geom_line(
-    linewidth = 0.8
-  ) +
-
-  geom_hline(
-    yintercept = 2,
-    linetype = "dashed"
-  ) +
-
-  theme_minimal(
-    base_size = 12
-  ) +
-
-  labs(
-    title =
-      "U.S. CPI Inflation",
-    x = "Date",
-    y = "12-Month CPI Inflation (%)"
-  )
+fig_macro <- ggplot(macro_data, aes(x = Month, y = CPI_Inflation)) +
+  geom_line(linewidth = 0.8) +
+  geom_hline(yintercept = 2, linetype = "dashed") +
+  theme_minimal(base_size = 12) +
+  labs(title = "U.S. CPI Inflation", x = "Date", y = "12-Month CPI Inflation (%)")
 
 print(fig_macro)
+ggsave("Figure_1_US_CPI_Inflation.png", fig_macro, width = 7, height = 5, dpi = 300)
 
-ggsave(
-  "Figure_1_US_CPI_Inflation.png",
-  fig_macro,
-  width = 7,
-  height = 5,
-  dpi = 300
-)
-
-# ------------------------------------------------------------------------------
-# 23. FIGURE 2: YIELD CURVE
-# ------------------------------------------------------------------------------
-
-fig_spread <-
-
-  ggplot(
-    macro_data,
-    aes(
-      x = Month,
-      y = Term_Spread
-    )
-  ) +
-
-  geom_line(
-    linewidth = 0.8
-  ) +
-
-  geom_hline(
-    yintercept = 0,
-    linetype = "dashed"
-  ) +
-
-  theme_minimal(
-    base_size = 12
-  ) +
-
-  labs(
-    title =
-      "U.S. Treasury Term Spread",
-    x = "Date",
-    y = "10-Year Treasury − 2-Year Treasury (%)"
-  )
+fig_spread <- ggplot(macro_data, aes(x = Month, y = Term_Spread)) +
+  geom_line(linewidth = 0.8) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  theme_minimal(base_size = 12) +
+  labs(title = "U.S. Treasury Term Spread", x = "Date", y = "10-Year Treasury − 2-Year Treasury (%)")
 
 print(fig_spread)
+ggsave("Figure_2_US_Term_Spread.png", fig_spread, width = 7, height = 5, dpi = 300)
 
-ggsave(
-  "Figure_2_US_Term_Spread.png",
-  fig_spread,
-  width = 7,
-  height = 5,
-  dpi = 300
-)
-
-# ------------------------------------------------------------------------------
-# 24. FIGURE 3: OBSERVED VS PREDICTED TIME TO RECESSION
-# ------------------------------------------------------------------------------
-
-fig_prediction <-
-
-  ggplot(
-    macro_data,
-    aes(
-      x = observed_months,
-      y = predicted_survival_months
-    )
-  ) +
-
-  geom_point(
-    alpha = 0.6,
-    size = 2
-  ) +
-
-  geom_abline(
-    intercept = 0,
-    slope = 1,
-    linetype = "dashed"
-  ) +
-
-  theme_minimal(
-    base_size = 12
-  ) +
-
-  labs(
-    title =
-      "Observed versus Predicted Time to Recession",
-    x =
-      "Observed Months",
-    y =
-      "Predicted Months"
-  )
+fig_prediction <- ggplot(macro_data, aes(x = observed_months, y = predicted_survival_months)) +
+  geom_point(alpha = 0.6, size = 2) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed") +
+  theme_minimal(base_size = 12) +
+  labs(title = "Observed versus DeepSurv Predicted Time to Recession", x = "Observed Months", y = "Predicted Months")
 
 print(fig_prediction)
+ggsave("Figure_3_Observed_vs_Predicted_Recession_Time.png", fig_prediction, width = 7, height = 5, dpi = 300)
 
-ggsave(
-  "Figure_3_Observed_vs_Predicted_Recession_Time.png",
-  fig_prediction,
-  width = 7,
-  height = 5,
-  dpi = 300
-)
-
-# ------------------------------------------------------------------------------
-# 25. FIGURE 4: PROPENSITY-SCORE OVERLAP
-# ------------------------------------------------------------------------------
-
-fig_propensity <-
-
-  ggplot(
-    macro_data,
-    aes(
-      x = propensity_score,
-      fill =
-        factor(
-          Monetary_Tightening
-        )
-    )
-  ) +
-
-  geom_density(
-    alpha = 0.5
-  ) +
-
-  theme_minimal(
-    base_size = 12
-  ) +
-
+fig_counterfactual <- ggplot(data.frame(
+  Month = macro_data$Month,
+  Neutral = months_control,
+  Tightening = months_treated
+), aes(x = Month)) +
+  geom_line(aes(y = Neutral, color = "Neutral Stance (Treatment=0)"), linewidth = 0.9, linetype = "dashed") +
+  geom_line(aes(y = Tightening, color = "Monetary Tightening (Treatment=1)"), linewidth = 0.9) +
+  scale_color_manual(values = c("Neutral Stance (Treatment=0)" = "blue", "Monetary Tightening (Treatment=1)" = "red")) +
+  theme_minimal(base_size = 12) +
   labs(
-    title =
-      "Propensity-Score Overlap",
-    x =
-      "Estimated Probability of Monetary Tightening",
-    y =
-      "Density",
-    fill =
-      "Tightening"
+    title = "Causal Counterfactual Analysis: Expected Months to Recession",
+    subtitle = "DeepSurv Predictions under Synthetic Policy Regimes",
+    x = "Date",
+    y = "Expected Months to Recession",
+    color = "Policy Regime"
   ) +
+  theme(legend.position = "bottom")
 
-  theme(
-    legend.position = "bottom"
+print(fig_counterfactual)
+ggsave("Figure_4_Counterfactual_Policy_Simulations.png", fig_counterfactual, width = 8, height = 5, dpi = 300)
+
+cat("\nPipeline completed successfully.\n")
+
+# ==============================================================================
+# 23. EXPORT ALL OUTPUT TABLES TO CSV FILES
+# ==============================================================================
+
+cat("\n--- Exporting Analysis Results to CSV Files ---\n")
+
+# ------------------------------------------------------------------------------
+# CSV 1: MODEL PERFORMANCE METRICS
+# ------------------------------------------------------------------------------
+write.csv(
+  performance_metrics,
+  file = "Table_1_Performance_Metrics.csv",
+  row.names = FALSE
+)
+cat("Saved: Table_1_Performance_Metrics.csv\n")
+
+# ------------------------------------------------------------------------------
+# CSV 2: POLICY REGIME MACROECONOMIC SUMMARY
+# ------------------------------------------------------------------------------
+csv_policy_summary <- policy_summary %>%
+  mutate(
+    Monetary_Tightening = ifelse(
+      Monetary_Tightening == 1,
+      "Monetary Tightening",
+      "Neutral / Easing"
+    )
   )
 
-print(fig_propensity)
+write.csv(
+  csv_policy_summary,
+  file = "Table_2_Policy_Regime_Summary.csv",
+  row.names = FALSE
+)
+cat("Saved: Table_2_Policy_Regime_Summary.csv\n")
 
-ggsave(
-  "Figure_4_Propensity_Score_Overlap.png",
-  fig_propensity,
-  width = 7,
-  height = 5,
-  dpi = 300
+# ------------------------------------------------------------------------------
+# CSV 3: CAUSAL POLICY SIMULATION RESULTS (ATE / ATT)
+# ------------------------------------------------------------------------------
+causal_effects_df <- data.frame(
+  Estimand = c(
+    "Average Treatment Effect (ATE)",
+    "Average Treatment Effect on Treated (ATT)"
+  ),
+  Interpretation = c(
+    "Expected shift in recession timing across all economic states under tightening vs neutral stance",
+    "Expected shift in recession timing specifically during periods when tightening was historically enacted"
+  ),
+  Effect_Months = c(ATE, ATT)
 )
 
+write.csv(
+  causal_effects_df,
+  file = "Table_3_Causal_Counterfactual_Estimates.csv",
+  row.names = FALSE
+)
+cat("Saved: Table_3_Causal_Counterfactual_Estimates.csv\n")
+
 # ------------------------------------------------------------------------------
-# 26. FIGURE 5: EVENT DISTRIBUTION
+# CSV 4: FULL DATASET WITH PREDICTIONS & COUNTERFACTUALS
 # ------------------------------------------------------------------------------
-
-fig_events <-
-
-  ggplot(
-    macro_data,
-    aes(
-      x = economic_event
-    )
-  ) +
-
-  geom_bar() +
-
-  theme_minimal(
-    base_size = 12
-  ) +
-
-  labs(
-    title =
-      "Economic Event Distribution",
-    x =
-      "Economic Event",
-    y =
-      "Number of Monthly Observations"
+macro_predictions_export <- macro_data %>%
+  dplyr::select(
+    Month,
+    USREC,
+    Monetary_Tightening,
+    IP_Growth,
+    CPI_Inflation,
+    UNRATE,
+    Term_Spread,
+    VIXCLS,
+    Credit_Spread,
+    propensity_score,
+    iptw_weight,
+    observed_months,
+    predicted_risk_score,
+    predicted_survival_months
+  ) %>%
+  mutate(
+    counterfactual_neutral_months = months_control,
+    counterfactual_tightening_months = months_treated,
+    individual_treatment_effect = individual_te
   )
 
-print(fig_events)
-
-ggsave(
-  "Figure_5_Economic_Event_Distribution.png",
-  fig_events,
-  width = 7,
-  height = 5,
-  dpi = 300
+write.csv(
+  macro_predictions_export,
+  file = "Table_4_Macro_Data_Predictions_Counterfactuals.csv",
+  row.names = FALSE
 )
+cat("Saved: Table_4_Macro_Data_Predictions_Counterfactuals.csv\n")
 
-cat(
-  "\nPipeline completed successfully.\n"
-)
+cat("\nAll 4 CSV files successfully exported to active working directory.\n")

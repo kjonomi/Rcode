@@ -532,3 +532,99 @@ cat("\nIndividual PDF figures exported: 'figure1_cindex_boxplot.pdf' and 'figure
 # Display in active session
 gridExtra::grid.arrange(p1, p2, ncol = 1)
 
+# ------------------------------------------------------------------------------
+# ECONOMIC EVENT DISTRIBUTION & TIMELINE
+# ------------------------------------------------------------------------------
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+
+# 1. Summary Table of Economic Events
+event_summary <- macro_data %>%
+  summarise(
+    Total_Months           = n(),
+    NBER_Recession_Months  = sum(USREC == 1, na.rm = TRUE),
+    Recession_Pct          = mean(USREC == 1, na.rm = TRUE) * 100,
+    Monetary_Tightening    = sum(Monetary_Tightening == 1, na.rm = TRUE),
+    Monetary_Tighten_Pct   = mean(Monetary_Tightening == 1, na.rm = TRUE) * 100,
+    Inflation_Shock        = sum(Inflation_Shock == 1, na.rm = TRUE),
+    Inflation_Shock_Pct    = mean(Inflation_Shock == 1, na.rm = TRUE) * 100,
+    Financial_Stress       = sum(Financial_Stress == 1, na.rm = TRUE),
+    Financial_Stress_Pct   = mean(Financial_Stress == 1, na.rm = TRUE) * 100
+  )
+
+# Reshape into a structured table
+event_table <- data.frame(
+  Economic_Event = c(
+    "NBER Recession (USREC = 1)",
+    "Monetary Tightening (Fed Funds +50bps/3M)",
+    "Inflation Shock (+2% over 36M median)",
+    "Financial Stress (Credit Spread / VIX >= 75th Pct)"
+  ),
+  Active_Months = c(
+    event_summary$NBER_Recession_Months,
+    event_summary$Monetary_Tightening,
+    event_summary$Inflation_Shock,
+    event_summary$Financial_Stress
+  ),
+  Total_Sample_Months = rep(event_summary$Total_Months, 4),
+  Percentage = c(
+    event_summary$Recession_Pct,
+    event_summary$Monetary_Tighten_Pct,
+    event_summary$Inflation_Shock_Pct,
+    event_summary$Financial_Stress_Pct
+  )
+)
+
+write.csv(event_table, "economic_event_distribution.csv", row.names = FALSE)
+cat("\nEconomic event distribution table saved to 'economic_event_distribution.csv'\n")
+
+# 2. Timeline Visualization
+macro_long <- macro_data %>%
+  select(Month, USREC, Monetary_Tightening, Inflation_Shock, Financial_Stress) %>%
+  pivot_longer(
+    cols = c(USREC, Monetary_Tightening, Inflation_Shock, Financial_Stress),
+    names_to = "Event_Type",
+    values_to = "Status"
+  ) %>%
+  mutate(
+    Event_Type = case_when(
+      Event_Type == "USREC" ~ "NBER Recession",
+      Event_Type == "Monetary_Tightening" ~ "Monetary Tightening",
+      Event_Type == "Inflation_Shock" ~ "Inflation Shock",
+      Event_Type == "Financial_Stress" ~ "Financial Stress"
+    ),
+    Event_Type = factor(
+      Event_Type,
+      levels = c(
+        "NBER Recession",
+        "Monetary Tightening",
+        "Inflation Shock",
+        "Financial Stress"
+      )
+    )
+  )
+
+p_events <- ggplot(macro_long, aes(x = Month, y = Event_Type, fill = factor(Status))) +
+  geom_tile(height = 0.7) +
+  scale_fill_manual(
+    values = c("0" = "#E0E0E0", "1" = "#B00020"),
+    labels = c("Inactive (0)", "Active (1)"),
+    name = "Event Status"
+  ) +
+  scale_x_date(date_breaks = "5 years", date_labels = "%Y") +
+  theme_minimal() +
+  labs(
+    title = "Historical Distribution of U.S. Macroeconomic Events & Regimes",
+    subtitle = "Monthly timeline of recessions, monetary shocks, inflation spikes, and financial stress",
+    x = "Year",
+    y = ""
+  ) +
+  theme(
+    legend.position = "bottom",
+    panel.grid.major.y = element_blank(),
+    axis.text.y = element_text(face = "bold", size = 10)
+  )
+
+ggsave("figure3_economic_event_distribution.pdf", plot = p_events, width = 10, height = 4.5, device = "pdf")
+cat("\nFigure saved to 'figure3_economic_event_distribution.pdf'\n")

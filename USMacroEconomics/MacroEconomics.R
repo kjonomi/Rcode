@@ -2,8 +2,8 @@
 # FOUR-WAY MODEL COMPARISON: 
 # 1. Standard Cox Proportional Hazards Model
 # 2. Random Survival Forests (RSF)
-# 3. Proposed Model (IPTW Causal Weighting + Vine Copula Cox)
-# 4. Proposed Model + RSF (IPTW Causal Weighting + Vine Copula + RSF)
+# 3. Proposed Model (Vine Copula Cox)
+# 4. Proposed Model + RSF (Vine Copula + RSF)
 # ACTUAL U.S. MACROECONOMIC DATA (FRED)
 # ==============================================================================
 
@@ -290,8 +290,6 @@ macro_data$recession_status  <- recession_status
 # ------------------------------------------------------------------------------
 # 11. FORMULA DEFINITIONS
 # ------------------------------------------------------------------------------
-ps_formula_stable <- Monetary_Tightening ~ CPI_Inflation + UNRATE + Term_Spread + FedFunds_Change
-
 surv_obj <- "Surv(time_to_recession, recession_status)"
 
 # 1. Standard Cox Formula
@@ -364,19 +362,7 @@ for (i in 1:n_rolls) {
     test_df  <- cbind(test_df,  vine_sim_test)
     
     # --------------------------------------------------------------------------
-    # B. Propensity Score & IPTW Weights Generation
-    # --------------------------------------------------------------------------
-    ps_roll <- glm(ps_formula_stable, data = train_df, family = binomial(link = "logit"))
-    
-    ps_pred <- predict(ps_roll, newdata = train_df, type = "response")
-    train_df$ps <- pmin(pmax(ps_pred, 0.02), 0.98)
-    
-    train_df$iptw <- ifelse(train_df$Monetary_Tightening == 1, 1 / train_df$ps, 1 / (1 - train_df$ps))
-    w_bnd         <- quantile(train_df$iptw, probs = c(0.01, 0.99), na.rm = TRUE)
-    train_df$iptw <- pmin(pmax(train_df$iptw, w_bnd[1]), w_bnd[2])
-    
-    # --------------------------------------------------------------------------
-    # C. Model Refitting
+    # B. Model Refitting
     # --------------------------------------------------------------------------
     # 1. Standard Cox PH
     m_std_cox <- coxph(standard_cox_formula, data = train_df)
@@ -384,22 +370,21 @@ for (i in 1:n_rolls) {
     # 2. Standard RSF
     m_rsf <- rfsrc(rsf_formula, data = train_df, ntree = 300, splitrule = "logrank")
     
-    # 3. Proposed Model (IPTW Weighted Cox PH + Vine Copula Features)
-    m_prop <- coxph(proposed_formula, data = train_df, weights = train_df$iptw, robust = TRUE)
+    # 3. Proposed Model (Unweighted Cox PH + Vine Copula Features)
+    m_prop <- coxph(proposed_formula, data = train_df)
     
-    # 4. Proposed Model + RSF (IPTW Weighted RSF + Vine Copula Features)
+    # 4. Proposed Model + RSF (Unweighted RSF + Vine Copula Features)
     m_prop_rsf <- rfsrc(
       proposed_formula, 
       data      = train_df, 
-      case.wt   = train_df$iptw, 
       ntree     = 300, 
       splitrule = "logrank"
     )
     
     # --------------------------------------------------------------------------
-    # D. Out-of-Sample Predictions & Harrell's C-Index
+    # C. Out-of-Sample Predictions & Harrell's C-Index
     # --------------------------------------------------------------------------
-    pred_std_risk  <- predict(m_std_cox, newdata = test_df, type = "risk")
+    pred_std_risk   <- predict(m_std_cox, newdata = test_df, type = "risk")
     pred_rsf_risk   <- predict(m_rsf, newdata = test_df)$predicted
     pred_prop_risk  <- predict(m_prop, newdata = test_df, type = "risk")
     pred_p_rsf_risk <- predict(m_prop_rsf, newdata = test_df)$predicted
@@ -433,8 +418,8 @@ summary_table <- data.frame(
   Model = c(
     "Standard Cox PH", 
     "Random Survival Forest (RSF)", 
-    "Proposed Model (IPTW + Vine Copula Cox)",
-    "Proposed Model + RSF (IPTW + Vine Copula RSF)"
+    "Proposed Model (Vine Copula Cox)",
+    "Proposed Model + RSF (Vine Copula RSF)"
   ),
   Mean_C_Index = c(
     mean(c_index_standard_cox, na.rm = TRUE),
@@ -476,16 +461,16 @@ results_long <- results_df %>%
     Model = case_when(
       Model == "Standard_Cox" ~ "Standard Cox PH",
       Model == "Random_Survival_Forest" ~ "Standard RSF",
-      Model == "Proposed_Model_Cox" ~ "Proposed (IPTW + Vine Cox)",
-      Model == "Proposed_Model_RSF" ~ "Proposed + RSF (IPTW + Vine RSF)"
+      Model == "Proposed_Model_Cox" ~ "Proposed (Vine Cox)",
+      Model == "Proposed_Model_RSF" ~ "Proposed + RSF (Vine RSF)"
     ),
     Model = factor(
       Model, 
       levels = c(
         "Standard Cox PH", 
         "Standard RSF", 
-        "Proposed (IPTW + Vine Cox)", 
-        "Proposed + RSF (IPTW + Vine RSF)"
+        "Proposed (Vine Cox)", 
+        "Proposed + RSF (Vine RSF)"
       )
     )
   )

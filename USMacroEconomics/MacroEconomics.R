@@ -402,9 +402,8 @@ for (i in 1:n_rolls) {
     c_index_proposed[i]     <- calc_cindex(Surv(time_to_recession, recession_status) ~ pred_prop_risk, test_df)
     c_index_proposed_rsf[i] <- calc_cindex(Surv(time_to_recession, recession_status) ~ pred_p_rsf_risk, test_df)
 }
-
 # ------------------------------------------------------------------------------
-# 13. RESULTS SUMMARY
+# 13. RESULTS SUMMARY & CSV EXPORTS
 # ------------------------------------------------------------------------------
 results_df <- data.frame(
   Fold = 1:n_rolls,
@@ -414,41 +413,62 @@ results_df <- data.frame(
   Proposed_Model_RSF = c_index_proposed_rsf
 )
 
-summary_table <- data.frame(
-  Model = c(
-    "Standard Cox PH", 
-    "Random Survival Forest (RSF)", 
-    "Proposed Model (Vine Copula Cox)",
-    "Proposed Model + RSF (Vine Copula RSF)"
-  ),
-  Mean_C_Index = c(
-    mean(c_index_standard_cox, na.rm = TRUE),
-    mean(c_index_rsf, na.rm = TRUE),
-    mean(c_index_proposed, na.rm = TRUE),
-    mean(c_index_proposed_rsf, na.rm = TRUE)
-  ),
-  Std_Dev = c(
-    sd(c_index_standard_cox, na.rm = TRUE),
-    sd(c_index_rsf, na.rm = TRUE),
-    sd(c_index_proposed, na.rm = TRUE),
-    sd(c_index_proposed_rsf, na.rm = TRUE)
-  ),
-  Median_C_Index = c(
-    median(c_index_standard_cox, na.rm = TRUE),
-    median(c_index_rsf, na.rm = TRUE),
-    median(c_index_proposed, na.rm = TRUE),
-    median(c_index_proposed_rsf, na.rm = TRUE)
+# Helper function to extract summary metrics per model vector
+calc_metrics <- function(x) {
+  x_clean <- na.omit(x)
+  q <- quantile(x_clean, probs = c(0, 0.25, 0.50, 0.75, 1.00))
+  
+  data.frame(
+    Mean_C_Index   = mean(x_clean),
+    Std_Dev        = sd(x_clean),
+    Min            = q[1],
+    Q1             = q[2],
+    Median_C_Index = q[3],
+    Q3             = q[4],
+    Max            = q[5],
+    IQR            = IQR(x_clean)
   )
+}
+
+# Construct summary table across all 4 models
+models_list <- list(
+  "Standard Cox PH"                        = c_index_standard_cox,
+  "Random Survival Forest (RSF)"           = c_index_rsf,
+  "Proposed Model (Vine Copula Cox)"       = c_index_proposed,
+  "Proposed Model + RSF (Vine Copula RSF)" = c_index_proposed_rsf
 )
 
+summary_table <- do.call(rbind, lapply(names(models_list), function(m_name) {
+  cbind(Model = m_name, calc_metrics(models_list[[m_name]]))
+}))
+
+# Print Summary Table to Console
+cat("\n========================================================================\n")
+cat("          OUT-OF-SAMPLE ROLLING BACKTEST RESULTS (HARRELL'S C-INDEX)    \n")
+cat("========================================================================\n")
+print(knitr::kable(summary_table, digits = 4, format = "simple", row.names = FALSE))
+cat("========================================================================\n")
+
+# Export CSV Tables
+write.csv(summary_table, file = "model_performance_summary.csv", row.names = FALSE)
+write.csv(results_df, file = "rolling_fold_cindex_results.csv", row.names = FALSE)
+cat("\nCSV tables exported: 'model_performance_summary.csv' and 'rolling_fold_cindex_results.csv'\n")
+
+
+# Print Summary Table to Console
 cat("\n========================================================================\n")
 cat("          OUT-OF-SAMPLE ROLLING BACKTEST RESULTS (HARRELL'S C-INDEX)    \n")
 cat("========================================================================\n")
 print(knitr::kable(summary_table, digits = 4, format = "simple"))
 cat("========================================================================\n")
 
+# Export CSV Tables
+write.csv(summary_table, file = "model_performance_summary.csv", row.names = FALSE)
+write.csv(results_df, file = "rolling_fold_cindex_results.csv", row.names = FALSE)
+cat("\nCSV tables exported: 'model_performance_summary.csv' and 'rolling_fold_cindex_results.csv'\n")
+
 # ------------------------------------------------------------------------------
-# 14. COMPARATIVE VISUALIZATION
+# 14. COMPARATIVE VISUALIZATION & PDF EXPORTS
 # ------------------------------------------------------------------------------
 results_long <- results_df %>%
   tidyr::pivot_longer(
@@ -461,20 +481,21 @@ results_long <- results_df %>%
     Model = case_when(
       Model == "Standard_Cox" ~ "Standard Cox PH",
       Model == "Random_Survival_Forest" ~ "Standard RSF",
-      Model == "Proposed_Model_Cox" ~ "Proposed (Vine Cox)",
-      Model == "Proposed_Model_RSF" ~ "Proposed + RSF (Vine RSF)"
+      Model == "Proposed_Model_Cox" ~ "Vine Cox",
+      Model == "Proposed_Model_RSF" ~ "Vine RSF"
     ),
     Model = factor(
       Model, 
       levels = c(
         "Standard Cox PH", 
         "Standard RSF", 
-        "Proposed (Vine Cox)", 
-        "Proposed + RSF (Vine RSF)"
+        "Vine Cox", 
+        "Vine RSF"
       )
     )
   )
 
+# Figure 1: Boxplot Comparison
 p1 <- ggplot(results_long, aes(x = Model, y = C_Index, fill = Model)) +
   geom_boxplot(alpha = 0.7, outlier.colour = "red") +
   stat_summary(fun = mean, geom = "point", shape = 18, size = 4, color = "black") +
@@ -490,6 +511,7 @@ p1 <- ggplot(results_long, aes(x = Model, y = C_Index, fill = Model)) +
     axis.text.x = element_text(angle = 15, hjust = 1)
   )
 
+# Figure 2: Stability Across Folds
 p2 <- ggplot(results_long, aes(x = Fold, y = C_Index, color = Model, group = Model)) +
   geom_line(linewidth = 1) +
   geom_point(size = 2) +
@@ -501,4 +523,12 @@ p2 <- ggplot(results_long, aes(x = Fold, y = C_Index, color = Model, group = Mod
   ) +
   theme(legend.position = "bottom")
 
+# Export Individual Plots as PDF
+ggsave(filename = "figure1_cindex_boxplot.pdf", plot = p1, width = 8, height = 6, device = "pdf")
+ggsave(filename = "figure2_performance_stability.pdf", plot = p2, width = 9, height = 6, device = "pdf")
+
+cat("\nIndividual PDF figures exported: 'figure1_cindex_boxplot.pdf' and 'figure2_performance_stability.pdf'\n")
+
+# Display in active session
 gridExtra::grid.arrange(p1, p2, ncol = 1)
+

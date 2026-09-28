@@ -6,34 +6,40 @@
 #
 # Purpose
 # -------
-# Build publication-ready numerical and LaTeX tables from the outputs of:
+# Build publication-ready numerical and LaTeX tables from:
 #
 #   09_simulation_normal.R
 #   10_simulation_non_normal.R
-#   11_simulation_summary.R
+#   11_phase1_estimation.R
 #   12_catboost_surrogate.R
 #   13_real_data.R
 #
-# The script is designed to work with the empirical-copula /
-# probability-scale SP-E-CUSUM implementation.
-#
 # Main outputs
 # ------------
-#   Table 1  : Simulation design
+#   Table 1  : Simulation / monitoring design
 #   Table 2  : ARL0 / ARL1 performance
 #   Table 3  : Detection performance
 #   Table 4  : Robustness / distribution comparison
-#   Table 5  : Optimization results
-#   Table 6  : Real-data threshold results
+#   Table 5  : CatBoost surrogate optimization history
+#   Table 6  : Real-data threshold calibration
 #   Table 7  : Real-data monitoring results
-#   Table 8  : CatBoost surrogate results
+#   Table 8  : Final CatBoost-selected design and validation
 #   Table 9  : Overall method comparison
 #
 # Supplementary outputs
 # ---------------------
-#   Supplementary parameter tables
-#   Supplementary calibration tables
-#   Supplementary robustness tables
+#   Supplementary parameter table
+#   Supplementary ARL0 table
+#   Supplementary recalibration table
+#
+# Canonical SP-E-CUSUM architecture
+# ----------------------------------
+#   transform_method = "mid"
+#   use_empirical_copula = TRUE
+#   fixed stationary Phase-I reference
+#   fixed empirical-copula reference
+#   upper-sided monitoring
+#   strict alarm rule: E_t > H
 #
 # =============================================================================
 
@@ -53,9 +59,11 @@ options(
 # -----------------------------------------------------------------------------
 
 `%||%` <- function(x, y) {
+
     if (is.null(x) || length(x) == 0L) {
         return(y)
     }
+
     x
 }
 
@@ -74,7 +82,55 @@ safe_numeric <- function(x) {
         x <- as.character(x)
     }
 
-    suppressWarnings(as.numeric(x))
+    suppressWarnings(
+        as.numeric(x)
+    )
+}
+
+
+# -----------------------------------------------------------------------------
+# Safe logical conversion
+# -----------------------------------------------------------------------------
+
+safe_logical <- function(
+    x,
+    default = NA
+) {
+
+    if (is.null(x) || length(x) == 0L) {
+        return(default)
+    }
+
+    if (is.logical(x)) {
+        return(x[1L])
+    }
+
+    if (is.character(x)) {
+
+        value <- tolower(
+            trimws(
+                x[1L]
+            )
+        )
+
+        if (value %in% c("true", "t", "yes", "y", "1")) {
+            return(TRUE)
+        }
+
+        if (value %in% c("false", "f", "no", "n", "0")) {
+            return(FALSE)
+        }
+    }
+
+    value <- suppressWarnings(
+        as.logical(x[1L])
+    )
+
+    if (is.na(value)) {
+        default
+    } else {
+        value
+    }
 }
 
 
@@ -93,16 +149,32 @@ safe_dataframe <- function(x) {
     }
 
     if (is.matrix(x)) {
-        return(as.data.frame(x))
+
+        return(
+            as.data.frame(
+                x,
+                stringsAsFactors = FALSE
+            )
+        )
     }
 
     if (is.atomic(x)) {
-        return(data.frame(value = x))
+
+        return(
+            data.frame(
+                value = x,
+                stringsAsFactors = FALSE
+            )
+        )
     }
 
     if (is.list(x)) {
+
         out <- tryCatch(
-            as.data.frame(x, stringsAsFactors = FALSE),
+            as.data.frame(
+                x,
+                stringsAsFactors = FALSE
+            ),
             error = function(e) NULL
         )
 
@@ -117,7 +189,10 @@ safe_dataframe <- function(x) {
 # Safe scalar extraction
 # -----------------------------------------------------------------------------
 
-safe_scalar <- function(x, default = NA_real_) {
+safe_scalar <- function(
+    x,
+    default = NA_real_
+) {
 
     if (is.null(x) || length(x) == 0L) {
         return(default)
@@ -145,7 +220,14 @@ safe_mean <- function(x) {
         return(NA_real_)
     }
 
-    mean(x, na.rm = TRUE)
+    if (all(is.na(x))) {
+        return(NA_real_)
+    }
+
+    mean(
+        x,
+        na.rm = TRUE
+    )
 }
 
 
@@ -161,7 +243,14 @@ safe_median <- function(x) {
         return(NA_real_)
     }
 
-    median(x, na.rm = TRUE)
+    if (all(is.na(x))) {
+        return(NA_real_)
+    }
+
+    median(
+        x,
+        na.rm = TRUE
+    )
 }
 
 
@@ -177,7 +266,59 @@ safe_sd <- function(x) {
         return(NA_real_)
     }
 
-    stats::sd(x, na.rm = TRUE)
+    if (all(is.na(x))) {
+        return(NA_real_)
+    }
+
+    stats::sd(
+        x,
+        na.rm = TRUE
+    )
+}
+
+
+# -----------------------------------------------------------------------------
+# Normalize transform-method labels
+# -----------------------------------------------------------------------------
+
+normalize_transform_method <- function(
+    x,
+    default = "mid"
+) {
+
+    if (is.null(x) || length(x) == 0L) {
+        return(default)
+    }
+
+    value <- tolower(
+        trimws(
+            as.character(x[[1L]])
+        )
+    )
+
+    value <- switch(
+        value,
+
+        "mid" = "mid",
+        "stationary_mid" = "mid",
+        "stationary-mid" = "mid",
+        "mid_rank" = "mid",
+        "mid-rank" = "mid",
+        "empirical" = "mid",
+        "empirical_cdf" = "mid",
+        "empirical-cdf" = "mid",
+
+        "empirical_copula" = "empirical_copula",
+        "empirical-copula" = "empirical_copula",
+        "ecdf_copula" = "empirical_copula",
+
+        "parametric" = "parametric",
+        "normal" = "parametric",
+
+        value
+    )
+
+    value
 }
 
 
@@ -211,7 +352,9 @@ RESULTS_TABLE_CONFIG <- list(
 )
 
 
-create_results_directories <- function(config = RESULTS_TABLE_CONFIG) {
+create_results_directories <- function(
+    config = RESULTS_TABLE_CONFIG
+) {
 
     dirs <- unique(
         c(
@@ -223,9 +366,15 @@ create_results_directories <- function(config = RESULTS_TABLE_CONFIG) {
         )
     )
 
+    dirs <- dirs[
+        !is.na(dirs) &
+            nzchar(dirs)
+    ]
+
     for (d in dirs) {
 
         if (!dir.exists(d)) {
+
             dir.create(
                 d,
                 recursive = TRUE,
@@ -249,7 +398,11 @@ method_labels <- c(
     sp_ecusum = "SP-E-CUSUM",
     single_cusum = "Single CUSUM",
     multi_cusum = "Multiple CUSUM",
-    shewhart = "Shewhart"
+    multiple_cusum = "Multiple CUSUM",
+    shewhart = "Shewhart",
+    ippo = "IPPO",
+    mappo = "MAPPO",
+    random = "Random"
 )
 
 
@@ -292,13 +445,18 @@ extract_result_component <- function(
     if (is.data.frame(results)) {
 
         if (component %in% names(results)) {
-            return(results[[component]])
+            return(
+                results[[component]]
+            )
         }
 
         for (nm in alternatives) {
 
             if (nm %in% names(results)) {
-                return(results[[nm]])
+
+                return(
+                    results[[nm]]
+                )
             }
         }
 
@@ -319,7 +477,10 @@ extract_result_component <- function(
     for (nm in candidates) {
 
         if (nm %in% names(results)) {
-            return(results[[nm]])
+
+            return(
+                results[[nm]]
+            )
         }
     }
 
@@ -338,7 +499,10 @@ standardize_method_table <- function(
 
     x <- safe_dataframe(x)
 
-    if (is.null(x) || nrow(x) == 0L) {
+    if (
+        is.null(x) ||
+        nrow(x) == 0L
+    ) {
         return(NULL)
     }
 
@@ -354,19 +518,29 @@ standardize_method_table <- function(
             "Model"
         )
 
-        method_column <- possible[
+        candidates <- possible[
             possible %in% names(x)
-        ][1L]
+        ]
+
+        if (length(candidates) > 0L) {
+
+            method_column <-
+                candidates[1L]
+        }
     }
 
-    if (!is.null(method_column) &&
-        method_column %in% names(x)) {
+    if (
+        !is.null(method_column) &&
+        method_column %in% names(x)
+    ) {
 
         x$Method <- get_method_label(
             x[[method_column]]
         )
 
-    } else if (!"Method" %in% names(x)) {
+    } else if (
+        !"Method" %in% names(x)
+    ) {
 
         x$Method <- "Unknown"
     }
@@ -400,7 +574,13 @@ round_numeric_columns <- function(
 
         x[numeric_columns] <- lapply(
             x[numeric_columns],
-            function(z) round(z, digits)
+            function(z) {
+
+                round(
+                    z,
+                    digits
+                )
+            }
         )
     }
 
@@ -420,33 +600,49 @@ rank_methods <- function(
 
     x <- safe_dataframe(x)
 
-    if (is.null(x) || nrow(x) == 0L) {
+    if (
+        is.null(x) ||
+        nrow(x) == 0L
+    ) {
         return(x)
     }
 
-    if (is.null(metric) ||
-        !metric %in% names(x)) {
+    if (
+        is.null(metric) ||
+        !metric %in% names(x)
+    ) {
 
         return(x)
     }
 
-    value <- safe_numeric(x[[metric]])
+    value <- safe_numeric(
+        x[[metric]]
+    )
 
     ord <- if (decreasing) {
+
         order(
             -value,
             na.last = TRUE
         )
+
     } else {
+
         order(
             value,
             na.last = TRUE
         )
     }
 
-    x <- x[ord, , drop = FALSE]
+    x <- x[
+        ord,
+        ,
+        drop = FALSE
+    ]
 
-    x$Rank <- seq_len(nrow(x))
+    x$Rank <- seq_len(
+        nrow(x)
+    )
 
     rownames(x) <- NULL
 
@@ -464,7 +660,6 @@ latex_escape <- function(x) {
 
     x[is.na(x)] <- ""
 
-    # Backslash first.
     x <- gsub(
         "\\\\",
         "\\\\textbackslash{}",
@@ -529,7 +724,27 @@ dataframe_to_latex <- function(
             paste(
                 rep(
                     "r",
-                    max(0L, ncol(df) - 1L)
+                    max(
+                        0L,
+                        ncol(df) - 1L
+                    )
+                ),
+                collapse = ""
+            )
+        )
+    }
+
+    if (nchar(align) != ncol(df)) {
+
+        align <- paste0(
+            "l",
+            paste(
+                rep(
+                    "r",
+                    max(
+                        0L,
+                        ncol(df) - 1L
+                    )
                 ),
                 collapse = ""
             )
@@ -540,13 +755,20 @@ dataframe_to_latex <- function(
 
         df_latex <- df
 
-        for (j in seq_len(ncol(df_latex))) {
+        for (j in seq_len(
+            ncol(df_latex)
+        )) {
 
-            if (!is.numeric(df_latex[[j]])) {
-
-                df_latex[[j]] <- latex_escape(
+            if (
+                !is.numeric(
                     df_latex[[j]]
                 )
+            ) {
+
+                df_latex[[j]] <-
+                    latex_escape(
+                        df_latex[[j]]
+                    )
             }
         }
 
@@ -560,27 +782,24 @@ dataframe_to_latex <- function(
         collapse = " & "
     )
 
-    lines <- character(0)
+    lines <- c(
+        "\\begin{table}[htbp]",
+        "\\centering"
+    )
 
     if (!is.null(caption)) {
 
         lines <- c(
             lines,
-            "\\begin{table}[htbp]",
-            "\\centering",
             paste0(
                 "\\caption{",
-                if (escape) latex_escape(caption) else caption,
+                if (escape) {
+                    latex_escape(caption)
+                } else {
+                    caption
+                },
                 "}"
             )
-        )
-
-    } else {
-
-        lines <- c(
-            lines,
-            "\\begin{table}[htbp]",
-            "\\centering"
         )
     }
 
@@ -613,14 +832,18 @@ dataframe_to_latex <- function(
 
     if (nrow(df_latex) > 0L) {
 
-        for (i in seq_len(nrow(df_latex))) {
+        for (i in seq_len(
+            nrow(df_latex)
+        )) {
 
             vals <- vapply(
                 df_latex[i, , drop = FALSE],
                 function(z) {
 
-                    if (length(z) == 0L ||
-                        is.na(z)) {
+                    if (
+                        length(z) == 0L ||
+                        all(is.na(z))
+                    ) {
                         return("")
                     }
 
@@ -654,7 +877,7 @@ dataframe_to_latex <- function(
 
 
 # =============================================================================
-# 9. SAVE TABLE
+# 9. SAVE TABLE CSV
 # =============================================================================
 
 save_table_csv <- function(
@@ -663,11 +886,15 @@ save_table_csv <- function(
     config = RESULTS_TABLE_CONFIG
 ) {
 
-    if (!isTRUE(config$save_csv)) {
+    if (!isTRUE(
+        config$save_csv
+    )) {
         return(invisible(NULL))
     }
 
-    create_results_directories(config)
+    create_results_directories(
+        config
+    )
 
     path <- file.path(
         config$csv_dir,
@@ -684,6 +911,10 @@ save_table_csv <- function(
 }
 
 
+# =============================================================================
+# 10. SAVE TABLE LATEX
+# =============================================================================
+
 save_table_latex <- function(
     x,
     filename,
@@ -692,11 +923,15 @@ save_table_latex <- function(
     config = RESULTS_TABLE_CONFIG
 ) {
 
-    if (!isTRUE(config$save_latex)) {
+    if (!isTRUE(
+        config$save_latex
+    )) {
         return(invisible(NULL))
     }
 
-    create_results_directories(config)
+    create_results_directories(
+        config
+    )
 
     lines <- dataframe_to_latex(
         x,
@@ -720,7 +955,7 @@ save_table_latex <- function(
 
 
 # =============================================================================
-# 10. SAVE RDS TABLE
+# 11. SAVE TABLE RDS
 # =============================================================================
 
 save_table_rds <- function(
@@ -729,11 +964,15 @@ save_table_rds <- function(
     config = RESULTS_TABLE_CONFIG
 ) {
 
-    if (!isTRUE(config$save_rds)) {
+    if (!isTRUE(
+        config$save_rds
+    )) {
         return(invisible(NULL))
     }
 
-    create_results_directories(config)
+    create_results_directories(
+        config
+    )
 
     path <- file.path(
         config$rds_dir,
@@ -750,7 +989,7 @@ save_table_rds <- function(
 
 
 # =============================================================================
-# 11. GENERIC TABLE SAVE
+# 12. GENERIC TABLE SAVE
 # =============================================================================
 
 save_results_table <- function(
@@ -772,13 +1011,19 @@ save_results_table <- function(
 
     save_table_csv(
         x,
-        paste0(table_name, ".csv"),
+        paste0(
+            table_name,
+            ".csv"
+        ),
         config
     )
 
     save_table_latex(
         x,
-        paste0(table_name, ".tex"),
+        paste0(
+            table_name,
+            ".tex"
+        ),
         caption = caption,
         label = label,
         config = config
@@ -786,7 +1031,10 @@ save_results_table <- function(
 
     save_table_rds(
         x,
-        paste0(table_name, ".rds"),
+        paste0(
+            table_name,
+            ".rds"
+        ),
         config
     )
 
@@ -795,7 +1043,7 @@ save_results_table <- function(
 
 
 # =============================================================================
-# 12. SIMULATION DESIGN TABLE
+# 13. SIMULATION / MONITORING DESIGN TABLE
 # =============================================================================
 
 make_simulation_design_table <- function(
@@ -810,16 +1058,20 @@ make_simulation_design_table <- function(
                     "Target ARL0",
                     "CUSUM reference values",
                     "Ensemble weights",
-                    "Transformation",
-                    "Copula",
+                    "Probability transformation",
+                    "Copula reference",
+                    "Monitoring side",
+                    "Alarm rule",
                     "Initialization"
                 ),
                 Specification = c(
-                    370,
+                    "370",
                     "0.25, 0.50, 0.75",
                     "Equal weights",
-                    "Empirical probability scale",
-                    "Empirical copula",
+                    "Stationary mid-rank",
+                    "Fixed empirical copula",
+                    "Upper",
+                    "E_t > H",
                     "Zero"
                 ),
                 stringsAsFactors = FALSE
@@ -834,52 +1086,136 @@ make_simulation_design_table <- function(
         specification
     ) {
 
-        rows[[length(rows) + 1L]] <<- data.frame(
-            Component = component,
-            Specification = as.character(specification),
-            stringsAsFactors = FALSE
-        )
+        rows[[length(rows) + 1L]] <<-
+            data.frame(
+                Component = component,
+                Specification =
+                    as.character(
+                        specification
+                    ),
+                stringsAsFactors = FALSE
+            )
     }
+
+
+    target_arl <- config$target_arl %||%
+        config$target_arl0 %||%
+        370
 
     add_row(
         "Target ARL0",
-        config$target_arl0 %||% 370
+        target_arl
     )
+
+
+    k_values <- config$k_values %||%
+        c(
+            0.25,
+            0.50,
+            0.75
+        )
 
     add_row(
         "CUSUM reference values",
         paste(
-            config$k_values %||%
-                c(0.25, 0.50, 0.75),
+            safe_numeric(k_values),
             collapse = ", "
         )
     )
 
+
+    weights <- config$weights %||%
+        c(
+            1 / 3,
+            1 / 3,
+            1 / 3
+        )
+
     add_row(
         "Ensemble weights",
-        "Equal"
-    )
-
-    add_row(
-        "Transformation",
-        config$transform_method %||%
-            "Empirical probability scale"
-    )
-
-    add_row(
-        "Copula",
-        ifelse(
-            isTRUE(config$use_empirical_copula),
-            "Empirical",
-            "Parametric"
+        paste(
+            round(
+                safe_numeric(weights),
+                4
+            ),
+            collapse = ", "
         )
     )
+
+
+    transform_method <-
+        normalize_transform_method(
+            config$transform_method %||%
+                "mid"
+        )
+
+    transformation_label <-
+        switch(
+            transform_method,
+
+            mid =
+                "Stationary mid-rank",
+
+            empirical_copula =
+                "Empirical copula probability scale",
+
+            parametric =
+                "Parametric probability scale",
+
+            transform_method
+        )
+
+    add_row(
+        "Probability transformation",
+        transformation_label
+    )
+
+
+    use_empirical_copula <-
+        isTRUE(
+            config$use_empirical_copula
+        ) ||
+        identical(
+            transform_method,
+            "empirical_copula"
+        )
+
+    copula_label <-
+        if (use_empirical_copula) {
+            "Fixed empirical copula"
+        } else {
+            "Parametric / independent"
+        }
+
+    add_row(
+        "Copula reference",
+        copula_label
+    )
+
+
+    add_row(
+        "Monitoring side",
+        config$side %||%
+            "upper"
+    )
+
+
+    alarm_rule <-
+        config$alarm_rule %||%
+        "E_t > H"
+
+    add_row(
+        "Alarm rule",
+        alarm_rule
+    )
+
 
     add_row(
         "Initialization",
         config$initialization %||%
             "Zero"
     )
+
 
     do.call(
         rbind,
@@ -889,7 +1225,7 @@ make_simulation_design_table <- function(
 
 
 # =============================================================================
-# 13. ARL TABLE
+# 14. ARL TABLE
 # =============================================================================
 
 make_arl_table <- function(
@@ -897,14 +1233,20 @@ make_arl_table <- function(
     metric_columns = NULL
 ) {
 
-    results <- safe_dataframe(results)
+    results <- safe_dataframe(
+        results
+    )
 
-    if (is.null(results) ||
-        nrow(results) == 0L) {
+    if (
+        is.null(results) ||
+        nrow(results) == 0L
+    ) {
         return(NULL)
     }
 
-    results <- standardize_method_table(results)
+    results <- standardize_method_table(
+        results
+    )
 
     if (is.null(metric_columns)) {
 
@@ -919,7 +1261,9 @@ make_arl_table <- function(
                 "Median_ARL0",
                 "Median_ARL1",
                 "SD_ARL0",
-                "SD_ARL1"
+                "SD_ARL1",
+                "CI_Lower",
+                "CI_Upper"
             ),
             names(results)
         )
@@ -940,35 +1284,41 @@ make_arl_table <- function(
         return(NULL)
     }
 
-    out <- results[
+    results[
         ,
         keep,
         drop = FALSE
     ]
-
-    out
 }
 
 
 # =============================================================================
-# 14. DETECTION PERFORMANCE TABLE
+# 15. DETECTION PERFORMANCE TABLE
 # =============================================================================
 
 make_detection_table <- function(
     results
 ) {
 
-    results <- safe_dataframe(results)
+    results <- safe_dataframe(
+        results
+    )
 
-    if (is.null(results) ||
-        nrow(results) == 0L) {
+    if (
+        is.null(results) ||
+        nrow(results) == 0L
+    ) {
         return(NULL)
     }
 
-    results <- standardize_method_table(results)
+    results <- standardize_method_table(
+        results
+    )
 
     candidate <- c(
         "Method",
+        "Shift",
+        "Distribution",
         "Detection_Rate",
         "DetectionRate",
         "Power",
@@ -977,7 +1327,8 @@ make_detection_table <- function(
         "Average_Delay",
         "Detection_Delay",
         "Median_Delay",
-        "SD_Delay"
+        "SD_Delay",
+        "Mean_Delay"
     )
 
     keep <- candidate[
@@ -997,31 +1348,40 @@ make_detection_table <- function(
 
 
 # =============================================================================
-# 15. ROBUSTNESS TABLE
+# 16. ROBUSTNESS TABLE
 # =============================================================================
 
 make_robustness_table <- function(
     results
 ) {
 
-    results <- safe_dataframe(results)
+    results <- safe_dataframe(
+        results
+    )
 
-    if (is.null(results) ||
-        nrow(results) == 0L) {
+    if (
+        is.null(results) ||
+        nrow(results) == 0L
+    ) {
         return(NULL)
     }
 
-    results <- standardize_method_table(results)
+    results <- standardize_method_table(
+        results
+    )
 
     candidate <- c(
         "Method",
         "Distribution",
         "Scenario",
+        "Shift",
         "ARL0",
         "ARL1",
         "Detection_Rate",
         "False_Alarm_Rate",
-        "Delay"
+        "Delay",
+        "Average_Delay",
+        "Median_Delay"
     )
 
     keep <- candidate[
@@ -1029,7 +1389,7 @@ make_robustness_table <- function(
     ]
 
     if (length(keep) == 0L) {
-        return(NULL)
+        return(results)
     }
 
     results[
@@ -1041,21 +1401,27 @@ make_robustness_table <- function(
 
 
 # =============================================================================
-# 16. OPTIMIZATION TABLE
+# 17. OPTIMIZATION TABLE
 # =============================================================================
 
 make_optimization_table <- function(
     results
 ) {
 
-    results <- safe_dataframe(results)
+    results <- safe_dataframe(
+        results
+    )
 
-    if (is.null(results) ||
-        nrow(results) == 0L) {
+    if (
+        is.null(results) ||
+        nrow(results) == 0L
+    ) {
         return(NULL)
     }
 
-    results <- standardize_method_table(results)
+    results <- standardize_method_table(
+        results
+    )
 
     objective_candidates <- c(
         "objective",
@@ -1068,14 +1434,17 @@ make_optimization_table <- function(
         "Loss"
     )
 
-    objective_column <- objective_candidates[
-        objective_candidates %in% names(results)
-    ][1L]
+    objective_columns <- objective_candidates[
+        objective_candidates %in%
+            names(results)
+    ]
 
-    if (is.na(objective_column)) {
-
+    if (length(objective_columns) == 0L) {
         return(results)
     }
+
+    objective_column <-
+        objective_columns[1L]
 
     value <- safe_numeric(
         results[[objective_column]]
@@ -1092,10 +1461,6 @@ make_optimization_table <- function(
         drop = FALSE
     ]
 
-    results$Rank <- seq_len(
-        nrow(results)
-    )
-
     rownames(results) <- NULL
 
     results
@@ -1103,36 +1468,45 @@ make_optimization_table <- function(
 
 
 # =============================================================================
-# 17. REAL-DATA THRESHOLD TABLE
+# 18. REAL-DATA THRESHOLD TABLE
 # =============================================================================
 
 make_real_threshold_table <- function(
     threshold_results
 ) {
 
-    threshold_results <- safe_dataframe(
-        threshold_results
-    )
+    threshold_results <-
+        safe_dataframe(
+            threshold_results
+        )
 
-    if (is.null(threshold_results) ||
-        nrow(threshold_results) == 0L) {
+    if (
+        is.null(threshold_results) ||
+        nrow(threshold_results) == 0L
+    ) {
         return(NULL)
     }
 
     candidate <- c(
+        "Method",
         "threshold",
         "Threshold",
         "H",
         "ARL0",
         "arl0",
         "Estimated_ARL0",
+        "estimated_arl0",
         "Target_ARL0",
+        "target_arl0",
         "Iterations",
-        "Converged"
+        "iterations",
+        "Converged",
+        "converged"
     )
 
     keep <- candidate[
-        candidate %in% names(threshold_results)
+        candidate %in%
+            names(threshold_results)
     ]
 
     if (length(keep) == 0L) {
@@ -1148,98 +1522,7 @@ make_real_threshold_table <- function(
 
 
 # =============================================================================
-# 18. CATBOOST SURROGATE TABLE
-# =============================================================================
-
-make_catboost_table <- function(
-    results
-) {
-
-    results <- safe_dataframe(results)
-
-    if (is.null(results) ||
-        nrow(results) == 0L) {
-        return(NULL)
-    }
-
-    results <- standardize_method_table(results)
-
-    candidate <- c(
-        "Method",
-        "RMSE",
-        "MAE",
-        "R2",
-        "AUC",
-        "Accuracy",
-        "Precision",
-        "Recall",
-        "F1",
-        "Objective"
-    )
-
-    keep <- candidate[
-        candidate %in% names(results)
-    ]
-
-    if (length(keep) == 0L) {
-        return(results)
-    }
-
-    results[
-        ,
-        unique(keep),
-        drop = FALSE
-    ]
-}
-
-
-# =============================================================================
-# 19. OVERALL METHOD COMPARISON
-# =============================================================================
-
-make_overall_method_table <- function(
-    results
-) {
-
-    results <- safe_dataframe(results)
-
-    if (is.null(results) ||
-        nrow(results) == 0L) {
-        return(NULL)
-    }
-
-    results <- standardize_method_table(results)
-
-    candidate <- c(
-        "Method",
-        "ARL0",
-        "ARL1",
-        "Detection_Rate",
-        "False_Alarm_Rate",
-        "Average_Delay",
-        "RMSE",
-        "MAE",
-        "Objective"
-    )
-
-    keep <- candidate[
-        candidate %in% names(results)
-    ]
-
-    if (length(keep) == 0L) {
-        return(results)
-    }
-
-    results[
-        ,
-        unique(keep),
-        drop = FALSE
-    ]
-}
-
-
-# =============================================================================
-# 20. EXTRACT THRESHOLD FROM RESULT
+# 19. EXTRACT THRESHOLD
 # =============================================================================
 
 extract_threshold <- function(
@@ -1250,12 +1533,24 @@ extract_threshold <- function(
         return(NA_real_)
     }
 
-    if (is.numeric(result) &&
-        length(result) > 0L) {
+    if (
+        is.numeric(result) &&
+        length(result) > 0L
+    ) {
 
-        return(
-            safe_scalar(result)
+        value <- safe_numeric(
+            result
         )
+
+        if (
+            length(value) > 0L &&
+            is.finite(value[1L])
+        ) {
+
+            return(
+                value[1L]
+            )
+        }
     }
 
     if (is.list(result)) {
@@ -1266,7 +1561,9 @@ extract_threshold <- function(
             "H",
             "control_limit",
             "control_limit_H",
-            "estimated_threshold"
+            "estimated_threshold",
+            "calibrated_threshold",
+            "calibrated_H"
         )
 
         for (nm in candidates) {
@@ -1277,8 +1574,14 @@ extract_threshold <- function(
                     result[[nm]]
                 )
 
-                if (length(value) > 0L) {
-                    return(value[1L])
+                if (
+                    length(value) > 0L &&
+                    is.finite(value[1L])
+                ) {
+
+                    return(
+                        value[1L]
+                    )
                 }
             }
         }
@@ -1289,7 +1592,7 @@ extract_threshold <- function(
 
 
 # =============================================================================
-# 21. REAL-DATA THRESHOLD TABLE FROM RESULT
+# 20. REAL-DATA THRESHOLD TABLE FROM RESULT
 # =============================================================================
 
 make_real_threshold_table_from_result <- function(
@@ -1300,47 +1603,19 @@ make_real_threshold_table_from_result <- function(
         return(NULL)
     }
 
+
     # -------------------------------------------------------------------------
-    # SP-E-CUSUM result
+    # Numeric threshold
     # -------------------------------------------------------------------------
 
-    if (is.list(result)) {
-
-        threshold <- extract_threshold(
-            result
-        )
-
-        arl0 <- safe_scalar(
-            result$arl0 %||%
-                result$phase1_arl0 %||%
-                result$estimated_arl0
-        )
-
-        target_arl0 <- safe_scalar(
-            result$target_arl0 %||%
-                result$target_ARL0
-        )
+    if (
+        is.numeric(result) &&
+        length(result) == 1L
+    ) {
 
         return(
             data.frame(
                 Method = "SP-E-CUSUM",
-                Threshold = threshold,
-                ARL0 = arl0,
-                Target_ARL0 = target_arl0,
-                stringsAsFactors = FALSE
-            )
-        )
-    }
-
-    # -------------------------------------------------------------------------
-    # Single CUSUM
-    # -------------------------------------------------------------------------
-
-    if (is.numeric(result)) {
-
-        return(
-            data.frame(
-                Method = "Single CUSUM",
                 Threshold = safe_scalar(result),
                 ARL0 = NA_real_,
                 Target_ARL0 = NA_real_,
@@ -1349,17 +1624,117 @@ make_real_threshold_table_from_result <- function(
         )
     }
 
+
     # -------------------------------------------------------------------------
-    # Multiple CUSUM
+    # Direct data frame
     # -------------------------------------------------------------------------
 
-    result_df <- safe_dataframe(result)
+    if (is.data.frame(result)) {
 
-    if (!is.null(result_df)) {
+        return(
+            make_real_threshold_table(
+                result
+            )
+        )
+    }
 
-        result_df$Method <- "Multiple CUSUM"
 
-        return(result_df)
+    # -------------------------------------------------------------------------
+    # Nested result object
+    # -------------------------------------------------------------------------
+
+    if (is.list(result)) {
+
+        threshold <- extract_threshold(
+            result
+        )
+
+        threshold_object <- NULL
+
+        nested_names <- c(
+            "threshold",
+            "threshold_result",
+            "threshold_results",
+            "calibration",
+            "recalibration",
+            "threshold_calibration",
+            "real_data_threshold"
+        )
+
+        for (nm in nested_names) {
+
+            if (
+                nm %in% names(result) &&
+                !is.null(result[[nm]])
+            ) {
+
+                threshold_object <-
+                    result[[nm]]
+
+                nested_threshold <-
+                    extract_threshold(
+                        threshold_object
+                    )
+
+                if (
+                    is.finite(
+                        nested_threshold
+                    )
+                ) {
+
+                    threshold <-
+                        nested_threshold
+
+                    break
+                }
+            }
+        }
+
+
+        arl0 <- safe_scalar(
+            result$arl0 %||%
+                result$estimated_arl0 %||%
+                result$threshold_arl0 %||%
+                result$calibrated_arl0 %||%
+                result$ARL0
+        )
+
+
+        target_arl0 <- safe_scalar(
+            result$target_arl0 %||%
+                result$target_ARL0 %||%
+                result$target_arl %||%
+                result$config$target_arl0 %||%
+                result$config$target_arl
+        )
+
+
+        iterations <- safe_scalar(
+            result$iterations %||%
+                result$threshold_iterations %||%
+                result$calibration_iterations
+        )
+
+
+        converged <- result$converged %||%
+            result$threshold_converged %||%
+            result$calibration_converged
+
+
+        return(
+            data.frame(
+                Method = "SP-E-CUSUM",
+                Threshold = threshold,
+                ARL0 = arl0,
+                Target_ARL0 = target_arl0,
+                Iterations = iterations,
+                Converged = safe_logical(
+                    converged,
+                    default = NA
+                ),
+                stringsAsFactors = FALSE
+            )
+        )
     }
 
     NULL
@@ -1367,7 +1742,7 @@ make_real_threshold_table_from_result <- function(
 
 
 # =============================================================================
-# 22. EXTRACT PHASE-I RESULT COMPONENTS
+# 21. EXTRACT PHASE-I RESULT COMPONENTS
 # =============================================================================
 
 extract_phase1_component <- function(
@@ -1385,24 +1760,24 @@ extract_phase1_component <- function(
 
     if (is.list(phase1_results)) {
 
-        # ---------------------------------------------------------------------
-        # Check explicit component key first.
-        # ---------------------------------------------------------------------
+        if (
+            component %in%
+                names(phase1_results)
+        ) {
 
-        if (component %in% names(phase1_results)) {
             return(
                 phase1_results[[component]]
             )
         }
 
-        # ---------------------------------------------------------------------
-        # ARL0 naming conventions.
-        # ---------------------------------------------------------------------
 
-        if (component %in% c(
-            "arl0",
-            "phase1_arl0"
-        )) {
+        if (
+            component %in%
+                c(
+                    "arl0",
+                    "phase1_arl0"
+                )
+        ) {
 
             return(
                 phase1_results$arl0 %||%
@@ -1412,15 +1787,15 @@ extract_phase1_component <- function(
             )
         }
 
-        # ---------------------------------------------------------------------
-        # Parameter-estimate naming conventions.
-        # ---------------------------------------------------------------------
 
-        if (component %in% c(
-            "parameter_estimates",
-            "phase1_parameter_estimates",
-            "parameters"
-        )) {
+        if (
+            component %in%
+                c(
+                    "parameter_estimates",
+                    "phase1_parameter_estimates",
+                    "parameters"
+                )
+        ) {
 
             return(
                 phase1_results$parameter_estimates %||%
@@ -1430,14 +1805,14 @@ extract_phase1_component <- function(
             )
         }
 
-        # ---------------------------------------------------------------------
-        # Recalibration naming conventions.
-        # ---------------------------------------------------------------------
 
-        if (component %in% c(
-            "recalibration",
-            "phase1_recalibration"
-        )) {
+        if (
+            component %in%
+                c(
+                    "recalibration",
+                    "phase1_recalibration"
+                )
+        ) {
 
             return(
                 phase1_results$recalibration %||%
@@ -1453,7 +1828,7 @@ extract_phase1_component <- function(
 
 
 # =============================================================================
-# 23. RESOLVE PHASE-I RESULTS
+# 22. RESOLVE PHASE-I RESULTS
 # =============================================================================
 
 resolve_phase1_results <- function(
@@ -1472,63 +1847,99 @@ resolve_phase1_results <- function(
         return(NULL)
     }
 
-    # Direct phase1 object.
+
     if ("phase1" %in% names(results)) {
-        return(results$phase1)
+
+        return(
+            results$phase1
+        )
     }
 
-    # SP-E-CUSUM result object.
-    if ("sp_ecusum_results" %in% names(results)) {
 
-        sp_results <- results$sp_ecusum_results
+    if (
+        "phase1_results" %in%
+            names(results)
+    ) {
+
+        return(
+            results$phase1_results
+        )
+    }
+
+
+    if (
+        "sp_ecusum_results" %in%
+            names(results)
+    ) {
+
+        sp_results <-
+            results$sp_ecusum_results
 
         if (is.list(sp_results)) {
 
-            if ("phase1" %in% names(sp_results)) {
-                return(sp_results$phase1)
+            if (
+                "phase1" %in%
+                    names(sp_results)
+            ) {
+
+                return(
+                    sp_results$phase1
+                )
             }
 
             return(sp_results)
         }
     }
 
-    # Nested results object.
-    if ("results" %in% names(results) &&
-        is.list(results$results)) {
+
+    if (
+        "results" %in% names(results) &&
+        is.list(results$results)
+    ) {
 
         nested <- results$results
 
-        if ("phase1" %in% names(nested)) {
-            return(nested$phase1)
+        if (
+            "phase1" %in%
+                names(nested)
+        ) {
+
+            return(
+                nested$phase1
+            )
         }
 
         return(nested)
     }
+
 
     results
 }
 
 
 # =============================================================================
-# 24. PHASE-I PARAMETER TABLE
+# 23. PHASE-I PARAMETER TABLE
 # =============================================================================
 
 make_phase1_parameter_table <- function(
     phase1_results
 ) {
 
-    phase1_results <- resolve_phase1_results(
-        phase1_results
-    )
+    phase1_results <-
+        resolve_phase1_results(
+            phase1_results
+        )
 
-    parameters <- extract_phase1_component(
-        phase1_results,
-        "parameter_estimates"
-    )
+    parameters <-
+        extract_phase1_component(
+            phase1_results,
+            "parameter_estimates"
+        )
 
-    parameters <- safe_dataframe(
-        parameters
-    )
+    parameters <-
+        safe_dataframe(
+            parameters
+        )
 
     if (is.null(parameters)) {
         return(NULL)
@@ -1539,38 +1950,42 @@ make_phase1_parameter_table <- function(
 
 
 # =============================================================================
-# 25. PHASE-I ARL TABLE
+# 24. PHASE-I ARL TABLE
 # =============================================================================
 
 make_phase1_arl_table <- function(
     phase1_results
 ) {
 
-    phase1_results <- resolve_phase1_results(
-        phase1_results
-    )
+    phase1_results <-
+        resolve_phase1_results(
+            phase1_results
+        )
 
-    arl <- extract_phase1_component(
-        phase1_results,
-        "arl0"
-    )
+    arl <-
+        extract_phase1_component(
+            phase1_results,
+            "arl0"
+        )
+
+    if (
+        is.numeric(arl) &&
+        length(arl) > 0L
+    ) {
+
+        return(
+            data.frame(
+                ARL0 = arl,
+                stringsAsFactors = FALSE
+            )
+        )
+    }
 
     arl <- safe_dataframe(
         arl
     )
 
     if (is.null(arl)) {
-
-        if (is.numeric(arl)) {
-
-            return(
-                data.frame(
-                    ARL0 = arl,
-                    stringsAsFactors = FALSE
-                )
-            )
-        }
-
         return(NULL)
     }
 
@@ -1579,25 +1994,28 @@ make_phase1_arl_table <- function(
 
 
 # =============================================================================
-# 26. PHASE-I RECALIBRATION TABLE
+# 25. PHASE-I RECALIBRATION TABLE
 # =============================================================================
 
 make_phase1_recalibration_table <- function(
     phase1_results
 ) {
 
-    phase1_results <- resolve_phase1_results(
-        phase1_results
-    )
+    phase1_results <-
+        resolve_phase1_results(
+            phase1_results
+        )
 
-    recalibration <- extract_phase1_component(
-        phase1_results,
-        "recalibration"
-    )
+    recalibration <-
+        extract_phase1_component(
+            phase1_results,
+            "recalibration"
+        )
 
-    recalibration <- safe_dataframe(
-        recalibration
-    )
+    recalibration <-
+        safe_dataframe(
+            recalibration
+        )
 
     if (is.null(recalibration)) {
         return(NULL)
@@ -1608,15 +2026,17 @@ make_phase1_recalibration_table <- function(
 
 
 # =============================================================================
-# 27. SIMULATION RESULT LOADER
+# 26. RESULT FILE LOADER
 # =============================================================================
 
 load_results_object <- function(
     path
 ) {
 
-    if (is.null(path) ||
-        !nzchar(path)) {
+    if (
+        is.null(path) ||
+        !nzchar(path)
+    ) {
 
         return(NULL)
     }
@@ -1636,25 +2056,31 @@ load_results_object <- function(
         tools::file_ext(path)
     )
 
+
     if (ext == "rds") {
 
         return(
             tryCatch(
                 readRDS(path),
                 error = function(e) {
+
                     warning(
                         "Unable to read RDS file: ",
                         conditionMessage(e),
                         call. = FALSE
                     )
+
                     NULL
                 }
             )
         )
     }
 
-    if (ext == "rda" ||
-        ext == "rdata") {
+
+    if (
+        ext == "rda" ||
+        ext == "rdata"
+    ) {
 
         env <- new.env(
             parent = emptyenv()
@@ -1666,6 +2092,7 @@ load_results_object <- function(
         )
 
         if (length(loaded) == 1L) {
+
             return(
                 get(
                     loaded[1L],
@@ -1682,6 +2109,7 @@ load_results_object <- function(
         )
     }
 
+
     if (ext == "csv") {
 
         return(
@@ -1691,16 +2119,19 @@ load_results_object <- function(
                     stringsAsFactors = FALSE
                 ),
                 error = function(e) {
+
                     warning(
                         "Unable to read CSV file: ",
                         conditionMessage(e),
                         call. = FALSE
                     )
+
                     NULL
                 }
             )
         )
     }
+
 
     warning(
         "Unsupported result file type: ",
@@ -1713,7 +2144,7 @@ load_results_object <- function(
 
 
 # =============================================================================
-# 28. NORMALIZE SIMULATION RESULTS
+# 27. NORMALIZE SIMULATION RESULTS
 # =============================================================================
 
 normalize_simulation_results <- function(
@@ -1729,21 +2160,28 @@ normalize_simulation_results <- function(
     }
 
     if (is.matrix(results)) {
-        return(as.data.frame(results))
+
+        return(
+            as.data.frame(
+                results,
+                stringsAsFactors = FALSE
+            )
+        )
     }
 
     if (!is.list(results)) {
         return(NULL)
     }
 
-    # Common result-object names.
+
     candidates <- c(
         "summary",
         "results",
         "simulation_summary",
         "summary_table",
         "performance",
-        "metrics"
+        "metrics",
+        "table"
     )
 
     for (nm in candidates) {
@@ -1760,17 +2198,15 @@ normalize_simulation_results <- function(
         }
     }
 
-    # If this itself is a rectangular list.
-    candidate <- safe_dataframe(
+
+    safe_dataframe(
         results
     )
-
-    candidate
 }
 
 
 # =============================================================================
-# 29. TABLE 1
+# 28. TABLE 1
 # =============================================================================
 
 make_table1 <- function(
@@ -1778,13 +2214,13 @@ make_table1 <- function(
 ) {
 
     make_simulation_design_table(
-        config
+        config = config
     )
 }
 
 
 # =============================================================================
-# 30. TABLE 2
+# 29. TABLE 2
 # =============================================================================
 
 make_table2 <- function(
@@ -1792,13 +2228,15 @@ make_table2 <- function(
 ) {
 
     make_arl_table(
-        normalize_simulation_results(results)
+        normalize_simulation_results(
+            results
+        )
     )
 }
 
 
 # =============================================================================
-# 31. TABLE 3
+# 30. TABLE 3
 # =============================================================================
 
 make_table3 <- function(
@@ -1806,13 +2244,15 @@ make_table3 <- function(
 ) {
 
     make_detection_table(
-        normalize_simulation_results(results)
+        normalize_simulation_results(
+            results
+        )
     )
 }
 
 
 # =============================================================================
-# 32. TABLE 4
+# 31. TABLE 4
 # =============================================================================
 
 make_table4 <- function(
@@ -1820,27 +2260,83 @@ make_table4 <- function(
 ) {
 
     make_robustness_table(
-        normalize_simulation_results(results)
+        normalize_simulation_results(
+            results
+        )
     )
 }
 
 
 # =============================================================================
-# 33. TABLE 5
+# 32. TABLE 5
 # =============================================================================
 
 make_table5 <- function(
     results
 ) {
 
+    if (is.null(results)) {
+        return(NULL)
+    }
+
+
+    # -------------------------------------------------------------------------
+    # Preferred source: CatBoost optimization history table
+    # -------------------------------------------------------------------------
+
+    if (
+        is.list(results) &&
+        !is.data.frame(results) &&
+        !is.null(results$history_table)
+    ) {
+
+        return(
+            make_optimization_table(
+                results$history_table
+            )
+        )
+    }
+
+
+    # -------------------------------------------------------------------------
+    # Alternative history object
+    # -------------------------------------------------------------------------
+
+    if (
+        is.list(results) &&
+        !is.data.frame(results) &&
+        !is.null(results$history)
+    ) {
+
+        history <- safe_dataframe(
+            results$history
+        )
+
+        if (!is.null(history)) {
+
+            return(
+                make_optimization_table(
+                    history
+                )
+            )
+        }
+    }
+
+
+    # -------------------------------------------------------------------------
+    # Generic fallback
+    # -------------------------------------------------------------------------
+
     make_optimization_table(
-        normalize_simulation_results(results)
+        normalize_simulation_results(
+            results
+        )
     )
 }
 
 
 # =============================================================================
-# 34. TABLE 6
+# 33. TABLE 6
 # =============================================================================
 
 make_table6 <- function(
@@ -1854,30 +2350,382 @@ make_table6 <- function(
 
 
 # =============================================================================
-# 35. TABLE 7
+# 34. TABLE 7
 # =============================================================================
 
 make_table7 <- function(
     results
 ) {
 
-    results <- normalize_simulation_results(
+    if (is.null(results)) {
+        return(NULL)
+    }
+
+
+    # -------------------------------------------------------------------------
+    # Direct monitoring table
+    # -------------------------------------------------------------------------
+
+    if (is.data.frame(results)) {
+
+        monitoring_names <- c(
+            "Time",
+            "Index",
+            "Observation",
+            "Statistic",
+            "CUSUM1",
+            "CUSUM2",
+            "CUSUM3",
+            "Probability1",
+            "Probability2",
+            "Probability3",
+            "Ensemble",
+            "Copula",
+            "Mean_Ensemble",
+            "Threshold",
+            "Alarm",
+            "Signal",
+            "Run_Length"
+        )
+
+        keep <- intersect(
+            monitoring_names,
+            names(results)
+        )
+
+        if (length(keep) > 0L) {
+
+            return(
+                results[
+                    ,
+                    keep,
+                    drop = FALSE
+                ]
+            )
+        }
+
+        return(results)
+    }
+
+
+    # -------------------------------------------------------------------------
+    # Nested real-data result
+    # -------------------------------------------------------------------------
+
+    if (is.list(results)) {
+
+        candidate_names <- c(
+            "monitoring_table",
+            "monitoring",
+            "monitoring_results",
+            "phase2_monitoring",
+            "phase2",
+            "monitoring_data",
+            "real_data_monitoring"
+        )
+
+        for (nm in candidate_names) {
+
+            if (
+                nm %in% names(results) &&
+                !is.null(results[[nm]])
+            ) {
+
+                candidate <- safe_dataframe(
+                    results[[nm]]
+                )
+
+                if (!is.null(candidate)) {
+
+                    return(
+                        make_table7(
+                            candidate
+                        )
+                    )
+                }
+            }
+        }
+    }
+
+
+    normalize_simulation_results(
         results
     )
+}
+
+
+# =============================================================================
+# 35. CATBOOST SURROGATE TABLE
+# =============================================================================
+
+make_catboost_table <- function(
+    results
+) {
 
     if (is.null(results)) {
         return(NULL)
     }
 
+
+    # -------------------------------------------------------------------------
+    # New CatBoost surrogate result object
+    # -------------------------------------------------------------------------
+
+    if (
+        is.list(results) &&
+        !is.data.frame(results)
+    ) {
+
+        final_fit <-
+            results$final_fit
+
+        best_eval <-
+            results$best_evaluation
+
+        final_validation <-
+            results$final_validation
+
+
+        if (!is.null(final_fit)) {
+
+            out <- data.frame(
+                Method = "SP-E-CUSUM",
+
+                H = safe_scalar(
+                    final_fit$H
+                ),
+
+                ARL0_Optimization =
+                    safe_scalar(
+                        best_eval$arl0
+                    ),
+
+                ARL0_Validation =
+                    safe_scalar(
+                        final_validation$ARL0
+                    ),
+
+                Objective =
+                    safe_scalar(
+                        best_eval$objective
+                    ),
+
+                stringsAsFactors = FALSE
+            )
+
+
+            # -----------------------------------------------------------------
+            # k values
+            # -----------------------------------------------------------------
+
+            if (
+                !is.null(
+                    final_fit$k_values
+                )
+            ) {
+
+                k_values <-
+                    safe_numeric(
+                        final_fit$k_values
+                    )
+
+                for (j in seq_along(
+                    k_values
+                )) {
+
+                    out[
+                        paste0(
+                            "k",
+                            j
+                        )
+                    ] <-
+                        k_values[j]
+                }
+            }
+
+
+            # -----------------------------------------------------------------
+            # Ensemble weights
+            # -----------------------------------------------------------------
+
+            if (
+                !is.null(
+                    final_fit$weights
+                )
+            ) {
+
+                weights <-
+                    safe_numeric(
+                        final_fit$weights
+                    )
+
+                for (j in seq_along(
+                    weights
+                )) {
+
+                    out[
+                        paste0(
+                            "Weight",
+                            j
+                        )
+                    ] <-
+                        weights[j]
+                }
+            }
+
+
+            # -----------------------------------------------------------------
+            # Validation metrics
+            # -----------------------------------------------------------------
+
+            if (
+                !is.null(
+                    final_validation
+                )
+            ) {
+
+                validation_df <-
+                    safe_dataframe(
+                        final_validation
+                    )
+
+                if (
+                    !is.null(
+                        validation_df
+                    )
+                ) {
+
+                    for (
+                        nm in names(
+                            validation_df
+                        )
+                    ) {
+
+                        if (
+                            nm %in%
+                                names(out)
+                        ) {
+                            next
+                        }
+
+                        value <-
+                            validation_df[[nm]]
+
+                        if (
+                            length(value) == 1L
+                        ) {
+
+                            out[[nm]] <-
+                                value
+                        }
+                    }
+                }
+            }
+
+
+            return(out)
+        }
+
+
+        # ---------------------------------------------------------------------
+        # Fallback to history
+        # ---------------------------------------------------------------------
+
+        if (
+            !is.null(
+                results$history_table
+            )
+        ) {
+
+            return(
+                safe_dataframe(
+                    results$history_table
+                )
+            )
+        }
+    }
+
+
+    # -------------------------------------------------------------------------
+    # Data-frame result
+    # -------------------------------------------------------------------------
+
+    results <- safe_dataframe(
+        results
+    )
+
+    if (
+        is.null(results) ||
+        nrow(results) == 0L
+    ) {
+
+        return(NULL)
+    }
+
+    results
+}
+
+
+# =============================================================================
+# 36. TABLE 8
+# =============================================================================
+
+make_table8 <- function(
+    results
+) {
+
+    make_catboost_table(
+        results
+    )
+}
+
+
+# =============================================================================
+# 37. OVERALL METHOD COMPARISON
+# =============================================================================
+
+make_overall_method_table <- function(
+    results
+) {
+
+    results <- safe_dataframe(
+        results
+    )
+
+    if (
+        is.null(results) ||
+        nrow(results) == 0L
+    ) {
+
+        return(NULL)
+    }
+
+    results <- standardize_method_table(
+        results
+    )
+
     candidate <- c(
         "Method",
-        "Time",
-        "Observation",
-        "Statistic",
-        "Threshold",
-        "Alarm",
-        "Signal",
-        "Run_Length"
+        "Distribution",
+        "Scenario",
+        "Shift",
+        "ARL0",
+        "ARL1",
+        "Mean_ARL0",
+        "Mean_ARL1",
+        "Median_ARL0",
+        "Median_ARL1",
+        "SD_ARL0",
+        "SD_ARL1",
+        "Detection_Rate",
+        "False_Alarm_Rate",
+        "Average_Delay",
+        "Detection_Delay",
+        "Median_Delay",
+        "SD_Delay",
+        "RMSE",
+        "MAE",
+        "Objective"
     )
 
     keep <- candidate[
@@ -1897,21 +2745,7 @@ make_table7 <- function(
 
 
 # =============================================================================
-# 36. TABLE 8
-# =============================================================================
-
-make_table8 <- function(
-    results
-) {
-
-    make_catboost_table(
-        normalize_simulation_results(results)
-    )
-}
-
-
-# =============================================================================
-# 37. TABLE 9
+# 38. TABLE 9
 # =============================================================================
 
 make_table9 <- function(
@@ -1919,13 +2753,15 @@ make_table9 <- function(
 ) {
 
     make_overall_method_table(
-        normalize_simulation_results(results)
+        normalize_simulation_results(
+            results
+        )
     )
 }
 
 
 # =============================================================================
-# 38. SUPPLEMENTARY PARAMETER TABLE
+# 39. SUPPLEMENTARY PARAMETER TABLE
 # =============================================================================
 
 make_supplementary_parameter_table <- function(
@@ -1939,7 +2775,7 @@ make_supplementary_parameter_table <- function(
 
 
 # =============================================================================
-# 39. SUPPLEMENTARY ARL TABLE
+# 40. SUPPLEMENTARY ARL TABLE
 # =============================================================================
 
 make_supplementary_arl_table <- function(
@@ -1953,7 +2789,7 @@ make_supplementary_arl_table <- function(
 
 
 # =============================================================================
-# 40. SUPPLEMENTARY RECALIBRATION TABLE
+# 41. SUPPLEMENTARY RECALIBRATION TABLE
 # =============================================================================
 
 make_supplementary_recalibration_table <- function(
@@ -1967,7 +2803,7 @@ make_supplementary_recalibration_table <- function(
 
 
 # =============================================================================
-# 41. BUILD ALL RESULTS TABLES
+# 42. BUILD ALL RESULTS TABLES
 # =============================================================================
 
 build_all_results_tables <- function(
@@ -1977,6 +2813,7 @@ build_all_results_tables <- function(
     catboost_results = NULL,
     real_data_results = NULL,
     phase1_results = NULL,
+    method_config = NULL,
     config = RESULTS_TABLE_CONFIG
 ) {
 
@@ -1986,123 +2823,166 @@ build_all_results_tables <- function(
 
     tables <- list()
 
-    # -------------------------------------------------------------------------
-    # Table 1: simulation design
-    # -------------------------------------------------------------------------
-
-    tables$Table1 <- make_table1()
 
     # -------------------------------------------------------------------------
-    # Table 2: ARL performance
+    # Table 1
     # -------------------------------------------------------------------------
 
-    if (!is.null(simulation_summary)) {
-
-        tables$Table2 <- make_table2(
-            simulation_summary
+    tables$Table1 <-
+        make_table1(
+            config = method_config
         )
 
-    } else if (!is.null(simulation_normal)) {
 
-        tables$Table2 <- make_table2(
+    # -------------------------------------------------------------------------
+    # Table 2
+    # -------------------------------------------------------------------------
+
+    if (!is.null(
+        simulation_summary
+    )) {
+
+        tables$Table2 <-
+            make_table2(
+                simulation_summary
+            )
+
+    } else if (
+        !is.null(
             simulation_normal
         )
+    ) {
+
+        tables$Table2 <-
+            make_table2(
+                simulation_normal
+            )
     }
 
+
     # -------------------------------------------------------------------------
-    # Table 3: detection performance
+    # Table 3
     # -------------------------------------------------------------------------
 
-    if (!is.null(simulation_summary)) {
+    if (!is.null(
+        simulation_summary
+    )) {
 
-        tables$Table3 <- make_table3(
-            simulation_summary
-        )
+        tables$Table3 <-
+            make_table3(
+                simulation_summary
+            )
 
-    } else if (!is.null(simulation_normal)) {
-
-        tables$Table3 <- make_table3(
+    } else if (
+        !is.null(
             simulation_normal
         )
+    ) {
+
+        tables$Table3 <-
+            make_table3(
+                simulation_normal
+            )
     }
 
+
     # -------------------------------------------------------------------------
-    # Table 4: robustness
+    # Table 4
     # -------------------------------------------------------------------------
 
-    if (!is.null(simulation_non_normal)) {
+    if (!is.null(
+        simulation_non_normal
+    )) {
 
-        tables$Table4 <- make_table4(
-            simulation_non_normal
-        )
-
-    } else if (!is.null(simulation_summary)) {
-
-        tables$Table4 <- make_table4(
-            simulation_summary
-        )
+        tables$Table4 <-
+            make_table4(
+                simulation_non_normal
+            )
     }
 
+
     # -------------------------------------------------------------------------
-    # Table 5: optimization
+    # Table 5
     # -------------------------------------------------------------------------
 
-    if (!is.null(simulation_summary)) {
+    if (!is.null(
+        catboost_results
+    )) {
 
-        tables$Table5 <- make_table5(
-            simulation_summary
-        )
+        tables$Table5 <-
+            make_table5(
+                catboost_results
+            )
     }
 
+
     # -------------------------------------------------------------------------
-    # Table 6: real-data threshold
+    # Table 6
     # -------------------------------------------------------------------------
 
-    if (!is.null(real_data_results)) {
+    if (!is.null(
+        real_data_results
+    )) {
 
-        tables$Table6 <- make_table6(
-            real_data_results
-        )
+        tables$Table6 <-
+            make_table6(
+                real_data_results
+            )
     }
 
+
     # -------------------------------------------------------------------------
-    # Table 7: real-data monitoring
+    # Table 7
     # -------------------------------------------------------------------------
 
-    if (!is.null(real_data_results)) {
+    if (!is.null(
+        real_data_results
+    )) {
 
-        tables$Table7 <- make_table7(
-            real_data_results
-        )
+        tables$Table7 <-
+            make_table7(
+                real_data_results
+            )
     }
 
+
     # -------------------------------------------------------------------------
-    # Table 8: CatBoost surrogate
+    # Table 8
     # -------------------------------------------------------------------------
 
-    if (!is.null(catboost_results)) {
+    if (!is.null(
+        catboost_results
+    )) {
 
-        tables$Table8 <- make_table8(
-            catboost_results
-        )
+        tables$Table8 <-
+            make_table8(
+                catboost_results
+            )
     }
 
+
     # -------------------------------------------------------------------------
-    # Table 9: overall comparison
+    # Table 9
     # -------------------------------------------------------------------------
 
-    if (!is.null(simulation_summary)) {
+    if (!is.null(
+        simulation_summary
+    )) {
 
-        tables$Table9 <- make_table9(
-            simulation_summary
-        )
+        tables$Table9 <-
+            make_table9(
+                simulation_summary
+            )
     }
+
 
     # -------------------------------------------------------------------------
     # Supplementary tables
     # -------------------------------------------------------------------------
 
-    if (!is.null(phase1_results)) {
+    if (!is.null(
+        phase1_results
+    )) {
 
         tables$Supplementary_Parameters <-
             make_supplementary_parameter_table(
@@ -2120,12 +3000,13 @@ build_all_results_tables <- function(
             )
     }
 
+
     tables
 }
 
 
 # =============================================================================
-# 42. SAVE ALL RESULTS TABLES
+# 43. SAVE ALL RESULTS TABLES
 # =============================================================================
 
 save_all_results_tables <- function(
@@ -2133,8 +3014,10 @@ save_all_results_tables <- function(
     config = RESULTS_TABLE_CONFIG
 ) {
 
-    if (is.null(tables) ||
-        length(tables) == 0L) {
+    if (
+        is.null(tables) ||
+        length(tables) == 0L
+    ) {
 
         warning(
             "No tables were supplied.",
@@ -2152,7 +3035,10 @@ save_all_results_tables <- function(
 
     saved <- list()
 
-    for (table_name in names(tables)) {
+
+    for (
+        table_name in names(tables)
+    ) {
 
         table <- tables[[table_name]]
 
@@ -2168,11 +3054,12 @@ save_all_results_tables <- function(
             next
         }
 
+
         caption <- switch(
             table_name,
 
             Table1 =
-                "Simulation design.",
+                "SP-E-CUSUM simulation and monitoring design.",
 
             Table2 =
                 "Average run length performance.",
@@ -2184,7 +3071,7 @@ save_all_results_tables <- function(
                 "Robustness across distributions and scenarios.",
 
             Table5 =
-                "Optimization results.",
+                "CatBoost surrogate optimization history.",
 
             Table6 =
                 "Real-data threshold calibration.",
@@ -2193,7 +3080,7 @@ save_all_results_tables <- function(
                 "Real-data monitoring results.",
 
             Table8 =
-                "CatBoost surrogate results.",
+                "Final CatBoost-selected SP-E-CUSUM design and validation.",
 
             Table9 =
                 "Overall method comparison.",
@@ -2210,35 +3097,43 @@ save_all_results_tables <- function(
             table_name
         )
 
+
         label <- paste0(
             "tab:",
-            tolower(table_name)
+            tolower(
+                table_name
+            )
         )
 
-        saved[[table_name]] <- save_results_table(
-            table,
-            table_name = table_name,
-            caption = caption,
-            label = label,
-            config = config
-        )
+
+        saved[[table_name]] <-
+            save_results_table(
+                table,
+                table_name =
+                    table_name,
+                caption =
+                    caption,
+                label =
+                    label,
+                config =
+                    config
+            )
     }
+
 
     invisible(saved)
 }
 
 
 # =============================================================================
-# 43. COMBINE METHOD RESULTS
+# 44. COMBINE METHOD RESULTS
 # =============================================================================
 
 combine_method_results <- function(
     ...
 ) {
 
-    objects <- list(
-        ...
-    )
+    objects <- list(...)
 
     objects <- objects[
         !vapply(
@@ -2251,6 +3146,7 @@ combine_method_results <- function(
     if (length(objects) == 0L) {
         return(NULL)
     }
+
 
     dfs <- lapply(
         objects,
@@ -2268,6 +3164,7 @@ combine_method_results <- function(
         }
     )
 
+
     dfs <- dfs[
         !vapply(
             dfs,
@@ -2280,32 +3177,6 @@ combine_method_results <- function(
         return(NULL)
     }
 
-    common_names <- Reduce(
-        intersect,
-        lapply(
-            dfs,
-            names
-        )
-    )
-
-    if (length(common_names) > 0L) {
-
-        return(
-            do.call(
-                rbind,
-                lapply(
-                    dfs,
-                    function(x) {
-                        x[
-                            ,
-                            common_names,
-                            drop = FALSE
-                        ]
-                    }
-                )
-            )
-        )
-    }
 
     all_names <- unique(
         unlist(
@@ -2316,7 +3187,12 @@ combine_method_results <- function(
         )
     )
 
-    out <- lapply(
+
+    # -------------------------------------------------------------------------
+    # Add missing columns
+    # -------------------------------------------------------------------------
+
+    dfs <- lapply(
         dfs,
         function(x) {
 
@@ -2340,15 +3216,20 @@ combine_method_results <- function(
         }
     )
 
-    do.call(
+
+    out <- do.call(
         rbind,
-        out
+        dfs
     )
+
+    rownames(out) <- NULL
+
+    out
 }
 
 
 # =============================================================================
-# 44. METHOD SUMMARY
+# 45. METHOD SUMMARY
 # =============================================================================
 
 summarize_methods <- function(
@@ -2369,11 +3250,14 @@ summarize_methods <- function(
         results
     )
 
-    if (is.null(metric) ||
-        !metric %in% names(results)) {
+    if (
+        is.null(metric) ||
+        !metric %in% names(results)
+    ) {
 
         return(results)
     }
+
 
     aggregate_formula <- as.formula(
         paste(
@@ -2382,6 +3266,7 @@ summarize_methods <- function(
         )
     )
 
+
     summary <- aggregate(
         aggregate_formula,
         data = results,
@@ -2389,7 +3274,11 @@ summarize_methods <- function(
 
             x <- safe_numeric(x)
 
-            if (length(x) == 0L) {
+            if (
+                length(x) == 0L ||
+                all(is.na(x))
+            ) {
+
                 return(NA_real_)
             }
 
@@ -2400,7 +3289,13 @@ summarize_methods <- function(
         }
     )
 
-    names(summary)[2L] <- metric
+
+    names(summary)[2L] <-
+        metric
+
+
+    # Ranking is available as an analysis utility only.
+    # It is not automatically applied to publication tables.
 
     rank_methods(
         summary,
@@ -2411,7 +3306,7 @@ summarize_methods <- function(
 
 
 # =============================================================================
-# 45. VALIDATE RESULTS TABLE SYNTAX
+# 46. VALIDATE RESULTS TABLE SYNTAX
 # =============================================================================
 
 validate_results_table_syntax <- function(
@@ -2427,10 +3322,13 @@ validate_results_table_syntax <- function(
         )
     }
 
+
     parsed <- tryCatch(
+
         parse(
             file = file
         ),
+
         error = function(e) {
 
             stop(
@@ -2443,6 +3341,7 @@ validate_results_table_syntax <- function(
         }
     )
 
+
     message(
         file,
         " parsed successfully."
@@ -2453,7 +3352,7 @@ validate_results_table_syntax <- function(
 
 
 # =============================================================================
-# 46. UNIT TESTS
+# 47. UNIT TESTS
 # =============================================================================
 
 run_results_table_tests <- function() {
@@ -2461,6 +3360,7 @@ run_results_table_tests <- function() {
     message(
         "Running 14_results_tables.R tests..."
     )
+
 
     # -------------------------------------------------------------------------
     # Test %||%
@@ -2479,6 +3379,39 @@ run_results_table_tests <- function() {
             7
         )
     )
+
+
+    # -------------------------------------------------------------------------
+    # Test transform normalization
+    # -------------------------------------------------------------------------
+
+    stopifnot(
+        identical(
+            normalize_transform_method(
+                "mid"
+            ),
+            "mid"
+        )
+    )
+
+    stopifnot(
+        identical(
+            normalize_transform_method(
+                "empirical_copula"
+            ),
+            "empirical_copula"
+        )
+    )
+
+    stopifnot(
+        identical(
+            normalize_transform_method(
+                "ecdf_copula"
+            ),
+            "empirical_copula"
+        )
+    )
+
 
     # -------------------------------------------------------------------------
     # Test method labels
@@ -2505,8 +3438,9 @@ run_results_table_tests <- function() {
         )
     )
 
+
     # -------------------------------------------------------------------------
-    # Test ranking
+    # Test ranking utility
     # -------------------------------------------------------------------------
 
     test_dynamic <- data.frame(
@@ -2523,15 +3457,25 @@ run_results_table_tests <- function() {
         stringsAsFactors = FALSE
     )
 
+
     ranked <- rank_methods(
         test_dynamic,
         metric = "Objective",
         decreasing = TRUE
     )
 
+
     stopifnot(
-        ranked$Method[1L] == "A"
+        identical(
+            ranked$Method,
+            c(
+                "A",
+                "C",
+                "B"
+            )
+        )
     )
+
 
     # -------------------------------------------------------------------------
     # Test threshold extraction
@@ -2540,6 +3484,7 @@ run_results_table_tests <- function() {
     threshold_test <- list(
         threshold = 0.873
     )
+
 
     stopifnot(
         isTRUE(
@@ -2552,20 +3497,28 @@ run_results_table_tests <- function() {
         )
     )
 
+
     # -------------------------------------------------------------------------
     # Test phase-I extraction
     # -------------------------------------------------------------------------
 
     phase1_test <- list(
+
         phase1_arl0 = 371,
+
         estimates = data.frame(
             parameter = "k",
-            estimate = 0.25
+            estimate = 0.25,
+            stringsAsFactors = FALSE
         ),
-        recalibration_results = data.frame(
-            threshold = 0.9
-        )
+
+        recalibration_results =
+            data.frame(
+                threshold = 0.9,
+                stringsAsFactors = FALSE
+            )
     )
+
 
     stopifnot(
         identical(
@@ -2577,6 +3530,7 @@ run_results_table_tests <- function() {
         )
     )
 
+
     stopifnot(
         is.data.frame(
             extract_phase1_component(
@@ -2585,6 +3539,7 @@ run_results_table_tests <- function() {
             )
         )
     )
+
 
     stopifnot(
         is.data.frame(
@@ -2595,21 +3550,325 @@ run_results_table_tests <- function() {
         )
     )
 
+
+    # -------------------------------------------------------------------------
+    # Test Table 1
+    # -------------------------------------------------------------------------
+
+    design_config <- list(
+        target_arl = 370,
+
+        k_values = c(
+            0.25,
+            0.50,
+            0.75
+        ),
+
+        weights = c(
+            1 / 3,
+            1 / 3,
+            1 / 3
+        ),
+
+        transform_method =
+            "mid",
+
+        use_empirical_copula =
+            TRUE,
+
+        side = "upper",
+
+        alarm_rule = "E_t > H",
+
+        initialization = "Zero"
+    )
+
+
+    table1 <- make_table1(
+        design_config
+    )
+
+
+    stopifnot(
+        is.data.frame(table1)
+    )
+
+
+    stopifnot(
+        nrow(table1) >= 8L
+    )
+
+
+    stopifnot(
+        any(
+            table1$Specification ==
+                "Fixed empirical copula"
+        )
+    )
+
+
+    # -------------------------------------------------------------------------
+    # Test CatBoost history
+    # -------------------------------------------------------------------------
+
+    catboost_test <- list(
+
+        history_table =
+            data.frame(
+                iteration = c(
+                    1,
+                    2
+                ),
+
+                objective = c(
+                    10.0,
+                    5.0
+                ),
+
+                arl0 = c(
+                    100,
+                    200
+                ),
+
+                stringsAsFactors = FALSE
+            ),
+
+        final_fit = list(
+
+            H = 0.981,
+
+            k_values = c(
+                0.25,
+                0.50,
+                0.75
+            ),
+
+            weights = c(
+                1 / 3,
+                1 / 3,
+                1 / 3
+            )
+        ),
+
+        best_evaluation = list(
+
+            objective = 5.0,
+
+            arl0 = 365
+        ),
+
+        final_validation = list(
+            ARL0 = 371
+        )
+    )
+
+
+    table5 <- make_table5(
+        catboost_test
+    )
+
+
+    stopifnot(
+        is.data.frame(table5)
+    )
+
+
+    table8 <- make_table8(
+        catboost_test
+    )
+
+
+    stopifnot(
+        is.data.frame(table8)
+    )
+
+
+    stopifnot(
+        isTRUE(
+            all.equal(
+                safe_scalar(
+                    table8$H
+                ),
+                0.981
+            )
+        )
+    )
+
+
+    # -------------------------------------------------------------------------
+    # Test real-data threshold extraction
+    # -------------------------------------------------------------------------
+
+    real_test <- list(
+
+        threshold = 0.981487,
+
+        arl0 = 369.5,
+
+        target_arl0 = 370,
+
+        iterations = 8,
+
+        converged = TRUE
+    )
+
+
+    table6 <- make_table6(
+        real_test
+    )
+
+
+    stopifnot(
+        is.data.frame(table6)
+    )
+
+
+    stopifnot(
+        isTRUE(
+            all.equal(
+                safe_scalar(
+                    table6$Threshold
+                ),
+                0.981487
+            )
+        )
+    )
+
+
+    stopifnot(
+        isTRUE(
+            safe_logical(
+                table6$Converged
+            )
+        )
+    )
+
+
+    # -------------------------------------------------------------------------
+    # Test monitoring table
+    # -------------------------------------------------------------------------
+
+    monitoring_test <- data.frame(
+
+        Time = 1:3,
+
+        Observation = c(
+            0.2,
+            0.4,
+            0.6
+        ),
+
+        CUSUM1 = c(
+            0,
+            0.1,
+            0.2
+        ),
+
+        CUSUM2 = c(
+            0,
+            0.05,
+            0.1
+        ),
+
+        CUSUM3 = c(
+            0,
+            0.02,
+            0.04
+        ),
+
+        Probability1 = c(
+            0.5,
+            0.6,
+            0.7
+        ),
+
+        Probability2 = c(
+            0.5,
+            0.55,
+            0.65
+        ),
+
+        Probability3 = c(
+            0.5,
+            0.52,
+            0.60
+        ),
+
+        Ensemble = c(
+            0.1,
+            0.2,
+            0.3
+        ),
+
+        Copula = c(
+            0.10,
+            0.20,
+            0.30
+        ),
+
+        Threshold = rep(
+            0.981487,
+            3
+        ),
+
+        Alarm = c(
+            FALSE,
+            FALSE,
+            FALSE
+        ),
+
+        stringsAsFactors = FALSE
+    )
+
+
+    table7 <- make_table7(
+        monitoring_test
+    )
+
+
+    stopifnot(
+        is.data.frame(table7)
+    )
+
+
+    stopifnot(
+        all(
+            c(
+                "CUSUM1",
+                "CUSUM2",
+                "CUSUM3",
+                "Probability1",
+                "Probability2",
+                "Probability3",
+                "Ensemble",
+                "Copula",
+                "Threshold",
+                "Alarm"
+            ) %in%
+                names(table7)
+        )
+    )
+
+
     # -------------------------------------------------------------------------
     # Test LaTeX generation
     # -------------------------------------------------------------------------
 
     test_table <- data.frame(
+
         Method = c(
             "SP-E-CUSUM",
             "Single CUSUM"
         ),
+
         ARL0 = c(
             369.87,
             351.22
         ),
+
         stringsAsFactors = FALSE
     )
+
 
     latex <- dataframe_to_latex(
         test_table,
@@ -2617,9 +3876,11 @@ run_results_table_tests <- function() {
         label = "tab:test"
     )
 
+
     stopifnot(
         length(latex) > 0L
     )
+
 
     stopifnot(
         any(
@@ -2630,6 +3891,7 @@ run_results_table_tests <- function() {
         )
     )
 
+
     stopifnot(
         any(
             grepl(
@@ -2638,6 +3900,7 @@ run_results_table_tests <- function() {
             )
         )
     )
+
 
     message(
         "All 14_results_tables.R tests passed."
@@ -2648,7 +3911,7 @@ run_results_table_tests <- function() {
 
 
 # =============================================================================
-# 47. COMPLETE RESULTS-TABLE WORKFLOW
+# 48. COMPLETE RESULTS-TABLE WORKFLOW
 # =============================================================================
 
 run_results_table_workflow <- function(
@@ -2658,6 +3921,7 @@ run_results_table_workflow <- function(
     catboost_results = NULL,
     real_data_results = NULL,
     phase1_results = NULL,
+    method_config = NULL,
     config = RESULTS_TABLE_CONFIG
 ) {
 
@@ -2665,34 +3929,76 @@ run_results_table_workflow <- function(
         config
     )
 
+
     tables <- build_all_results_tables(
-        simulation_normal = simulation_normal,
-        simulation_non_normal = simulation_non_normal,
-        simulation_summary = simulation_summary,
-        catboost_results = catboost_results,
-        real_data_results = real_data_results,
-        phase1_results = phase1_results,
-        config = config
+        simulation_normal =
+            simulation_normal,
+
+        simulation_non_normal =
+            simulation_non_normal,
+
+        simulation_summary =
+            simulation_summary,
+
+        catboost_results =
+            catboost_results,
+
+        real_data_results =
+            real_data_results,
+
+        phase1_results =
+            phase1_results,
+
+        method_config =
+            method_config,
+
+        config =
+            config
     )
+
 
     save_all_results_tables(
         tables,
         config = config
     )
 
-    invisible(tables)
+
+    invisible(
+        tables
+    )
 }
 
 
 # =============================================================================
-# 48. SCRIPT COMPLETION MESSAGE
+# 49. OPTIONAL AUTOMATIC VALIDATION
+# =============================================================================
+
+if (
+    identical(
+        Sys.getenv(
+            "SP_E_CUSUM_RUN_TABLE_TESTS",
+            unset = "0"
+        ),
+        "1"
+    )
+) {
+
+    run_results_table_tests()
+}
+
+
+# =============================================================================
+# 50. SCRIPT COMPLETION MESSAGE
 # =============================================================================
 
 message(
     paste0(
         "14_results_tables.R loaded successfully with ",
-        "empirical-copula-compatible result extraction, ",
-        "phase-I result handling, and publication-ready ",
+        "canonical stationary mid-rank / empirical-copula ",
+        "design reporting, ",
+        "CatBoost surrogate optimization-history handling, ",
+        "real-data threshold and monitoring extraction, ",
+        "Phase-I result handling, and publication-ready ",
         "CSV/LaTeX/RDS table generation."
     )
 )

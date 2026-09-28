@@ -13,7 +13,7 @@
 # 2. Use stationary mid-rank probability transformation.
 # 3. Use the empirical-copula architecture.
 # 4. Construct ONE fixed empirical-copula reference.
-# 5. Calibrate one unified probability-scale threshold H.
+# 5. Calibrate ONE unified probability-scale threshold H.
 # 6. Construct SP_E_CUSUM_FIT using the SAME stationary models and H.
 # 7. Attach the EXACT empirical-copula reference used for calibration.
 # 8. Pass SP_E_CUSUM_FIT downstream.
@@ -24,14 +24,14 @@
 # They must NOT be rebuilt or modified during calibration or master-fit
 # construction.
 #
-# Current canonical probability transform:
+# Canonical probability transformation:
 #   stationary mid-rank
 #
-# Current canonical copula architecture:
+# Canonical dependence architecture:
 #   empirical copula = TRUE
 #
 # Updated:
-#   2026-09-21
+#   2026-09-27
 # =============================================================================
 
 
@@ -59,9 +59,10 @@ set.seed(GLOBAL_SEED)
 
 PROJECT_NAME <- "SP-E-CUSUM"
 
+# Keep one common output directory for the current analysis.
 OUTPUT_DIR <- file.path(
   getwd(),
-  "SP_E_CUSUM_OUTPUT"
+  "sp_ecusum_results"
 )
 
 if (!dir.exists(OUTPUT_DIR)) {
@@ -70,6 +71,83 @@ if (!dir.exists(OUTPUT_DIR)) {
     recursive = TRUE,
     showWarnings = FALSE
   )
+}
+
+
+# =============================================================================
+# 1.1 BASIC COMPATIBILITY HELPERS
+# =============================================================================
+
+`%||%` <- function(
+    x,
+    y
+) {
+
+  if (
+    is.null(x) ||
+    length(x) == 0L
+  ) {
+    return(y)
+  }
+
+  x
+}
+
+
+assert_true <- function(
+    condition,
+    message
+) {
+
+  if (!isTRUE(condition)) {
+    stop(
+      message,
+      call. = FALSE
+    )
+  }
+
+  invisible(TRUE)
+}
+
+
+assert_scalar_numeric <- function(
+    x,
+    name
+) {
+
+  assert_true(
+    length(x) == 1L &&
+      is.numeric(x) &&
+      is.finite(x),
+    paste0(
+      name,
+      " must be one finite numeric value."
+    )
+  )
+
+  invisible(TRUE)
+}
+
+
+assert_positive_numeric <- function(
+    x,
+    name
+) {
+
+  assert_scalar_numeric(
+    x,
+    name
+  )
+
+  assert_true(
+    x > 0,
+    paste0(
+      name,
+      " must be positive."
+    )
+  )
+
+  invisible(TRUE)
 }
 
 
@@ -155,13 +233,12 @@ CONFIG <- list(
 
   # ---------------------------------------------------------------------------
   # Probability transform
-  # ---------------------------------------------------------------------------
   #
-  # Canonical transformation:
-  #   stationary mid-rank
+  # IMPORTANT:
+  #   "mid" is the probability transformation.
   #
-  # Empirical-copula architecture:
-  #   TRUE
+  # The empirical copula is a separate dependence architecture and is
+  # controlled by use_empirical_copula = TRUE.
   # ---------------------------------------------------------------------------
 
   transform_method = "mid",
@@ -182,11 +259,6 @@ CONFIG <- list(
 
   # ---------------------------------------------------------------------------
   # Empirical-copula reference
-  # ---------------------------------------------------------------------------
-  #
-  # The reference empirical copula is constructed ONCE from the canonical
-  # stationary models and then reused throughout calibration and downstream
-  # analysis.
   # ---------------------------------------------------------------------------
 
   calibration_copula_n_samples = 10000L,
@@ -226,139 +298,7 @@ CONFIG <- list(
 
 
 # =============================================================================
-# 4. HELPER FUNCTIONS
-# =============================================================================
-
-assert_true <- function(
-    condition,
-    message
-) {
-
-  if (!isTRUE(condition)) {
-    stop(
-      message,
-      call. = FALSE
-    )
-  }
-
-  invisible(TRUE)
-}
-
-
-assert_scalar_numeric <- function(
-    x,
-    name
-) {
-
-  assert_true(
-    length(x) == 1L &&
-      is.numeric(x) &&
-      is.finite(x),
-    paste0(
-      name,
-      " must be one finite numeric value."
-    )
-  )
-
-  invisible(TRUE)
-}
-
-
-assert_positive_numeric <- function(
-    x,
-    name
-) {
-
-  assert_scalar_numeric(
-    x,
-    name
-  )
-
-  assert_true(
-    x > 0,
-    paste0(
-      name,
-      " must be positive."
-    )
-  )
-
-  invisible(TRUE)
-}
-
-
-# =============================================================================
-# 5. EMPIRICAL-COPULA REFERENCE RESOLVER
-# =============================================================================
-#
-# Compatibility helper for inspecting existing fit objects.
-#
-# IMPORTANT:
-#   The canonical master-fit path below does NOT use this resolver to select
-#   the calibration reference. The exact CALIBRATION_COPULA is attached
-#   directly to the master fit.
-# =============================================================================
-
-resolve_main_empirical_copula_reference <- function(
-    fit
-) {
-
-  if (is.null(fit)) {
-    return(NULL)
-  }
-
-  candidate_names <- c(
-    "reference_empirical_copula",
-    "empirical_copula",
-    "copula_reference",
-    "reference_copula",
-    "copula"
-  )
-
-  for (nm in candidate_names) {
-
-    if (
-      nm %in% names(fit) &&
-      !is.null(fit[[nm]])
-    ) {
-
-      return(
-        fit[[nm]]
-      )
-    }
-  }
-
-  if (
-    !is.null(fit$stationary_models) &&
-    is.list(fit$stationary_models)
-  ) {
-
-    for (model in fit$stationary_models) {
-
-      if (!is.list(model)) {
-        next
-      }
-
-      for (nm in candidate_names) {
-
-        if (
-          nm %in% names(model) &&
-          !is.null(model[[nm]])
-        ) {
-
-          return(
-            model[[nm]]
-          )
-        }
-      }
-    }
-  }
-
-  NULL
-}
-
-
-# =============================================================================
-# 6. CONFIGURATION VALIDATION
+# 4. CONFIGURATION VALIDATION
 # =============================================================================
 
 assert_true(
@@ -370,7 +310,9 @@ assert_true(
   "CONFIG$J must be a positive integer."
 )
 
-CONFIG$J <- as.integer(CONFIG$J)
+CONFIG$J <- as.integer(
+  CONFIG$J
+)
 
 
 assert_true(
@@ -431,11 +373,13 @@ assert_true(
 
 
 # =============================================================================
-# 6.1 CANONICAL EMPIRICAL-COPULA REQUIREMENTS
+# 4.1 CANONICAL ARCHITECTURE VALIDATION
 # =============================================================================
 
 assert_true(
-  isTRUE(CONFIG$use_empirical_copula),
+  isTRUE(
+    CONFIG$use_empirical_copula
+  ),
   paste0(
     "Canonical SP-E-CUSUM requires ",
     "CONFIG$use_empirical_copula = TRUE."
@@ -456,7 +400,7 @@ assert_true(
 
 
 # =============================================================================
-# 6.2 NUMERICAL CONFIGURATION VALIDATION
+# 4.2 NUMERICAL CONFIGURATION VALIDATION
 # =============================================================================
 
 assert_positive_numeric(
@@ -480,9 +424,15 @@ assert_true(
   "Calibration H lower bound must be smaller than upper bound."
 )
 
+assert_true(
+  CONFIG$calibration_h_lower > 0 &&
+    CONFIG$calibration_h_upper < 1,
+  "Calibration H bounds must lie inside (0,1)."
+)
+
 
 # =============================================================================
-# 6.3 EMPIRICAL-COPULA SAMPLE-SIZE VALIDATION
+# 4.3 EMPIRICAL-COPULA SAMPLE-SIZE VALIDATION
 # =============================================================================
 
 assert_true(
@@ -491,7 +441,9 @@ assert_true(
     is.finite(CONFIG$calibration_copula_n_samples) &&
     CONFIG$calibration_copula_n_samples >= 2 &&
     CONFIG$calibration_copula_n_samples ==
-      as.integer(CONFIG$calibration_copula_n_samples),
+      as.integer(
+        CONFIG$calibration_copula_n_samples
+      ),
   paste0(
     "CONFIG$calibration_copula_n_samples must be an integer ",
     "greater than or equal to 2."
@@ -505,7 +457,7 @@ CONFIG$calibration_copula_n_samples <-
 
 
 # =============================================================================
-# 6.4 CALIBRATION DIMENSION VALIDATION
+# 4.4 CALIBRATION DIMENSION VALIDATION
 # =============================================================================
 
 assert_true(
@@ -520,7 +472,7 @@ assert_true(
 
 
 # =============================================================================
-# 7. DISPLAY CONFIGURATION
+# 5. DISPLAY CONFIGURATION
 # =============================================================================
 
 cat("\n")
@@ -538,6 +490,13 @@ cat(
 cat(
   "Global seed: ",
   GLOBAL_SEED,
+  "\n",
+  sep = ""
+)
+
+cat(
+  "Output directory: ",
+  OUTPUT_DIR,
   "\n",
   sep = ""
 )
@@ -611,7 +570,7 @@ cat("============================================================\n\n")
 
 
 # =============================================================================
-# 8. CONSTRUCT STATIONARY MODELS -- EXACTLY ONCE
+# 6. CONSTRUCT STATIONARY MODELS -- EXACTLY ONCE
 # =============================================================================
 
 cat(
@@ -622,19 +581,35 @@ cat(
   "Constructing stationary CUSUM reference models...\n"
 )
 
+cat(
+  "------------------------------------------------------------\n"
+)
+
+set.seed(
+  GLOBAL_SEED
+)
+
 stationary_models <- make_stationary_models(
-  k_values = CONFIG$k_values,
-  grid_width = CONFIG$grid_width,
-  state_max = CONFIG$state_max
+  k_values =
+    CONFIG$k_values,
+
+  grid_width =
+    CONFIG$grid_width,
+
+  state_max =
+    CONFIG$state_max
 )
 
 assert_true(
-  is.list(stationary_models),
+  is.list(
+    stationary_models
+  ),
   "stationary_models must be a list."
 )
 
 assert_true(
-  length(stationary_models) == CONFIG$J,
+  length(stationary_models) ==
+    CONFIG$J,
   paste0(
     "Expected ",
     CONFIG$J,
@@ -646,7 +621,7 @@ assert_true(
 
 
 # =============================================================================
-# 8.1 REQUIRED STATIONARY-MODEL COMPONENTS
+# 6.1 REQUIRED STATIONARY-MODEL COMPONENTS
 # =============================================================================
 
 CANONICAL_STATIONARY_MODEL_COMPONENTS <- c(
@@ -691,7 +666,9 @@ for (j in seq_along(stationary_models)) {
     names(model)
   )
 
-  if (length(missing_components) > 0L) {
+  if (
+    length(missing_components) > 0L
+  ) {
 
     stop(
       paste0(
@@ -710,8 +687,12 @@ for (j in seq_along(stationary_models)) {
   assert_true(
     isTRUE(
       all.equal(
-        as.numeric(model$k),
-        as.numeric(CONFIG$k_values[[j]]),
+        as.numeric(
+          model$k
+        ),
+        as.numeric(
+          CONFIG$k_values[[j]]
+        ),
         tolerance = 1e-12
       )
     ),
@@ -725,25 +706,30 @@ for (j in seq_along(stationary_models)) {
 
 
 # =============================================================================
-# 9. FREEZE CANONICAL STATIONARY MODELS
+# 7. FREEZE CANONICAL STATIONARY MODELS
 # =============================================================================
 
-CANONICAL_STATIONARY_MODELS <- stationary_models
+CANONICAL_STATIONARY_MODELS <-
+  stationary_models
 
-CANONICAL_STATIONARY_MODEL_NAMES <- lapply(
-  CANONICAL_STATIONARY_MODELS,
-  names
-)
+CANONICAL_STATIONARY_MODEL_NAMES <-
+  lapply(
+    CANONICAL_STATIONARY_MODELS,
+    names
+  )
 
-CANONICAL_STATIONARY_MODEL_LENGTHS <- vapply(
-  CANONICAL_STATIONARY_MODELS,
-  length,
-  integer(1)
-)
+CANONICAL_STATIONARY_MODEL_LENGTHS <-
+  vapply(
+    CANONICAL_STATIONARY_MODELS,
+    length,
+    integer(1)
+  )
 
 cat(
   "Stationary models constructed: ",
-  length(CANONICAL_STATIONARY_MODELS),
+  length(
+    CANONICAL_STATIONARY_MODELS
+  ),
   "\n",
   sep = ""
 )
@@ -764,7 +750,7 @@ cat(
 
 
 # =============================================================================
-# 10. STATIONARY MODEL SUMMARY
+# 8. STATIONARY MODEL SUMMARY
 # =============================================================================
 
 cat("\n")
@@ -780,9 +766,14 @@ cat(
   "------------------------------------------------------------\n"
 )
 
-for (j in seq_along(CANONICAL_STATIONARY_MODELS)) {
+for (
+  j in seq_along(
+    CANONICAL_STATIONARY_MODELS
+  )
+) {
 
-  model <- CANONICAL_STATIONARY_MODELS[[j]]
+  model <-
+    CANONICAL_STATIONARY_MODELS[[j]]
 
   cat("\n")
 
@@ -880,7 +871,7 @@ for (j in seq_along(CANONICAL_STATIONARY_MODELS)) {
 
 
 # =============================================================================
-# 11. CONSTRUCT EMPIRICAL-COPULA REFERENCE AND CALIBRATE THRESHOLD
+# 9. CONSTRUCT EMPIRICAL-COPULA REFERENCE
 # =============================================================================
 
 cat("\n")
@@ -889,7 +880,7 @@ cat(
 )
 
 cat(
-  "Preparing probability-scale calibration...\n"
+  "Preparing probability-scale calibration\n"
 )
 
 cat(
@@ -901,297 +892,300 @@ set.seed(
 )
 
 
-# =============================================================================
-# 11.1 Construct the canonical empirical-copula reference
-# =============================================================================
-
-if (isTRUE(CONFIG$use_empirical_copula)) {
-
-    cat(
-        "Empirical copula     : ENABLED\n"
-    )
+CALIBRATION_COPULA_OBJECT <- NULL
+CALIBRATION_COPULA <- NULL
 
 
-    # -------------------------------------------------------------------------
-    # Validate reference sample size.
-    # -------------------------------------------------------------------------
+if (
+  isTRUE(
+    CONFIG$use_empirical_copula
+  )
+) {
 
-    assert_true(
-        length(CONFIG$calibration_copula_n_samples) == 1L &&
-            is.numeric(CONFIG$calibration_copula_n_samples) &&
-            is.finite(CONFIG$calibration_copula_n_samples) &&
-            CONFIG$calibration_copula_n_samples >= 2 &&
-            CONFIG$calibration_copula_n_samples ==
-                as.integer(
-                    CONFIG$calibration_copula_n_samples
-                ),
-        paste0(
-            "CONFIG$calibration_copula_n_samples must be an integer ",
-            "greater than or equal to 2."
-        )
-    )
+  cat(
+    "Empirical copula     : ENABLED\n"
+  )
 
-    CONFIG$calibration_copula_n_samples <-
-        as.integer(
-            CONFIG$calibration_copula_n_samples
-        )
+  # ---------------------------------------------------------------------------
+  # Construct the reference exactly once.
+  # ---------------------------------------------------------------------------
 
+  CALIBRATION_COPULA_OBJECT <-
+    fit_reference_empirical_copula(
+      stationary_models =
+        CANONICAL_STATIONARY_MODELS,
 
-    # -------------------------------------------------------------------------
-    # Construct the reference object ONCE.
-    #
-    # fit_reference_empirical_copula() returns a wrapper containing the
-    # actual empirical-copula object in its $copula component.
-    # -------------------------------------------------------------------------
-
-    CALIBRATION_COPULA_OBJECT <-
-        fit_reference_empirical_copula(
-            stationary_models =
-                CANONICAL_STATIONARY_MODELS,
-
-            n_samples =
-                CONFIG$calibration_copula_n_samples,
-
-            mu0 =
-                CONFIG$mu0,
-
-            sigma0 =
-                CONFIG$sigma0,
-
-            side =
-                CONFIG$side,
-
-            transform_method =
-                CONFIG$transform_method,
-
-            seed =
-                GLOBAL_SEED
-        )
-
-
-    # -------------------------------------------------------------------------
-    # Basic construction check.
-    # -------------------------------------------------------------------------
-
-    assert_true(
-        !is.null(
-            CALIBRATION_COPULA_OBJECT
-        ),
-        "fit_reference_empirical_copula() returned NULL."
-    )
-
-    assert_true(
-        is.list(
-            CALIBRATION_COPULA_OBJECT
-        ),
-        "Empirical-copula reference object must be a list."
-    )
-
-    assert_true(
-        !is.null(
-            CALIBRATION_COPULA_OBJECT$copula
-        ),
-        paste0(
-            "fit_reference_empirical_copula() did not return ",
-            "a nested $copula object."
-        )
-    )
-
-
-    # -------------------------------------------------------------------------
-    # Extract the actual empirical-copula object.
-    # -------------------------------------------------------------------------
-
-    CALIBRATION_COPULA <-
-        CALIBRATION_COPULA_OBJECT$copula
-
-
-    # -------------------------------------------------------------------------
-    # Validate that the extracted object has the expected class.
-    # -------------------------------------------------------------------------
-
-    assert_true(
-        inherits(
-            CALIBRATION_COPULA,
-            "empirical_copula"
-        ),
-        paste0(
-            "The $copula component returned by ",
-            "fit_reference_empirical_copula() does not inherit ",
-            "from class 'empirical_copula'."
-        )
-    )
-
-
-    # -------------------------------------------------------------------------
-    # Mark as the fixed stationary reference.
-    # -------------------------------------------------------------------------
-
-    CALIBRATION_COPULA$fixed_reference <-
-        TRUE
-
-    CALIBRATION_COPULA$stationary_reference <-
-        TRUE
-
-
-    # -------------------------------------------------------------------------
-    # Validate empirical-copula structure.
-    # -------------------------------------------------------------------------
-
-    CALIBRATION_COPULA <-
-        validate_empirical_copula(
-            CALIBRATION_COPULA,
-            expected_dimension =
-                CONFIG$J
-        )
-
-
-    # -------------------------------------------------------------------------
-    # Explicit dimension validation.
-    # -------------------------------------------------------------------------
-
-    if (
-        !is.null(
-            CALIBRATION_COPULA$n_comp
-        )
-    ) {
-
-        assert_true(
-            as.integer(
-                CALIBRATION_COPULA$n_comp
-            ) ==
-                as.integer(
-                    CONFIG$J
-                ),
-            paste0(
-                "Empirical-copula dimension mismatch: ",
-                "expected J = ",
-                CONFIG$J,
-                ", obtained ",
-                CALIBRATION_COPULA$n_comp,
-                "."
-            )
-        )
-    }
-
-
-    # -------------------------------------------------------------------------
-    # Explicit observation-count validation.
-    # -------------------------------------------------------------------------
-
-    if (
-        !is.null(
-            CALIBRATION_COPULA$n_obs
-        )
-    ) {
-
-        assert_true(
-            as.integer(
-                CALIBRATION_COPULA$n_obs
-            ) ==
-                as.integer(
-                    CONFIG$calibration_copula_n_samples
-                ),
-            paste0(
-                "Empirical-copula observation count mismatch: ",
-                "expected ",
-                CONFIG$calibration_copula_n_samples,
-                ", obtained ",
-                CALIBRATION_COPULA$n_obs,
-                "."
-            )
-        )
-    }
-
-
-    # -------------------------------------------------------------------------
-    # Report diagnostics.
-    # -------------------------------------------------------------------------
-
-    cat(
-        "Copula reference     : constructed successfully\n"
-    )
-
-    cat(
-        "Copula class         : ",
-        paste(
-            class(CALIBRATION_COPULA),
-            collapse = ", "
-        ),
-        "\n",
-        sep = ""
-    )
-
-    cat(
-        "Copula reference n   : ",
+      n_samples =
         CONFIG$calibration_copula_n_samples,
-        "\n",
-        sep = ""
-    )
 
-    if (
-        !is.null(
-            CALIBRATION_COPULA$n_comp
-        )
-    ) {
+      mu0 =
+        CONFIG$mu0,
 
-        cat(
-            "Copula dimension     : ",
-            CALIBRATION_COPULA$n_comp,
-            "\n",
-            sep = ""
-        )
-    }
+      sigma0 =
+        CONFIG$sigma0,
 
-    if (
-        !is.null(
-            CALIBRATION_COPULA$n_obs
-        )
-    ) {
+      side =
+        CONFIG$side,
 
-        cat(
-            "Copula observations  : ",
-            CALIBRATION_COPULA$n_obs,
-            "\n",
-            sep = ""
-        )
-    }
-
-    cat(
-        "Reference scale      : ",
+      transform_method =
         CONFIG$transform_method,
-        "\n",
-        sep = ""
+
+      seed =
+        GLOBAL_SEED
     )
+
+  # ---------------------------------------------------------------------------
+  # Basic checks.
+  # ---------------------------------------------------------------------------
+
+  assert_true(
+    !is.null(
+      CALIBRATION_COPULA_OBJECT
+    ),
+    "fit_reference_empirical_copula() returned NULL."
+  )
+
+  assert_true(
+    is.list(
+      CALIBRATION_COPULA_OBJECT
+    ),
+    "Empirical-copula reference object must be a list."
+  )
+
+  assert_true(
+    !is.null(
+      CALIBRATION_COPULA_OBJECT$copula
+    ),
+    paste0(
+      "fit_reference_empirical_copula() did not return ",
+      "a nested $copula object."
+    )
+  )
+
+  # ---------------------------------------------------------------------------
+  # Extract the actual empirical-copula object.
+  # ---------------------------------------------------------------------------
+
+  CALIBRATION_COPULA <-
+    CALIBRATION_COPULA_OBJECT$copula
+
+  assert_true(
+    inherits(
+      CALIBRATION_COPULA,
+      "empirical_copula"
+    ),
+    paste0(
+      "The $copula component returned by ",
+      "fit_reference_empirical_copula() does not inherit ",
+      "from class 'empirical_copula'."
+    )
+  )
+
+  # ---------------------------------------------------------------------------
+  # Mark as fixed stationary reference.
+  # ---------------------------------------------------------------------------
+
+  CALIBRATION_COPULA$fixed_reference <-
+    TRUE
+
+  CALIBRATION_COPULA$stationary_reference <-
+    TRUE
+
+  # ---------------------------------------------------------------------------
+  # Validate ONCE before the object is attached to the master fit.
+  #
+  # IMPORTANT:
+  # After this point, the exact validated object is retained unchanged.
+  # ---------------------------------------------------------------------------
+
+  CALIBRATION_COPULA <-
+    validate_empirical_copula(
+      CALIBRATION_COPULA,
+      expected_dimension =
+        CONFIG$J
+    )
+
+  # ---------------------------------------------------------------------------
+  # Explicit dimension validation.
+  # ---------------------------------------------------------------------------
+
+  if (
+    !is.null(
+      CALIBRATION_COPULA$n_comp
+    )
+  ) {
+
+    assert_true(
+      as.integer(
+        CALIBRATION_COPULA$n_comp
+      ) ==
+        as.integer(
+          CONFIG$J
+        ),
+      paste0(
+        "Empirical-copula dimension mismatch: expected J = ",
+        CONFIG$J,
+        ", obtained ",
+        CALIBRATION_COPULA$n_comp,
+        "."
+      )
+    )
+  }
+
+  # ---------------------------------------------------------------------------
+  # Explicit observation-count validation.
+  # ---------------------------------------------------------------------------
+
+  if (
+    !is.null(
+      CALIBRATION_COPULA$n_obs
+    )
+  ) {
+
+    assert_true(
+      as.integer(
+        CALIBRATION_COPULA$n_obs
+      ) ==
+        as.integer(
+          CONFIG$calibration_copula_n_samples
+        ),
+      paste0(
+        "Empirical-copula observation count mismatch: expected ",
+        CONFIG$calibration_copula_n_samples,
+        ", obtained ",
+        CALIBRATION_COPULA$n_obs,
+        "."
+      )
+    )
+  }
+
+  # ---------------------------------------------------------------------------
+  # Data dimensions.
+  # ---------------------------------------------------------------------------
+
+  assert_true(
+    !is.null(
+      CALIBRATION_COPULA$data
+    ),
+    "CALIBRATION_COPULA does not contain reference data."
+  )
+
+  assert_true(
+    nrow(
+      CALIBRATION_COPULA$data
+    ) ==
+      CONFIG$calibration_copula_n_samples,
+    paste0(
+      "Calibration copula reference size mismatch: expected ",
+      CONFIG$calibration_copula_n_samples,
+      ", obtained ",
+      nrow(
+        CALIBRATION_COPULA$data
+      ),
+      "."
+    )
+  )
+
+  assert_true(
+    ncol(
+      CALIBRATION_COPULA$data
+    ) ==
+      CONFIG$J,
+    paste0(
+      "Calibration copula dimension mismatch: expected ",
+      CONFIG$J,
+      ", obtained ",
+      ncol(
+        CALIBRATION_COPULA$data
+      ),
+      "."
+    )
+  )
+
+  # ---------------------------------------------------------------------------
+  # Diagnostics.
+  # ---------------------------------------------------------------------------
+
+  cat(
+    "Copula reference     : constructed successfully\n"
+  )
+
+  cat(
+    "Copula class         : ",
+    paste(
+      class(
+        CALIBRATION_COPULA
+      ),
+      collapse = ", "
+    ),
+    "\n",
+    sep = ""
+  )
+
+  cat(
+    "Copula reference n   : ",
+    CONFIG$calibration_copula_n_samples,
+    "\n",
+    sep = ""
+  )
+
+  if (
+    !is.null(
+      CALIBRATION_COPULA$n_comp
+    )
+  ) {
 
     cat(
-        "Smoothing            : FALSE\n"
+      "Copula dimension     : ",
+      CALIBRATION_COPULA$n_comp,
+      "\n",
+      sep = ""
     )
+  }
+
+  if (
+    !is.null(
+      CALIBRATION_COPULA$n_obs
+    )
+  ) {
 
     cat(
-        "Fixed reference      : TRUE\n"
+      "Copula observations  : ",
+      CALIBRATION_COPULA$n_obs,
+      "\n",
+      sep = ""
     )
+  }
 
-    cat(
-        "Stationary reference : TRUE\n"
-    )
+  cat(
+    "Reference scale      : ",
+    CONFIG$transform_method,
+    "\n",
+    sep = ""
+  )
 
+  cat(
+    "Smoothing            : FALSE\n"
+  )
+
+  cat(
+    "Fixed reference      : TRUE\n"
+  )
+
+  cat(
+    "Stationary reference : TRUE\n"
+  )
 
 } else {
 
-    CALIBRATION_COPULA_OBJECT <-
-        NULL
-
-    CALIBRATION_COPULA <-
-        NULL
-
-    cat(
-        "Empirical copula     : DISABLED\n"
-    )
+  cat(
+    "Empirical copula     : DISABLED\n"
+  )
 }
 
+
 # =============================================================================
-# 11.2 CALIBRATE UNIFIED PROBABILITY-SCALE THRESHOLD H
+# 10. CALIBRATE UNIFIED PROBABILITY-SCALE THRESHOLD H
 # =============================================================================
 
 cat("\n")
@@ -1263,26 +1257,35 @@ calibration <- calibrate_threshold(
 
 
 # =============================================================================
-# 11.3 VALIDATE CALIBRATION OUTPUT
+# 10.1 VALIDATE CALIBRATION OUTPUT
 # =============================================================================
 
 assert_true(
-  !is.null(calibration),
+  !is.null(
+    calibration
+  ),
   "calibrate_threshold() returned NULL."
 )
 
 assert_true(
-  !is.null(calibration$H) &&
-    length(calibration$H) == 1L &&
-    is.numeric(calibration$H) &&
-    is.finite(calibration$H),
+  !is.null(
+    calibration$H
+  ) &&
+    length(
+      calibration$H
+    ) == 1L &&
+    is.numeric(
+      calibration$H
+    ) &&
+    is.finite(
+      calibration$H
+    ),
   "Calibration did not return a valid scalar threshold H."
 )
 
-H <-
-  as.numeric(
-    calibration$H
-  )
+H <- as.numeric(
+  calibration$H
+)
 
 assert_true(
   H > 0 &&
@@ -1312,7 +1315,7 @@ cat(
 
 
 # =============================================================================
-# 11.4 RETAIN THE EXACT COPULA USED DURING CALIBRATION
+# 10.2 RETAIN EXACT COPULA IN CALIBRATION OBJECT
 # =============================================================================
 
 if (
@@ -1327,11 +1330,6 @@ if (
     ),
     "Empirical copula is enabled but CALIBRATION_COPULA is NULL."
   )
-
-  # ---------------------------------------------------------------------------
-  # Store the exact same reference object under canonical and compatibility
-  # names.
-  # ---------------------------------------------------------------------------
 
   calibration$reference_empirical_copula <-
     CALIBRATION_COPULA
@@ -1348,19 +1346,12 @@ if (
   calibration$copula <-
     CALIBRATION_COPULA
 
-  # ---------------------------------------------------------------------------
-  # Explicit identity check.
-  # ---------------------------------------------------------------------------
-
   assert_true(
     identical(
       calibration$reference_empirical_copula,
       CALIBRATION_COPULA
     ),
-    paste0(
-      "The empirical-copula reference retained in the calibration ",
-      "object is not identical to CALIBRATION_COPULA."
-    )
+    "Calibration does not retain the exact empirical-copula reference."
   )
 
   cat(
@@ -1378,7 +1369,7 @@ if (
 
 
 # =============================================================================
-# 11.5 FINAL SECTION-11 CONSISTENCY CHECKS
+# 10.3 FINAL CALIBRATION COPULA CHECKS
 # =============================================================================
 
 if (
@@ -1386,13 +1377,6 @@ if (
     CONFIG$use_empirical_copula
   )
 ) {
-
-  assert_true(
-    !is.null(
-      CALIBRATION_COPULA
-    ),
-    "Empirical copula is enabled but CALIBRATION_COPULA is NULL."
-  )
 
   assert_true(
     inherits(
@@ -1425,22 +1409,13 @@ if (
   )
 
   cat(
-    "Section 11 copula checks : PASSED\n"
-  )
-
-} else {
-
-  cat(
-    "Section 11 copula checks : NOT APPLICABLE\n"
+    "Calibration copula checks : PASSED\n"
   )
 }
 
-cat(
-  "------------------------------------------------------------\n"
-)
 
 # =============================================================================
-# 12. EXTRACT AND VALIDATE H
+# 11. EXTRACT CALIBRATED H
 # =============================================================================
 
 extract_calibration_H <- function(
@@ -1455,7 +1430,9 @@ extract_calibration_H <- function(
     "calibrated_threshold"
   )
 
-  for (nm in possible_names) {
+  for (
+    nm in possible_names
+  ) {
 
     if (
       !is.null(
@@ -1523,7 +1500,7 @@ cat(
 
 
 # =============================================================================
-# 13. CONSTRUCT MASTER SP-E-CUSUM FIT
+# 12. CONSTRUCT MASTER SP-E-CUSUM FIT
 # =============================================================================
 
 cat("\n")
@@ -1562,7 +1539,6 @@ SP_E_CUSUM_FIT <- fit_sp_e_cusum(
     CONFIG$use_empirical_copula
 )
 
-
 assert_true(
   is.list(
     SP_E_CUSUM_FIT
@@ -1572,10 +1548,7 @@ assert_true(
 
 
 # =============================================================================
-# 14. FORCE CANONICAL TOP-LEVEL METADATA
-# =============================================================================
-#
-# These assignments do NOT modify the stationary reference models.
+# 13. FORCE CANONICAL TOP-LEVEL METADATA
 # =============================================================================
 
 SP_E_CUSUM_FIT$use_empirical_copula <-
@@ -1601,18 +1574,18 @@ SP_E_CUSUM_FIT$H <-
 
 
 # =============================================================================
-# 15. ATTACH THE EXACT CALIBRATION COPULA
+# 14. ATTACH EXACT CALIBRATION COPULA
 # =============================================================================
 #
 # IMPORTANT:
 #
-# Do NOT search the master fit for another copula.
+# CALIBRATION_COPULA has already been validated in Section 9.
 #
-# The canonical reference is CALIBRATION_COPULA, which is the exact object
-# used during threshold calibration.
+# It is now attached directly and is NOT validated, reconstructed, or replaced
+# after attachment.
 #
-# This prevents fit_sp_e_cusum() or another downstream routine from silently
-# replacing the calibration reference with a newly fitted copula.
+# This guarantees that the master fit retains the exact object used during
+# threshold calibration.
 # =============================================================================
 
 if (
@@ -1620,10 +1593,6 @@ if (
     CONFIG$use_empirical_copula
   )
 ) {
-
-  # ---------------------------------------------------------------------------
-  # Validate canonical calibration reference.
-  # ---------------------------------------------------------------------------
 
   assert_true(
     !is.null(
@@ -1656,7 +1625,9 @@ if (
       "Calibration copula reference size mismatch: expected ",
       CONFIG$calibration_copula_n_samples,
       ", obtained ",
-      nrow(CALIBRATION_COPULA$data),
+      nrow(
+        CALIBRATION_COPULA$data
+      ),
       "."
     )
   )
@@ -1670,14 +1641,15 @@ if (
       "Calibration copula dimension mismatch: expected ",
       CONFIG$J,
       ", obtained ",
-      ncol(CALIBRATION_COPULA$data),
+      ncol(
+        CALIBRATION_COPULA$data
+      ),
       "."
     )
   )
 
-
   # ---------------------------------------------------------------------------
-  # Attach EXACTLY the same fixed reference object.
+  # Attach EXACT SAME OBJECT.
   # ---------------------------------------------------------------------------
 
   SP_E_CUSUM_FIT$reference_empirical_copula <-
@@ -1695,9 +1667,8 @@ if (
   SP_E_CUSUM_FIT$copula <-
     CALIBRATION_COPULA
 
-
   # ---------------------------------------------------------------------------
-  # Validate every attached alias.
+  # Exact identity checks.
   # ---------------------------------------------------------------------------
 
   assert_true(
@@ -1705,7 +1676,7 @@ if (
       SP_E_CUSUM_FIT$reference_empirical_copula,
       CALIBRATION_COPULA
     ),
-    "Master fit reference_empirical_copula is not identical to CALIBRATION_COPULA."
+    "Master-fit reference_empirical_copula is not identical to CALIBRATION_COPULA."
   )
 
   assert_true(
@@ -1713,7 +1684,7 @@ if (
       SP_E_CUSUM_FIT$empirical_copula,
       CALIBRATION_COPULA
     ),
-    "Master fit empirical_copula is not identical to CALIBRATION_COPULA."
+    "Master-fit empirical_copula is not identical to CALIBRATION_COPULA."
   )
 
   assert_true(
@@ -1721,7 +1692,7 @@ if (
       SP_E_CUSUM_FIT$copula_reference,
       CALIBRATION_COPULA
     ),
-    "Master fit copula_reference is not identical to CALIBRATION_COPULA."
+    "Master-fit copula_reference is not identical to CALIBRATION_COPULA."
   )
 
   assert_true(
@@ -1729,7 +1700,7 @@ if (
       SP_E_CUSUM_FIT$reference_copula,
       CALIBRATION_COPULA
     ),
-    "Master fit reference_copula is not identical to CALIBRATION_COPULA."
+    "Master-fit reference_copula is not identical to CALIBRATION_COPULA."
   )
 
   assert_true(
@@ -1737,25 +1708,8 @@ if (
       SP_E_CUSUM_FIT$copula,
       CALIBRATION_COPULA
     ),
-    "Master fit copula is not identical to CALIBRATION_COPULA."
+    "Master-fit copula is not identical to CALIBRATION_COPULA."
   )
-
-
-  # ---------------------------------------------------------------------------
-  # Revalidate the attached canonical reference.
-  # ---------------------------------------------------------------------------
-
-  SP_E_CUSUM_FIT$reference_empirical_copula <-
-    validate_empirical_copula(
-      SP_E_CUSUM_FIT$reference_empirical_copula,
-      expected_dimension =
-        CONFIG$J
-    )
-
-
-  # ---------------------------------------------------------------------------
-  # Final diagnostic.
-  # ---------------------------------------------------------------------------
 
   cat(
     "Empirical-copula reference : EXACT calibration object attached\n"
@@ -1789,35 +1743,26 @@ if (
 
 } else {
 
-  SP_E_CUSUM_FIT$reference_empirical_copula <-
-    NULL
-
-  SP_E_CUSUM_FIT$empirical_copula <-
-    NULL
-
-  SP_E_CUSUM_FIT$copula_reference <-
-    NULL
-
-  SP_E_CUSUM_FIT$reference_copula <-
-    NULL
-
-  SP_E_CUSUM_FIT$copula <-
-    NULL
+  SP_E_CUSUM_FIT$reference_empirical_copula <- NULL
+  SP_E_CUSUM_FIT$empirical_copula <- NULL
+  SP_E_CUSUM_FIT$copula_reference <- NULL
+  SP_E_CUSUM_FIT$reference_copula <- NULL
+  SP_E_CUSUM_FIT$copula <- NULL
 
   cat(
     "Empirical-copula reference : DISABLED\n"
   )
 }
 
+
 # =============================================================================
-# 16. CRITICAL STATIONARY-MODEL RESTORATION
+# 15. RESTORE EXACT CANONICAL STATIONARY MODELS
 # =============================================================================
 #
-# Restore the exact canonical stationary models after master-fit construction.
+# This does NOT rebuild the stationary models.
 #
-# This does NOT rebuild them.
-# It simply ensures that the master fit points to the canonical reference
-# objects.
+# It simply ensures that the master fit contains the exact canonical
+# stationary-model objects constructed in Section 6.
 # =============================================================================
 
 SP_E_CUSUM_FIT$stationary_models <-
@@ -1825,7 +1770,7 @@ SP_E_CUSUM_FIT$stationary_models <-
 
 
 # =============================================================================
-# 17. TOP-LEVEL CONVENIENCE ALIASES
+# 16. TOP-LEVEL CONVENIENCE ALIASES
 # =============================================================================
 
 SP_E_CUSUM_FIT$state_values <-
@@ -1846,7 +1791,7 @@ SP_E_CUSUM_FIT$stationary_probs <-
 
 
 # =============================================================================
-# 18. EMPIRICAL-COPULA MASTER-FIT VALIDATION
+# 17. EMPIRICAL-COPULA MASTER-FIT VALIDATION
 # =============================================================================
 
 cat("\n")
@@ -1885,6 +1830,18 @@ assert_true(
 )
 
 assert_true(
+  identical(
+    SP_E_CUSUM_FIT$transform_method,
+    "mid"
+  ),
+  paste0(
+    "Canonical master fit must use transform_method = 'mid'. ",
+    "Obtained: ",
+    SP_E_CUSUM_FIT$transform_method
+  )
+)
+
+assert_true(
   !is.null(
     SP_E_CUSUM_FIT$reference_empirical_copula
   ),
@@ -1904,10 +1861,7 @@ cat(
 )
 
 cat(
-  "[PASS] transform method = ",
-  SP_E_CUSUM_FIT$transform_method,
-  "\n",
-  sep = ""
+  "[PASS] transform method = mid\n"
 )
 
 cat(
@@ -1920,24 +1874,39 @@ cat(
 
 
 # =============================================================================
-# 19. OPTIONAL MASTER-FIT VALIDATION FUNCTION
+# 18. OPTIONAL MASTER-FIT VALIDATION FUNCTION
 # =============================================================================
 
 if (
   exists(
     "validate_sp_e_cusum_fit",
-    mode = "function"
+    mode = "function",
+    inherits = TRUE
   )
 ) {
 
-  validate_sp_e_cusum_fit(
-    SP_E_CUSUM_FIT
+  tryCatch(
+
+    validate_sp_e_cusum_fit(
+      SP_E_CUSUM_FIT
+    ),
+
+    error = function(e) {
+
+      stop(
+        paste0(
+          "validate_sp_e_cusum_fit() failed: ",
+          conditionMessage(e)
+        ),
+        call. = FALSE
+      )
+    }
   )
 }
 
 
 # =============================================================================
-# 20. STRICT MASTER-FIT STATIONARY-MODEL CONSISTENCY VALIDATION
+# 19. STRICT STATIONARY-MODEL CONSISTENCY VALIDATION
 # =============================================================================
 
 cat("\n")
@@ -1961,7 +1930,9 @@ assert_true(
 
 assert_true(
   length(fit_models) ==
-    length(CANONICAL_STATIONARY_MODELS),
+    length(
+      CANONICAL_STATIONARY_MODELS
+    ),
   "Master fit contains the wrong number of stationary models."
 )
 
@@ -2041,7 +2012,7 @@ cat(
 
 
 # =============================================================================
-# 21. MASTER-FIT VALIDATION
+# 20. MASTER-FIT VALIDATION
 # =============================================================================
 
 cat("\n")
@@ -2088,7 +2059,9 @@ assert_true(
 
 assert_true(
   abs(
-    as.numeric(fit_H) -
+    as.numeric(
+      fit_H
+    ) -
       H
   ) < 1e-12,
   paste0(
@@ -2125,10 +2098,11 @@ fit_k_values <- vapply(
   numeric(1)
 )
 
-
 assert_true(
   length(fit_k_values) ==
-    length(CONFIG$k_values) &&
+    length(
+      CONFIG$k_values
+    ) &&
     all(
       abs(
         unname(
@@ -2189,7 +2163,7 @@ if (
 
 
 # -----------------------------------------------------------------------------
-# equal-weight structure
+# Equal-weight structure
 # -----------------------------------------------------------------------------
 
 assert_true(
@@ -2208,7 +2182,7 @@ cat(
 
 
 # =============================================================================
-# 22. PRINT MASTER FIT
+# 21. PRINT MASTER FIT
 # =============================================================================
 
 cat("\n")
@@ -2301,72 +2275,7 @@ cat(
 
 
 # =============================================================================
-# 23. PHASE-I ESTIMATION
-# =============================================================================
-
-cat("\n")
-cat("------------------------------------------------------------\n")
-cat("Phase-I estimation\n")
-cat("------------------------------------------------------------\n")
-
-# -------------------------------------------------------------------------
-# 23.1 Resolve and validate Phase-I seed
-# -------------------------------------------------------------------------
-
-phase1_seed <- CONFIG$phase1_seed %||%
-    CONFIG$seed %||%
-    20260911L
-
-phase1_seed <- as.integer(phase1_seed)
-
-assert_true(
-    length(phase1_seed) == 1L &&
-        !is.na(phase1_seed) &&
-        phase1_seed >= 0L &&
-        phase1_seed <= .Machine$integer.max,
-    paste0(
-        "Invalid Phase-I seed: ",
-        deparse1(phase1_seed)
-    )
-)
-
-set.seed(phase1_seed)
-
-cat(
-    "Phase-I seed: ",
-    phase1_seed,
-    "\n",
-    sep = ""
-)
-
-# -------------------------------------------------------------------------
-# 23.2 Check Phase-I function
-# -------------------------------------------------------------------------
-
-phase1_result <- NULL
-
-assert_true(
-    exists(
-        "run_phase1",
-        mode = "function",
-        inherits = TRUE
-    ),
-    paste0(
-        "Phase-I function run_phase1() was not found.\n",
-        "Please source 11_phase1_estimation.R before Section 23."
-    )
-)
-
-# -------------------------------------------------------------------------
-# 23.3 Run Phase-I estimation using the canonical master fit
-# -------------------------------------------------------------------------
-
-phase1_result <- run_phase1(
-    fit = SP_E_CUSUM_FIT
-)
-
-# =============================================================================
-# 24. STANDARD NORMAL PERFORMANCE EVALUATION
+# 22. PHASE-I ESTIMATION
 # =============================================================================
 
 cat("\n")
@@ -2375,7 +2284,101 @@ cat(
 )
 
 cat(
-  "Standard normal performance evaluation\n"
+  "Phase-I estimation\n"
+)
+
+cat(
+  "------------------------------------------------------------\n"
+)
+
+phase1_seed <- CONFIG$phase1_seed %||%
+  CONFIG$seed %||%
+  20260911L
+
+phase1_seed <- as.integer(
+  phase1_seed
+)
+
+assert_true(
+  length(phase1_seed) == 1L &&
+    !is.na(phase1_seed) &&
+    phase1_seed >= 0L &&
+    phase1_seed <= .Machine$integer.max,
+  paste0(
+    "Invalid Phase-I seed: ",
+    deparse1(
+      phase1_seed
+    )
+  )
+)
+
+set.seed(
+  phase1_seed
+)
+
+cat(
+  "Phase-I seed: ",
+  phase1_seed,
+  "\n",
+  sep = ""
+)
+
+phase1_result <- NULL
+
+assert_true(
+  exists(
+    "run_phase1",
+    mode = "function",
+    inherits = TRUE
+  ),
+  paste0(
+    "Phase-I function run_phase1() was not found.\n",
+    "Please source 11_phase1_estimation.R before Section 22."
+  )
+)
+
+phase1_result <- tryCatch(
+
+  run_phase1(
+    fit =
+      SP_E_CUSUM_FIT
+  ),
+
+  error = function(e) {
+
+    warning(
+      paste0(
+        "Phase-I estimation failed: ",
+        conditionMessage(e)
+      ),
+      call. = FALSE
+    )
+
+    NULL
+  }
+)
+
+
+# =============================================================================
+# 23. NORMAL PERFORMANCE EVALUATION
+# =============================================================================
+#
+# IMPORTANT:
+#   Normal simulation is run ONCE.
+#   The result is reused downstream.
+# =============================================================================
+
+cat("\n")
+cat(
+  "------------------------------------------------------------\n"
+)
+
+cat(
+  "Normal performance evaluation\n"
+)
+
+cat(
+  "------------------------------------------------------------\n"
 )
 
 normal_results <- NULL
@@ -2383,38 +2386,75 @@ normal_results <- NULL
 if (
   exists(
     "evaluate_normal_performance",
-    mode = "function"
+    mode = "function",
+    inherits = TRUE
   )
 ) {
 
-  normal_results <- evaluate_normal_performance(
-    fit =
-      SP_E_CUSUM_FIT
+  normal_results <- tryCatch(
+
+    evaluate_normal_performance(
+      fit =
+        SP_E_CUSUM_FIT
+    ),
+
+    error = function(e) {
+
+      warning(
+        paste0(
+          "Normal performance evaluation failed: ",
+          conditionMessage(e)
+        ),
+        call. = FALSE
+      )
+
+      NULL
+    }
   )
 
 } else if (
   exists(
     "run_normal_simulation",
-    mode = "function"
+    mode = "function",
+    inherits = TRUE
   )
 ) {
 
-  normal_results <- run_normal_simulation(
-    fit =
-      SP_E_CUSUM_FIT
+  normal_results <- tryCatch(
+
+    run_normal_simulation(
+      fit =
+        SP_E_CUSUM_FIT
+    ),
+
+    error = function(e) {
+
+      warning(
+        paste0(
+          "Normal simulation failed: ",
+          conditionMessage(e)
+        ),
+        call. = FALSE
+      )
+
+      NULL
+    }
   )
 
 } else {
 
   warning(
-    "Normal-performance function not found. Result set to NULL.",
+    paste0(
+      "Neither evaluate_normal_performance() nor ",
+      "run_normal_simulation() is available."
+    ),
     call. = FALSE
   )
 }
 
 
 # =============================================================================
-# 25. WEIGHTED PERFORMANCE
+# 24. WEIGHTED PERFORMANCE
 # =============================================================================
 
 cat("\n")
@@ -2426,25 +2466,45 @@ cat(
   "Weighted performance evaluation\n"
 )
 
+cat(
+  "------------------------------------------------------------\n"
+)
+
 weighted_results <- NULL
 
 if (
   exists(
     "evaluate_weighted_performance",
-    mode = "function"
+    mode = "function",
+    inherits = TRUE
   )
 ) {
 
-  weighted_results <-
+  weighted_results <- tryCatch(
+
     evaluate_weighted_performance(
       fit =
         SP_E_CUSUM_FIT
-    )
+    ),
+
+    error = function(e) {
+
+      warning(
+        paste0(
+          "Weighted performance evaluation failed: ",
+          conditionMessage(e)
+        ),
+        call. = FALSE
+      )
+
+      NULL
+    }
+  )
 }
 
 
 # =============================================================================
-# 26. SINGLE-CUSUM BENCHMARK
+# 25. SINGLE-CUSUM BENCHMARK
 # =============================================================================
 
 cat("\n")
@@ -2456,55 +2516,45 @@ cat(
   "Single-CUSUM benchmark\n"
 )
 
+cat(
+  "------------------------------------------------------------\n"
+)
+
 single_benchmark <- NULL
 
 if (
   exists(
     "run_single_multiple_benchmarks",
-    mode = "function"
+    mode = "function",
+    inherits = TRUE
   )
 ) {
 
-  single_benchmark <-
+  single_benchmark <- tryCatch(
+
     run_single_multiple_benchmarks(
       fit =
         SP_E_CUSUM_FIT
-    )
-}
+    ),
 
+    error = function(e) {
 
-# =============================================================================
-# 27. NORMAL SIMULATION
-# =============================================================================
+      warning(
+        paste0(
+          "Single-CUSUM benchmark failed: ",
+          conditionMessage(e)
+        ),
+        call. = FALSE
+      )
 
-cat("\n")
-cat(
-  "------------------------------------------------------------\n"
-)
-
-cat(
-  "Normal simulation\n"
-)
-
-simulation_normal <- NULL
-
-if (
-  exists(
-    "run_normal_simulation",
-    mode = "function"
+      NULL
+    }
   )
-) {
-
-  simulation_normal <-
-    run_normal_simulation(
-      fit =
-        SP_E_CUSUM_FIT
-    )
 }
 
 
 # =============================================================================
-# 28. NONNORMAL SIMULATION
+# 26. NONNORMAL SIMULATION
 # =============================================================================
 
 cat("\n")
@@ -2516,235 +2566,298 @@ cat(
   "Nonnormal simulation\n"
 )
 
+cat(
+  "------------------------------------------------------------\n"
+)
+
 simulation_nonnormal <- NULL
 
 if (
   exists(
     "run_nonnormal_simulation",
-    mode = "function"
+    mode = "function",
+    inherits = TRUE
   )
 ) {
 
-  simulation_nonnormal <-
+  simulation_nonnormal <- tryCatch(
+
     run_nonnormal_simulation(
       fit =
         SP_E_CUSUM_FIT
-    )
+    ),
+
+    error = function(e) {
+
+      warning(
+        paste0(
+          "Nonnormal simulation failed: ",
+          conditionMessage(e)
+        ),
+        call. = FALSE
+      )
+
+      NULL
+    }
+  )
 }
 
+
 # =============================================================================
-# 29. PARAMETER OPTIMIZATION
+# 27. PARAMETER OPTIMIZATION
 # =============================================================================
 
 cat("\n")
 cat(
-    "------------------------------------------------------------\n"
+  "------------------------------------------------------------\n"
 )
+
 cat(
-    "Parameter optimization\n"
+  "Parameter optimization\n"
 )
+
 cat(
-    "------------------------------------------------------------\n"
+  "------------------------------------------------------------\n"
 )
 
 optimization_result <- NULL
 
 if (
-    exists(
-        "run_parameter_optimization",
-        mode = "function",
-        inherits = TRUE
-    )
+  exists(
+    "run_parameter_optimization",
+    mode = "function",
+    inherits = TRUE
+  )
 ) {
 
-    optimization_result <-
-        tryCatch(
+  optimization_result <- tryCatch(
 
-            run_parameter_optimization(
-                fit =
-                    SP_E_CUSUM_FIT
-            ),
+    run_parameter_optimization(
+      fit =
+        SP_E_CUSUM_FIT
+    ),
 
-            error = function(e) {
+    error = function(e) {
 
-                warning(
-                    paste0(
-                        "Parameter optimization failed: ",
-                        conditionMessage(e)
-                    ),
-                    call. = FALSE
-                )
-
-                NULL
-            }
-        )
-
-} else {
-
-    warning(
+      warning(
         paste0(
-            "run_parameter_optimization() is not available. ",
-            "Source 07_parameter_optimization.R first."
+          "Parameter optimization failed: ",
+          conditionMessage(e)
         ),
         call. = FALSE
-    )
-}
+      )
 
-# -------------------------------------------------------------------------
-# Optimization summary
-# -------------------------------------------------------------------------
-
-if (
-    !is.null(optimization_result)
-) {
-
-    cat("\n")
-    cat(
-        "Parameter optimization completed.\n"
-    )
-
-    if (
-        !is.null(optimization_result$best)
-    ) {
-
-        best <- optimization_result$best
-
-        if (
-            !is.null(best$k_values)
-        ) {
-
-            cat(
-                sprintf(
-                    "Optimized k values: %s\n",
-                    paste(
-                        format(
-                            best$k_values,
-                            digits = 6,
-                            trim = TRUE
-                        ),
-                        collapse = ", "
-                    )
-                )
-            )
-        }
-
-        if (
-            !is.null(best$weights)
-        ) {
-
-            cat(
-                sprintf(
-                    "Optimized weights: %s\n",
-                    paste(
-                        format(
-                            best$weights,
-                            digits = 6,
-                            trim = TRUE
-                        ),
-                        collapse = ", "
-                    )
-                )
-            )
-        }
-
-        if (
-            !is.null(best$H) &&
-            is.finite(best$H)
-        ) {
-
-            cat(
-                sprintf(
-                    "Optimized threshold H: %.8f\n",
-                    best$H
-                )
-            )
-        }
-
-        if (
-            !is.null(best$objective) &&
-            is.finite(best$objective)
-        ) {
-
-            cat(
-                sprintf(
-                    "Optimized objective: %.6f\n",
-                    best$objective
-                )
-            )
-        }
+      NULL
     }
+  )
 
 } else {
 
-    cat(
-        "Parameter optimization was not completed.\n"
-    )
+  warning(
+    paste0(
+      "run_parameter_optimization() is not available. ",
+      "Source 07_parameter_optimization.R first."
+    ),
+    call. = FALSE
+  )
 }
+
+
+# -----------------------------------------------------------------------------
+# Optimization summary
+# -----------------------------------------------------------------------------
+
+if (
+  !is.null(
+    optimization_result
+  )
+) {
+
+  cat("\n")
+  cat(
+    "Parameter optimization completed.\n"
+  )
+
+  if (
+    !is.null(
+      optimization_result$best
+    )
+  ) {
+
+    best <-
+      optimization_result$best
+
+    if (
+      !is.null(
+        best$k_values
+      )
+    ) {
+
+      cat(
+        sprintf(
+          "Optimized k values: %s\n",
+          paste(
+            format(
+              best$k_values,
+              digits = 6,
+              trim = TRUE
+            ),
+            collapse = ", "
+          )
+        )
+      )
+    }
+
+    if (
+      !is.null(
+        best$weights
+      )
+    ) {
+
+      cat(
+        sprintf(
+          "Optimized weights: %s\n",
+          paste(
+            format(
+              best$weights,
+              digits = 6,
+              trim = TRUE
+            ),
+            collapse = ", "
+          )
+        )
+      )
+    }
+
+    if (
+      !is.null(
+        best$H
+      ) &&
+      length(
+        best$H
+      ) == 1L &&
+      is.finite(
+        best$H
+      )
+    ) {
+
+      cat(
+        sprintf(
+          "Optimized threshold H: %.8f\n",
+          best$H
+        )
+      )
+    }
+
+    if (
+      !is.null(
+        best$objective
+      ) &&
+      length(
+        best$objective
+      ) == 1L &&
+      is.finite(
+        best$objective
+      )
+    ) {
+
+      cat(
+        sprintf(
+          "Optimized objective: %.6f\n",
+          best$objective
+        )
+      )
+    }
+  }
+
+} else {
+
+  cat(
+    "Parameter optimization was not completed.\n"
+  )
+}
+
+
 # =============================================================================
-# 30. CATBOOST SURROGATE
+# 28. CATBOOST SURROGATE
 # =============================================================================
 
 cat("\n")
-
 cat(
-    "------------------------------------------------------------\n"
+  "------------------------------------------------------------\n"
 )
 
 cat(
-    "CatBoost surrogate analysis\n"
+  "CatBoost surrogate analysis\n"
 )
 
 cat(
-    "------------------------------------------------------------\n"
+  "------------------------------------------------------------\n"
 )
 
 catboost_result <- NULL
 
-
 if (
-    exists(
-        "run_catboost_surrogate",
-        mode = "function",
-        inherits = TRUE
-    )
+  exists(
+    "run_catboost_surrogate",
+    mode = "function",
+    inherits = TRUE
+  )
 ) {
 
-    catboost_result <-
-        tryCatch(
+  if (
+    exists(
+      "CATBOOST_CONFIG",
+      inherits = TRUE
+    )
+  ) {
 
-            run_catboost_surrogate(
-                config =
-                    CATBOOST_CONFIG
-            ),
+    catboost_result <- tryCatch(
 
-            error = function(e) {
+      run_catboost_surrogate(
+        config =
+          CATBOOST_CONFIG
+      ),
 
-                warning(
-                    paste0(
-                        "CatBoost surrogate analysis failed: ",
-                        conditionMessage(e)
-                    ),
-                    call. = FALSE
-                )
+      error = function(e) {
 
-                NULL
-            }
+        warning(
+          paste0(
+            "CatBoost surrogate analysis failed: ",
+            conditionMessage(e)
+          ),
+          call. = FALSE
         )
+
+        NULL
+      }
+    )
+
+  } else {
+
+    warning(
+      paste0(
+        "CATBOOST_CONFIG was not found. ",
+        "CatBoost surrogate analysis was skipped."
+      ),
+      call. = FALSE
+    )
+  }
 
 } else {
 
-    warning(
-        paste0(
-            "run_catboost_surrogate() is not available. ",
-            "Source the CatBoost surrogate module first."
-        ),
-        call. = FALSE
-    )
+  warning(
+    paste0(
+      "run_catboost_surrogate() is not available. ",
+      "CatBoost surrogate analysis was skipped."
+    ),
+    call. = FALSE
+  )
 }
 
 
 # =============================================================================
-# 31. REAL DATA
+# 29. REAL DATA
 # =============================================================================
 
 cat("\n")
@@ -2756,25 +2869,84 @@ cat(
   "Real-data analysis\n"
 )
 
+cat(
+  "------------------------------------------------------------\n"
+)
+
 real_data_result <- NULL
 
 if (
   exists(
     "run_real_data_analysis",
-    mode = "function"
+    mode = "function",
+    inherits = TRUE
   )
 ) {
 
-  real_data_result <-
-    run_real_data_analysis(
-      fit =
-        SP_E_CUSUM_FIT
+  if (
+    exists(
+      "REAL_DATA_CONFIG",
+      inherits = TRUE
     )
+  ) {
+
+    real_data_result <- tryCatch(
+
+      run_real_data_analysis(
+        config =
+          REAL_DATA_CONFIG
+      ),
+
+      error = function(e) {
+
+        warning(
+          paste0(
+            "Real-data analysis failed: ",
+            conditionMessage(e)
+          ),
+          call. = FALSE
+        )
+
+        NULL
+      }
+    )
+
+  } else {
+
+    warning(
+      paste0(
+        "REAL_DATA_CONFIG was not found. ",
+        "Real-data analysis was skipped."
+      ),
+      call. = FALSE
+    )
+  }
+
+} else {
+
+  warning(
+    paste0(
+      "run_real_data_analysis() is not available. ",
+      "Real-data analysis was skipped."
+    ),
+    call. = FALSE
+  )
+}
+
+if (
+  !is.null(
+    real_data_result
+  )
+) {
+
+  cat(
+    "\nReal-data analysis completed.\n"
+  )
 }
 
 
 # =============================================================================
-# 32. RESULT TABLES
+# 30. RESULT TABLES
 # =============================================================================
 
 cat("\n")
@@ -2786,16 +2958,22 @@ cat(
   "Generating result tables\n"
 )
 
+cat(
+  "------------------------------------------------------------\n"
+)
+
 result_tables <- NULL
 
 if (
   exists(
     "generate_results_tables",
-    mode = "function"
+    mode = "function",
+    inherits = TRUE
   )
 ) {
 
-  result_tables <-
+  result_tables <- tryCatch(
+
     generate_results_tables(
       fit =
         SP_E_CUSUM_FIT,
@@ -2807,7 +2985,7 @@ if (
         weighted_results,
 
       simulation_normal =
-        simulation_normal,
+        normal_results,
 
       simulation_nonnormal =
         simulation_nonnormal,
@@ -2817,12 +2995,33 @@ if (
 
       real_data_result =
         real_data_result
-    )
+    ),
+
+    error = function(e) {
+
+      warning(
+        paste0(
+          "Result-table generation failed: ",
+          conditionMessage(e)
+        ),
+        call. = FALSE
+      )
+
+      NULL
+    }
+  )
+
+} else {
+
+  warning(
+    "generate_results_tables() is not available.",
+    call. = FALSE
+  )
 }
 
 
 # =============================================================================
-# 33. RESULT FIGURES
+# 31. RESULT FIGURES
 # =============================================================================
 
 cat("\n")
@@ -2834,16 +3033,22 @@ cat(
   "Generating result figures\n"
 )
 
+cat(
+  "------------------------------------------------------------\n"
+)
+
 result_figures <- NULL
 
 if (
   exists(
     "generate_results_figures",
-    mode = "function"
+    mode = "function",
+    inherits = TRUE
   )
 ) {
 
-  result_figures <-
+  result_figures <- tryCatch(
+
     generate_results_figures(
       fit =
         SP_E_CUSUM_FIT,
@@ -2855,7 +3060,7 @@ if (
         weighted_results,
 
       simulation_normal =
-        simulation_normal,
+        normal_results,
 
       simulation_nonnormal =
         simulation_nonnormal,
@@ -2865,12 +3070,33 @@ if (
 
       real_data_result =
         real_data_result
-    )
+    ),
+
+    error = function(e) {
+
+      warning(
+        paste0(
+          "Result-figure generation failed: ",
+          conditionMessage(e)
+        ),
+        call. = FALSE
+      )
+
+      NULL
+    }
+  )
+
+} else {
+
+  warning(
+    "generate_results_figures() is not available.",
+    call. = FALSE
+  )
 }
 
 
 # =============================================================================
-# 34. CALIBRATION SUMMARY
+# 32. CALIBRATION SUMMARY
 # =============================================================================
 
 calibration_summary <- list(
@@ -2920,7 +3146,7 @@ calibration_summary <- list(
 
 
 # =============================================================================
-# 35. FINAL CANONICAL STATIONARY-MODEL CHECK
+# 33. FINAL CANONICAL STATIONARY-MODEL CHECK
 # =============================================================================
 
 cat("\n")
@@ -2957,7 +3183,7 @@ cat(
 
 
 # =============================================================================
-# 36. FINAL EMPIRICAL-COPULA CHECK
+# 34. FINAL EMPIRICAL-COPULA CHECK
 # =============================================================================
 
 cat("\n")
@@ -3006,6 +3232,22 @@ assert_true(
   "Final empirical-copula reference differs from CALIBRATION_COPULA."
 )
 
+assert_true(
+  identical(
+    SP_E_CUSUM_FIT$empirical_copula,
+    CALIBRATION_COPULA
+  ),
+  "Final empirical-copula alias differs from CALIBRATION_COPULA."
+)
+
+assert_true(
+  identical(
+    SP_E_CUSUM_FIT$copula_reference,
+    CALIBRATION_COPULA
+  ),
+  "Final copula_reference alias differs from CALIBRATION_COPULA."
+)
+
 cat(
   "[PASS] empirical copula = TRUE\n"
 )
@@ -3020,7 +3262,7 @@ cat(
 
 
 # =============================================================================
-# 37. SAVE MASTER FIT
+# 35. SAVE MASTER FIT
 # =============================================================================
 
 MASTER_FIT_FILE <- file.path(
@@ -3042,7 +3284,7 @@ cat(
 
 
 # =============================================================================
-# 38. SAVE CALIBRATION
+# 36. SAVE CALIBRATION
 # =============================================================================
 
 CALIBRATION_FILE <- file.path(
@@ -3064,7 +3306,7 @@ cat(
 
 
 # =============================================================================
-# 39. SAVE PHASE-I RESULT
+# 37. SAVE PHASE-I RESULT
 # =============================================================================
 
 if (
@@ -3093,7 +3335,7 @@ if (
 
 
 # =============================================================================
-# 40. SAVE COMPLETE ANALYSIS OBJECT
+# 38. SAVE COMPLETE ANALYSIS OBJECT
 # =============================================================================
 
 COMPLETE_ANALYSIS <- list(
@@ -3132,7 +3374,7 @@ COMPLETE_ANALYSIS <- list(
     single_benchmark,
 
   simulation_normal =
-    simulation_normal,
+    normal_results,
 
   simulation_nonnormal =
     simulation_nonnormal,
@@ -3176,7 +3418,7 @@ cat(
 
 
 # =============================================================================
-# 41. SAVE CONFIGURATION
+# 39. SAVE CONFIGURATION
 # =============================================================================
 
 CONFIG_FILE <- file.path(
@@ -3198,7 +3440,7 @@ cat(
 
 
 # =============================================================================
-# 42. SESSION INFORMATION
+# 40. SAVE SESSION INFORMATION
 # =============================================================================
 
 SESSION_INFO_FILE <- file.path(
@@ -3220,7 +3462,7 @@ cat(
 
 
 # =============================================================================
-# 43. OUTPUT VALIDATION
+# 41. OUTPUT VALIDATION
 # =============================================================================
 
 cat("\n")
@@ -3273,7 +3515,101 @@ cat(
 
 
 # =============================================================================
-# 44. FINAL CONSISTENCY CHECKS
+# 42. RELOAD MASTER FIT AND VERIFY PERSISTENCE
+# =============================================================================
+
+cat("\n")
+cat(
+  "------------------------------------------------------------\n"
+)
+
+cat(
+  "Reloading saved master fit for persistence validation\n"
+)
+
+RELOADED_MASTER_FIT <-
+  readRDS(
+    MASTER_FIT_FILE
+  )
+
+assert_true(
+  is.list(
+    RELOADED_MASTER_FIT
+  ),
+  "Reloaded master fit is not a list."
+)
+
+assert_true(
+  identical(
+    RELOADED_MASTER_FIT$transform_method,
+    "mid"
+  ),
+  "Reloaded master fit does not retain transform_method = 'mid'."
+)
+
+assert_true(
+  isTRUE(
+    RELOADED_MASTER_FIT$use_empirical_copula
+  ),
+  "Reloaded master fit does not retain empirical-copula = TRUE."
+)
+
+assert_true(
+  isTRUE(
+    all.equal(
+      as.numeric(
+        RELOADED_MASTER_FIT$H
+      ),
+      as.numeric(
+        H
+      ),
+      tolerance = 1e-12
+    )
+  ),
+  "Reloaded master fit does not retain calibrated H."
+)
+
+assert_true(
+  !is.null(
+    RELOADED_MASTER_FIT$reference_empirical_copula
+  ),
+  "Reloaded master fit has a NULL empirical-copula reference."
+)
+
+assert_true(
+  identical(
+    RELOADED_MASTER_FIT$reference_empirical_copula,
+    CALIBRATION_COPULA
+  ),
+  "Reloaded master-fit copula differs from the calibration copula."
+)
+
+for (
+  j in seq_along(
+    CANONICAL_STATIONARY_MODELS
+  )
+) {
+
+  assert_true(
+    identical(
+      RELOADED_MASTER_FIT$stationary_models[[j]],
+      CANONICAL_STATIONARY_MODELS[[j]]
+    ),
+    paste0(
+      "Reloaded stationary model ",
+      j,
+      " differs from the canonical stationary model."
+    )
+  )
+}
+
+cat(
+  "PASS: saved master fit retains the canonical architecture.\n"
+)
+
+
+# =============================================================================
+# 43. FINAL CONSISTENCY CHECKS
 # =============================================================================
 
 cat("\n")
@@ -3296,9 +3632,11 @@ cat(
 
 final_H <- NULL
 
-if (!is.null(
-  SP_E_CUSUM_FIT$H
-)) {
+if (
+  !is.null(
+    SP_E_CUSUM_FIT$H
+  )
+) {
 
   final_H <-
     SP_E_CUSUM_FIT$H
@@ -3309,7 +3647,6 @@ if (!is.null(
     SP_E_CUSUM_FIT$threshold
 }
 
-
 assert_true(
   length(final_H) == 1L &&
     is.numeric(final_H) &&
@@ -3319,8 +3656,12 @@ assert_true(
 
 assert_true(
   abs(
-    as.numeric(final_H) -
-      as.numeric(H)
+    as.numeric(
+      final_H
+    ) -
+      as.numeric(
+        H
+      )
   ) < 1e-12,
   "Final H consistency check failed."
 )
@@ -3341,8 +3682,27 @@ assert_true(
   "Final empirical-copula consistency check failed."
 )
 
+assert_true(
+  !is.null(
+    SP_E_CUSUM_FIT$reference_empirical_copula
+  ),
+  "Final empirical-copula reference is NULL."
+)
+
+assert_true(
+  identical(
+    SP_E_CUSUM_FIT$reference_empirical_copula,
+    CALIBRATION_COPULA
+  ),
+  "Final empirical-copula reference differs from calibration reference."
+)
+
 cat(
   "[PASS] Empirical copula = TRUE\n"
+)
+
+cat(
+  "[PASS] Exact calibration copula retained\n"
 )
 
 
@@ -3358,11 +3718,16 @@ assert_true(
   "Final transform-method consistency check failed."
 )
 
+assert_true(
+  identical(
+    CONFIG$transform_method,
+    "mid"
+  ),
+  "Final canonical transform is not 'mid'."
+)
+
 cat(
-  "[PASS] Transform = ",
-  CONFIG$transform_method,
-  "\n",
-  sep = ""
+  "[PASS] Transform = mid\n"
 )
 
 
@@ -3373,7 +3738,8 @@ cat(
 assert_true(
   length(
     SP_E_CUSUM_FIT$stationary_models
-  ) == CONFIG$J,
+  ) ==
+    CONFIG$J,
   "Final J consistency check failed."
 )
 
@@ -3418,9 +3784,11 @@ cat(
 # Weights
 # -----------------------------------------------------------------------------
 
-if (!is.null(
-  SP_E_CUSUM_FIT$weights
-)) {
+if (
+  !is.null(
+    SP_E_CUSUM_FIT$weights
+  )
+) {
 
   assert_true(
     isTRUE(
@@ -3444,12 +3812,14 @@ cat(
 
 
 # -----------------------------------------------------------------------------
-# Stationary model identity
+# Stationary-model identity
 # -----------------------------------------------------------------------------
 
-for (j in seq_along(
-  CANONICAL_STATIONARY_MODELS
-)) {
+for (
+  j in seq_along(
+    CANONICAL_STATIONARY_MODELS
+  )
+) {
 
   assert_true(
     identical(
@@ -3492,8 +3862,57 @@ cat(
 )
 
 
+# -----------------------------------------------------------------------------
+# Master-fit aliases
+# -----------------------------------------------------------------------------
+
+assert_true(
+  identical(
+    SP_E_CUSUM_FIT$reference_empirical_copula,
+    CALIBRATION_COPULA
+  ),
+  "reference_empirical_copula alias failed."
+)
+
+assert_true(
+  identical(
+    SP_E_CUSUM_FIT$empirical_copula,
+    CALIBRATION_COPULA
+  ),
+  "empirical_copula alias failed."
+)
+
+assert_true(
+  identical(
+    SP_E_CUSUM_FIT$copula_reference,
+    CALIBRATION_COPULA
+  ),
+  "copula_reference alias failed."
+)
+
+assert_true(
+  identical(
+    SP_E_CUSUM_FIT$reference_copula,
+    CALIBRATION_COPULA
+  ),
+  "reference_copula alias failed."
+)
+
+assert_true(
+  identical(
+    SP_E_CUSUM_FIT$copula,
+    CALIBRATION_COPULA
+  ),
+  "copula alias failed."
+)
+
+cat(
+  "[PASS] All empirical-copula aliases\n"
+)
+
+
 # =============================================================================
-# 45. FINAL SUMMARY
+# 44. FINAL SUMMARY
 # =============================================================================
 
 cat("\n")
@@ -3519,6 +3938,13 @@ cat(
 cat(
   "Seed                 : ",
   GLOBAL_SEED,
+  "\n",
+  sep = ""
+)
+
+cat(
+  "Output directory     : ",
+  OUTPUT_DIR,
   "\n",
   sep = ""
 )
@@ -3581,6 +4007,13 @@ cat(
 )
 
 cat(
+  "copula reference n   : ",
+  CONFIG$calibration_copula_n_samples,
+  "\n",
+  sep = ""
+)
+
+cat(
   "target ARL0          : ",
   CONFIG$target_arl,
   "\n",
@@ -3617,8 +4050,78 @@ cat(
 )
 
 cat(
+  "normal results       : ",
+  !is.null(
+    normal_results
+  ),
+  "\n",
+  sep = ""
+)
+
+cat(
+  "nonnormal results    : ",
+  !is.null(
+    simulation_nonnormal
+  ),
+  "\n",
+  sep = ""
+)
+
+cat(
+  "optimization         : ",
+  !is.null(
+    optimization_result
+  ),
+  "\n",
+  sep = ""
+)
+
+cat(
+  "CatBoost             : ",
+  !is.null(
+    catboost_result
+  ),
+  "\n",
+  sep = ""
+)
+
+cat(
+  "real data            : ",
+  !is.null(
+    real_data_result
+  ),
+  "\n",
+  sep = ""
+)
+
+cat(
+  "result tables        : ",
+  !is.null(
+    result_tables
+  ),
+  "\n",
+  sep = ""
+)
+
+cat(
+  "result figures       : ",
+  !is.null(
+    result_figures
+  ),
+  "\n",
+  sep = ""
+)
+
+cat(
   "master fit           : ",
   MASTER_FIT_FILE,
+  "\n",
+  sep = ""
+)
+
+cat(
+  "calibration          : ",
+  CALIBRATION_FILE,
   "\n",
   sep = ""
 )
@@ -3639,15 +4142,27 @@ cat(
 )
 
 cat(
-  "Stationary models were constructed once and retained unchanged.\n"
+  "Stationary models were constructed exactly once and retained unchanged.\n"
 )
 
 cat(
-  "The canonical architecture uses stationary mid-rank transformation\n"
+  "The canonical probability transformation is stationary mid-rank.\n"
 )
 
 cat(
-  "with empirical-copula support enabled.\n"
+  "The empirical-copula dependence architecture is enabled.\n"
+)
+
+cat(
+  "The exact empirical-copula reference used for calibration is retained\n"
+)
+
+cat(
+  "in the master fit and all canonical copula aliases.\n"
+)
+
+cat(
+  "The normal-performance simulation is executed only once.\n"
 )
 
 cat(

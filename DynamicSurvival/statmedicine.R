@@ -496,31 +496,56 @@ cat("\n------------------------------------------------------------\n")
 cat("AGGREGATING RESULTS & EXPORTING CSV FILES\n")
 cat("------------------------------------------------------------\n")
 
-# Combine list elements into unified data frames
-cindex_raw_folds <- dplyr::bind_rows(cv_cindex_results)
-brier_raw_folds  <- dplyr::bind_rows(cv_brier_results)
+# Safe unlist/bind of results
+cindex_raw_folds <- if (length(cv_cindex_results) > 0) dplyr::bind_rows(cv_cindex_results) else data.frame()
+brier_raw_folds  <- if (length(cv_brier_results) > 0)  dplyr::bind_rows(cv_brier_results)  else data.frame()
 
-# 1. Summarize C-index Across Cross-Validation Folds
-cindex_summary_metrics <- cindex_raw_folds %>%
-  dplyr::group_by(landmark, model) %>%
-  dplyr::summarize(
-    Mean_Cindex = round(mean(Cindex, na.rm = TRUE), 4),
-    SD_Cindex   = round(sd(Cindex, na.rm = TRUE), 4),
-    SE_Cindex   = round(sd(Cindex, na.rm = TRUE) / sqrt(dplyr::n()), 4),
-    .groups     = "drop"
-  )
+# ------------------------------------------------------------------------------
+# 1. SUMMARIZE C-INDEX
+# ------------------------------------------------------------------------------
+if (nrow(cindex_raw_folds) > 0 && all(c("landmark", "model", "Cindex") %in% names(cindex_raw_folds))) {
+  cindex_summary_metrics <- cindex_raw_folds %>%
+    dplyr::filter(!is.na(Cindex)) %>%
+    dplyr::group_by(landmark, model) %>%
+    dplyr::summarize(
+      Mean_Cindex = round(mean(Cindex, na.rm = TRUE), 4),
+      SD_Cindex   = round(sd(Cindex, na.rm = TRUE), 4),
+      SE_Cindex   = round(sd(Cindex, na.rm = TRUE) / sqrt(dplyr::n()), 4),
+      .groups     = "drop"
+    )
+} else {
+  warning("cindex_raw_folds is empty or missing required columns. Creating empty summary dataframe.")
+  cindex_summary_metrics <- data.frame(landmark = numeric(), model = character(), Mean_Cindex = numeric(), SD_Cindex = numeric(), SE_Cindex = numeric())
+}
 
-# 2. Summarize Brier Score Across Cross-Validation Folds
-brier_summary_metrics <- brier_raw_folds %>%
-  dplyr::group_by(landmark, model) %>%
-  dplyr::summarize(
-    Mean_Brier = round(mean(Brier, na.rm = TRUE), 4),
-    SD_Brier   = round(sd(Brier, na.rm = TRUE), 4),
-    SE_Brier   = round(sd(Brier, na.rm = TRUE) / sqrt(dplyr::n()), 4),
-    .groups    = "drop"
-  )
+# ------------------------------------------------------------------------------
+# 2. SUMMARIZE BRIER SCORE
+# ------------------------------------------------------------------------------
+if (nrow(brier_raw_folds) > 0 && all(c("landmark", "model", "Brier") %in% names(brier_raw_folds))) {
+  
+  # Ensure column names match expected types
+  brier_raw_folds <- brier_raw_folds %>%
+    dplyr::mutate(
+      landmark = as.numeric(as.character(landmark)),
+      model    = as.character(model),
+      Brier    = as.numeric(Brier)
+    )
+  
+  brier_summary_metrics <- brier_raw_folds %>%
+    dplyr::filter(!is.na(Brier)) %>%
+    dplyr::group_by(landmark, model) %>%
+    dplyr::summarize(
+      Mean_Brier = round(mean(Brier, na.rm = TRUE), 4),
+      SD_Brier   = round(sd(Brier, na.rm = TRUE), 4),
+      SE_Brier   = round(sd(Brier, na.rm = TRUE) / sqrt(dplyr::n()), 4),
+      .groups    = "drop"
+    )
+} else {
+  warning("brier_raw_folds is empty or missing required columns. Check Section 8 riskRegression::Score output.")
+  brier_summary_metrics <- data.frame(landmark = numeric(), model = character(), Mean_Brier = numeric(), SD_Brier = numeric(), SE_Brier = numeric())
+}
 
-# Write raw and summarized tables to CSV
+# Write CSV outputs
 readr::write_csv(cindex_raw_folds, "cindex_raw_folds.csv")
 readr::write_csv(cindex_summary_metrics, "cindex_summary_metrics.csv")
 readr::write_csv(brier_raw_folds, "brier_raw_folds.csv")
@@ -542,7 +567,6 @@ cat("------------------------------------------------------------\n")
 
 suppressPackageStartupMessages(library(ggplot2))
 
-# Define clean custom plot theme
 theme_publication <- function() {
   theme_minimal(base_size = 12) +
     theme(
@@ -556,61 +580,68 @@ theme_publication <- function() {
     )
 }
 
-# --- PDF 1: Concordance Index (C-Index) Plot ---
-p_cindex <- ggplot(
-  cindex_summary_metrics,
-  aes(x = factor(landmark), y = Mean_Cindex, color = model, group = model)
-) +
-  geom_line(linewidth = 1) +
-  geom_point(size = 3) +
-  geom_errorbar(
-    aes(ymin = Mean_Cindex - SE_Cindex, ymax = Mean_Cindex + SE_Cindex),
-    width = 0.15,
-    linewidth = 0.7
+# --- PDF 1: Concordance Index Plot ---
+if (nrow(cindex_summary_metrics) > 0) {
+  p_cindex <- ggplot(
+    cindex_summary_metrics,
+    aes(x = factor(landmark), y = Mean_Cindex, color = model, group = model)
   ) +
-  coord_cartesian(ylim = c(0.50, 1.00)) +
-  scale_color_manual(values = c("Copula_LSTM" = "#2B5C8F", "Cox" = "#D95F02", "LSTM" = "#7570B3")) +
-  labs(
-    title = "Dynamic Concordance Index (C-Index) Across Landmark Times",
-    subtitle = "5-Fold Cross-Validation (Mean ± SE; Horizon = 12 Months)",
-    x = "Landmark Time (Months)",
-    y = "Time-Dependent C-Index",
-    color = "Model"
-  ) +
-  theme_publication()
-
-ggsave("cindex_performance.pdf", plot = p_cindex, width = 8, height = 6, device = "pdf")
-cat("[Saved] C-index visualization saved to 'cindex_performance.pdf'\n")
+    geom_line(linewidth = 1) +
+    geom_point(size = 3) +
+    geom_errorbar(
+      aes(ymin = Mean_Cindex - SE_Cindex, ymax = Mean_Cindex + SE_Cindex),
+      width = 0.15,
+      linewidth = 0.7
+    ) +
+    coord_cartesian(ylim = c(0.50, 1.00)) +
+    scale_color_manual(values = c("Copula_LSTM" = "#2B5C8F", "Cox" = "#D95F02", "LSTM" = "#7570B3")) +
+    labs(
+      title = "Dynamic Concordance Index (C-Index) Across Landmark Times",
+      subtitle = "5-Fold Cross-Validation (Mean ± SE; Horizon = 12 Months)",
+      x = "Landmark Time (Months)",
+      y = "Time-Dependent C-Index",
+      color = "Model"
+    ) +
+    theme_publication()
+  
+  ggsave("cindex_performance.pdf", plot = p_cindex, width = 8, height = 6, device = "pdf")
+  cat("[Saved] C-index visualization saved to 'cindex_performance.pdf'\n")
+} else {
+  cat("[Skipped] C-index plot skipped due to empty metrics dataframe.\n")
+}
 
 # --- PDF 2: Brier Score Plot ---
-max_brier <- max(brier_summary_metrics$Mean_Brier + brier_summary_metrics$SE_Brier, na.rm = TRUE) * 1.2
-
-p_brier <- ggplot(
-  brier_summary_metrics,
-  aes(x = factor(landmark), y = Mean_Brier, color = model, group = model)
-) +
-  geom_line(linewidth = 1) +
-  geom_point(size = 3) +
-  geom_errorbar(
-    aes(ymin = Mean_Brier - SE_Brier, ymax = Mean_Brier + SE_Brier),
-    width = 0.15,
-    linewidth = 0.7
+if (nrow(brier_summary_metrics) > 0) {
+  max_brier <- max(brier_summary_metrics$Mean_Brier + brier_summary_metrics$SE_Brier, na.rm = TRUE) * 1.2
+  
+  p_brier <- ggplot(
+    brier_summary_metrics,
+    aes(x = factor(landmark), y = Mean_Brier, color = model, group = model)
   ) +
-  coord_cartesian(ylim = c(0, max_brier)) +
-  scale_color_manual(values = c("Copula_LSTM" = "#2B5C8F", "Cox" = "#D95F02", "LSTM" = "#7570B3")) +
-  labs(
-    title = "Prediction Error (Brier Score) Across Landmark Times",
-    subtitle = "5-Fold Cross-Validation (Mean ± SE; Horizon = 12 Months; Lower is Better)",
-    x = "Landmark Time (Months)",
-    y = "Brier Score",
-    color = "Model"
-  ) +
-  theme_publication()
-
-ggsave("brier_performance.pdf", plot = p_brier, width = 8, height = 6, device = "pdf")
-cat("[Saved] Brier score visualization saved to 'brier_performance.pdf'\n")
+    geom_line(linewidth = 1) +
+    geom_point(size = 3) +
+    geom_errorbar(
+      aes(ymin = Mean_Brier - SE_Brier, ymax = Mean_Brier + SE_Brier),
+      width = 0.15,
+      linewidth = 0.7
+    ) +
+    coord_cartesian(ylim = c(0, max_brier)) +
+    scale_color_manual(values = c("Copula_LSTM" = "#2B5C8F", "Cox" = "#D95F02", "LSTM" = "#7570B3")) +
+    labs(
+      title = "Prediction Error (Brier Score) Across Landmark Times",
+      subtitle = "5-Fold Cross-Validation (Mean ± SE; Horizon = 12 Months; Lower is Better)",
+      x = "Landmark Time (Months)",
+      y = "Brier Score",
+      color = "Model"
+    ) +
+    theme_publication()
+  
+  ggsave("brier_performance.pdf", plot = p_brier, width = 8, height = 6, device = "pdf")
+  cat("[Saved] Brier score visualization saved to 'brier_performance.pdf'\n")
+} else {
+  cat("[Skipped] Brier plot skipped due to empty metrics dataframe.\n")
+}
 
 cat("\n============================================================\n")
-cat("ALL BENCHMARK OUTPUTS SUCCESSFULLY GENERATED\n")
+cat("BENCHMARK OUTPUT PIPELINE COMPLETE\n")
 cat("============================================================\n")
-

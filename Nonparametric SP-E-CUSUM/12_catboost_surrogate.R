@@ -1,31 +1,58 @@
 # =============================================================================
 # 12_catboost_surrogate.R
 # =============================================================================
-# CATBOOST SURROGATE OPTIMIZATION FOR SP-E-CUSUM
 #
-# Revised September 2026
+# Stationary Probability-Scale Ensemble CUSUM (SP-E-CUSUM)
 #
-# Main computational improvements
-# -------------------------------
-# 1. Empirical CDF uses sorted samples + findInterval().
-# 2. Stationary CUSUM distributions are cached by unique k.
-# 3. Monte Carlo simulation is vectorized across paths.
-# 4. Calibration and objective ARL0 paths are generated separately.
-# 5. OOC paths are processed shift-by-shift to reduce memory.
-# 6. Development defaults are substantially smaller.
-# 7. CatBoost remains the surrogate optimizer.
+# CatBoost Surrogate Optimization with Empirical Copula Margins
 #
-# The final validation sample sizes can be increased after the design
-# optimization has completed.
+# IMPORTANT
+# ---------
+# CatBoost is used ONLY as a computational surrogate for the expensive
+# Monte Carlo design objective.
+#
+# Optimization strategy
+# ---------------------
+# Initial designs:                 10
+# Surrogate iterations:            10
+# Candidates / iteration:          30
+# Direct evaluations / iteration:  1
+#
+# Therefore:
+#
+#   10 initial direct evaluations
+#   + 10 x 1 surrogate-selected direct evaluations
+#   = 20 direct optimization evaluations
+#
+# At each surrogate iteration:
+#
+#   1. Fit CatBoost to all previously evaluated designs.
+#   2. Generate 30 candidate designs.
+#   3. Predict all 30 objectives using CatBoost.
+#   4. Directly evaluate only the candidate with the smallest
+#      predicted objective.
+#
+# The final selected design MUST still be evaluated by direct Monte Carlo.
+#
+# All internal functions use the "catboost_" prefix where appropriate.
+# This prevents collisions with functions defined in the main SP-E-CUSUM
+# modules, particularly:
+#
+#     calibrate_candidate_threshold()
+#     simulate_candidate_arl()
+#     build_stationary_model()
+#     make_candidate_fit()
+#
 # =============================================================================
 
 
 # =============================================================================
-# 0. PACKAGES
+# 1. REQUIRED PACKAGES
 # =============================================================================
 
 required_packages <- c(
-    "stats"
+    "stats",
+    "utils"
 )
 
 for (pkg in required_packages) {
@@ -33,51 +60,53 @@ for (pkg in required_packages) {
     if (!requireNamespace(pkg, quietly = TRUE)) {
 
         stop(
-            paste0(
-                "Required package '",
-                pkg,
-                "' is not installed."
-            ),
+            "Required package '",
+            pkg,
+            "' is not installed.",
             call. = FALSE
         )
     }
 }
 
 
-# CatBoost is optional.
-# If unavailable, a lightweight polynomial surrogate is used.
+# =============================================================================
+# 2. OPTIONAL CATBOOST PACKAGE
+# =============================================================================
 
-HAS_CATBOOST <- requireNamespace(
-    "catboost",
-    quietly = TRUE
-)
+HAS_CATBOOST <-
+    requireNamespace(
+        "catboost",
+        quietly = TRUE
+    )
 
 
 # =============================================================================
-# 1. GLOBAL CONFIGURATION
+# 3. CONFIGURATION
 # =============================================================================
 
 CATBOOST_CONFIG <- list(
 
     # -------------------------------------------------------------------------
-    # Reference distribution
+    # Baseline process
     # -------------------------------------------------------------------------
 
     mu0 = 0,
-
     sigma0 = 1,
-
     distribution = "normal",
 
 
     # -------------------------------------------------------------------------
-    # Ensemble
+    # Ensemble size
     # -------------------------------------------------------------------------
 
-    J = 3L,
+    J = 3,
+
+
+    # -------------------------------------------------------------------------
+    # Candidate CUSUM reference values
+    # -------------------------------------------------------------------------
 
     k_min = 0.10,
-
     k_max = 1.25,
 
     k_candidates = c(
@@ -94,27 +123,26 @@ CATBOOST_CONFIG <- list(
         1.25
     ),
 
-    weight_min = 0,
 
+    # -------------------------------------------------------------------------
+    # Weight bounds
+    # -------------------------------------------------------------------------
+
+    weight_min = 0,
     weight_max = 1,
 
 
     # -------------------------------------------------------------------------
-    # Probability-scale transformation
+    # Probability transform
     # -------------------------------------------------------------------------
 
-    # The optimizer uses the fixed empirical probability-scale stationary
-    # references together with the empirical-copula ensemble architecture.
-
     transform_method = "empirical_copula",
-
     copula_smoothing = "none",
-
     side = "upper",
 
 
     # -------------------------------------------------------------------------
-    # Target ARL
+    # Target ARL0
     # -------------------------------------------------------------------------
 
     target_arl0 = 370,
@@ -124,32 +152,33 @@ CATBOOST_CONFIG <- list(
     # Threshold calibration
     # -------------------------------------------------------------------------
 
-    calibration_n_rep = 200L,
-
-    calibration_max_run = 1500L,
+    calibration_n_rep = 1000,
+    calibration_max_run = 5000,
 
     calibration_lower = 0.50,
-
     calibration_upper = 0.999,
 
-    calibration_H_tol = 0.001,
+    calibration_H_tol = 0.0005,
+    calibration_arl_tol = 0.05,
 
-    calibration_arl_tol = 0.10,
+    calibration_max_iter = 25,
 
-    calibration_max_iter = 10L,
-
-    calibration_seed = 20260912L,
+    calibration_seed = 20260912,
 
 
     # -------------------------------------------------------------------------
-    # Optimization objective
+    # Monte Carlo objective
     # -------------------------------------------------------------------------
 
-    objective_n_arl0 = 100L,
+    objective_n_arl0 = 500,
+    objective_n_ooc = 300,
 
-    objective_n_ooc = 75L,
+    objective_max_run = 5000,
 
-    objective_max_run = 1500L,
+
+    # -------------------------------------------------------------------------
+    # OOC shifts
+    # -------------------------------------------------------------------------
 
     shifts = c(
         0.25,
@@ -173,74 +202,77 @@ CATBOOST_CONFIG <- list(
         0.10
     ),
 
-    arl0_penalty_weight = 10,
 
+    # -------------------------------------------------------------------------
+    # Objective weights
+    # -------------------------------------------------------------------------
+
+    arl0_penalty_weight = 10,
     ooc_weight = 1,
 
 
     # -------------------------------------------------------------------------
-    # Surrogate optimization
+    # Surrogate design
+    #
+    # Requested configuration:
+    #
+    #   Initial designs:                 10
+    #   Surrogate iterations:            10
+    #   Candidates / iteration:          30
+    #   Direct evaluations / iteration:   1
     # -------------------------------------------------------------------------
 
-    n_initial_design = 10L,
+    n_initial_design = 10,
 
-    n_surrogate_iterations = 10L,
+    n_surrogate_iterations = 10,
 
-    n_candidates_per_iteration = 30L,
+    n_candidates_per_iteration = 30,
+
+    n_direct_evaluations_per_iteration = 1,
 
     exploration_fraction = 0.20,
-
-    # Number of candidates actually evaluated at each surrogate iteration.
-    # Keeping this at 1 makes the optimization computationally inexpensive.
-
-    n_select_per_iteration = 1L,
 
 
     # -------------------------------------------------------------------------
     # CatBoost
     # -------------------------------------------------------------------------
 
-    catboost_iterations = 200L,
+    catboost_iterations = 500,
 
-    catboost_depth = 5L,
+    catboost_depth = 6,
 
     catboost_learning_rate = 0.05,
 
     catboost_l2_leaf_reg = 3,
 
-    catboost_random_seed = 20260912L,
+    catboost_random_seed = 20260912,
 
 
     # -------------------------------------------------------------------------
-    # Final validation
+    # Direct validation
     # -------------------------------------------------------------------------
 
-    validation_n_arl0 = 2000L,
+    validation_n_arl0 = 5000,
 
-    validation_n_ooc = 500L,
+    validation_n_ooc = 2000,
 
-    validation_max_run = 5000L,
+    validation_max_run = 10000,
 
-    validation_seed = 20260913L,
-
-
-    # -------------------------------------------------------------------------
-    # Global seed
-    # -------------------------------------------------------------------------
-
-    seed = 20260912L,
+    validation_seed = 20260913,
 
 
     # -------------------------------------------------------------------------
-    # Output
+    # Seed/output
     # -------------------------------------------------------------------------
 
-    output_dir = "sp_ecusum_results/catboost_surrogate"
+    seed = 20260912,
+
+    output_dir = "results/catboost_surrogate"
 )
 
 
 # =============================================================================
-# 2. SMALL UTILITIES
+# 4. NULL COALESCING & WEIGHT NORMALIZATION
 # =============================================================================
 
 `%||%` <- function(x, y) {
@@ -253,145 +285,427 @@ CATBOOST_CONFIG <- list(
 }
 
 
-catboost_assert <- function(
-    condition,
-    message
-) {
-
-    if (!isTRUE(condition)) {
-
-        stop(
-            message,
-            call. = FALSE
-        )
-    }
-
-    invisible(TRUE)
-}
-
-
-# =============================================================================
-# 3. WEIGHT NORMALIZATION
-# =============================================================================
-
-catboost_normalize_weights <- function(
-    weights
+normalize_real_weights <- function(
+    weights,
+    J = length(weights)
 ) {
 
     weights <- as.numeric(weights)
 
-    if (length(weights) == 0) {
+    if (
+        length(weights) != J ||
+        any(!is.finite(weights)) ||
+        any(weights < 0)
+    ) {
 
         stop(
-            "weights must contain at least one value.",
+            "Invalid weights vector.",
             call. = FALSE
         )
     }
-
-    if (any(!is.finite(weights))) {
-
-        stop(
-            "weights contain non-finite values.",
-            call. = FALSE
-        )
-    }
-
-    weights <- pmax(
-        weights,
-        0
-    )
 
     total <- sum(weights)
 
-    if (total <= 0) {
+    if (
+        !is.finite(total) ||
+        total <= 0
+    ) {
 
-        weights <- rep(
-            1 / length(weights),
-            length(weights)
+        stop(
+            "Weights must have a positive finite sum.",
+            call. = FALSE
         )
-
-    } else {
-
-        weights <- weights / total
     }
 
-    weights
+    weights / total
 }
 
 
 # =============================================================================
-# 4. RANDOM STANDARDIZED DATA
+# 5. CONFIGURATION VALIDATION
+# =============================================================================
+
+validate_catboost_config <- function(
+    config = CATBOOST_CONFIG
+) {
+
+    if (!is.list(config)) {
+
+        stop(
+            "CATBOOST_CONFIG must be a list.",
+            call. = FALSE
+        )
+    }
+
+    required <- c(
+
+        "mu0",
+        "sigma0",
+        "distribution",
+
+        "J",
+
+        "k_min",
+        "k_max",
+        "k_candidates",
+
+        "weight_min",
+        "weight_max",
+
+        "transform_method",
+        "side",
+
+        "target_arl0",
+
+        "calibration_n_rep",
+        "calibration_max_run",
+        "calibration_lower",
+        "calibration_upper",
+        "calibration_H_tol",
+        "calibration_arl_tol",
+        "calibration_max_iter",
+        "calibration_seed",
+
+        "objective_n_arl0",
+        "objective_n_ooc",
+        "objective_max_run",
+
+        "shifts",
+        "shift_weights",
+
+        "arl0_penalty_weight",
+        "ooc_weight",
+
+        "n_initial_design",
+        "n_surrogate_iterations",
+        "n_candidates_per_iteration",
+        "n_direct_evaluations_per_iteration",
+        "exploration_fraction",
+
+        "catboost_iterations",
+        "catboost_depth",
+        "catboost_learning_rate",
+        "catboost_l2_leaf_reg",
+        "catboost_random_seed",
+
+        "validation_n_arl0",
+        "validation_n_ooc",
+        "validation_max_run",
+        "validation_seed",
+
+        "seed",
+        "output_dir"
+    )
+
+    missing <-
+        required[
+            !vapply(
+                required,
+                function(x) x %in% names(config),
+                logical(1)
+            )
+        ]
+
+    if (length(missing) > 0) {
+
+        stop(
+            "CATBOOST_CONFIG is missing: ",
+            paste(missing, collapse = ", "),
+            call. = FALSE
+        )
+    }
+
+
+    # -------------------------------------------------------------------------
+    # Side
+    # -------------------------------------------------------------------------
+
+    config$side <- tolower(config$side)
+
+    if (
+        !config$side %in% c(
+            "upper",
+            "lower"
+        )
+    ) {
+
+        stop(
+            "side must be 'upper' or 'lower'.",
+            call. = FALSE
+        )
+    }
+
+
+    # -------------------------------------------------------------------------
+    # Transform method
+    # -------------------------------------------------------------------------
+
+    config$transform_method <-
+        tolower(
+            config$transform_method
+        )
+
+    if (
+        !config$transform_method %in%
+            c(
+                "lower_tail",
+                "mid",
+                "cdf",
+                "probability",
+                "empirical_copula"
+            )
+    ) {
+
+        stop(
+            "Unsupported transform_method.",
+            call. = FALSE
+        )
+    }
+
+
+    # -------------------------------------------------------------------------
+    # Shift weights
+    # -------------------------------------------------------------------------
+
+    if (
+        length(config$shift_weights) !=
+            length(config$shifts)
+    ) {
+
+        stop(
+            "shift_weights and shifts must have the same length.",
+            call. = FALSE
+        )
+    }
+
+    if (
+        any(!is.finite(config$shift_weights)) ||
+        any(config$shift_weights < 0) ||
+        sum(config$shift_weights) <= 0
+    ) {
+
+        stop(
+            "shift_weights must be nonnegative with positive sum.",
+            call. = FALSE
+        )
+    }
+
+    config$shift_weights <-
+        config$shift_weights /
+        sum(config$shift_weights)
+
+
+    # -------------------------------------------------------------------------
+    # Surrogate-design validation
+    # -------------------------------------------------------------------------
+
+    if (
+        config$n_initial_design < 5
+    ) {
+
+        stop(
+            "n_initial_design must be at least 5.",
+            call. = FALSE
+        )
+    }
+
+    if (
+        config$n_surrogate_iterations < 0
+    ) {
+
+        stop(
+            "n_surrogate_iterations must be nonnegative.",
+            call. = FALSE
+        )
+    }
+
+    if (
+        config$n_candidates_per_iteration < 1
+    ) {
+
+        stop(
+            "n_candidates_per_iteration must be at least 1.",
+            call. = FALSE
+        )
+    }
+
+    if (
+        config$n_direct_evaluations_per_iteration < 1 ||
+        config$n_direct_evaluations_per_iteration >
+            config$n_candidates_per_iteration
+    ) {
+
+        stop(
+            "n_direct_evaluations_per_iteration must be between 1 and ",
+            "n_candidates_per_iteration.",
+            call. = FALSE
+        )
+    }
+
+
+    # -------------------------------------------------------------------------
+    # Ensemble-size validation
+    # -------------------------------------------------------------------------
+
+    if (
+        config$J < 1
+    ) {
+
+        stop(
+            "J must be at least 1.",
+            call. = FALSE
+        )
+    }
+
+    if (
+        config$J > length(config$k_candidates)
+    ) {
+
+        stop(
+            "J cannot exceed the number of available k_candidates.",
+            call. = FALSE
+        )
+    }
+
+
+    config
+}
+
+
+CATBOOST_CONFIG <-
+    validate_catboost_config(
+        CATBOOST_CONFIG
+    )
+
+
+# =============================================================================
+# 6. STANDARDIZED RANDOM VARIABLES
 # =============================================================================
 
 generate_standardized_random <- function(
     n,
-    shift = 0,
-    seed = NULL
+    distribution = "normal"
 ) {
 
-    if (!is.null(seed)) {
+    distribution <- tolower(distribution)
 
-        set.seed(seed)
+    if (distribution == "normal") {
+
+        return(
+            stats::rnorm(n)
+        )
     }
 
-    stats::rnorm(
-        n = n,
-        mean = shift,
-        sd = 1
+    if (distribution == "t5") {
+
+        return(
+            stats::rt(
+                n,
+                df = 5
+            ) /
+                sqrt(5 / 3)
+        )
+    }
+
+    if (distribution == "lognormal") {
+
+        z <- stats::rlnorm(
+            n,
+            meanlog = 0,
+            sdlog = 1
+        )
+
+        return(
+            (z - mean(z)) /
+                stats::sd(z)
+        )
+    }
+
+    if (distribution == "gamma") {
+
+        z <- stats::rgamma(
+            n,
+            shape = 2,
+            rate = 2
+        )
+
+        return(
+            (z - mean(z)) /
+                stats::sd(z)
+        )
+    }
+
+    if (distribution == "contaminated_normal") {
+
+        indicator <-
+            stats::runif(n) < 0.05
+
+        z <- stats::rnorm(n)
+
+        z[indicator] <-
+            stats::rnorm(
+                sum(indicator),
+                sd = 5
+            )
+
+        return(
+            z / sqrt(2.2)
+        )
+    }
+
+    stop(
+        "Unsupported distribution: ",
+        distribution,
+        call. = FALSE
     )
 }
 
 
 # =============================================================================
-# 5. MONITORING PATH GENERATION
+# 7. GENERATE MONITORING PATHS
 # =============================================================================
 
 generate_monitoring_paths <- function(
     n_paths,
     max_run,
-    shift = 0,
+    config = CATBOOST_CONFIG,
+    mean_shift = 0,
     seed = NULL
 ) {
 
-    n_paths <- as.integer(n_paths)
-
-    max_run <- as.integer(max_run)
-
-    if (n_paths <= 0) {
-
-        stop(
-            "n_paths must be positive.",
-            call. = FALSE
-        )
-    }
-
-    if (max_run <= 0) {
-
-        stop(
-            "max_run must be positive.",
-            call. = FALSE
-        )
-    }
-
     if (!is.null(seed)) {
-
         set.seed(seed)
     }
 
-    matrix(
-        stats::rnorm(
+    z <- matrix(
+        generate_standardized_random(
             n_paths * max_run,
-            mean = shift,
-            sd = 1
+            config$distribution
         ),
         nrow = n_paths,
         ncol = max_run
     )
+
+    x <- sweep(
+        z,
+        1,
+        config$mu0 + mean_shift,
+        FUN = "+"
+    )
+
+    x <- sweep(
+        x,
+        1,
+        config$sigma0,
+        FUN = "*"
+    )
+
+    x
 }
 
 
 # =============================================================================
-# 6. CUSUM RECURSION
+# 8. CUSUM RECURSION
 # =============================================================================
 
 catboost_cusum_update <- function(
@@ -422,14 +736,14 @@ catboost_cusum_update <- function(
     }
 
     stop(
-        "side must be 'upper' or 'lower'.",
+        "side must be upper or lower.",
         call. = FALSE
     )
 }
 
 
 # =============================================================================
-# 7. BUILD PHASE-I EMPIRICAL PROBABILITY-SCALE MODELS
+# 9. EMPIRICAL COPULA MARGINS
 # =============================================================================
 
 fit_empirical_copula_models <- function(
@@ -438,49 +752,15 @@ fit_empirical_copula_models <- function(
     side = "upper"
 ) {
 
-    phase1_z <- as.numeric(
-        phase1_z
-    )
+    J <- length(k_values)
+    n <- length(phase1_z)
 
-    k_values <- as.numeric(
-        k_values
-    )
-
-    J <- length(
-        k_values
-    )
-
-    n <- length(
-        phase1_z
-    )
-
-    if (n <= 0) {
-
-        stop(
-            "phase1_z is empty.",
-            call. = FALSE
+    c_matrix <-
+        matrix(
+            0,
+            nrow = n,
+            ncol = J
         )
-    }
-
-    if (J <= 0) {
-
-        stop(
-            "k_values is empty.",
-            call. = FALSE
-        )
-    }
-
-
-    # -------------------------------------------------------------------------
-    # Calculate Phase-I CUSUM paths
-    # -------------------------------------------------------------------------
-
-    c_matrix <- matrix(
-        0,
-        nrow = n,
-        ncol = J
-    )
-
 
     for (j in seq_len(J)) {
 
@@ -490,215 +770,52 @@ fit_empirical_copula_models <- function(
 
         for (t in seq_len(n)) {
 
-            state <- catboost_cusum_update(
-                C_prev = state,
-                z = phase1_z[t],
-                k = k,
-                side = side
-            )
+            state <-
+                catboost_cusum_update(
+                    C_prev = state,
+                    z = phase1_z[t],
+                    k = k,
+                    side = side
+                )
 
             c_matrix[t, j] <- state
         }
     }
 
-
-    # -------------------------------------------------------------------------
-    # Build empirical CDF models
-    # -------------------------------------------------------------------------
-
-    ecdf_models <- vector(
-        "list",
-        J
-    )
-
+    ecdf_models <-
+        vector(
+            "list",
+            J
+        )
 
     for (j in seq_len(J)) {
 
-        sample_j <- c_matrix[, j]
-
-        sorted_sample <- sort(
-            sample_j,
-            method = "quick"
-        )
-
-        n_sample <- length(
-            sorted_sample
-        )
-
-
-        cdf_function <- local({
-
-            sorted_sample_local <- sorted_sample
-
-            n_sample_local <- n_sample
-
-            function(x) {
-
-                x <- as.numeric(x)
-
-                counts <- findInterval(
-                    x,
-                    sorted_sample_local,
-                    left.open = FALSE
-                )
-
-                counts /
-                    (n_sample_local + 1)
-            }
-        })
-
-
-        ecdf_models[[j]] <- list(
-
-            sample = sample_j,
-
-            sorted_sample = sorted_sample,
-
-            n = n_sample,
-
-            cdf = cdf_function,
-
-            probability = cdf_function
-        )
+        ecdf_models[[j]] <-
+            stats::ecdf(
+                c_matrix[, j]
+            )
     }
-
 
     ecdf_models
 }
 
-
-# =============================================================================
-# 8. FAST EMPIRICAL CDF
-# =============================================================================
-
-compute_empirical_cdf <- function(
-    c_value,
-    sample = NULL,
-    smoothing = "none",
-    sorted_sample = NULL
-) {
-
-    if (!is.null(sorted_sample)) {
-
-        sorted_sample <- as.numeric(
-            sorted_sample
-        )
-
-    } else {
-
-        if (is.null(sample)) {
-
-            stop(
-                "Either sample or sorted_sample must be supplied.",
-                call. = FALSE
-            )
-        }
-
-        sorted_sample <- sort(
-            as.numeric(sample),
-            method = "quick"
-        )
-    }
-
-
-    n <- length(
-        sorted_sample
-    )
-
-
-    if (n <= 0) {
-
-        stop(
-            "The stationary sample is empty.",
-            call. = FALSE
-        )
-    }
-
-
-    # -------------------------------------------------------------------------
-    # Fast empirical CDF
-    # -------------------------------------------------------------------------
-
-    if (smoothing == "none") {
-
-        counts <- findInterval(
-            c_value,
-            sorted_sample,
-            left.open = FALSE
-        )
-
-        return(
-            counts / (n + 1)
-        )
-    }
-
-
-    # -------------------------------------------------------------------------
-    # Optional beta smoothing
-    # -------------------------------------------------------------------------
-
-    if (smoothing == "beta") {
-
-        ranks <- seq_len(n)
-
-        prob_vec <- stats::pbeta(
-            c_value,
-            shape1 = ranks,
-            shape2 = n + 1 - ranks
-        )
-
-        return(
-            mean(prob_vec)
-        )
-    }
-
-
-    stop(
-        "Unsupported copula smoothing: ",
-        smoothing,
-        call. = FALSE
-    )
-}
-
-
-# =============================================================================
-# 9. EMPIRICAL COPULA TRANSFORMATION
-# =============================================================================
 
 apply_empirical_copula_transform <- function(
     c_values,
     ecdf_models
 ) {
 
-    c_values <- as.numeric(
-        c_values
-    )
+    J <- length(c_values)
 
-    J <- length(
-        c_values
-    )
-
-    if (length(ecdf_models) != J) {
-
-        stop(
-            "Dimension mismatch in empirical copula margins.",
-            call. = FALSE
-        )
-    }
-
-
-    u_values <- numeric(
-        J
-    )
-
+    u_values <- numeric(J)
 
     for (j in seq_len(J)) {
 
-        u_values[j] <- ecdf_models[[j]]$cdf(
-            c_values[j]
-        )
+        u_values[j] <-
+            ecdf_models[[j]](
+                c_values[j]
+            )
     }
-
 
     pmin(
         1,
@@ -710,8 +827,60 @@ apply_empirical_copula_transform <- function(
 }
 
 
+compute_empirical_cdf <- function(
+    c_value,
+    sample,
+    smoothing = "none"
+) {
+
+    n <- length(sample)
+
+    if (n <= 0) {
+
+        stop(
+            "The stationary sample is empty.",
+            call. = FALSE
+        )
+    }
+
+    if (smoothing == "none") {
+
+        return(
+            sum(sample <= c_value) /
+                (n + 1)
+        )
+    }
+
+    if (smoothing == "beta") {
+
+        ranks <-
+            rank(
+                sample,
+                ties.method = "average"
+            )
+
+        prob_vec <-
+            stats::pbeta(
+                c_value,
+                shape1 = ranks,
+                shape2 = n + 1 - ranks
+            )
+
+        return(
+            mean(prob_vec)
+        )
+    }
+
+    stop(
+        "Unsupported copula smoothing: ",
+        smoothing,
+        call. = FALSE
+    )
+}
+
+
 # =============================================================================
-# 10. BUILD ONE STATIONARY CUSUM MODEL
+# 10. CATBOOST-SPECIFIC STATIONARY MODEL
 # =============================================================================
 
 catboost_build_stationary_model <- function(
@@ -721,1009 +890,547 @@ catboost_build_stationary_model <- function(
     max_iter = 10000
 ) {
 
-    n_stationary <- max(
-        5000,
+    n_stationary <-
+        max(
+            10000,
+            min(
+                max_iter,
+                50000
+            )
+        )
+
+    burn_in <-
         min(
-            max_iter,
-            20000
+            2000,
+            floor(n_stationary / 5)
         )
-    )
 
-    burn_in <- min(
-        1000,
-        floor(
-            n_stationary / 5
+    z <-
+        stats::rnorm(
+            n_stationary + burn_in
         )
-    )
 
-
-    z <- stats::rnorm(
-        n_stationary + burn_in
-    )
-
-
-    state <- numeric(
-        n_stationary + burn_in
-    )
-
+    state <-
+        numeric(
+            n_stationary + burn_in
+        )
 
     C <- 0
 
-
     for (i in seq_along(z)) {
 
-        C <- catboost_cusum_update(
-            C_prev = C,
-            z = z[i],
-            k = k,
-            side = side
-        )
+        C <-
+            catboost_cusum_update(
+                C_prev = C,
+                z = z[i],
+                k = k,
+                side = side
+            )
 
         state[i] <- C
     }
 
-
-    stationary_sample <- state[
-        seq.int(
-            burn_in + 1,
-            length(state)
-        )
-    ]
-
-
-    sorted_sample <- sort(
-        stationary_sample,
-        method = "quick"
-    )
-
-
-    n_sample <- length(
-        sorted_sample
-    )
-
-
-    cdf_function <- local({
-
-        sorted_sample_local <- sorted_sample
-
-        n_sample_local <- n_sample
-
-        function(x) {
-
-            counts <- findInterval(
-                x,
-                sorted_sample_local,
-                left.open = FALSE
+    stationary_sample <-
+        state[
+            seq.int(
+                burn_in + 1,
+                length(state)
             )
-
-            counts /
-                (n_sample_local + 1)
-        }
-    })
-
+        ]
 
     list(
-
         k = k,
-
         side = side,
-
         sample = stationary_sample,
 
-        sorted_sample = sorted_sample,
+        cdf = function(x) {
 
-        n = n_sample,
+            compute_empirical_cdf(
+                x,
+                stationary_sample,
+                smoothing = smoothing
+            )
+        },
 
-        smoothing = smoothing,
+        probability = function(x) {
 
-        cdf = cdf_function,
-
-        probability = cdf_function
-    )
-}
-
-
-# =============================================================================
-# 11. BUILD STATIONARY MODEL CACHE
-# =============================================================================
-
-catboost_build_stationary_model_cache <- function(
-    config = CATBOOST_CONFIG
-) {
-
-    unique_k <- sort(
-        unique(
-            config$k_candidates
-        )
-    )
-
-
-    cache <- vector(
-        "list",
-        length(unique_k)
-    )
-
-
-    names(cache) <- format(
-        unique_k,
-        trim = TRUE,
-        scientific = FALSE
-    )
-
-
-    cat(
-        "\nBuilding stationary CUSUM model cache...\n"
-    )
-
-
-    for (i in seq_along(unique_k)) {
-
-        k <- unique_k[i]
-
-
-        cat(
-            "  k = ",
-            k,
-            "\n",
-            sep = ""
-        )
-
-
-        cache[[i]] <- catboost_build_stationary_model(
-            k = k,
-            side = config$side,
-            smoothing = config$copula_smoothing %||% "none"
-        )
-    }
-
-
-    cat(
-        "Stationary model cache completed.\n\n"
-    )
-
-
-    cache
-}
-
-
-# =============================================================================
-# 12. RETRIEVE STATIONARY MODELS FROM CACHE
-# =============================================================================
-
-catboost_get_stationary_models <- function(
-    k_values,
-    cache
-) {
-
-    result <- vector(
-        "list",
-        length(k_values)
-    )
-
-
-    for (j in seq_along(k_values)) {
-
-        key <- format(
-            k_values[j],
-            trim = TRUE,
-            scientific = FALSE
-        )
-
-
-        if (is.null(cache[[key]])) {
-
-            stop(
-                "Stationary model not found for k = ",
-                k_values[j],
-                call. = FALSE
+            compute_empirical_cdf(
+                x,
+                stationary_sample,
+                smoothing = smoothing
             )
         }
-
-
-        result[[j]] <- cache[[key]]
-    }
-
-
-    result
+    )
 }
 
 
 # =============================================================================
-# 13. BUILD CANDIDATE STATIONARY MODELS
+# 11. CATBOOST-SPECIFIC CANDIDATE STATIONARY MODELS
 # =============================================================================
 
 catboost_build_candidate_stationary_models <- function(
     k_values,
-    stationary_cache
+    config = CATBOOST_CONFIG
 ) {
 
-    catboost_get_stationary_models(
-        k_values = k_values,
-        cache = stationary_cache
+    lapply(
+        k_values,
+        function(k) {
+
+            catboost_build_stationary_model(
+                k = k,
+                side = config$side,
+                smoothing =
+                    config$copula_smoothing %||% "none"
+            )
+        }
     )
 }
 
 
 # =============================================================================
-# 14. PROBABILITY TRANSFORMATION
+# 12. PROBABILITY-SCALE TRANSFORM
 # =============================================================================
 
 catboost_probability_transform <- function(
-    c_values,
-    stationary_models
+    c_value,
+    stationary_model,
+    method = "empirical_copula"
 ) {
 
-    J <- length(
-        c_values
-    )
-
-
-    if (length(stationary_models) != J) {
-
-        stop(
-            "CUSUM/model dimension mismatch.",
-            call. = FALSE
+    result <-
+        stationary_model$cdf(
+            c_value
         )
-    }
 
-
-    u <- numeric(
-        J
-    )
-
-
-    for (j in seq_len(J)) {
-
-        u[j] <- stationary_models[[j]]$cdf(
-            c_values[j]
-        )
-    }
-
-
-    pmin(
-        1,
-        pmax(
-            0,
-            u
-        )
-    )
-}
-
-
-# =============================================================================
-# 15. EMPIRICAL COPULA ENSEMBLE VALUE
-# =============================================================================
-
-catboost_empirical_copula_value <- function(
-    u_values
-) {
-
-    u_values <- as.numeric(
-        u_values
-    )
-
-
-    if (length(u_values) == 0) {
-
-        return(0)
-    }
-
-
-    if (any(!is.finite(u_values))) {
-
-        return(0)
-    }
-
-
-    prod(
-        u_values
-    )
-}
-
-
-# =============================================================================
-# 16. CANDIDATE SP-E-CUSUM UPDATE
-# =============================================================================
-
-catboost_sp_ecusum_update <- function(
-    C_prev,
-    z,
-    k_values,
-    weights,
-    stationary_models,
-    side = "upper"
-) {
-
-    J <- length(
-        k_values
-    )
-
-
-    C_new <- numeric(
-        J
-    )
-
-
-    for (j in seq_len(J)) {
-
-        C_new[j] <- catboost_cusum_update(
-            C_prev = C_prev[j],
-            z = z,
-            k = k_values[j],
-            side = side
-        )
-    }
-
-
-    u_values <- catboost_probability_transform(
-        c_values = C_new,
-        stationary_models = stationary_models
-    )
-
-
-    copula_value <- catboost_empirical_copula_value(
-        u_values
-    )
-
-
-    ensemble_value <- sum(
-        weights * u_values
-    )
-
-
-    list(
-
-        C = C_new,
-
-        u = u_values,
-
-        copula = copula_value,
-
-        ensemble = ensemble_value
-    )
-}
-
-
-# =============================================================================
-# 17. VECTOR OF CUSUM STATES
-# =============================================================================
-
-catboost_update_state_vector <- function(
-    state,
-    z,
-    k_values,
-    side = "upper"
-) {
-
-    if (side == "upper") {
-
-        return(
-            pmax(
-                0,
-                state + z - k_values
-            )
-        )
-    }
-
-
-    if (side == "lower") {
-
-        return(
-            pmax(
-                0,
-                state - z - k_values
-            )
-        )
-    }
-
-
-    stop(
-        "side must be 'upper' or 'lower'.",
-        call. = FALSE
-    )
-}
-
-
-# =============================================================================
-# 18. FAST VECTOR CDF EVALUATION
-# =============================================================================
-
-catboost_vector_probability_transform <- function(
-    state_matrix,
-    stationary_models
-) {
-
-    state_matrix <- as.matrix(
-        state_matrix
-    )
-
-    n_paths <- nrow(
-        state_matrix
-    )
-
-    J <- ncol(
-        state_matrix
-    )
-
-
-    if (length(stationary_models) != J) {
-
-        stop(
-            "State/model dimension mismatch.",
-            call. = FALSE
-        )
-    }
-
-
-    U <- matrix(
+    max(
         0,
-        nrow = n_paths,
-        ncol = J
-    )
-
-
-    for (j in seq_len(J)) {
-
-        sorted_sample <-
-            stationary_models[[j]]$sorted_sample
-
-        n_sample <-
-            stationary_models[[j]]$n
-
-
-        U[, j] <- findInterval(
-            state_matrix[, j],
-            sorted_sample,
-            left.open = FALSE
-        ) /
-            (n_sample + 1)
-    }
-
-
-    pmin(
-        1,
-        pmax(
-            0,
-            U
+        min(
+            1,
+            as.numeric(result)[1]
         )
     )
 }
 
 
 # =============================================================================
-# 19. VECTOR-COPULA ENSEMBLE
-# =============================================================================
-
-catboost_vector_ensemble <- function(
-    U,
-    weights
-) {
-
-    U <- as.matrix(
-        U
-    )
-
-    weights <- catboost_normalize_weights(
-        weights
-    )
-
-
-    if (ncol(U) != length(weights)) {
-
-        stop(
-            "U/weight dimension mismatch.",
-            call. = FALSE
-        )
-    }
-
-
-    rowSums(
-        sweep(
-            U,
-            2,
-            weights,
-            "*"
-        )
-    )
-}
-
-
-# =============================================================================
-# 20. FAST VECTOR COPULA PRODUCT
-# =============================================================================
-
-catboost_vector_copula <- function(
-    U
-) {
-
-    U <- as.matrix(
-        U
-    )
-
-
-    apply(
-        U,
-        1,
-        prod
-    )
-}
-
-
-# =============================================================================
-# 21. FAST CANDIDATE PATH SIMULATION
-# =============================================================================
-
-catboost_run_candidate_path <- function(
-    raw_paths,
-    fit,
-    max_run
-) {
-
-    if (is.vector(raw_paths)) {
-
-        raw_paths <- matrix(
-            raw_paths,
-            nrow = 1
-        )
-    }
-
-
-    raw_paths <- as.matrix(
-        raw_paths
-    )
-
-
-    n_paths <- nrow(
-        raw_paths
-    )
-
-
-    J <- length(
-        fit$k_values
-    )
-
-
-    max_run <- min(
-        as.integer(max_run),
-        ncol(raw_paths)
-    )
-
-
-    if (max_run <= 0) {
-
-        stop(
-            "max_run must be positive.",
-            call. = FALSE
-        )
-    }
-
-
-    if (length(fit$weights) != J) {
-
-        stop(
-            "Weight dimension does not match k_values.",
-            call. = FALSE
-        )
-    }
-
-
-    if (length(fit$stationary_models) != J) {
-
-        stop(
-            "Stationary-model dimension does not match k_values.",
-            call. = FALSE
-        )
-    }
-
-
-    # -------------------------------------------------------------------------
-    # State matrix
-    # -------------------------------------------------------------------------
-
-    state <- matrix(
-        0,
-        nrow = n_paths,
-        ncol = J
-    )
-
-
-    # Censoring convention:
-    #
-    # signal at max_run -> max_run
-    # no signal by max_run -> max_run + 1
-
-    rl <- rep(
-        max_run + 1,
-        n_paths
-    )
-
-
-    active <- rep(
-        TRUE,
-        n_paths
-    )
-
-
-    # -------------------------------------------------------------------------
-    # Sequential monitoring
-    # -------------------------------------------------------------------------
-
-    for (t in seq_len(max_run)) {
-
-        active_idx <- which(
-            active
-        )
-
-
-        if (length(active_idx) == 0) {
-
-            break
-        }
-
-
-        z <- (
-            raw_paths[
-                active_idx,
-                t
-            ] -
-                fit$mu0
-        ) /
-            fit$sigma0
-
-
-        state_active <- state[
-            active_idx,
-            ,
-            drop = FALSE
-        ]
-
-
-        # ---------------------------------------------------------------------
-        # Update all active paths
-        # ---------------------------------------------------------------------
-
-        if (fit$side == "upper") {
-
-            state_active <- pmax(
-                0,
-                sweep(
-                    state_active,
-                    2,
-                    fit$k_values,
-                    "-"
-                ) +
-                    z
-            )
-
-        } else {
-
-            state_active <- pmax(
-                0,
-                sweep(
-                    state_active,
-                    2,
-                    fit$k_values,
-                    "-"
-                ) -
-                    z
-            )
-        }
-
-
-        state[
-            active_idx,
-            ,
-            drop = FALSE
-        ] <- state_active
-
-
-        # ---------------------------------------------------------------------
-        # Probability-scale transformation
-        # ---------------------------------------------------------------------
-
-        U <- catboost_vector_probability_transform(
-            state_matrix = state_active,
-            stationary_models = fit$stationary_models
-        )
-
-
-        # ---------------------------------------------------------------------
-        # Weighted probability-scale ensemble
-        # ---------------------------------------------------------------------
-
-        ensemble <- catboost_vector_ensemble(
-            U = U,
-            weights = fit$weights
-        )
-
-
-        # ---------------------------------------------------------------------
-        # Alarm
-        #
-        # Strict inequality:
-        # E_t > H
-        # ---------------------------------------------------------------------
-
-        alarm_local <- (
-            ensemble > fit$H
-        )
-
-
-        if (any(alarm_local)) {
-
-            alarm_idx <- active_idx[
-                alarm_local
-            ]
-
-
-            rl[
-                alarm_idx
-            ] <- t
-
-
-            active[
-                alarm_idx
-            ] <- FALSE
-        }
-    }
-
-
-    rl
-}
-
-
-# =============================================================================
-# 22. SIMULATE CANDIDATE ARL
-# =============================================================================
-
-catboost_simulate_candidate_arl <- function(
-    fit,
-    paths,
-    max_run
-) {
-
-    rl <- catboost_run_candidate_path(
-        raw_paths = paths,
-        fit = fit,
-        max_run = max_run
-    )
-
-
-    mean(
-        rl
-    )
-}
-
-
-# =============================================================================
-# 23. BUILD CANDIDATE FIT
+# 13. CATBOOST CANDIDATE FIT
 # =============================================================================
 
 catboost_make_candidate_fit <- function(
     k_values,
     weights,
     H,
-    config,
-    stationary_cache
+    stationary_models,
+    config = CATBOOST_CONFIG
 ) {
 
-    k_values <- as.numeric(
-        k_values
-    )
-
-    weights <- catboost_normalize_weights(
-        weights
-    )
-
-
-    if (length(k_values) != config$J) {
-
-        stop(
-            "Number of k values must equal config$J.",
-            call. = FALSE
-        )
-    }
-
-
-    if (length(weights) != config$J) {
-
-        stop(
-            "Number of weights must equal config$J.",
-            call. = FALSE
-        )
-    }
-
-
-    if (any(!is.finite(k_values))) {
-
-        stop(
-            "k_values contain non-finite values.",
-            call. = FALSE
-        )
-    }
-
-
-    if (any(k_values < config$k_min) ||
-        any(k_values > config$k_max)) {
-
-        stop(
-            "k_values fall outside the configured range.",
-            call. = FALSE
-        )
-    }
-
-
-    stationary_models <-
-        catboost_build_candidate_stationary_models(
-            k_values = k_values,
-            stationary_cache = stationary_cache
+    weights <-
+        normalize_real_weights(
+            weights,
+            length(k_values)
         )
 
+    structure(
+        list(
+            mu0 = config$mu0,
+            sigma0 = config$sigma0,
 
-    list(
+            k_values =
+                as.numeric(k_values),
 
-        k_values = k_values,
+            weights =
+                as.numeric(weights),
 
-        weights = weights,
+            H =
+                as.numeric(H),
 
-        H = as.numeric(
-            H
+            threshold =
+                as.numeric(H),
+
+            side =
+                config$side,
+
+            transform_method =
+                config$transform_method,
+
+            stationary_models =
+                stationary_models,
+
+            J =
+                length(k_values),
+
+            n_components =
+                length(k_values)
         ),
-
-        mu0 = config$mu0,
-
-        sigma0 = config$sigma0,
-
-        side = config$side,
-
-        stationary_models = stationary_models
+        class = c(
+            "sp_ecusum_catboost_fit",
+            "sp_ecusum_fit"
+        )
     )
 }
 
 
 # =============================================================================
-# 24. THRESHOLD CALIBRATION
+# 14. SINGLE OBSERVATION UPDATE
+# =============================================================================
+
+catboost_sp_ecusum_update <- function(
+    state,
+    z,
+    fit
+) {
+
+    J <-
+        fit$J %||%
+        length(fit$k_values)
+
+    C_new <- numeric(J)
+
+    probabilities <- numeric(J)
+
+    for (j in seq_len(J)) {
+
+        C_new[j] <-
+            catboost_cusum_update(
+                C_prev = state[j],
+                z = z,
+                k = fit$k_values[j],
+                side = fit$side
+            )
+
+        probabilities[j] <-
+            catboost_probability_transform(
+                c_value = C_new[j],
+                stationary_model =
+                    fit$stationary_models[[j]],
+                method =
+                    fit$transform_method
+            )
+    }
+
+    ensemble <-
+        sum(
+            fit$weights *
+                probabilities
+        )
+
+    list(
+        cusum = C_new,
+        probabilities = probabilities,
+        ensemble = ensemble,
+
+        signal =
+            isTRUE(
+                ensemble > fit$H
+            )
+    )
+}
+
+
+# =============================================================================
+# 15. RUN ONE CANDIDATE PATH
+# =============================================================================
+
+catboost_run_candidate_path <- function(
+    x,
+    fit,
+    max_run = length(x)
+) {
+
+    mu_hat <- fit$mu0
+
+    sigma_hat <- fit$sigma0
+
+    J <- fit$J
+
+    state <- numeric(J)
+
+    n_run <-
+        min(
+            length(x),
+            max_run
+        )
+
+    for (t in seq_len(n_run)) {
+
+        z <-
+            (x[t] - mu_hat) /
+            sigma_hat
+
+        update <-
+            catboost_sp_ecusum_update(
+                state = state,
+                z = z,
+                fit = fit
+            )
+
+        state <- update$cusum
+
+        if (update$signal) {
+
+            return(
+                as.integer(t)
+            )
+        }
+    }
+
+    as.integer(
+        max_run + 1
+    )
+}
+
+
+# =============================================================================
+# 16. CATBOOST-SPECIFIC MONTE CARLO ARL
+# =============================================================================
+
+catboost_simulate_candidate_arl <- function(
+    raw_paths,
+    fit,
+    max_run = ncol(raw_paths)
+) {
+
+    raw_paths <-
+        as.matrix(raw_paths)
+
+    n_paths <-
+        nrow(raw_paths)
+
+    run_lengths <-
+        numeric(n_paths)
+
+    for (i in seq_len(n_paths)) {
+
+        run_lengths[i] <-
+            catboost_run_candidate_path(
+                x = raw_paths[i, ],
+                fit = fit,
+                max_run = max_run
+            )
+    }
+
+    run_lengths
+}
+
+
+# =============================================================================
+# 17. CATBOOST-SPECIFIC JOINT THRESHOLD CALIBRATION
 # =============================================================================
 
 catboost_calibrate_candidate_threshold <- function(
     k_values,
     weights,
-    config,
-    stationary_cache,
-    arl0_paths = NULL
+    config = CATBOOST_CONFIG,
+    raw_paths = NULL,
+    seed = NULL
 ) {
 
-    if (is.null(arl0_paths)) {
+    if (!is.null(seed)) {
 
-        arl0_paths <- generate_monitoring_paths(
-            n_paths = config$calibration_n_rep,
-            max_run = config$calibration_max_run,
-            shift = 0,
-            seed = config$calibration_seed
+        set.seed(seed)
+    }
+
+    if (is.null(raw_paths)) {
+
+        raw_paths <-
+            generate_monitoring_paths(
+                n_paths =
+                    config$calibration_n_rep,
+
+                max_run =
+                    config$calibration_max_run,
+
+                config = config,
+
+                mean_shift = 0,
+
+                seed = seed
+            )
+    }
+
+    stationary_models <-
+        catboost_build_candidate_stationary_models(
+            k_values = k_values,
+            config = config
+        )
+
+    evaluate_H <- function(H) {
+
+        fit <-
+            catboost_make_candidate_fit(
+                k_values =
+                    k_values,
+
+                weights =
+                    weights,
+
+                H =
+                    H,
+
+                stationary_models =
+                    stationary_models,
+
+                config =
+                    config
+            )
+
+        rl <-
+            catboost_simulate_candidate_arl(
+                raw_paths =
+                    raw_paths,
+
+                fit =
+                    fit,
+
+                max_run =
+                    config$calibration_max_run
+            )
+
+        mean(rl)
+    }
+
+    lower <-
+        config$calibration_lower
+
+    upper <-
+        config$calibration_upper
+
+    arl_lower <-
+        evaluate_H(lower)
+
+    arl_upper <-
+        evaluate_H(upper)
+
+    target <-
+        config$target_arl0
+
+
+    if (arl_lower > target) {
+
+        return(
+            list(
+                H = lower,
+                ARL0 = arl_lower,
+                status =
+                    "target_below_lower_bound",
+                iterations = 0L,
+                stationary_models =
+                    stationary_models
+            )
         )
     }
 
 
-    lower <- config$calibration_lower
+    if (arl_upper < target) {
 
-    upper <- config$calibration_upper
-
-    target <- config$target_arl0
-
-
-    best_H <- NA_real_
-
-    best_arl <- Inf
-
-    best_error <- Inf
-
-    iter <- 0L
-
-
-    for (iter in seq_len(
-        config$calibration_max_iter
-    )) {
-
-        H <- (
-            lower + upper
-        ) / 2
-
-
-        fit <- catboost_make_candidate_fit(
-            k_values = k_values,
-            weights = weights,
-            H = H,
-            config = config,
-            stationary_cache = stationary_cache
+        return(
+            list(
+                H = upper,
+                ARL0 = arl_upper,
+                status =
+                    "target_above_upper_bound",
+                iterations = 0L,
+                stationary_models =
+                    stationary_models
+            )
         )
+    }
 
 
-        arl <- catboost_simulate_candidate_arl(
-            fit = fit,
-            paths = arl0_paths,
-            max_run = config$calibration_max_run
+    best_H <- lower
+
+    best_ARL <- arl_lower
+
+    status <- "max_iterations"
+
+
+    for (
+        iter in seq_len(
+            config$calibration_max_iter
         )
+    ) {
 
+        midpoint <-
+            (lower + upper) / 2
 
-        error <- abs(
-            arl - target
-        )
-
-
-        if (error < best_error) {
-
-            best_error <- error
-
-            best_H <- H
-
-            best_arl <- arl
-        }
-
-
-        relative_error <- (
-            abs(
-                arl - target
-            ) /
-                target
-        )
+        arl_mid <-
+            evaluate_H(midpoint)
 
 
         if (
-            relative_error <=
+            abs(arl_mid - target) <
+            abs(best_ARL - target)
+        ) {
+
+            best_H <- midpoint
+
+            best_ARL <- arl_mid
+        }
+
+
+        if (
+            abs(arl_mid - target) /
+                target <=
                 config$calibration_arl_tol
         ) {
 
-            break
+            return(
+                list(
+                    H = midpoint,
+                    ARL0 = arl_mid,
+                    status = "arl_tolerance",
+                    iterations = iter,
+                    stationary_models =
+                        stationary_models
+                )
+            )
         }
 
 
         if (
-            abs(
-                upper - lower
-            ) <=
+            (upper - lower) <=
                 config$calibration_H_tol
         ) {
 
-            break
+            return(
+                list(
+                    H = midpoint,
+                    ARL0 = arl_mid,
+                    status = "H_tolerance",
+                    iterations = iter,
+                    stationary_models =
+                        stationary_models
+                )
+            )
         }
 
 
-        # ---------------------------------------------------------------------
-        # Bisection direction
-        # ---------------------------------------------------------------------
+        if (arl_mid < target) {
 
-        if (arl < target) {
-
-            # Threshold too low.
-            lower <- H
+            lower <- midpoint
 
         } else {
 
-            # Threshold too high.
-            upper <- H
+            upper <- midpoint
         }
     }
 
 
     list(
-
         H = best_H,
-
-        arl0 = best_arl,
-
-        iterations = iter,
-
-        converged = (
-            is.finite(best_error) &&
-                best_error / target <=
-                config$calibration_arl_tol
-        )
+        ARL0 = best_ARL,
+        status = status,
+        iterations =
+            config$calibration_max_iter,
+        stationary_models =
+            stationary_models
     )
 }
 
 
 # =============================================================================
-# 25. DESIGN ENCODING
+# 18. DESIGN VECTOR UTILITIES
 # =============================================================================
 
 make_design_vector <- function(
@@ -1732,373 +1439,420 @@ make_design_vector <- function(
 ) {
 
     c(
-        as.numeric(k_values),
-        as.numeric(weights)
+        k_values,
+        weights
     )
 }
 
 
-# =============================================================================
-# 26. DESIGN DECODING
-# =============================================================================
-
 decode_design_vector <- function(
     x,
-    J
+    J = CATBOOST_CONFIG$J
 ) {
 
     if (length(x) != 2 * J) {
 
         stop(
-            "Design vector has incorrect length.",
+            "Design vector must have length 2*J.",
             call. = FALSE
         )
     }
 
-
-    k_values <- x[
-        seq_len(J)
-    ]
-
-
-    weights <- x[
-        seq.int(
-            J + 1,
-            2 * J
+    k_values <-
+        as.numeric(
+            x[seq_len(J)]
         )
-    ]
 
+    weights <-
+        as.numeric(
+            x[
+                J + seq_len(J)
+            ]
+        )
 
-    list(
+    weights[
+        !is.finite(weights)
+    ] <- 0
 
-        k_values = k_values,
-
-        weights = catboost_normalize_weights(
+    weights <-
+        pmax(
+            0,
             weights
         )
+
+    weights <-
+        normalize_real_weights(
+            weights,
+            J
+        )
+
+    list(
+        k_values = k_values,
+        weights = weights
     )
 }
 
-
-# =============================================================================
-# 27. RANDOM DESIGN GENERATION
-# =============================================================================
 
 generate_random_design <- function(
     config = CATBOOST_CONFIG
 ) {
 
-    J <- config$J
-
-
-    if (
-        length(config$k_candidates) <
-            J
-    ) {
-
-        stop(
-            "Number of k candidates must be at least J.",
-            call. = FALSE
+    k_values <-
+        sort(
+            sample(
+                config$k_candidates,
+                size = config$J,
+                replace = FALSE
+            )
         )
-    }
 
+    weights <-
+        stats::runif(
+            config$J,
+            min = config$weight_min,
+            max = config$weight_max
+        )
 
-    k_values <- sample(
-        config$k_candidates,
-        size = J,
-        replace = FALSE
-    )
+    weights <-
+        normalize_real_weights(
+            weights,
+            config$J
+        )
 
-
-    weights <- stats::runif(
-        J,
-        min = config$weight_min,
-        max = config$weight_max
-    )
-
-
-    weights <- catboost_normalize_weights(
-        weights
-    )
-
-
-    list(
-
+    make_design_vector(
         k_values = k_values,
-
         weights = weights
     )
 }
 
 
 # =============================================================================
-# 28. OBJECTIVE FUNCTION
-# =============================================================================
-
-catboost_objective_value <- function(
-    arl0,
-    ooc_arl,
-    config
-) {
-
-    arl0_penalty <- (
-        abs(
-            arl0 -
-                config$target_arl0
-        ) /
-            config$target_arl0
-    )
-
-
-    # If shift weights are supplied, normalize them and use them in the
-    # weighted OOC ARL component.
-
-    shift_weights <- as.numeric(
-        config$shift_weights
-    )
-
-    shift_weights <- catboost_normalize_weights(
-        shift_weights
-    )
-
-
-    normalized_ooc <- sum(
-        shift_weights *
-            (
-                ooc_arl /
-                    config$target_arl0
-            )
-    )
-
-
-    config$arl0_penalty_weight *
-        arl0_penalty +
-        config$ooc_weight *
-        normalized_ooc
-}
-
-
-# =============================================================================
-# 29. EVALUATE ONE DESIGN
+# 19. MONTE CARLO DESIGN OBJECTIVE
 # =============================================================================
 
 evaluate_design <- function(
     design,
-    config,
-    stationary_cache,
-    calibration_arl0_paths,
-    objective_arl0_paths,
-    ooc_paths_list
+    config = CATBOOST_CONFIG,
+    arl0_paths = NULL,
+    ooc_paths = NULL,
+    design_id = NA_integer_
 ) {
 
-    k_values <- design$k_values
+    decoded <-
+        decode_design_vector(
+            design,
+            J = config$J
+        )
 
-    weights <- design$weights
+    k_values <- decoded$k_values
+
+    weights <- decoded$weights
+
+
+    # -------------------------------------------------------------------------
+    # ARL0 paths
+    # -------------------------------------------------------------------------
+
+    if (is.null(arl0_paths)) {
+
+        arl0_paths <-
+            generate_monitoring_paths(
+                n_paths =
+                    config$objective_n_arl0,
+
+                max_run =
+                    config$objective_max_run,
+
+                config = config,
+
+                mean_shift = 0
+            )
+    }
 
 
     # -------------------------------------------------------------------------
     # Threshold calibration
     # -------------------------------------------------------------------------
 
-    calibration <- catboost_calibrate_candidate_threshold(
-        k_values = k_values,
-        weights = weights,
-        config = config,
-        stationary_cache = stationary_cache,
-        arl0_paths = calibration_arl0_paths
-    )
+    calibration <-
+        catboost_calibrate_candidate_threshold(
+            k_values =
+                k_values,
+
+            weights =
+                weights,
+
+            config =
+                config,
+
+            raw_paths =
+                arl0_paths
+        )
 
 
-    H <- calibration$H
+    fit <-
+        catboost_make_candidate_fit(
+            k_values =
+                k_values,
+
+            weights =
+                weights,
+
+            H =
+                calibration$H,
+
+            stationary_models =
+                calibration$stationary_models,
+
+            config =
+                config
+        )
 
 
     # -------------------------------------------------------------------------
-    # Candidate fit
+    # Empirical ARL0
     # -------------------------------------------------------------------------
 
-    fit <- catboost_make_candidate_fit(
-        k_values = k_values,
-        weights = weights,
-        H = H,
-        config = config,
-        stationary_cache = stationary_cache
-    )
+    arl0_rl <-
+        catboost_simulate_candidate_arl(
+            raw_paths =
+                arl0_paths,
+
+            fit =
+                fit,
+
+            max_run =
+                config$objective_max_run
+        )
+
+    empirical_arl0 <-
+        mean(arl0_rl)
+
+    arl0_relative_error <-
+        abs(
+            empirical_arl0 -
+                config$target_arl0
+        ) /
+        config$target_arl0
 
 
     # -------------------------------------------------------------------------
-    # In-control ARL used for objective
+    # OOC objective
     # -------------------------------------------------------------------------
 
-    arl0 <- catboost_simulate_candidate_arl(
-        fit = fit,
-        paths = objective_arl0_paths,
-        max_run = config$objective_max_run
-    )
+    ooc_rows <-
+        vector(
+            "list",
+            length(config$shifts)
+        )
+
+    weighted_ooc_arl <- 0
 
 
-    # -------------------------------------------------------------------------
-    # Out-of-control ARL
-    # -------------------------------------------------------------------------
+    for (s in seq_along(config$shifts)) {
 
-    ooc_arl <- numeric(
-        length(config$shifts)
-    )
+        shift <-
+            config$shifts[s]
+
+        paths <-
+            if (is.null(ooc_paths)) {
+
+                generate_monitoring_paths(
+                    n_paths =
+                        config$objective_n_ooc,
+
+                    max_run =
+                        config$objective_max_run,
+
+                    config = config,
+
+                    mean_shift =
+                        shift *
+                        config$sigma0
+                )
+
+            } else {
+
+                ooc_paths[[s]]
+            }
 
 
-    for (s in seq_along(
-        config$shifts
-    )) {
-
-        ooc_arl[s] <-
+        rl <-
             catboost_simulate_candidate_arl(
-                fit = fit,
-                paths = ooc_paths_list[[s]],
-                max_run = config$objective_max_run
+                raw_paths =
+                    paths,
+
+                fit =
+                    fit,
+
+                max_run =
+                    config$objective_max_run
+            )
+
+
+        arl_s <-
+            mean(rl)
+
+
+        weighted_ooc_arl <-
+            weighted_ooc_arl +
+            config$shift_weights[s] *
+            (
+                arl_s /
+                    config$target_arl0
+            )
+
+
+        ooc_rows[[s]] <-
+            data.frame(
+
+                design_id =
+                    design_id,
+
+                shift =
+                    shift,
+
+                ARL =
+                    arl_s,
+
+                signal_rate =
+                    mean(
+                        rl <=
+                            config$objective_max_run
+                    )
             )
     }
 
 
     # -------------------------------------------------------------------------
-    # Objective
+    # Combined objective
     # -------------------------------------------------------------------------
 
-    objective <- catboost_objective_value(
-        arl0 = arl0,
-        ooc_arl = ooc_arl,
-        config = config
-    )
+    objective <-
+        config$arl0_penalty_weight *
+        arl0_relative_error +
+        config$ooc_weight *
+        weighted_ooc_arl
+
+
+    # -------------------------------------------------------------------------
+    # Design result
+    # -------------------------------------------------------------------------
+
+    design_row <-
+        data.frame(
+
+            design_id =
+                design_id,
+
+            k1 =
+                k_values[1],
+
+            k2 =
+                if (
+                    config$J >= 2
+                ) {
+                    k_values[2]
+                } else {
+                    NA_real_
+                },
+
+            k3 =
+                if (
+                    config$J >= 3
+                ) {
+                    k_values[3]
+                } else {
+                    NA_real_
+                },
+
+            w1 =
+                weights[1],
+
+            w2 =
+                if (
+                    config$J >= 2
+                ) {
+                    weights[2]
+                } else {
+                    NA_real_
+                },
+
+            w3 =
+                if (
+                    config$J >= 3
+                ) {
+                    weights[3]
+                } else {
+                    NA_real_
+                },
+
+            H =
+                calibration$H,
+
+            calibration_ARL0 =
+                calibration$ARL0,
+
+            empirical_ARL0 =
+                empirical_arl0,
+
+            ARL0_relative_error =
+                arl0_relative_error,
+
+            weighted_OOC_ARL =
+                weighted_ooc_arl,
+
+            objective =
+                objective,
+
+            calibration_status =
+                calibration$status,
+
+            calibration_iterations =
+                calibration$iterations
+        )
 
 
     list(
+        design =
+            design_row,
 
-        objective = objective,
+        ooc =
+            do.call(
+                rbind,
+                ooc_rows
+            ),
 
-        arl0 = arl0,
-
-        ooc_arl = ooc_arl,
-
-        H = H,
-
-        k_values = k_values,
-
-        weights = weights,
-
-        calibration = calibration
+        fit =
+            fit
     )
 }
 
 
 # =============================================================================
-# 30. CREATE DESIGN DATA FRAME
-# =============================================================================
-
-design_to_row <- function(
-    design,
-    evaluation,
-    id,
-    config = CATBOOST_CONFIG
-) {
-
-    row <- data.frame(
-
-        id = id,
-
-        objective =
-            evaluation$objective,
-
-        arl0 =
-            evaluation$arl0,
-
-        H =
-            evaluation$H
-    )
-
-
-    for (j in seq_along(
-        design$k_values
-    )) {
-
-        row[
-            paste0(
-                "k",
-                j
-            )
-        ] <- design$k_values[j]
-    }
-
-
-    for (j in seq_along(
-        design$weights
-    )) {
-
-        row[
-            paste0(
-                "weight",
-                j
-            )
-        ] <- design$weights[j]
-    }
-
-
-    for (s in seq_along(
-        evaluation$ooc_arl
-    )) {
-
-        row[
-            paste0(
-                "OOC_ARL_",
-                config_shift_label(
-                    config$shifts[s]
-                )
-            )
-        ] <- evaluation$ooc_arl[s]
-    }
-
-
-    row
-}
-
-
-# =============================================================================
-# 31. SHIFT LABEL
-# =============================================================================
-
-config_shift_label <- function(
-    shift
-) {
-
-    x <- format(
-        shift,
-        trim = TRUE,
-        scientific = FALSE
-    )
-
-
-    gsub(
-        "\\.",
-        "_",
-        x
-    )
-}
-
-
-# =============================================================================
-# 32. INITIAL DESIGN GENERATION
+# 20. INITIAL DESIGN & SURROGATE FITTING
 # =============================================================================
 
 generate_initial_design <- function(
-    config = CATBOOST_CONFIG
+    config = CATBOOST_CONFIG,
+    seed = NULL
 ) {
 
-    designs <- vector(
-        "list",
-        config$n_initial_design
-    )
+    if (!is.null(seed)) {
+        set.seed(seed)
+    }
 
+    designs <-
+        vector(
+            "list",
+            config$n_initial_design
+        )
 
-    for (i in seq_len(
-        config$n_initial_design
-    )) {
+    for (
+        i in seq_len(
+            config$n_initial_design
+        )
+    ) {
 
         designs[[i]] <-
             generate_random_design(
@@ -2106,135 +1860,174 @@ generate_initial_design <- function(
             )
     }
 
-
-    designs
+    unique(
+        do.call(
+            rbind,
+            designs
+        )
+    )
 }
 
 
-# =============================================================================
-# 33. FIT CATBOOST SURROGATE
-# =============================================================================
-
 fit_catboost_surrogate <- function(
-    X,
-    y,
+    design_results,
     config = CATBOOST_CONFIG
 ) {
 
-    X <- as.data.frame(
-        X
-    )
+    d <-
+        as.data.frame(
+            design_results
+        )
 
-    y <- as.numeric(
-        y
-    )
+    d <-
+        d[
+            is.finite(d$objective),
+            ,
+            drop = FALSE
+        ]
 
+    if (nrow(d) < 5) {
+
+        stop(
+            "At least five valid design evaluations are required.",
+            call. = FALSE
+        )
+    }
+
+
+    predictor_names <-
+        c(
+            "k1",
+            "k2",
+            "k3",
+            "w1",
+            "w2",
+            "w3"
+        )
+
+
+    X <-
+        d[
+            ,
+            predictor_names,
+            drop = FALSE
+        ]
+
+    y <- d$objective
+
+
+    # -------------------------------------------------------------------------
+    # CatBoost
+    # -------------------------------------------------------------------------
 
     if (HAS_CATBOOST) {
 
-        pool <- catboost::catboost.load_pool(
-            data = X,
-            label = y
-        )
-
-
-        model <- catboost::catboost.train(
-
-            learn_pool = pool,
-
-            params = list(
-
-                loss_function = "RMSE",
-
-                iterations =
-                    config$catboost_iterations,
-
-                depth =
-                    config$catboost_depth,
-
-                learning_rate =
-                    config$catboost_learning_rate,
-
-                l2_leaf_reg =
-                    config$catboost_l2_leaf_reg,
-
-                random_seed =
-                    config$catboost_random_seed,
-
-                verbose = FALSE
+        pool <-
+            catboost::catboost.load_pool(
+                data = X,
+                label = y
             )
-        )
 
+        model <-
+            catboost::catboost.train(
+                learn_pool = pool,
+
+                params = list(
+
+                    loss_function = "RMSE",
+
+                    iterations =
+                        config$catboost_iterations,
+
+                    depth =
+                        config$catboost_depth,
+
+                    learning_rate =
+                        config$catboost_learning_rate,
+
+                    l2_leaf_reg =
+                        config$catboost_l2_leaf_reg,
+
+                    random_seed =
+                        config$catboost_random_seed,
+
+                    verbose = FALSE
+                )
+            )
 
         return(
             list(
+                model = model,
                 type = "catboost",
-                model = model
+                predictors = predictor_names
             )
         )
     }
 
 
     # -------------------------------------------------------------------------
-    # Lightweight polynomial fallback
+    # Quadratic fallback
     # -------------------------------------------------------------------------
 
-    X_matrix <- as.matrix(
-        X
-    )
+    formula <-
+        stats::as.formula(
+            paste(
+                "objective ~",
+                paste(
+                    predictor_names,
+                    collapse = " + "
+                ),
+                "+ I(k1^2) + I(k2^2) + I(k3^2)",
+                "+ I(w1^2) + I(w2^2) + I(w3^2)",
+                "+ k1:k2 + k1:k3 + k2:k3",
+                "+ k1:w1 + k2:w2 + k3:w3"
+            )
+        )
 
 
-    X_poly <- cbind(
-        X_matrix,
-        X_matrix^2
-    )
-
-
-    X_poly <- as.data.frame(
-        X_poly
-    )
-
-
-    model <- stats::lm(
-        y ~ .,
-        data = X_poly
-    )
+    lm_fit <-
+        stats::lm(
+            formula,
+            data = d
+        )
 
 
     list(
-        type = "lm",
-        model = model
+        model = lm_fit,
+        type = "quadratic_fallback",
+        predictors = predictor_names
     )
 }
 
 
-# =============================================================================
-# 34. PREDICT SURROGATE
-# =============================================================================
-
 predict_surrogate <- function(
     surrogate,
-    X
+    candidate_designs
 ) {
 
-    X <- as.data.frame(
-        X
-    )
-
-
-    if (
-        surrogate$type ==
-            "catboost"
-    ) {
-
-        pool <- catboost::catboost.load_pool(
-            data = X
+    d <-
+        as.data.frame(
+            candidate_designs
         )
 
 
+    if (
+        surrogate$type == "catboost"
+    ) {
+
+        pool <-
+            catboost::catboost.load_pool(
+                data =
+                    d[
+                        ,
+                        surrogate$predictors,
+                        drop = FALSE
+                    ]
+            )
+
         return(
             as.numeric(
-                predict(
+                catboost::catboost.predict(
                     surrogate$model,
                     pool
                 )
@@ -2243,466 +2036,254 @@ predict_surrogate <- function(
     }
 
 
-    X_matrix <- as.matrix(
-        X
-    )
-
-
-    X_poly <- cbind(
-        X_matrix,
-        X_matrix^2
-    )
-
-
     as.numeric(
-        predict(
+        stats::predict(
             surrogate$model,
-            newdata = as.data.frame(
-                X_poly
-            )
+            newdata = d
         )
     )
 }
 
 
-# =============================================================================
-# 35. GENERATE CANDIDATE DESIGNS
-# =============================================================================
-
 generate_candidate_designs <- function(
-    n_candidates,
-    config = CATBOOST_CONFIG
+    n,
+    config = CATBOOST_CONFIG,
+    seed = NULL
 ) {
 
-    designs <- vector(
-        "list",
-        n_candidates
-    )
+    if (!is.null(seed)) {
+        set.seed(seed)
+    }
+
+    out <-
+        matrix(
+            NA_real_,
+            nrow = n,
+            ncol = 2 * config$J
+        )
+
+    colnames(out) <-
+        c(
+            paste0(
+                "k",
+                seq_len(config$J)
+            ),
+
+            paste0(
+                "w",
+                seq_len(config$J)
+            )
+        )
 
 
-    for (i in seq_len(
-        n_candidates
-    )) {
+    for (i in seq_len(n)) {
 
-        designs[[i]] <-
+        out[i, ] <-
             generate_random_design(
                 config
             )
     }
 
-
-    designs
+    out
 }
 
 
 # =============================================================================
-# 36. DESIGN MATRIX
+# 20B. SELECT SURROGATE CANDIDATES
+# =============================================================================
+#
+# The surrogate evaluates 30 candidate designs computationally.
+#
+# Only the best predicted candidate(s) are evaluated by expensive
+# Monte Carlo. The requested default is:
+#
+#     n_candidates_per_iteration = 30
+#     n_direct_evaluations_per_iteration = 1
+#
 # =============================================================================
 
-designs_to_matrix <- function(
-    designs
+select_surrogate_candidates <- function(
+    surrogate,
+    historical_designs,
+    config = CATBOOST_CONFIG,
+    n_candidates = NULL,
+    n_direct = NULL,
+    seed = NULL
 ) {
 
-    if (length(designs) == 0) {
+    if (!is.null(seed)) {
+        set.seed(seed)
+    }
+
+
+    if (is.null(n_candidates)) {
+
+        n_candidates <-
+            config$n_candidates_per_iteration
+    }
+
+
+    if (is.null(n_direct)) {
+
+        n_direct <-
+            config$n_direct_evaluations_per_iteration
+    }
+
+
+    # -------------------------------------------------------------------------
+    # Generate candidate pool
+    # -------------------------------------------------------------------------
+
+    candidates <-
+        generate_candidate_designs(
+            n = n_candidates,
+            config = config,
+            seed = seed
+        )
+
+
+    # -------------------------------------------------------------------------
+    # Surrogate predictions
+    # -------------------------------------------------------------------------
+
+    prediction <-
+        predict_surrogate(
+            surrogate =
+                surrogate,
+
+            candidate_designs =
+                candidates
+        )
+
+
+    # -------------------------------------------------------------------------
+    # Remove previously evaluated designs
+    # -------------------------------------------------------------------------
+
+    existing_keys <-
+        apply(
+            historical_designs[
+                ,
+                c(
+                    "k1",
+                    "k2",
+                    "k3",
+                    "w1",
+                    "w2",
+                    "w3"
+                ),
+                drop = FALSE
+            ],
+            1,
+            paste,
+            collapse = "_"
+        )
+
+
+    candidate_keys <-
+        apply(
+            candidates,
+            1,
+            paste,
+            collapse = "_"
+        )
+
+
+    unique_idx <-
+        which(
+            !candidate_keys %in%
+                existing_keys
+        )
+
+
+    if (length(unique_idx) == 0) {
 
         return(
             matrix(
                 numeric(0),
-                nrow = 0
-            )
-        )
-    }
-
-
-    do.call(
-        rbind,
-        lapply(
-            designs,
-            function(d) {
-
-                make_design_vector(
-                    d$k_values,
-                    d$weights
-                )
-            }
-        )
-    )
-}
-
-
-# =============================================================================
-# 37. SELECT SURROGATE CANDIDATES
-# =============================================================================
-
-select_surrogate_candidates <- function(
-    candidate_designs,
-    surrogate,
-    n_select,
-    exploration_fraction,
-    historical_designs = NULL
-) {
-
-    if (length(candidate_designs) == 0) {
-
-        return(
-            list()
-        )
-    }
-
-
-    X_candidates <-
-        designs_to_matrix(
-            candidate_designs
-        )
-
-
-    X_candidates <- as.data.frame(
-        X_candidates
-    )
-
-
-    pred <- predict_surrogate(
-        surrogate,
-        X_candidates
-    )
-
-
-    n_select <- max(
-        1L,
-        min(
-            as.integer(n_select),
-            length(candidate_designs)
-        )
-    )
-
-
-    n_explore <- min(
-        floor(
-            n_select *
-                exploration_fraction
-        ),
-        n_select
-    )
-
-
-    n_exploit <- (
-        n_select -
-            n_explore
-    )
-
-
-    selected_idx <- integer(
-        0
-    )
-
-
-    if (n_exploit > 0) {
-
-        selected_idx <- c(
-            selected_idx,
-            order(
-                pred
-            )[seq_len(n_exploit)]
-        )
-    }
-
-
-    if (n_explore > 0) {
-
-        remaining <- setdiff(
-            seq_along(candidate_designs),
-            selected_idx
-        )
-
-
-        if (length(remaining) > 0) {
-
-            selected_idx <- c(
-                selected_idx,
-                sample(
-                    remaining,
-                    size = min(
-                        n_explore,
-                        length(remaining)
+                nrow = 0,
+                ncol = ncol(candidates),
+                dimnames =
+                    list(
+                        NULL,
+                        colnames(candidates)
                     )
-                )
             )
-        }
+        )
     }
 
 
-    selected_idx <- unique(
-        selected_idx
-    )
+    candidates <-
+        candidates[
+            unique_idx,
+            ,
+            drop = FALSE
+        ]
+
+    prediction <-
+        prediction[
+            unique_idx
+        ]
 
 
-    candidate_designs[
-        selected_idx
-    ]
+    # -------------------------------------------------------------------------
+    # Select lowest predicted objective
+    # -------------------------------------------------------------------------
+
+    n_direct <-
+        min(
+            n_direct,
+            nrow(candidates)
+        )
+
+
+    exploit_order <-
+        order(
+            prediction,
+            decreasing = FALSE
+        )
+
+
+    selected_idx <-
+        exploit_order[
+            seq_len(n_direct)
+        ]
+
+
+    selected <-
+        candidates[
+            selected_idx,
+            ,
+            drop = FALSE
+        ]
+
+
+    attr(
+        selected,
+        "surrogate_prediction"
+    ) <-
+        prediction[
+            selected_idx
+        ]
+
+
+    selected
 }
 
 
 # =============================================================================
-# 38. PROCESS ONE OOC SHIFT
-# =============================================================================
-
-catboost_generate_ooc_paths <- function(
-    n_paths,
-    max_run,
-    shift,
-    seed
-) {
-
-    generate_monitoring_paths(
-        n_paths = n_paths,
-        max_run = max_run,
-        shift = shift,
-        seed = seed
-    )
-}
-
-
-# =============================================================================
-# 39. FINAL VALIDATION
-# =============================================================================
-
-catboost_validate_final_design <- function(
-    fit,
-    config = CATBOOST_CONFIG
-) {
-
-    cat(
-        "\n"
-    )
-
-    cat(
-        "============================================================\n"
-    )
-
-    cat(
-        "FINAL DIRECT VALIDATION\n"
-    )
-
-    cat(
-        "============================================================\n"
-    )
-
-
-    # -------------------------------------------------------------------------
-    # ARL0
-    # -------------------------------------------------------------------------
-
-    cat(
-        "\nGenerating final ARL0 paths...\n"
-    )
-
-
-    arl0_paths <- generate_monitoring_paths(
-        n_paths =
-            config$validation_n_arl0,
-        max_run =
-            config$validation_max_run,
-        shift = 0,
-        seed =
-            config$validation_seed
-    )
-
-
-    final_arl0 <- catboost_simulate_candidate_arl(
-        fit = fit,
-        paths = arl0_paths,
-        max_run =
-            config$validation_max_run
-    )
-
-
-    rm(
-        arl0_paths
-    )
-
-    gc()
-
-
-    # -------------------------------------------------------------------------
-    # OOC shifts
-    # -------------------------------------------------------------------------
-
-    final_ooc_arl <- numeric(
-        length(config$shifts)
-    )
-
-
-    for (s in seq_along(
-        config$shifts
-    )) {
-
-        shift <- config$shifts[s]
-
-
-        cat(
-            "  Validating shift = ",
-            shift,
-            "\n",
-            sep = ""
-        )
-
-
-        paths <- catboost_generate_ooc_paths(
-            n_paths =
-                config$validation_n_ooc,
-            max_run =
-                config$validation_max_run,
-            shift = shift,
-            seed =
-                config$validation_seed +
-                s
-        )
-
-
-        final_ooc_arl[s] <-
-            catboost_simulate_candidate_arl(
-                fit = fit,
-                paths = paths,
-                max_run =
-                    config$validation_max_run
-            )
-
-
-        rm(
-            paths
-        )
-
-        gc()
-    }
-
-
-    result <- data.frame(
-        H = fit$H,
-        ARL0 = final_arl0,
-        check.names = FALSE
-    )
-
-
-    for (s in seq_along(
-        config$shifts
-    )) {
-
-        result[
-            paste0(
-                "ARL_",
-                config_shift_label(
-                    config$shifts[s]
-                )
-            )
-        ] <- final_ooc_arl[s]
-    }
-
-
-    result
-}
-
-
-# =============================================================================
-# 40. MAIN CATBOOST SURROGATE OPTIMIZATION
+# 21. RUN CATBOOST SURROGATE OPTIMIZATION
 # =============================================================================
 
 run_catboost_surrogate_optimization <- function(
     config = CATBOOST_CONFIG
 ) {
 
-    set.seed(
-        config$seed
-    )
+    config <-
+        validate_catboost_config(
+            config
+        )
 
-
-    # -------------------------------------------------------------------------
-    # Validate configuration
-    # -------------------------------------------------------------------------
-
-    catboost_assert(
-        length(config$k_candidates) >= config$J,
-        "Number of k candidates must be at least J."
-    )
-
-    catboost_assert(
-        length(config$shifts) ==
-            length(config$shift_weights),
-        "shifts and shift_weights must have the same length."
-    )
-
-    catboost_assert(
-        config$J >= 1,
-        "J must be at least 1."
-    )
-
-    catboost_assert(
-        config$target_arl0 > 0,
-        "target_arl0 must be positive."
-    )
-
-    catboost_assert(
-        config$calibration_n_rep > 0,
-        "calibration_n_rep must be positive."
-    )
-
-    catboost_assert(
-        config$objective_n_arl0 > 0,
-        "objective_n_arl0 must be positive."
-    )
-
-    catboost_assert(
-        config$objective_n_ooc > 0,
-        "objective_n_ooc must be positive."
-    )
-
-    catboost_assert(
-        config$calibration_max_run > 0,
-        "calibration_max_run must be positive."
-    )
-
-    catboost_assert(
-        config$objective_max_run > 0,
-        "objective_max_run must be positive."
-    )
-
-    catboost_assert(
-        config$calibration_lower <
-            config$calibration_upper,
-        "calibration_lower must be less than calibration_upper."
-    )
-
-    catboost_assert(
-        config$k_min < config$k_max,
-        "k_min must be less than k_max."
-    )
-
-    catboost_assert(
-        all(
-            config$k_candidates >=
-                config$k_min
-        ) &&
-            all(
-                config$k_candidates <=
-                    config$k_max
-            ),
-        "All k_candidates must lie within [k_min, k_max]."
-    )
-
-    catboost_assert(
-        config$exploration_fraction >= 0 &&
-            config$exploration_fraction <= 1,
-        "exploration_fraction must lie in [0, 1]."
-    )
-
-    catboost_assert(
-        config$n_select_per_iteration >= 1,
-        "n_select_per_iteration must be at least 1."
-    )
-
-
-    # -------------------------------------------------------------------------
-    # Output directory
-    # -------------------------------------------------------------------------
 
     dir.create(
         config$output_dir,
@@ -2711,12 +2292,17 @@ run_catboost_surrogate_optimization <- function(
     )
 
 
-    cat(
-        "\n"
+    set.seed(
+        config$seed
     )
 
+
+    # -------------------------------------------------------------------------
+    # Optimization summary
+    # -------------------------------------------------------------------------
+
     cat(
-        "============================================================\n"
+        "\n============================================================\n"
     )
 
     cat(
@@ -2727,130 +2313,108 @@ run_catboost_surrogate_optimization <- function(
         "============================================================\n"
     )
 
-
     cat(
-        "\nCatBoost available: ",
-        HAS_CATBOOST,
-        "\n",
-        sep = ""
-    )
-
-
-    cat(
-        "Initial designs: ",
+        "Initial designs:                 ",
         config$n_initial_design,
         "\n",
         sep = ""
     )
 
-
     cat(
-        "Surrogate iterations: ",
+        "Surrogate iterations:            ",
         config$n_surrogate_iterations,
         "\n",
         sep = ""
     )
 
-
     cat(
-        "Candidates / iteration: ",
+        "Candidates / iteration:          ",
         config$n_candidates_per_iteration,
         "\n",
         sep = ""
     )
 
-
     cat(
-        "Direct evaluations / iteration: ",
-        config$n_select_per_iteration,
+        "Direct evaluations / iteration:  ",
+        config$n_direct_evaluations_per_iteration,
         "\n",
         sep = ""
     )
 
+    cat(
+        "Expected direct evaluations:     ",
+        config$n_initial_design +
+            config$n_surrogate_iterations *
+            config$n_direct_evaluations_per_iteration,
+        "\n",
+        sep = ""
+    )
+
+    cat(
+        "CatBoost available:              ",
+        HAS_CATBOOST,
+        "\n",
+        sep = ""
+    )
+
+    cat(
+        "============================================================\n"
+    )
+
 
     # -------------------------------------------------------------------------
-    # Stationary model cache
-    # -------------------------------------------------------------------------
-
-    stationary_cache <-
-        catboost_build_stationary_model_cache(
-            config
-        )
-
-
-    # -------------------------------------------------------------------------
-    # Common random numbers for threshold calibration
-    #
-    # These paths are used only for threshold calibration.
+    # Common Monte Carlo paths
     # -------------------------------------------------------------------------
 
     cat(
-        "Generating common calibration ARL0 paths...\n"
+        "\nGenerating common Monte Carlo paths...\n"
     )
 
 
-    calibration_arl0_paths <- generate_monitoring_paths(
-        n_paths =
-            config$calibration_n_rep,
-        max_run =
-            config$calibration_max_run,
-        shift = 0,
-        seed =
-            config$calibration_seed
-    )
+    arl0_paths <-
+        generate_monitoring_paths(
+            n_paths =
+                config$objective_n_arl0,
 
+            max_run =
+                config$objective_max_run,
 
-    # -------------------------------------------------------------------------
-    # Common random numbers for objective ARL0
-    # -------------------------------------------------------------------------
+            config =
+                config,
 
-    cat(
-        "Generating common optimization ARL0 paths...\n"
-    )
+            mean_shift = 0,
 
-
-    objective_arl0_paths <- generate_monitoring_paths(
-        n_paths =
-            config$objective_n_arl0,
-        max_run =
-            config$objective_max_run,
-        shift = 0,
-        seed =
-            config$seed +
-            500L
-    )
-
-
-    # -------------------------------------------------------------------------
-    # OOC paths
-    # -------------------------------------------------------------------------
-
-    ooc_paths_list <- vector(
-        "list",
-        length(
-            config$shifts
+            seed =
+                config$seed
         )
-    )
 
 
-    for (s in seq_along(
-        config$shifts
-    )) {
+    ooc_paths <-
+        lapply(
+            seq_along(config$shifts),
+            function(i) {
 
-        ooc_paths_list[[s]] <-
-            generate_monitoring_paths(
-                n_paths =
-                    config$objective_n_ooc,
-                max_run =
-                    config$objective_max_run,
-                shift =
-                    config$shifts[s],
-                seed =
-                    config$seed +
-                    1000 +
-                    s
-            )
-    }
+                generate_monitoring_paths(
+                    n_paths =
+                        config$objective_n_ooc,
+
+                    max_run =
+                        config$objective_max_run,
+
+                    config =
+                        config,
+
+                    mean_shift =
+                        config$shifts[i] *
+                        config$sigma0,
+
+                    seed =
+                        config$seed +
+                        1000L +
+                        i
+                )
+            }
+        )
 
 
     # -------------------------------------------------------------------------
@@ -2858,289 +2422,208 @@ run_catboost_surrogate_optimization <- function(
     # -------------------------------------------------------------------------
 
     cat(
-        "\nEvaluating initial designs...\n"
+        "\nEvaluating initial design...\n"
     )
 
 
     initial_designs <-
         generate_initial_design(
-            config
+            config =
+                config,
+
+            seed =
+                config$seed + 1L
         )
 
 
-    history <- list()
-
-    design_counter <- 0L
-
-
-    for (i in seq_along(
-        initial_designs
-    )) {
-
-        design_counter <- (
-            design_counter +
-                1L
+    initial_results <-
+        vector(
+            "list",
+            nrow(initial_designs)
         )
 
+
+    for (
+        i in seq_len(
+            nrow(initial_designs)
+        )
+    ) {
 
         cat(
             "  Initial design ",
             i,
-            " / ",
-            length(initial_designs),
+            "/",
+            nrow(initial_designs),
             "\n",
             sep = ""
         )
 
 
-        evaluation <- evaluate_design(
-            design =
-                initial_designs[[i]],
-            config =
-                config,
-            stationary_cache =
-                stationary_cache,
-            calibration_arl0_paths =
-                calibration_arl0_paths,
-            objective_arl0_paths =
-                objective_arl0_paths,
-            ooc_paths_list =
-                ooc_paths_list
+        initial_results[[i]] <-
+            evaluate_design(
+                design =
+                    initial_designs[i, ],
+
+                config =
+                    config,
+
+                arl0_paths =
+                    arl0_paths,
+
+                ooc_paths =
+                    ooc_paths,
+
+                design_id =
+                    i
+            )
+    }
+
+
+    design_table <-
+        do.call(
+            rbind,
+            lapply(
+                initial_results,
+                `[[`,
+                "design"
+            )
         )
 
 
-        history[[design_counter]] <-
-            list(
-                design =
-                    initial_designs[[i]],
-                evaluation =
-                    evaluation
+    ooc_table <-
+        do.call(
+            rbind,
+            lapply(
+                initial_results,
+                `[[`,
+                "ooc"
             )
-    }
+        )
+
+
+    next_design_id <-
+        max(
+            design_table$design_id
+        ) + 1L
 
 
     # -------------------------------------------------------------------------
     # Surrogate iterations
     # -------------------------------------------------------------------------
 
-    if (config$n_surrogate_iterations > 0) {
-
-        for (iter in seq_len(
+    for (
+        iter in seq_len(
             config$n_surrogate_iterations
-        )) {
+        )
+    ) {
+
+        cat(
+            "\n------------------------------------------------------------\n"
+        )
+
+        cat(
+            "CatBoost surrogate iteration ",
+            iter,
+            "/",
+            config$n_surrogate_iterations,
+            "\n",
+            sep = ""
+        )
+
+        cat(
+            "------------------------------------------------------------\n"
+        )
+
+
+        # ---------------------------------------------------------------------
+        # Fit surrogate
+        # ---------------------------------------------------------------------
+
+        surrogate <-
+            fit_catboost_surrogate(
+                design_results =
+                    design_table,
+
+                config =
+                    config
+            )
+
+
+        # ---------------------------------------------------------------------
+        # Generate 30 candidates and directly evaluate only 1
+        # ---------------------------------------------------------------------
+
+        candidate_designs <-
+            select_surrogate_candidates(
+                surrogate =
+                    surrogate,
+
+                historical_designs =
+                    design_table,
+
+                config =
+                    config,
+
+                n_candidates =
+                    config$n_candidates_per_iteration,
+
+                n_direct =
+                    config$n_direct_evaluations_per_iteration,
+
+                seed =
+                    config$seed +
+                    10000L +
+                    iter
+            )
+
+
+        # ---------------------------------------------------------------------
+        # No unique candidates
+        # ---------------------------------------------------------------------
+
+        if (
+            nrow(candidate_designs) == 0
+        ) {
 
             cat(
-                "\n"
+                "No unique candidates generated; stopping.\n"
             )
+
+            break
+        }
+
+
+        surrogate_prediction <-
+            attr(
+                candidate_designs,
+                "surrogate_prediction"
+            )
+
+
+        cat(
+            "  Candidate pool size: ",
+            config$n_candidates_per_iteration,
+            "\n",
+            sep = ""
+        )
+
+        cat(
+            "  Direct evaluations: ",
+            nrow(candidate_designs),
+            "\n",
+            sep = ""
+        )
+
+        if (
+            !is.null(surrogate_prediction)
+        ) {
 
             cat(
-                "------------------------------------------------------------\n"
-            )
-
-            cat(
-                "Surrogate iteration ",
-                iter,
-                " / ",
-                config$n_surrogate_iterations,
-                "\n",
-                sep = ""
-            )
-
-
-            # -----------------------------------------------------------------
-            # Historical design matrix
-            # -----------------------------------------------------------------
-
-            historical_designs <- lapply(
-                history,
-                function(h)
-                    h$design
-            )
-
-
-            X_history <- designs_to_matrix(
-                historical_designs
-            )
-
-
-            y_history <- vapply(
-                history,
-                function(h)
-                    h$evaluation$objective,
-                numeric(1)
-            )
-
-
-            # -----------------------------------------------------------------
-            # Fit surrogate
-            # -----------------------------------------------------------------
-
-            surrogate <- fit_catboost_surrogate(
-                X = X_history,
-                y = y_history,
-                config = config
-            )
-
-
-            # -----------------------------------------------------------------
-            # Generate candidate pool
-            # -----------------------------------------------------------------
-
-            candidate_designs <-
-                generate_candidate_designs(
-                    n_candidates =
-                        config$n_candidates_per_iteration,
-                    config =
-                        config
-                )
-
-
-            # -----------------------------------------------------------------
-            # Select candidate(s)
-            # -----------------------------------------------------------------
-
-            n_select <- min(
-                config$n_select_per_iteration,
-                length(candidate_designs)
-            )
-
-
-            selected_designs <-
-                select_surrogate_candidates(
-                    candidate_designs =
-                        candidate_designs,
-                    surrogate =
-                        surrogate,
-                    n_select =
-                        n_select,
-                    exploration_fraction =
-                        config$exploration_fraction,
-                    historical_designs =
-                        historical_designs
-                )
-
-
-            # -----------------------------------------------------------------
-            # Direct evaluation
-            # -----------------------------------------------------------------
-
-            for (j in seq_along(
-                selected_designs
-            )) {
-
-                design_counter <- (
-                    design_counter +
-                        1L
-                )
-
-
-                cat(
-                    "  Evaluating selected candidate ",
-                    j,
-                    " / ",
-                    length(selected_designs),
-                    "\n",
-                    sep = ""
-                )
-
-
-                evaluation <- evaluate_design(
-                    design =
-                        selected_designs[[j]],
-                    config =
-                        config,
-                    stationary_cache =
-                        stationary_cache,
-                    calibration_arl0_paths =
-                        calibration_arl0_paths,
-                    objective_arl0_paths =
-                        objective_arl0_paths,
-                    ooc_paths_list =
-                        ooc_paths_list
-                )
-
-
-                history[[design_counter]] <-
-                    list(
-                        design =
-                            selected_designs[[j]],
-                        evaluation =
-                            evaluation
-                    )
-            }
-
-
-            # -----------------------------------------------------------------
-            # Current best
-            # -----------------------------------------------------------------
-
-            objective_values <- vapply(
-                history,
-                function(h)
-                    h$evaluation$objective,
-                numeric(1)
-            )
-
-
-            best_idx <- which.min(
-                objective_values
-            )
-
-
-            # IMPORTANT:
-            # history[[best_idx]] extracts the list element.
-            # history[best_idx] returns a one-element list and cannot be
-            # accessed with best$evaluation.
-
-            best <- history[[best_idx]]
-
-
-            cat(
-                "\nCurrent best design:\n"
-            )
-
-
-            cat(
-                "  Objective = ",
-                best$evaluation$objective,
-                "\n",
-                sep = ""
-            )
-
-
-            cat(
-                "  ARL0      = ",
-                best$evaluation$arl0,
-                "\n",
-                sep = ""
-            )
-
-
-            cat(
-                "  H         = ",
-                best$evaluation$H,
-                "\n",
-                sep = ""
-            )
-
-
-            cat(
-                "  k         = ",
+                "  Predicted objective: ",
                 paste(
-                    best$design$k_values,
-                    collapse = ", "
-                ),
-                "\n",
-                sep = ""
-            )
-
-
-            cat(
-                "  weights   = ",
-                paste(
-                    round(
-                        best$design$weights,
-                        4
+                    format(
+                        surrogate_prediction,
+                        digits = 6
                     ),
                     collapse = ", "
                 ),
@@ -3148,306 +2631,605 @@ run_catboost_surrogate_optimization <- function(
                 sep = ""
             )
         }
+
+
+        # ---------------------------------------------------------------------
+        # Direct Monte Carlo evaluation
+        # ---------------------------------------------------------------------
+
+        new_results <-
+            vector(
+                "list",
+                nrow(candidate_designs)
+            )
+
+
+        for (
+            i in seq_len(
+                nrow(candidate_designs)
+            )
+        ) {
+
+            cat(
+                "  Direct evaluation ",
+                i,
+                "/",
+                nrow(candidate_designs),
+                "\n",
+                sep = ""
+            )
+
+
+            new_results[[i]] <-
+                evaluate_design(
+                    design =
+                        candidate_designs[i, ],
+
+                    config =
+                        config,
+
+                    arl0_paths =
+                        arl0_paths,
+
+                    ooc_paths =
+                        ooc_paths,
+
+                    design_id =
+                        next_design_id
+                )
+
+
+            next_design_id <-
+                next_design_id + 1L
+        }
+
+
+        # ---------------------------------------------------------------------
+        # Update histories
+        # ---------------------------------------------------------------------
+
+        new_design_rows <-
+            do.call(
+                rbind,
+                lapply(
+                    new_results,
+                    `[[`,
+                    "design"
+                )
+            )
+
+
+        new_ooc_rows <-
+            do.call(
+                rbind,
+                lapply(
+                    new_results,
+                    `[[`,
+                    "ooc"
+                )
+            )
+
+
+        design_table <-
+            rbind(
+                design_table,
+                new_design_rows
+            )
+
+
+        ooc_table <-
+            rbind(
+                ooc_table,
+                new_ooc_rows
+            )
+
+
+        # ---------------------------------------------------------------------
+        # Save iteration history
+        # ---------------------------------------------------------------------
+
+        utils::write.csv(
+            design_table,
+
+            file =
+                file.path(
+                    config$output_dir,
+                    "surrogate_design_history.csv"
+                ),
+
+            row.names = FALSE
+        )
+
+
+        utils::write.csv(
+            ooc_table,
+
+            file =
+                file.path(
+                    config$output_dir,
+                    "surrogate_ooc_history.csv"
+                ),
+
+            row.names = FALSE
+        )
+
+
+        # ---------------------------------------------------------------------
+        # Current best
+        # ---------------------------------------------------------------------
+
+        best_idx <-
+            which.min(
+                design_table$objective
+            )
+
+
+        cat(
+            "\nCurrent best design:\n"
+        )
+
+
+        print(
+            design_table[
+                best_idx,
+                ,
+                drop = FALSE
+            ],
+            row.names = FALSE
+        )
     }
 
 
-    # -------------------------------------------------------------------------
-    # Select final design
-    # -------------------------------------------------------------------------
+    # =============================================================================
+    # 22. BEST DESIGN
+    # =============================================================================
 
-    objective_values <- vapply(
-        history,
-        function(h)
-            h$evaluation$objective,
-        numeric(1)
+    best_idx <-
+        which.min(
+            design_table$objective
+        )
+
+
+    best_design <-
+        design_table[
+            best_idx,
+            ,
+            drop = FALSE
+        ]
+
+
+    best_k_values <-
+        c(
+            best_design$k1,
+            best_design$k2,
+            best_design$k3
+        )[
+            seq_len(config$J)
+        ]
+
+
+    best_weights <-
+        c(
+            best_design$w1,
+            best_design$w2,
+            best_design$w3
+        )[
+            seq_len(config$J)
+        ]
+
+
+    best_weights <-
+        normalize_real_weights(
+            best_weights,
+            config$J
+        )
+
+
+    # =============================================================================
+    # 23. DIRECT MONTE CARLO VALIDATION
+    # =============================================================================
+
+    cat(
+        "\n============================================================\n"
+    )
+
+    cat(
+        "DIRECT MONTE CARLO VALIDATION OF BEST DESIGN\n"
+    )
+
+    cat(
+        "============================================================\n"
     )
 
 
-    best_idx <- which.min(
-        objective_values
-    )
+    validation_arl0_paths <-
+        generate_monitoring_paths(
+            n_paths =
+                config$validation_n_arl0,
+
+            max_run =
+                config$validation_max_run,
+
+            config =
+                config,
+
+            mean_shift = 0,
+
+            seed =
+                config$validation_seed
+        )
 
 
-    # IMPORTANT:
-    # Use [[best_idx]], not [ [best_idx] ].
+    validation_ooc_paths <-
+        lapply(
+            seq_along(config$shifts),
+            function(i) {
 
-    best_history <- history[[best_idx]]
+                generate_monitoring_paths(
+                    n_paths =
+                        config$validation_n_ooc,
 
-    best_design <- best_history$design
+                    max_run =
+                        config$validation_max_run,
 
-    best_evaluation <- best_history$evaluation
+                    config =
+                        config,
+
+                    mean_shift =
+                        config$shifts[i] *
+                        config$sigma0,
+
+                    seed =
+                        config$validation_seed +
+                        1000L +
+                        i
+                )
+            }
+        )
 
 
     # -------------------------------------------------------------------------
-    # Rebuild final fit
+    # Validation calibration configuration
     # -------------------------------------------------------------------------
 
-    final_fit <- catboost_make_candidate_fit(
-        k_values =
-            best_design$k_values,
-        weights =
-            best_design$weights,
-        H =
-            best_evaluation$H,
-        config =
-            config,
-        stationary_cache =
-            stationary_cache
-    )
+    val_config <- config
+
+    val_config$calibration_n_rep <-
+        config$validation_n_arl0
+
+    val_config$calibration_max_run <-
+        config$validation_max_run
+
+    val_config$calibration_seed <-
+        config$validation_seed
 
 
     # -------------------------------------------------------------------------
-    # Final direct validation
+    # Validate threshold
     # -------------------------------------------------------------------------
 
-    final_validation <-
-        catboost_validate_final_design(
-            fit =
-                final_fit,
+    validation_calibration <-
+        catboost_calibrate_candidate_threshold(
+            k_values =
+                best_k_values,
+
+            weights =
+                best_weights,
+
+            config =
+                val_config,
+
+            raw_paths =
+                validation_arl0_paths,
+
+            seed =
+                config$validation_seed
+        )
+
+
+    validation_fit <-
+        catboost_make_candidate_fit(
+            k_values =
+                best_k_values,
+
+            weights =
+                best_weights,
+
+            H =
+                validation_calibration$H,
+
+            stationary_models =
+                validation_calibration$stationary_models,
+
             config =
                 config
         )
 
 
     # -------------------------------------------------------------------------
-    # History table
+    # Validation ARL0
     # -------------------------------------------------------------------------
 
-    history_table <- do.call(
-        rbind,
+    validation_arl0_rl <-
+        catboost_simulate_candidate_arl(
+            raw_paths =
+                validation_arl0_paths,
+
+            fit =
+                validation_fit,
+
+            max_run =
+                config$validation_max_run
+        )
+
+
+    validation_arl0 <-
+        mean(
+            validation_arl0_rl
+        )
+
+
+    # -------------------------------------------------------------------------
+    # Validation OOC
+    # -------------------------------------------------------------------------
+
+    validation_ooc_rows <-
         lapply(
-            seq_along(history),
+            seq_along(config$shifts),
             function(i) {
 
-                h <- history[[i]]
+                rl <-
+                    catboost_simulate_candidate_arl(
+                        raw_paths =
+                            validation_ooc_paths[[i]],
+
+                        fit =
+                            validation_fit,
+
+                        max_run =
+                            config$validation_max_run
+                    )
 
 
-                row <- data.frame(
+                data.frame(
 
-                    id = i,
+                    shift =
+                        config$shifts[i],
 
-                    objective =
-                        h$evaluation$objective,
+                    ARL =
+                        mean(rl),
 
-                    arl0 =
-                        h$evaluation$arl0,
+                    SD =
+                        stats::sd(rl),
 
-                    H =
-                        h$evaluation$H
-                )
+                    median =
+                        stats::median(rl),
 
-
-                for (j in seq_along(
-                    h$design$k_values
-                )) {
-
-                    row[
-                        paste0(
-                            "k",
-                            j
-                        )
-                    ] <-
-                        h$design$k_values[j]
-                }
-
-
-                for (j in seq_along(
-                    h$design$weights
-                )) {
-
-                    row[
-                        paste0(
-                            "weight",
-                            j
-                        )
-                    ] <-
-                        h$design$weights[j]
-                }
-
-
-                for (s in seq_along(
-                    h$evaluation$ooc_arl
-                )) {
-
-                    row[
-                        paste0(
-                            "OOC_ARL_",
-                            config_shift_label(
-                                config$shifts[s]
+                    q025 =
+                        as.numeric(
+                            stats::quantile(
+                                rl,
+                                0.025,
+                                names = FALSE
                             )
+                        ),
+
+                    q975 =
+                        as.numeric(
+                            stats::quantile(
+                                rl,
+                                0.975,
+                                names = FALSE
+                            )
+                        ),
+
+                    signal_rate =
+                        mean(
+                            rl <=
+                                config$validation_max_run
                         )
-                    ] <-
-                        h$evaluation$ooc_arl[s]
-                }
-
-
-                row
+                )
             }
         )
-    )
 
 
-    # -------------------------------------------------------------------------
-    # Save history
-    # -------------------------------------------------------------------------
-
-    utils::write.csv(
-        history_table,
-        file = file.path(
-            config$output_dir,
-            "optimization_history.csv"
-        ),
-        row.names = FALSE
-    )
-
-
-    # -------------------------------------------------------------------------
-    # Final design table
-    # -------------------------------------------------------------------------
-
-    final_design_table <- data.frame(
-
-        H =
-            final_fit$H,
-
-        ARL0_optimization =
-            best_evaluation$arl0,
-
-        ARL0_validation =
-            final_validation$ARL0,
-
-        check.names = FALSE
-    )
-
-
-    for (j in seq_along(
-        final_fit$k_values
-    )) {
-
-        final_design_table[
-            paste0(
-                "k",
-                j
-            )
-        ] <-
-            final_fit$k_values[j]
-    }
-
-
-    for (j in seq_along(
-        final_fit$weights
-    )) {
-
-        final_design_table[
-            paste0(
-                "weight",
-                j
-            )
-        ] <-
-            final_fit$weights[j]
-    }
-
-
-    # -------------------------------------------------------------------------
-    # Add final validation OOC ARLs
-    # -------------------------------------------------------------------------
-
-    for (s in seq_along(
-        config$shifts
-    )) {
-
-        validation_name <- paste0(
-            "ARL_",
-            config_shift_label(
-                config$shifts[s]
-            )
+    validation_ooc <-
+        do.call(
+            rbind,
+            validation_ooc_rows
         )
 
 
-        final_design_table[
-            validation_name
-        ] <-
-            final_validation[
-                validation_name
-            ]
-    }
+    # -------------------------------------------------------------------------
+    # Validation summary
+    # -------------------------------------------------------------------------
+
+    validation_summary <-
+        data.frame(
+
+            k1 =
+                best_k_values[1],
+
+            k2 =
+                if (
+                    config$J >= 2
+                ) {
+                    best_k_values[2]
+                } else {
+                    NA_real_
+                },
+
+            k3 =
+                if (
+                    config$J >= 3
+                ) {
+                    best_k_values[3]
+                } else {
+                    NA_real_
+                },
+
+            w1 =
+                best_weights[1],
+
+            w2 =
+                if (
+                    config$J >= 2
+                ) {
+                    best_weights[2]
+                } else {
+                    NA_real_
+                },
+
+            w3 =
+                if (
+                    config$J >= 3
+                ) {
+                    best_weights[3]
+                } else {
+                    NA_real_
+                },
+
+            H =
+                validation_calibration$H,
+
+            calibration_ARL0 =
+                validation_calibration$ARL0,
+
+            validation_ARL0 =
+                validation_arl0,
+
+            validation_ARL0_bias =
+                validation_arl0 -
+                config$target_arl0,
+
+            validation_ARL0_percent_bias =
+                100 *
+                (
+                    validation_arl0 -
+                    config$target_arl0
+                ) /
+                config$target_arl0,
+
+            validation_status =
+                validation_calibration$status
+        )
 
 
-    # -------------------------------------------------------------------------
-    # Save final design and validation
-    # -------------------------------------------------------------------------
+    # =============================================================================
+    # 24. SAVE RESULTS
+    # =============================================================================
 
     utils::write.csv(
-        final_design_table,
-        file = file.path(
-            config$output_dir,
-            "final_design.csv"
-        ),
+        design_table,
+
+        file =
+            file.path(
+                config$output_dir,
+                "surrogate_design_history.csv"
+            ),
+
         row.names = FALSE
     )
 
 
     utils::write.csv(
-        final_validation,
-        file = file.path(
-            config$output_dir,
-            "final_validation.csv"
-        ),
+        ooc_table,
+
+        file =
+            file.path(
+                config$output_dir,
+                "surrogate_ooc_history.csv"
+            ),
+
         row.names = FALSE
     )
 
 
-    # -------------------------------------------------------------------------
-    # Save RDS
-    # -------------------------------------------------------------------------
+    utils::write.csv(
+        validation_summary,
 
-    result <- list(
+        file =
+            file.path(
+                config$output_dir,
+                "surrogate_validation_summary.csv"
+            ),
 
-        config =
-            config,
-
-        stationary_cache =
-            stationary_cache,
-
-        history =
-            history,
-
-        history_table =
-            history_table,
-
-        best_design =
-            best_design,
-
-        best_evaluation =
-            best_evaluation,
-
-        final_fit =
-            final_fit,
-
-        final_validation =
-            final_validation
+        row.names = FALSE
     )
+
+
+    utils::write.csv(
+        validation_ooc,
+
+        file =
+            file.path(
+                config$output_dir,
+                "surrogate_validation_ooc.csv"
+            ),
+
+        row.names = FALSE
+    )
+
+
+    # =============================================================================
+    # 25. FINAL RESULTS
+    # =============================================================================
+
+    final_results <-
+        list(
+
+            best_design =
+                best_design,
+
+            best_k_values =
+                best_k_values,
+
+            best_weights =
+                best_weights,
+
+            best_H =
+                validation_calibration$H,
+
+            validation_summary =
+                validation_summary,
+
+            validation_ooc =
+                validation_ooc,
+
+            validation_fit =
+                validation_fit,
+
+            design_history =
+                design_table,
+
+            ooc_history =
+                ooc_table,
+
+            config =
+                config,
+
+            catboost_available =
+                HAS_CATBOOST
+        )
 
 
     saveRDS(
-        result,
-        file = file.path(
-            config$output_dir,
-            "catboost_surrogate_result.rds"
-        )
+        final_results,
+
+        file =
+            file.path(
+                config$output_dir,
+                "catboost_surrogate_results.rds"
+            )
     )
 
 
-    # -------------------------------------------------------------------------
-    # Console summary
-    # -------------------------------------------------------------------------
+    # =============================================================================
+    # 26. FINAL CONSOLE SUMMARY
+    # =============================================================================
 
     cat(
-        "\n"
-    )
-
-    cat(
-        "============================================================\n"
+        "\n============================================================\n"
     )
 
     cat(
@@ -3458,81 +3240,85 @@ run_catboost_surrogate_optimization <- function(
         "============================================================\n"
     )
 
-
     cat(
-        "\nSelected design:\n"
-    )
-
-
-    cat(
-        "  k values : ",
-        paste(
-            final_fit$k_values,
-            collapse = ", "
-        ),
+        "Initial designs:                 ",
+        config$n_initial_design,
         "\n",
         sep = ""
     )
 
-
     cat(
-        "  weights  : ",
-        paste(
-            round(
-                final_fit$weights,
-                6
-            ),
-            collapse = ", "
-        ),
+        "Surrogate iterations:            ",
+        config$n_surrogate_iterations,
         "\n",
         sep = ""
     )
 
-
     cat(
-        "  H        : ",
-        final_fit$H,
+        "Candidates / iteration:          ",
+        config$n_candidates_per_iteration,
         "\n",
         sep = ""
     )
 
-
     cat(
-        "\nOptimization ARL0: ",
-        best_evaluation$arl0,
+        "Direct evaluations / iteration:  ",
+        config$n_direct_evaluations_per_iteration,
         "\n",
         sep = ""
     )
 
-
     cat(
-        "Validation ARL0:  ",
-        final_validation$ARL0,
+        "Total optimization evaluations:  ",
+        nrow(design_table),
         "\n",
         sep = ""
     )
 
+    cat(
+        "\nBest design:\n"
+    )
+
+    print(
+        best_design,
+        row.names = FALSE
+    )
 
     cat(
-        "\nOutput directory:\n  ",
+        "\nValidation summary:\n"
+    )
+
+    print(
+        validation_summary,
+        row.names = FALSE
+    )
+
+    cat(
+        "\nResults saved to:\n"
+    )
+
+    cat(
         normalizePath(
             config$output_dir,
             winslash = "/",
             mustWork = FALSE
         ),
-        "\n",
-        sep = ""
+        "\n"
+    )
+
+    cat(
+        "============================================================\n"
     )
 
 
     invisible(
-        result
+        final_results
     )
 }
 
 
 # =============================================================================
-# 41. PUBLIC WRAPPER
+# 27. PUBLIC RUNNER
 # =============================================================================
 
 run_catboost_surrogate <- function(
@@ -3546,104 +3332,23 @@ run_catboost_surrogate <- function(
 
 
 # =============================================================================
-# 42. OPTIONAL QUICK DEVELOPMENT CONFIGURATION
-# =============================================================================
-
-CATBOOST_QUICK_CONFIG <- CATBOOST_CONFIG
-
-CATBOOST_QUICK_CONFIG$n_initial_design <- 5L
-
-CATBOOST_QUICK_CONFIG$n_surrogate_iterations <- 3L
-
-CATBOOST_QUICK_CONFIG$n_candidates_per_iteration <- 15L
-
-CATBOOST_QUICK_CONFIG$n_select_per_iteration <- 1L
-
-CATBOOST_QUICK_CONFIG$calibration_n_rep <- 50L
-
-CATBOOST_QUICK_CONFIG$calibration_max_run <- 500L
-
-CATBOOST_QUICK_CONFIG$calibration_max_iter <- 6L
-
-CATBOOST_QUICK_CONFIG$objective_n_arl0 <- 50L
-
-CATBOOST_QUICK_CONFIG$objective_n_ooc <- 30L
-
-CATBOOST_QUICK_CONFIG$objective_max_run <- 500L
-
-CATBOOST_QUICK_CONFIG$validation_n_arl0 <- 200L
-
-CATBOOST_QUICK_CONFIG$validation_n_ooc <- 100L
-
-CATBOOST_QUICK_CONFIG$validation_max_run <- 1000L
-
-CATBOOST_QUICK_CONFIG$output_dir <-
-    "sp_ecusum_results/catboost_surrogate_quick"
-
-
-# =============================================================================
-# 43. LOAD MESSAGE
+# END OF FILE
 # =============================================================================
 
 cat(
-    "\n"
+    "\n12_catboost_surrogate.R loaded.\n"
 )
 
 cat(
-    "12_catboost_surrogate.R loaded successfully.\n"
-)
-
-cat(
-    "Fast empirical CDF: findInterval()\n"
-)
-
-cat(
-    "Stationary model cache: enabled\n"
-)
-
-cat(
-    "Vectorized Monte Carlo simulation: enabled\n"
-)
-
-cat(
-    "Separate calibration/objective ARL0 paths: enabled\n"
-)
-
-cat(
-    "Memory-efficient OOC validation: enabled\n"
-)
-
-cat(
-    "CatBoost available: ",
-    HAS_CATBOOST,
+    "Optimization settings: ",
+    "Initial designs = ",
+    CATBOOST_CONFIG$n_initial_design,
+    ", iterations = ",
+    CATBOOST_CONFIG$n_surrogate_iterations,
+    ", candidates/iteration = ",
+    CATBOOST_CONFIG$n_candidates_per_iteration,
+    ", direct evaluations/iteration = ",
+    CATBOOST_CONFIG$n_direct_evaluations_per_iteration,
     "\n",
     sep = ""
-)
-
-cat(
-    "\n"
-)
-
-cat(
-    "Run optimization with:\n"
-)
-
-cat(
-    "  result <- run_catboost_surrogate()\n"
-)
-
-cat(
-    "\n"
-)
-
-cat(
-    "For a quick test run:\n"
-)
-
-cat(
-    "  result <- run_catboost_surrogate(CATBOOST_QUICK_CONFIG)\n"
-)
-
-cat(
-    "\n"
 )

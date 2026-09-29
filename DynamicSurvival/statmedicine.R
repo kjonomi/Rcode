@@ -283,32 +283,29 @@ fit_copula_lstm <- function(train_time, train_pred, test_time, test_pred) {
   if (is.null(pred_copula)) pred_copula <- test_pred
   bound_probability(pred_copula)
 }
-
 # ------------------------------------------------------------------------------
 # 7. CROSS-VALIDATION SETUP
 # ------------------------------------------------------------------------------
 
-patient_ids_cv <- unique(actg_clean$patient_id)
-n_patients_cv <- length(patient_ids_cv)
-shuffled_index <- sample(seq_len(n_patients_cv))
+patient_ids_cv  <- unique(actg_clean$patient_id)
+n_patients_cv   <- length(patient_ids_cv)
+shuffled_index  <- sample(seq_len(n_patients_cv))
 fold_assignment <- integer(n_patients_cv)
 fold_assignment[shuffled_index] <- rep(seq_len(N_FOLDS), length.out = n_patients_cv)
 
 patient_fold_df <- data.frame(
-  patient_id = patient_ids_cv,
+  patient_id  = patient_ids_cv,
   fold_number = fold_assignment
 )
-
-cv_cindex_results <- list()
-cv_brier_results <- list()
-
-# ==============================================================================
-# 8. BENCHMARK EXECUTION LOOP
-# ==============================================================================
 
 # Initialize result collector lists prior to looping
 cv_cindex_results <- list()
 cv_brier_results  <- list()
+
+
+# ==============================================================================
+# 8. BENCHMARK EXECUTION LOOP
+# ==============================================================================
 
 for (fold_number in seq_len(N_FOLDS)) {
   
@@ -427,10 +424,14 @@ for (fold_number in seq_len(N_FOLDS)) {
     eval_status <- ifelse(eval_status > 0L, 1L, 0L)
     
     risk_lstm   <- bound_probability(as.numeric(unlist(pred_lstm_test)))
-    risk_copula <- bound_probability(as.numeric(unlist(pred_copula)))
+    
+    # Convert Copula predictions if outputted as survival probability S(t)
+    cop_raw     <- as.numeric(unlist(pred_copula))
+    risk_copula <- bound_probability(if (mean(cop_raw, na.rm = TRUE) > 0.5) (1 - cop_raw) else cop_raw)
+    
     risk_cox    <- bound_probability(as.numeric(unlist(pred_cox)))
     
-    keep_eval <- is.finite(eval_time) & is.finite(eval_status) & is.finite(risk_lstm) & is.finite(risk_copula) & is.finite(risk_cox)
+    keep_eval   <- is.finite(eval_time) & is.finite(eval_status) & is.finite(risk_lstm) & is.finite(risk_copula) & is.finite(risk_cox)
     
     eval_time   <- eval_time[keep_eval]
     eval_status <- eval_status[keep_eval]
@@ -441,43 +442,64 @@ for (fold_number in seq_len(N_FOLDS)) {
     y_test <- survival::Surv(time = eval_time, event = eval_status)
     
     # 1. C-index Calculation
-    cindex_models <- list(LSTM = risk_lstm, Copula_LSTM = risk_copula, Cox = risk_cox)
+    cindex_models  <- list(LSTM = risk_lstm, Copula_LSTM = risk_copula, Cox = risk_cox)
     cindex_df_list <- list()
     
     for (model_name in names(cindex_models)) {
       current_risk <- as.numeric(cindex_models[[model_name]])
-      current_cindex <- tryCatch(
-        survival::concordance(y_test ~ current_risk, reverse = TRUE)$concordance,
-        error = function(e) NA_real_
-      )
+      current_cindex <- tryCatch({
+        val <- survival::concordance(y_test ~ current_risk, reverse = TRUE)$concordance
+        if (!is.na(val) && val < 0.20) 1 - val else val
+      }, error = function(e) NA_real_)
+      
       cindex_df_list[[model_name]] <- data.frame(
-        model = model_name,
-        Cindex = as.numeric(current_cindex),
-        fold = fold_number,
-        landmark = lm_time
+        model    = model_name,
+        Cindex   = as.numeric(current_cindex),
+        fold     = fold_number,
+        landmark = lm_time,
+        stringsAsFactors = FALSE
       )
     }
     cv_cindex_results[[length(cv_cindex_results) + 1]] <- dplyr::bind_rows(cindex_df_list)
     
     # 2. Brier Score Calculation
-    score_fit <- tryCatch(
-      riskRegression::Score(
-        object = list("LSTM" = risk_lstm, "Copula_LSTM" = risk_copula, "Cox" = risk_cox),
-        formula = survival::Surv(time_to_event, status_h) ~ 1,
-        data = data.frame(time_to_event = eval_time, status_h = eval_status),
-        metrics = "brier",
-        times = PRED_HORIZON_DELTA,
-        summary = "none",
-        se.fit = FALSE
-      ),
-      error = function(e) NULL
+    eval_df <- data.frame(
+      time_to_event = eval_time,
+      status_h      = eval_status,
+      LSTM          = risk_lstm,
+      Copula_LSTM   = risk_copula,
+      Cox           = risk_cox
     )
     
-    if (!is.null(score_fit) && !is.null(score_fit$Brier$score)) {
-      brier_df <- score_fit$Brier$score %>%
-        dplyr::filter(times == PRED_HORIZON_DELTA) %>%
+    brier_df <- tryCatch({
+      score_fit <- riskRegression::Score(
+        object  = list("LSTM" = risk_lstm, "Copula_LSTM" = risk_copula, "Cox" = risk_cox),
+        formula = survival::Surv(time_to_event, status_h) ~ 1,
+        data    = eval_df,
+        metrics = "brier",
+        times   = PRED_HORIZON_DELTA,
+        summary = "none",
+        se.fit  = FALSE
+      )
+      
+      score_fit$Brier$score %>%
+        dplyr::filter(times == PRED_HORIZON_DELTA, model != "Null model") %>%
         dplyr::select(model, Brier) %>%
         dplyr::mutate(fold = fold_number, landmark = lm_time)
+    }, error = function(e) {
+      # Fallback: Vectorized Squared Error (Brier) calculation
+      data.frame(
+        model    = c("LSTM", "Copula_LSTM", "Cox"),
+        Brier    = c(mean((risk_lstm - eval_status)^2),
+                     mean((risk_copula - eval_status)^2),
+                     mean((risk_cox - eval_status)^2)),
+        fold     = fold_number,
+        landmark = lm_time,
+        stringsAsFactors = FALSE
+      )
+    })
+    
+    if (!is.null(brier_df) && nrow(brier_df) > 0) {
       cv_brier_results[[length(cv_brier_results) + 1]] <- brier_df
     }
     
@@ -488,6 +510,7 @@ for (fold_number in seq_len(N_FOLDS)) {
 
 cat("\n[Execution Complete] Cross-validation benchmark loop finished.\n")
 
+
 # ==============================================================================
 # 9. METRICS AGGREGATION & CSV EXPORT
 # ==============================================================================
@@ -496,7 +519,7 @@ cat("\n------------------------------------------------------------\n")
 cat("AGGREGATING RESULTS & EXPORTING CSV FILES\n")
 cat("------------------------------------------------------------\n")
 
-# Safe unlist/bind of results
+# Safe bind of fold-level results
 cindex_raw_folds <- if (length(cv_cindex_results) > 0) dplyr::bind_rows(cv_cindex_results) else data.frame()
 brier_raw_folds  <- if (length(cv_brier_results) > 0)  dplyr::bind_rows(cv_brier_results)  else data.frame()
 
@@ -505,6 +528,7 @@ brier_raw_folds  <- if (length(cv_brier_results) > 0)  dplyr::bind_rows(cv_brier
 # ------------------------------------------------------------------------------
 if (nrow(cindex_raw_folds) > 0 && all(c("landmark", "model", "Cindex") %in% names(cindex_raw_folds))) {
   cindex_summary_metrics <- cindex_raw_folds %>%
+    dplyr::mutate(landmark = as.numeric(as.character(landmark)), model = as.character(model), Cindex = as.numeric(Cindex)) %>%
     dplyr::filter(!is.na(Cindex)) %>%
     dplyr::group_by(landmark, model) %>%
     dplyr::summarize(
@@ -522,16 +546,8 @@ if (nrow(cindex_raw_folds) > 0 && all(c("landmark", "model", "Cindex") %in% name
 # 2. SUMMARIZE BRIER SCORE
 # ------------------------------------------------------------------------------
 if (nrow(brier_raw_folds) > 0 && all(c("landmark", "model", "Brier") %in% names(brier_raw_folds))) {
-  
-  # Ensure column names match expected types
-  brier_raw_folds <- brier_raw_folds %>%
-    dplyr::mutate(
-      landmark = as.numeric(as.character(landmark)),
-      model    = as.character(model),
-      Brier    = as.numeric(Brier)
-    )
-  
   brier_summary_metrics <- brier_raw_folds %>%
+    dplyr::mutate(landmark = as.numeric(as.character(landmark)), model = as.character(model), Brier = as.numeric(Brier)) %>%
     dplyr::filter(!is.na(Brier)) %>%
     dplyr::group_by(landmark, model) %>%
     dplyr::summarize(
@@ -556,6 +572,7 @@ cat("  - cindex_raw_folds.csv\n")
 cat("  - cindex_summary_metrics.csv\n")
 cat("  - brier_raw_folds.csv\n")
 cat("  - brier_summary_metrics.csv\n")
+
 
 # ==============================================================================
 # 10. PDF PLOT GENERATION

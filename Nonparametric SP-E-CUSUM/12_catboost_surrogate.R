@@ -247,16 +247,25 @@ CATBOOST_CONFIG <- list(
 
     catboost_random_seed = 20260912,
 
+    # Rank-safe surrogate fallback when CatBoost is unavailable.
+    surrogate_ridge_lambda = 0.01,
+
 
     # -------------------------------------------------------------------------
     # Direct validation
     # -------------------------------------------------------------------------
 
+    # Independent validation design:
+    # one Monte Carlo sample calibrates H and a separate sample evaluates ARL0.
+    validation_calibration_n_arl0 = 5000,
     validation_n_arl0 = 5000,
 
     validation_n_ooc = 2000,
 
     validation_max_run = 10000,
+
+    # Relative ARL0 tolerance used only for final validation status.
+    validation_arl_tol = 0.02,
 
     validation_seed = 20260913,
 
@@ -387,10 +396,13 @@ validate_catboost_config <- function(
         "catboost_learning_rate",
         "catboost_l2_leaf_reg",
         "catboost_random_seed",
+        "surrogate_ridge_lambda",
 
+        "validation_calibration_n_arl0",
         "validation_n_arl0",
         "validation_n_ooc",
         "validation_max_run",
+        "validation_arl_tol",
         "validation_seed",
 
         "seed",
@@ -530,6 +542,17 @@ validate_catboost_config <- function(
     }
 
     if (
+        !is.finite(config$surrogate_ridge_lambda) ||
+        config$surrogate_ridge_lambda <= 0
+    ) {
+
+        stop(
+            "surrogate_ridge_lambda must be a positive finite value.",
+            call. = FALSE
+        )
+    }
+
+    if (
         config$n_direct_evaluations_per_iteration < 1 ||
         config$n_direct_evaluations_per_iteration >
             config$n_candidates_per_iteration
@@ -538,6 +561,28 @@ validate_catboost_config <- function(
         stop(
             "n_direct_evaluations_per_iteration must be between 1 and ",
             "n_candidates_per_iteration.",
+            call. = FALSE
+        )
+    }
+
+    if (
+        config$validation_calibration_n_arl0 < 1 ||
+        config$validation_n_arl0 < 1
+    ) {
+
+        stop(
+            "Validation ARL0 sample sizes must be positive.",
+            call. = FALSE
+        )
+    }
+
+    if (
+        !is.finite(config$validation_arl_tol) ||
+        config$validation_arl_tol <= 0
+    ) {
+
+        stop(
+            "validation_arl_tol must be a positive finite value.",
             call. = FALSE
         )
     }
@@ -1966,39 +2011,84 @@ fit_catboost_surrogate <- function(
 
 
     # -------------------------------------------------------------------------
-    # Quadratic fallback
+    # Rank-safe ridge fallback
+    # -------------------------------------------------------------------------
+    #
+    # The previous quadratic lm() fallback used many interaction/quadratic
+    # terms relative to the small number of evaluated designs. This can make
+    # the model matrix rank deficient and produces:
+    #
+    #   prediction from rank-deficient fit
+    #
+    # Use a regularized linear surrogate instead. Ridge regression is stable
+    # when n is small and the predictors are correlated.
     # -------------------------------------------------------------------------
 
-    formula <-
-        stats::as.formula(
-            paste(
-                "objective ~",
-                paste(
-                    predictor_names,
-                    collapse = " + "
-                ),
-                "+ I(k1^2) + I(k2^2) + I(k3^2)",
-                "+ I(w1^2) + I(w2^2) + I(w3^2)",
-                "+ k1:k2 + k1:k3 + k2:k3",
-                "+ k1:w1 + k2:w2 + k3:w3"
+    ridge_lambda <-
+        config$surrogate_ridge_lambda %||% 0.01
+
+    X_full <-
+        as.matrix(
+            X
+        )
+
+    X_design <-
+        cbind(
+            intercept = 1,
+            X_full
+        )
+
+    penalty <-
+        diag(
+            ncol(X_design)
+        )
+
+    # Do not penalize the intercept.
+    penalty[1, 1] <- 0
+
+    ridge_beta <-
+        tryCatch(
+            solve(
+                crossprod(X_design) +
+                    ridge_lambda * penalty,
+                crossprod(
+                    X_design,
+                    y
+                )
+            ),
+            error = function(e) {
+                NULL
+            }
+        )
+
+    if (is.null(ridge_beta)) {
+
+        # Final rank-safe fallback: intercept + simple linear least squares
+        # through QR decomposition. This path should be extremely rare.
+        linear_fit <-
+            stats::lm(
+                objective ~ k1 + k2 + k3 + w1 + w2 + w3,
+                data = d
+            )
+
+        return(
+            list(
+                model = linear_fit,
+                type = "linear_fallback",
+                predictors = predictor_names
             )
         )
-
-
-    lm_fit <-
-        stats::lm(
-            formula,
-            data = d
-        )
-
+    }
 
     list(
-        model = lm_fit,
-        type = "quadratic_fallback",
+        model = list(
+            beta = as.numeric(ridge_beta),
+            lambda = ridge_lambda
+        ),
+        type = "ridge_fallback",
         predictors = predictor_names
     )
 }
-
 
 predict_surrogate <- function(
     surrogate,
@@ -2009,7 +2099,6 @@ predict_surrogate <- function(
         as.data.frame(
             candidate_designs
         )
-
 
     if (
         surrogate$type == "catboost"
@@ -2035,6 +2124,32 @@ predict_surrogate <- function(
         )
     }
 
+    if (
+        surrogate$type == "ridge_fallback"
+    ) {
+
+        X <-
+            as.matrix(
+                d[
+                    ,
+                    surrogate$predictors,
+                    drop = FALSE
+                ]
+            )
+
+        X_design <-
+            cbind(
+                intercept = 1,
+                X
+            )
+
+        return(
+            as.numeric(
+                X_design %*%
+                    surrogate$model$beta
+            )
+        )
+    }
 
     as.numeric(
         stats::predict(
@@ -2548,6 +2663,13 @@ run_catboost_surrogate_optimization <- function(
                     config
             )
 
+        cat(
+            "  Surrogate model: ",
+            surrogate$type,
+            "\n",
+            sep = ""
+        )
+
 
         # ---------------------------------------------------------------------
         # Generate 30 candidates and directly evaluate only 1
@@ -2842,6 +2964,25 @@ run_catboost_surrogate_optimization <- function(
     )
 
 
+    # Separate Monte Carlo samples are used for threshold calibration and
+    # final ARL0 evaluation. This prevents using the same paths twice.
+    validation_calibration_paths <-
+        generate_monitoring_paths(
+            n_paths =
+                config$validation_calibration_n_arl0,
+
+            max_run =
+                config$validation_max_run,
+
+            config =
+                config,
+
+            mean_shift = 0,
+
+            seed =
+                config$validation_seed
+        )
+
     validation_arl0_paths <-
         generate_monitoring_paths(
             n_paths =
@@ -2856,7 +2997,7 @@ run_catboost_surrogate_optimization <- function(
             mean_shift = 0,
 
             seed =
-                config$validation_seed
+                config$validation_seed + 1L
         )
 
 
@@ -2895,7 +3036,7 @@ run_catboost_surrogate_optimization <- function(
     val_config <- config
 
     val_config$calibration_n_rep <-
-        config$validation_n_arl0
+        config$validation_calibration_n_arl0
 
     val_config$calibration_max_run <-
         config$validation_max_run
@@ -2920,7 +3061,7 @@ run_catboost_surrogate_optimization <- function(
                 val_config,
 
             raw_paths =
-                validation_arl0_paths,
+                validation_calibration_paths,
 
             seed =
                 config$validation_seed
@@ -3110,8 +3251,32 @@ run_catboost_surrogate_optimization <- function(
                 ) /
                 config$target_arl0,
 
+            validation_relative_error =
+                abs(
+                    validation_arl0 -
+                    config$target_arl0
+                ) /
+                config$target_arl0,
+
             validation_status =
-                validation_calibration$status
+                if (
+                    abs(
+                        validation_arl0 -
+                        config$target_arl0
+                    ) /
+                    config$target_arl0 <=
+                    config$validation_arl_tol
+                ) {
+                    "passed"
+                } else {
+                    "failed"
+                },
+
+            validation_calibration_status =
+                validation_calibration$status,
+
+            validation_calibration_iterations =
+                validation_calibration$iterations
         )
 
 
@@ -3291,6 +3456,20 @@ run_catboost_surrogate_optimization <- function(
     print(
         validation_summary,
         row.names = FALSE
+    )
+
+    cat(
+        "\nValidation ARL0 tolerance: ",
+        100 * config$validation_arl_tol,
+        "%\n",
+        sep = ""
+    )
+
+    cat(
+        "Validation status: ",
+        validation_summary$validation_status,
+        "\n",
+        sep = ""
     )
 
     cat(

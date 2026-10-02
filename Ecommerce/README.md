@@ -35,34 +35,21 @@ For customer \(i\), let \(W_i\) denote the promotional treatment and
 \(Y_i\) the observed conversion outcome. The framework estimates the
 conditional treatment effect
 
-$\[
-\tau(X_i)
-=
-E[Y_i(1)-Y_i(0)\mid X_i].
-\]$
+$\tau(X_i)=E[Y_i(1)-Y_i(0)\mid X_i]$.
 
 A neural propensity model first estimates the probability of treatment:
 
-$\[
-\widehat e(X_i)=P(W_i=1\mid X_i).
-\]$
+$\widehat e(X_i)=P(W_i=1\mid X_i)$.
 
 The estimated propensity is clipped to the interval
 
-$\[
-[0.05,0.95]
-\]$
+$[0.05,0.95]$
 
 to reduce numerical instability from extreme treatment probabilities.
 
 The CATE network is trained using the propensity-adjusted pseudo-outcome
 
-$\[
-\psi_i
-=
-\frac{(W_i-\widetilde e_i)Y_i}
-{\widetilde e_i(1-\widetilde e_i)}.
-\]$
+$\psi_i=\frac{(W_i-\widetilde e_i)Y_i}{\widetilde e_i(1-\widetilde e_i)}$.
 
 Monte Carlo dropout is then used to obtain multiple stochastic CATE
 predictions. Their standard deviation provides a model-based measure of
@@ -70,13 +57,7 @@ predictive uncertainty.
 
 The final risk-adjusted treatment effect is
 
-$\[
-\widehat{\tau}^{RA}_i
-=
-\widehat{\tau}_i
--
-\lambda\widehat{\sigma}_i,
-\]$
+$\widehat{\tau}^{RA}_i=\widehat{\tau}_i-\lambda\widehat{\sigma}_i$,
 
 where \(\lambda=0.50\) in the current implementation.
 

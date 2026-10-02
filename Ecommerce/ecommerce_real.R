@@ -241,6 +241,22 @@ write.csv(
 
 cat("\nSaved CSV: Criteo_Uplift_Evaluation_Results.csv\n")
 
+library(dplyr)
+
+# Custom summary per model/metric group
+summary_df <- test_eval_df %>%
+  summarise(
+    across(where(is.numeric), list(
+      Mean   = ~ mean(.x, na.rm = TRUE),
+      SD     = ~ sd(.x, na.rm = TRUE),
+      Min    = ~ min(.x, na.rm = TRUE),
+      Max    = ~ max(.x, na.rm = TRUE)
+    ), .names = "{.col}_{.fn}")
+  )
+
+print(summary_df)
+write.csv(summary_df, "Criteo_Uplift_Summary_Stats.csv", row.names = FALSE)
+
 # Figure 1: Uplift Distribution & Margin Cutoff Line
 p1 <- ggplot(test_eval_df, aes(x = CATE_RiskAdj, fill = Action_Signal)) +
   geom_histogram(bins = 40, alpha = 0.8, color = "white") +
@@ -261,23 +277,18 @@ p1 <- ggplot(test_eval_df, aes(x = CATE_RiskAdj, fill = Action_Signal)) +
 ggsave("Figure1_Criteo_Uplift_Distribution.pdf", plot = p1, width = 8, height = 5, units = "in")
 cat("Saved PDF: Figure1_Criteo_Uplift_Distribution.pdf\n")
 
-# Figure 2: Session Duration vs Competitor Index by Targeted Segment
-p2 <- ggplot(test_eval_df, aes(x = f2, y = f3, color = Customer_Segment)) +
-  geom_point(alpha = 0.6, size = 1.8) +
-  scale_color_manual(values = c(
-    "Persuadable (Target Coupon)" = "#2ca02c",
-    "High Uncertainty (Hold Promotion)" = "#ff7f0e",
-    "Unnecessary Cost (Organic Buyer)" = "#1f77b4",
-    "Lost Cause / Do Not Disturb" = "#d62728"
-  )) +
+library(ggplot2)
+
+p2 <- ggplot(test_eval_df, aes(x = f2, y = f3)) +
+  geom_hex(bins = 100) +
+  facet_wrap(~ Customer_Segment) +
+  scale_fill_viridis_c() +
   labs(
-    title = "Customer Segmentation by Session Duration & Competitor Index",
+    title = "Customer Density by Session Duration & Competitor Index",
     x = "Session Duration Feature (f2)",
-    y = "Competitor Price Index Feature (f3)",
-    color = "Segment"
+    y = "Competitor Price Index Feature (f3)"
   ) +
   theme_minimal(base_size = 12) +
-  theme(legend.position = "bottom", plot.title = element_text(face = "bold"))
+  theme(plot.title = element_text(face = "bold"))
 
 ggsave("Figure2_Criteo_Customer_Segments.pdf", plot = p2, width = 8.5, height = 5.5, units = "in")
-cat("Saved PDF: Figure2_Criteo_Customer_Segments.pdf\n")

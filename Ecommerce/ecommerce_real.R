@@ -5,7 +5,6 @@
 # - Uncertainty-Aware Discount Decision Rules (MC Dropout)
 ###############################################################################
 
-# install.packages(c("dplyr", "tidyr", "torch", "ggplot2", "readr", "R6"))
 library(dplyr)
 library(tidyr)
 library(torch)
@@ -20,64 +19,76 @@ torch_manual_seed(2026)
 # 1. LOAD & PROCESS CRITEO / ALTERNATIVE UPLIFT BENCHMARK DATA
 ###############################################################################
 
-load_criteo_uplift_data <- function(file_path = NULL, n_samples = 15000) {
-  # 1. If local Criteo CSV path is provided and exists, load real data
+load_criteo_uplift_data <- function(file_path = NULL, n_samples = 25000) {
   if (!is.null(file_path) && file.exists(file_path)) {
     cat(sprintf("Loading local dataset from: %s...\n", file_path))
     raw_df <- read_csv(file_path, show_col_types = FALSE)
     
+    # Normalize potential column name variations
+    col_names <- colnames(raw_df)
+    w_col <- if ("treatment" %in% col_names) "treatment" else if ("W" %in% col_names) "W" else NULL
+    y_col <- if ("conversion" %in% col_names) "conversion" else if ("Y" %in% col_names) "Y" else NULL
+    
+    if (is.null(w_col) || is.null(y_col)) {
+      stop("Dataset must contain treatment ('treatment' or 'W') and outcome ('conversion' or 'Y') columns.")
+    }
+    
     df_proc <- raw_df %>%
       mutate(
-        W = treatment,        # Treatment W (1 = Discount/Promotion, 0 = Control)
-        Y = conversion       # Outcome Y (1 = Converted/Purchased, 0 = No Purchase)
+        W = .data[[w_col]],
+        Y = .data[[y_col]]
       ) %>%
       na.omit()
       
     return(df_proc)
   }
   
-  # 2. Fallback: High-Fidelity Criteo Benchmark Structure (Continuous Anonymized Features f0-f11)
-  cat("Generating Criteo Benchmark Dataset Structure (12 Continuous Session Features)...\n")
+  cat("Generating Synthetic Criteo Benchmark Dataset Structure...\n")
   
-  f0  <- rnorm(n_samples, mean = 10, sd = 2)    # User Recency Metric
-  f1  <- rnorm(n_samples, mean = 2, sd = 1)     # Engagement Score
-  f2  <- rnorm(n_samples, mean = 150, sd = 50)  # Session Duration (Sec)
-  f3  <- rnorm(n_samples, mean = 0, sd = 1)     # Competitor Index
-  f4  <- rnorm(n_samples, mean = 5, sd = 2)     # Historical Views
-  f5  <- rnorm(n_samples, mean = 1, sd = 0.5)   # Basket Size
+  f0  <- rnorm(n_samples, mean = 18, sd = 5)    # Recency / History
+  f1  <- rnorm(n_samples, mean = 10, sd = 0.5)  # Engagement Score
+  f2  <- rnorm(n_samples, mean = 8.5, sd = 0.3) # Session Duration
+  f3  <- rnorm(n_samples, mean = 4, sd = 1.5)   # Competitor Index
+  f4  <- rnorm(n_samples, mean = 10, sd = 0.2)  # Views
+  f5  <- rnorm(n_samples, mean = 4, sd = 0.5)   # Basket Metric
+  f6  <- rnorm(n_samples, mean = -4, sd = 5)    # User Activity
+  f7  <- rnorm(n_samples, mean = 5, sd = 1.2)   # Spend Index
+  f8  <- rnorm(n_samples, mean = 3.9, sd = 0.1) # Device Factor
+  f9  <- rnorm(n_samples, mean = 16, sd = 7)    # Temporal Metric
+  f10 <- rnorm(n_samples, mean = 5.3, sd = 0.2) # Session Depth
+  f11 <- rnorm(n_samples, mean = -0.17, sd = 0.01) # Cart Ratio
   
-  # Propensity Logit (Treatment Assignment Probability)
-  logit_p <- -0.5 + 0.05 * f0 + 0.1 * f1 + 0.002 * f2 - 0.2 * f3
+  logit_p <- -0.5 + 0.02 * f0 + 0.05 * f1 - 0.03 * f3
   propensity <- 1 / (1 + exp(-logit_p))
   W <- rbinom(n_samples, 1, propensity)
   
-  # True CATE (Net Response Uplift)
-  true_cate <- 0.02 + 0.12 * (f2 > 160) * (f3 < 0) - 0.05 * (f0 > 12)
+  # Heterogeneous true CATE (small realistic uplift magnitude ~0.001 to 0.005)
+  true_cate <- 0.0015 + 0.003 * (f2 > 8.5) * (f3 < 4) - 0.001 * (f0 > 20)
   
-  # Baseline Conversion Probability (Y0)
-  y0_prob <- 1 / (1 + exp(-(-3.0 + 0.1 * f0 + 0.2 * f1 + 0.005 * f2)))
-  y1_prob <- pmin(pmax(y0_prob + true_cate, 0.001), 0.999)
+  y0_prob <- 1 / (1 + exp(-(-6.5 + 0.01 * f0 + 0.02 * f1)))
+  y1_prob <- pmin(pmax(y0_prob + true_cate, 0.0001), 0.999)
   
   Y <- ifelse(W == 1, rbinom(n_samples, 1, y1_prob), rbinom(n_samples, 1, y0_prob))
   
   df_proc <- data.frame(
     user_id = 1:n_samples, W = W, Y = Y, True_CATE = true_cate,
-    f0 = f0, f1 = f1, f2 = f2, f3 = f3, f4 = f4, f5 = f5
+    f0 = f0, f1 = f1, f2 = f2, f3 = f3, f4 = f4, f5 = f5,
+    f6 = f6, f7 = f7, f8 = f8, f9 = f9, f10 = f10, f11 = f11
   )
   
   return(df_proc)
 }
 
-# Pass local file path if available (e.g., "criteo-uplift-v2.1.csv"), otherwise uses benchmark generator
 criteo_df <- load_criteo_uplift_data(file_path = "criteo-uplift-v2.1.csv")
 
 feature_cols <- grep("^f[0-9]+$", colnames(criteo_df), value = TRUE)
 if (length(feature_cols) == 0) {
-  feature_cols <- setdiff(colnames(criteo_df), c("user_id", "W", "Y", "True_CATE", "spend"))
+  feature_cols <- setdiff(colnames(criteo_df), c("user_id", "W", "Y", "True_CATE", "spend", "treatment", "conversion"))
 }
 
-cat(sprintf("Dataset Loaded: %d rows, %d treated (%1.1f%%), %d conversions.\n", 
-            nrow(criteo_df), sum(criteo_df$W), mean(criteo_df$W)*100, sum(criteo_df$Y)))
+cat(sprintf("Dataset Loaded: %d rows, %d treated (%1.1f%%), %d conversions (%1.3f%%).\n", 
+            nrow(criteo_df), sum(criteo_df$W), mean(criteo_df$W) * 100, 
+            sum(criteo_df$Y), mean(criteo_df$Y) * 100))
 
 ###############################################################################
 # 2. DATA PREPROCESSING & TRAIN / TEST SPLIT
@@ -124,14 +135,30 @@ PropensityNet <- nn_module(
   forward = function(x) self$net(x)
 )
 
-# 2) Uplift CATE Estimator Network
+# 2) Outcome Baseline Network mu_w(X) for Doubly Robust target
+OutcomeNet <- nn_module(
+  "OutcomeNet",
+  initialize = function(in_features) {
+    self$net <- nn_sequential(
+      nn_linear(in_features + 1, 32), # Inputs X and W
+      nn_relu(),
+      nn_linear(32, 16),
+      nn_relu(),
+      nn_linear(16, 1),
+      nn_sigmoid()
+    )
+  },
+  forward = function(x, w) self$net(torch_cat(list(x, w), dim = 2))
+)
+
+# 3) CATE Estimator Network
 CATENet <- nn_module(
   "CATENet",
   initialize = function(in_features) {
     self$net <- nn_sequential(
       nn_linear(in_features, 64),
       nn_relu(),
-      nn_dropout(p = 0.2), # MC Dropout for uncertainty quantification
+      nn_dropout(p = 0.2), # MC Dropout active for prediction
       nn_linear(64, 32),
       nn_relu(),
       nn_dropout(p = 0.2),
@@ -141,7 +168,7 @@ CATENet <- nn_module(
   forward = function(x) self$net(x)
 )
 
-# Train Propensity Model
+# --- Train Propensity Network ---
 prop_net <- PropensityNet(length(feature_cols))
 opt_prop <- optim_adam(prop_net$parameters, lr = 0.005, weight_decay = 1e-4)
 
@@ -154,15 +181,35 @@ for (epoch in 1:150) {
   opt_prop$step()
 }
 
+# --- Train Outcome Network ---
+outcome_net <- OutcomeNet(length(feature_cols))
+opt_out <- optim_adam(outcome_net$parameters, lr = 0.005, weight_decay = 1e-4)
+
+outcome_net$train()
+for (epoch in 1:150) {
+  opt_out$zero_grad()
+  pred_y <- outcome_net(t_X_tr, t_W_tr)
+  loss_y <- nnf_binary_cross_entropy(pred_y, t_Y_tr)
+  loss_y$backward()
+  opt_out$step()
+}
+
+# --- Construct Doubly Robust Pseudo-Outcome ---
+outcome_net$eval()
 prop_net$eval()
+
 with_no_grad({
-  e_hat <- prop_net(t_X_tr)$clamp(0.05, 0.95)
+  e_hat  <- prop_net(t_X_tr)$clamp(0.05, 0.95)
+  mu_1   <- outcome_net(t_X_tr, torch_ones_like(t_W_tr))
+  mu_0   <- outcome_net(t_X_tr, torch_zeros_like(t_W_tr))
+  
+  # Doubly Robust Target Construction
+  dr_target <- (mu_1 - mu_0) + 
+    (t_W_tr * (t_Y_tr - mu_1) / e_hat) - 
+    ((1 - t_W_tr) * (t_Y_tr - mu_0) / (1 - e_hat))
 })
 
-# Construct Doubly Robust Pseudo Target
-dr_target <- (t_W_tr - e_hat) * t_Y_tr / (e_hat * (1 - e_hat))
-
-# Train CATE Uplift Network
+# --- Train CATE Uplift Network ---
 cate_net <- CATENet(length(feature_cols))
 opt_cate <- optim_adam(cate_net$parameters, lr = 0.003, weight_decay = 1e-3)
 
@@ -177,7 +224,8 @@ for (epoch in 1:200) {
 
 cat("\n============================================================\n")
 cat("MODEL TRAINING COMPLETE FOR CRITEO BENCHMARK DATA\n")
-cat(sprintf("Propensity Loss: %1.4f | CATE Loss: %1.4f\n", loss_p$item(), loss_c$item()))
+cat(sprintf("Propensity Loss: %1.4f | Outcome Loss: %1.4f | CATE Loss: %1.4f\n", 
+            loss_p$item(), loss_y$item(), loss_c$item()))
 
 ###############################################################################
 # 4. UNCERTAINTY QUANTIFICATION & POLICY DECISION RULE
@@ -185,7 +233,7 @@ cat(sprintf("Propensity Loss: %1.4f | CATE Loss: %1.4f\n", loss_p$item(), loss_c
 
 predict_cate_with_uncertainty <- function(X_mat, n_mc_samples = 30) {
   t_x <- torch_tensor(X_mat, dtype = torch_float())
-  cate_net$train() # Retain MC Dropout active for uncertainty estimation
+  cate_net$train() # Retain MC Dropout active during prediction
   
   preds_matrix <- matrix(0, nrow = nrow(X_mat), ncol = n_mc_samples)
   
@@ -203,8 +251,15 @@ predict_cate_with_uncertainty <- function(X_mat, n_mc_samples = 30) {
 
 cate_pred <- predict_cate_with_uncertainty(X_test, n_mc_samples = 30)
 
-MARGIN_THRESHOLD <- 0.015 # Minimum required net uplift threshold (1.5%p)
-LAMBDA_RISK      <- 0.50  # Risk-aversion uncertainty coefficient
+# Calibrate operational threshold dynamically to fit conversion scale
+LAMBDA_RISK <- 0.50
+cate_risk_adj_raw <- cate_pred$mean - (LAMBDA_RISK * cate_pred$sd)
+
+# Default to top ~10% tail threshold if 0.015 exceeds sample limits
+quantile_threshold <- as.numeric(quantile(cate_risk_adj_raw[cate_risk_adj_raw > 0], 0.90, na.rm = TRUE))
+MARGIN_THRESHOLD   <- if (is.na(quantile_threshold) || quantile_threshold < 0.0005) 0.0015 else quantile_threshold
+
+cat(sprintf("\nCalibrated Promotion Margin Threshold (tau_min): %1.5f\n", MARGIN_THRESHOLD))
 
 test_eval_df <- test_df %>%
   mutate(
@@ -241,28 +296,30 @@ write.csv(
 
 cat("\nSaved CSV: Criteo_Uplift_Evaluation_Results.csv\n")
 
-library(dplyr)
-
-# Custom summary per model/metric group
 summary_df <- test_eval_df %>%
   summarise(
     across(where(is.numeric), list(
-      Mean   = ~ mean(.x, na.rm = TRUE),
-      SD     = ~ sd(.x, na.rm = TRUE),
-      Min    = ~ min(.x, na.rm = TRUE),
-      Max    = ~ max(.x, na.rm = TRUE)
+      Mean = ~ mean(.x, na.rm = TRUE),
+      SD   = ~ sd(.x, na.rm = TRUE),
+      Min  = ~ min(.x, na.rm = TRUE),
+      Max  = ~ max(.x, na.rm = TRUE)
     ), .names = "{.col}_{.fn}")
   )
 
-print(summary_df)
 write.csv(summary_df, "Criteo_Uplift_Summary_Stats.csv", row.names = FALSE)
 
-# Figure 1: Uplift Distribution & Margin Cutoff Line
+# Dynamic plot coordinates
+x_min <- min(test_eval_df$CATE_RiskAdj, na.rm = TRUE)
+x_max <- max(test_eval_df$CATE_RiskAdj, na.rm = TRUE)
+anno_x <- MARGIN_THRESHOLD + (x_max - x_min) * 0.02
+
+# Figure 1: Uplift Distribution & Targeting Threshold
 p1 <- ggplot(test_eval_df, aes(x = CATE_RiskAdj, fill = Action_Signal)) +
-  geom_histogram(bins = 40, alpha = 0.8, color = "white") +
+  geom_histogram(bins = 45, alpha = 0.85, color = "white") +
   geom_vline(xintercept = MARGIN_THRESHOLD, color = "red", linetype = "dashed", linewidth = 1) +
-  annotate("text", x = MARGIN_THRESHOLD + 0.005, y = 80, 
-           label = paste0("Margin Cutoff (", MARGIN_THRESHOLD * 100, "%)"), color = "red", fontface = "bold", hjust = 0) +
+  annotate("text", x = anno_x, y = nrow(test_eval_df) * 0.08, 
+           label = sprintf("Margin Cutoff (%1.3f%%)", MARGIN_THRESHOLD * 100), 
+           color = "red", fontface = "bold", hjust = 0) +
   scale_fill_manual(values = c("Issue Coupon (W=1)" = "#2ca02c", "Hold Normal Price (W=0)" = "#7f7f7f")) +
   labs(
     title = "Criteo Uplift Distribution & Targeting Signals",
@@ -277,18 +334,20 @@ p1 <- ggplot(test_eval_df, aes(x = CATE_RiskAdj, fill = Action_Signal)) +
 ggsave("Figure1_Criteo_Uplift_Distribution.pdf", plot = p1, width = 8, height = 5, units = "in")
 cat("Saved PDF: Figure1_Criteo_Uplift_Distribution.pdf\n")
 
-library(ggplot2)
-
+# Figure 2: Customer Segmentation Map
 p2 <- ggplot(test_eval_df, aes(x = f2, y = f3)) +
-  geom_hex(bins = 100) +
+  geom_hex(bins = 80) +
   facet_wrap(~ Customer_Segment) +
   scale_fill_viridis_c() +
   labs(
     title = "Customer Density by Session Duration & Competitor Index",
+    subtitle = "Segmentation Under Uncertainty-Aware Promotion Policy",
     x = "Session Duration Feature (f2)",
-    y = "Competitor Price Index Feature (f3)"
+    y = "Competitor Price Index Feature (f3)",
+    fill = "Density"
   ) +
   theme_minimal(base_size = 12) +
   theme(plot.title = element_text(face = "bold"))
 
 ggsave("Figure2_Criteo_Customer_Segments.pdf", plot = p2, width = 8.5, height = 5.5, units = "in")
+cat("Saved PDF: Figure2_Criteo_Customer_Segments.pdf\n")

@@ -27,7 +27,7 @@ set.seed(2026)
 # 1. REAL FRED DATA EXTRACTION
 ###############################################################################
 
-Sys.setenv(FRED_API_KEY = "993b31984c261a86a3c54f6122b420c2")
+Sys.setenv(FRED_API_KEY = "Your valid FRED API key")
 fredr_set_key(Sys.getenv("FRED_API_KEY"))
 
 fetch_fred_macro_data <- function(start_date = "1990-01-01") {

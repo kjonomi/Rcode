@@ -1,27 +1,35 @@
-# Nonparametric Copula–Tensor Neural Network (NP-CTNN) for High-Dimensional Causal Inference
+# NP-CTNN with Causal Directional Dependence (CDD)
+## Empirical FRED Macroeconomic Application
 
-This repository contains the official computational implementation accompanying the manuscript:
+This repository contains the R implementation of an empirical **Nonparametric Copula-Tensor Neural Network (NP-CTNN)** with **Causal Directional Dependence (CDD)** for estimating heterogeneous treatment effects from macroeconomic time-series data.
 
-**"A Nonparametric Copula–Tensor Neural Network Framework for High-Dimensional Causal Inference."**
+The empirical application uses quarterly macroeconomic indicators obtained from the **Federal Reserve Economic Data (FRED)** database. The treatment is a binary indicator of a relatively high federal funds rate environment, and the outcome is quarterly real GDP growth.
 
-The repository provides replication code for both the Monte Carlo simulation study and the real-data empirical application using the Criteo uplift dataset.
+The framework combines:
 
-The proposed **Nonparametric Copula–Tensor Neural Network (NP-CTNN)** is evaluated against two benchmark methods:
-
-1. **Neural S-learner**
-2. **Causal Forest**
-
-The simulation study is specifically designed to examine causal-effect estimation under **high-dimensional and strongly correlated covariates**, nonlinear treatment assignment, heterogeneous treatment effects, heteroskedasticity, and non-Gaussian dependence between potential outcomes.
+- FRED macroeconomic data extraction;
+- stationary transformations of macroeconomic variables;
+- nonparametric directional-dependence measures;
+- empirical-copula transformations;
+- tensor-based feature construction;
+- a convolutional neural network;
+- counterfactual prediction under alternative treatment states; and
+- individualized causal-effect estimation.
 
 ---
 
-## Project Structure
+## 1. Research Objective
+
+The objective is to estimate the heterogeneous causal effect of a **high interest-rate environment** on **real GDP growth**.
+
+For each quarter $i$, let
+
+- $T_i = 1$ denote a high federal-funds-rate environment;
+- $T_i = 0$ denote a lower federal-funds-rate environment;
+- $Y_i$ denote quarterly real GDP growth; and
+- $X_i$ denote a vector of macroeconomic covariates.
+
+The treatment indicator is defined relative to the sample median of the effective federal funds rate:
 
 ```text
-NP_CTNN_Causal_Inference/
-├── 01_Simulation/
-│   └── 01_Simulation_NP_CTNN.R
-├── 02_Real_Data/
-│   └── 02_Real_Data_Criteo_NP_CTNN.R
-├── README.md
-└── LICENSE
+T_i = 1(FEDFUNDS_i > median(FEDFUNDS))

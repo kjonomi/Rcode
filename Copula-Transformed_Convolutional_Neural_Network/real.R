@@ -22,7 +22,7 @@ set.seed(20260822)
 tf$random$set_seed(20260822L)
 
 # Setup FRED API Key safely
-FRED_KEY <- Sys.getenv("FRED_API_KEY", unset = "993b31984c261a86a3c54f6122b420c2")
+FRED_KEY <- Sys.getenv("FRED_API_KEY", unset = "Your FRED_API_KEY")
 if (nchar(FRED_KEY) == 0) {
   stop("Error: FRED_API_KEY is missing. Please provide a valid key.")
 }

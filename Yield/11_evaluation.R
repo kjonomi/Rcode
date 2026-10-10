@@ -683,8 +683,8 @@ calculate_affine_consistency_error <- function(prediction, factor_prediction) {
   errors <- vapply(seq_len(N_YIELDS), function(j) {
     fit <- lm(
       prediction[, j] ~ factor_prediction[, 1] + 
-                        factor_prediction[, 2] + 
-                        factor_prediction[, 3]
+        factor_prediction[, 2] + 
+        factor_prediction[, 3]
     )
     mean(residuals(fit)^2)
   }, numeric(1))
@@ -725,8 +725,8 @@ calculate_affine_consistency_by_yield <- function(prediction, factor_prediction)
   vapply(seq_len(N_YIELDS), function(j) {
     fit <- lm(
       prediction[, j] ~ factor_prediction[, 1] + 
-                        factor_prediction[, 2] + 
-                        factor_prediction[, 3]
+        factor_prediction[, 2] + 
+        factor_prediction[, 3]
     )
     mean(residuals(fit)^2)
   }, numeric(1))

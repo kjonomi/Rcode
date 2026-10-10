@@ -1,0 +1,3 @@
+"Threshold","Value","Definition"
+"Training lower tercile",3.31277777777778,"33.33% quantile of training-period cross-sectional mean yield"
+"Training upper tercile",4.31166666666667,"66.67% quantile of training-period cross-sectional mean yield"

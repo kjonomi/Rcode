@@ -1,0 +1,2 @@
+"Model","DirectionalAccuracy","DGS10_ModifiedDuration","DGS10_MeanAbsoluteDurationPriceError","DGS10_RMSE_DurationPriceError","DGS10_PriceDirectionalAccuracy","N_Test"
+"PER",0.474509803921569,8,0.0122223056076747,0.0146221144947891,0.441624365482233,197

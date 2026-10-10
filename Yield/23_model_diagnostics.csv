@@ -1,0 +1,2 @@
+"Model","ModelFile","TrainableParameters","NonTrainableParameters","TotalParameters","SequenceLength","FeatureDimension","TreasuryYieldCount","NFactors","NYields","NTrain","NValidation","NTest","ForecastHorizon","Seed"
+"Transformer-CNN-BiLSTM-Affine","DeepAffineTransformer_Compiled.keras",253450,512,253962,20,125,6,3,6,914,196,197,1,123

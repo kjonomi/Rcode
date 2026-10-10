@@ -1,0 +1,4 @@
+"Output","Dimension","Description"
+"Affine_Factors",3,"EconomicLevel, EconomicSlope, EconomicCurvature"
+"Affine_Pricing",6,"DTB3, DGS2, DGS5, DGS7, DGS10, DGS30"
+"Volatility",1,"Conditional volatility"

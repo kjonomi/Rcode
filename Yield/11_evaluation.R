@@ -116,7 +116,7 @@ if (length(missing_input_files) > 0L) {
 }
 
 ###############################################################
-# 5. LOAD TEST DATA
+# 5. LOAD TEST DATA INTO GLOBAL ENV
 ###############################################################
 
 cat("\n")
@@ -124,7 +124,7 @@ cat("============================================================\n")
 cat("LOADING TEST DATA\n")
 cat("============================================================\n")
 
-load(DATA_FILE)
+load(DATA_FILE, envir = .GlobalEnv)
 
 ###############################################################
 # 6. REQUIRED DATA OBJECTS
@@ -138,7 +138,11 @@ required_objects <- c(
 )
 
 missing_objects <- required_objects[
-  !vapply(required_objects, exists, logical(1))
+  !vapply(
+    required_objects,
+    function(obj) exists(obj, envir = .GlobalEnv, inherits = FALSE),
+    logical(1)
+  )
 ]
 
 if (length(missing_objects) > 0L) {
@@ -151,12 +155,12 @@ if (length(missing_objects) > 0L) {
 }
 
 ###############################################################
-# 7. LOAD PREDICTIONS
+# 7. LOAD PREDICTIONS INTO GLOBAL ENV
 ###############################################################
 
-load(PREDICTION_FILES[["Uniform"]])
-load(PREDICTION_FILES[["Entropy"]])
-load(PREDICTION_FILES[["PER"]])
+load(PREDICTION_FILES[["Uniform"]], envir = .GlobalEnv)
+load(PREDICTION_FILES[["Entropy"]], envir = .GlobalEnv)
+load(PREDICTION_FILES[["PER"]],     envir = .GlobalEnv)
 
 ###############################################################
 # 8. CHECK PREDICTION OBJECTS
@@ -169,7 +173,11 @@ prediction_objects <- c(
 )
 
 missing_predictions <- prediction_objects[
-  !vapply(prediction_objects, exists, logical(1))
+  !vapply(
+    prediction_objects,
+    function(obj) exists(obj, envir = .GlobalEnv, inherits = FALSE),
+    logical(1)
+  )
 ]
 
 if (length(missing_predictions) > 0L) {

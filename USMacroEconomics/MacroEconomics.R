@@ -1,10 +1,11 @@
 # ==============================================================================
-# COMPREHENSIVE RECESSION PREDICTION BENCHMARKING (1986–2026)
-# Key Updates:
-# 1. Safe FRED API Key Setup (Sys.getenv with fallback default)
-# 2. Sample Start Date: 1986-01-01
-# 3. Complete Model Suite: Traditional (Estrella-Mishkin Probit, Dynamic Logit)
-#    + Survival Benchmarks (Standard Cox PH, RSF) + Proposed Vine Copula Models
+# COMPREHENSIVE RECESSION PREDICTION BENCHMARKING (1966-2026)
+# Updates:
+# 1. Sample Start Date: 1966-01-01 (Capturing 7 NBER Recessions)
+# 2. Replaced Unicode en-dashes with standard ASCII hyphens (-) in plot titles
+# 3. Safe FRED API Key setup (Sys.getenv with fallback default)
+# 4. Benchmarking: Estrella-Mishkin Probit, Dynamic Logit, Standard Cox PH,
+#    Random Survival Forests (RSF), and Proposed Vine Copula Extensions
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
@@ -45,20 +46,19 @@ library(fredr)
 
 set.seed(2026)
 
-# Initialize fredr with key
+# Initialize fredr with key safely
 if (nchar(FRED_KEY) > 0) {
   try(fredr_set_key(FRED_KEY), silent = TRUE)
 }
 
 # ------------------------------------------------------------------------------
-# 1. FRED DATA DOWNLOAD HELPER (WITH API KEY & CSV FALLBACK)
+# 1. FRED DATA DOWNLOAD HELPER (API KEY WITH DIRECT CSV FALLBACK)
 # ------------------------------------------------------------------------------
 
 fred_fetch <- function(series_id, api_key = FRED_KEY) {
-  # Try fetching via fredr API first
   res <- tryCatch({
     if (nchar(api_key) > 0) {
-      df <- fredr(series_id = series_id, observation_start = as.Date("1980-01-01"))
+      df <- fredr(series_id = series_id, observation_start = as.Date("1960-01-01"))
       out <- data.frame(Date = as.Date(df$date), Value = as.numeric(df$value))
       names(out) <- c("Date", series_id)
       out
@@ -66,7 +66,6 @@ fred_fetch <- function(series_id, api_key = FRED_KEY) {
       stop("No API key")
     }
   }, error = function(e) {
-    # Fallback to direct FRED CSV download
     url <- paste0("https://fred.stlouisfed.org/graph/fredgraph.csv?id=", series_id)
     x <- read.csv(url, stringsAsFactors = FALSE)
     names(x) <- c("Date", series_id)
@@ -77,18 +76,17 @@ fred_fetch <- function(series_id, api_key = FRED_KEY) {
   return(res)
 }
 
-# Fetch FRED Series
-indpro    <- fred_fetch("INDPRO")       # Industrial Production
-cpi       <- fred_fetch("CPIAUCSL")     # Consumer Price Index
-unrate    <- fred_fetch("UNRATE")       # Unemployment Rate
-fedfunds  <- fred_fetch("FEDFUNDS")     # Federal Funds Rate
-gs10      <- fred_fetch("GS10")         # 10-Year Treasury Yield
-gs2       <- fred_fetch("GS2")          # 2-Year Treasury Yield
-tb3m      <- fred_fetch("TB3MS")        # 3-Month Treasury Bill Yield
-vix       <- fred_fetch("VIXCLS")       # VIX Index
-housing   <- fred_fetch("HOUST")        # Housing Starts
-baa10y    <- fred_fetch("BAA10Y")       # BAA Corporate Bond Spread
-recession <- fred_fetch("USREC")        # NBER Recession Indicator
+# Fetch FRED Series (using long historical series starting pre-1966)
+indpro    <- fred_fetch("INDPRO")       # Industrial Production (1919+)
+cpi       <- fred_fetch("CPIAUCSL")     # CPI (1947+)
+unrate    <- fred_fetch("UNRATE")       # Unemployment Rate (1948+)
+fedfunds  <- fred_fetch("FEDFUNDS")     # Fed Funds Rate (1954+)
+gs10      <- fred_fetch("GS10")         # 10Y Treasury Yield (1953+)
+gs1       <- fred_fetch("GS1")          # 1Y Treasury Yield (1953+)
+tb3m      <- fred_fetch("TB3MS")        # 3M Treasury Bill Yield (1934+)
+houst     <- fred_fetch("HOUST")        # Housing Starts (1959+)
+baa       <- fred_fetch("BAA")          # Moody's BAA Corporate Yield (1919+)
+recession <- fred_fetch("USREC")        # NBER Recession Indicator (1854+)
 
 # ------------------------------------------------------------------------------
 # 2. CONVERT TO MONTHLY FREQUENCY
@@ -107,11 +105,10 @@ cpi_m      <- monthly_mean(cpi, "CPIAUCSL")
 unrate_m   <- monthly_mean(unrate, "UNRATE")
 fedfunds_m <- monthly_mean(fedfunds, "FEDFUNDS")
 gs10_m     <- monthly_mean(gs10, "GS10")
-gs2_m      <- monthly_mean(gs2, "GS2")
+gs1_m      <- monthly_mean(gs1, "GS1")
 tb3m_m     <- monthly_mean(tb3m, "TB3MS")
-vix_m      <- monthly_mean(vix, "VIXCLS")
-housing_m  <- monthly_mean(housing, "HOUST")
-baa10y_m   <- monthly_mean(baa10y, "BAA10Y")
+houst_m    <- monthly_mean(houst, "HOUST")
+baa_m      <- monthly_mean(baa, "BAA")
 
 recession_m <- recession %>%
   mutate(Month = as.Date(as.yearmon(Date), frac = 0)) %>%
@@ -119,7 +116,7 @@ recession_m <- recession %>%
   summarise(USREC = max(USREC, na.rm = TRUE), .groups = "drop")
 
 # ------------------------------------------------------------------------------
-# 3. MERGE ACTUAL MACROECONOMIC DATA
+# 3. MERGE HISTORICAL MACROECONOMIC DATASET
 # ------------------------------------------------------------------------------
 
 macro_data <- indpro_m %>%
@@ -127,43 +124,33 @@ macro_data <- indpro_m %>%
   left_join(unrate_m, by = "Month") %>%
   left_join(fedfunds_m, by = "Month") %>%
   left_join(gs10_m, by = "Month") %>%
-  left_join(gs2_m, by = "Month") %>%
+  left_join(gs1_m, by = "Month") %>%
   left_join(tb3m_m, by = "Month") %>%
-  left_join(vix_m, by = "Month") %>%
-  left_join(housing_m, by = "Month") %>%
-  left_join(baa10y_m, by = "Month") %>%
+  left_join(houst_m, by = "Month") %>%
+  left_join(baa_m, by = "Month") %>%
   left_join(recession_m, by = "Month")
 
 # ------------------------------------------------------------------------------
-# 4. SAMPLE PERIOD (STARTING 1986-01-01)
+# 4. FILTER SAMPLE (1966 TO 2026) & ECONOMIC TRANSFORMATIONS
 # ------------------------------------------------------------------------------
 
 macro_data <- macro_data %>%
   filter(
-    Month >= as.Date("1986-01-01"),
+    Month >= as.Date("1966-01-01"),
     Month <= as.Date("2026-08-01")
-  )
-
-# ------------------------------------------------------------------------------
-# 5. ECONOMIC TRANSFORMATIONS & SHOCK VARIABLES
-# ------------------------------------------------------------------------------
-
-macro_data <- macro_data %>%
+  ) %>%
   mutate(
-    # Estrella & Mishkin (1998) Term Spread Benchmark
+    # Classic Estrella & Mishkin (1998) Term Spread Benchmark
     Term_Spread_EM = GS10 - TB3MS,
+    Term_Spread_10Y1Y = GS10 - GS1,
     
     IP_Growth = 100 * (log(INDPRO) - lag(log(INDPRO), 12)),
     CPI_Inflation = 100 * (log(CPIAUCSL) - lag(log(CPIAUCSL), 12)),
     Unemployment_Change = UNRATE - lag(UNRATE),
     FedFunds_Change = FEDFUNDS - lag(FEDFUNDS),
     FedFunds_3M_Change = FEDFUNDS - lag(FEDFUNDS, 3),
-    Term_Spread = GS10 - GS2,
-    Term_Spread_Change = Term_Spread - lag(Term_Spread),
-    VIX_Change = VIXCLS - lag(VIXCLS),
     Housing_Growth = 100 * (log(HOUST) - lag(log(HOUST), 12)),
-    Credit_Spread = BAA10Y,
-    Credit_Spread_Change = BAA10Y - lag(BAA10Y),
+    Credit_Spread = BAA - GS10,
     
     # Treatment & Policy Indicator
     Monetary_Tightening = ifelse(FedFunds_3M_Change >= 0.50, 1, 0)
@@ -177,16 +164,11 @@ macro_data <- macro_data %>%
       FUN = function(x) quantile(x, probs = 0.75, na.rm = TRUE),
       fill = NA, align = "right"
     ),
-    VIX_Threshold = zoo::rollapply(
-      VIXCLS, width = 36,
-      FUN = function(x) quantile(x, probs = 0.75, na.rm = TRUE),
-      fill = NA, align = "right"
-    ),
-    Financial_Stress = ifelse(Credit_Spread >= Credit_Threshold | VIXCLS >= VIX_Threshold, 1, 0)
+    Financial_Stress = ifelse(Credit_Spread >= Credit_Threshold, 1, 0)
   )
 
 # ------------------------------------------------------------------------------
-# 6. CLEAN COMPLETE CASE SAMPLE & AUDIT NBER RECESSIONS
+# 5. CLEAN COMPLETE CASE SAMPLE & AUDIT NBER RECESSIONS
 # ------------------------------------------------------------------------------
 
 economic_features <- c(
@@ -196,7 +178,6 @@ economic_features <- c(
   "UNRATE",
   "Unemployment_Change",
   "FedFunds_Change",
-  "Term_Spread",
   "Credit_Spread",
   "Housing_Growth"
 )
@@ -216,7 +197,7 @@ cat("Recession Start Dates:", paste(rec_starts, collapse = ", "), "\n")
 cat("========================================================================\n\n")
 
 # ------------------------------------------------------------------------------
-# 7. SURVIVAL OUTCOME & BINARY HORIZON TARGETS
+# 6. SURVIVAL OUTCOME & BINARY HORIZON TARGETS
 # ------------------------------------------------------------------------------
 
 n_row <- nrow(macro_data)
@@ -244,7 +225,7 @@ macro_data$USREC_12M <- lead(macro_data$USREC, horizon)
 macro_data$USREC_12M[is.na(macro_data$USREC_12M)] <- 0
 
 # ------------------------------------------------------------------------------
-# 8. FORMULA DEFINITIONS FOR ALL BENCHMARKS & PROPOSED MODELS
+# 7. FORMULA DEFINITIONS FOR ALL BENCHMARKS & PROPOSED MODELS
 # ------------------------------------------------------------------------------
 
 surv_obj <- "Surv(time_to_recession, recession_status)"
@@ -268,10 +249,10 @@ formula_proposed  <- as.formula(
 )
 
 # ------------------------------------------------------------------------------
-# 9. OUT-OF-SAMPLE ROLLING BACKTEST (1986–2026)
+# 8. OUT-OF-SAMPLE ROLLING BACKTEST (1966-2026)
 # ------------------------------------------------------------------------------
 
-train_size   <- 180 # 15-year initial training window
+train_size   <- 216 # 18-year initial training window
 test_horizon <- 12  # 12-month evaluation step
 n_rolls      <- floor((nrow(macro_data) - train_size) / test_horizon)
 
@@ -299,7 +280,7 @@ for (i in 1:n_rolls) {
     next
   }
 
-  # A. Fit R-Vine Copula on TRAIN ONLY (prevents data leakage)
+  # A. Fit R-Vine Copula on TRAIN ONLY (Strict Out-of-Sample Protocol)
   train_feat <- as.matrix(train_df[, economic_features])
   test_feat  <- as.matrix(test_df[, economic_features])
   
@@ -330,7 +311,7 @@ for (i in 1:n_rolls) {
   m_prop        <- coxph(formula_proposed, data = train_df)
   m_prop_rsf    <- rfsrc(formula_proposed, data = train_df, ntree = 300, splitrule = "logrank")
 
-  # C. Out-of-Sample Risk Predictions & C-Index Computation
+  # C. Out-of-Sample Predictions & Harrell's C-Index Calculation
   pred_probit_risk <- predict(m_probit_em, newdata = test_df, type = "response")
   pred_logit_risk  <- predict(m_logit_macro, newdata = test_df, type = "response")
   pred_std_risk    <- predict(m_std_cox, newdata = test_df, type = "risk")
@@ -355,7 +336,7 @@ for (i in 1:n_rolls) {
 }
 
 # ------------------------------------------------------------------------------
-# 10. RESULTS SUMMARY & CSV EXPORTS
+# 9. PERFORMANCE SUMMARY & CSV EXPORTS
 # ------------------------------------------------------------------------------
 
 results_df <- data.frame(
@@ -395,16 +376,16 @@ summary_table <- do.call(rbind, lapply(names(models_list), function(m_name) {
 }))
 
 cat("\n========================================================================\n")
-cat("   OUT-OF-SAMPLE ROLLING BACKTEST RESULTS (HARRELL'S C-INDEX, 1986–2026)  \n")
+cat("   OUT-OF-SAMPLE ROLLING BACKTEST RESULTS (HARRELL'S C-INDEX, 1966-2026)  \n")
 cat("========================================================================\n")
 print(knitr::kable(summary_table, digits = 4, format = "simple", row.names = FALSE))
 cat("========================================================================\n")
 
-write.csv(summary_table, file = "model_performance_summary_1986.csv", row.names = FALSE)
-write.csv(results_df, file = "rolling_fold_cindex_results_1986.csv", row.names = FALSE)
+write.csv(summary_table, file = "model_performance_summary_1966.csv", row.names = FALSE)
+write.csv(results_df, file = "rolling_fold_cindex_results_1966.csv", row.names = FALSE)
 
 # ------------------------------------------------------------------------------
-# 11. COMPARATIVE VISUALIZATION & PDF EXPORT
+# 10. ASCII-SAFE COMPARATIVE VISUALIZATION & PDF EXPORT
 # ------------------------------------------------------------------------------
 
 results_long <- results_df %>%
@@ -431,13 +412,14 @@ p_box <- ggplot(results_long, aes(x = reorder(Model, C_Index, FUN = median), y =
   coord_flip() +
   theme_minimal() +
   labs(
-    title = "Out-of-Sample Recession Prediction Accuracy (1986–2026 Sample)",
+    title = "Out-of-Sample Recession Prediction Accuracy (1966-2026 Sample)",
     subtitle = "Comparing Proposed Vine Copula Extensions Against Literature Benchmarks",
     y = "Harrell's C-Index",
     x = ""
   ) +
   theme(legend.position = "none")
 
-ggsave(filename = "figure1_comprehensive_benchmark_1986.pdf", plot = p_box, width = 9, height = 5.5, device = "pdf")
+# Export PDF without Unicode character encoding issues
+ggsave(filename = "figure1_comprehensive_benchmark_1966.pdf", plot = p_box, width = 9, height = 5.5, device = "pdf")
 
 grid.arrange(p_box)

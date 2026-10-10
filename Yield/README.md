@@ -2,103 +2,104 @@
 
 ## Overview
 
-This project develops a deep sequential learning framework for one-step-ahead
-forecasting of the U.S. Treasury yield curve using macro-financial information,
-affine yield-curve factors, and adaptive experience replay.
+This repository provides an economically structured deep sequential learning framework for multi-target, one-step-ahead forecasting of the U.S. Treasury yield curve. By combining macro-financial sequence inputs, latent affine yield-curve factors, and non-chronological experience-replay sampling, the system captures non-linear temporal dependencies and cross-sectional yield-curve geometry while enforcing structural economic diagnostics.
+
+---
 
 ## Data
 
-Daily U.S. Treasury yields:
+The empirical sample incorporates U.S. Treasury yields and macro-financial indicators drawn from a historical dataset with a start date of **1965**:
 
-- DTB3: 3-month
-- DGS2: 2-year
-- DGS5: 5-year
-- DGS7: 7-year
-- DGS10: 10-year
-- DGS30: 30-year
+- **DTB3**: 3-Month Treasury Bill
+- **DGS2**: 2-Year Treasury Constant Maturity
+- **DGS5**: 5-Year Treasury Constant Maturity
+- **DGS7**: 7-Year Treasury Constant Maturity
+- **DGS10**: 10-Year Treasury Constant Maturity
+- **DGS30**: 30-Year Treasury Constant Maturity
 
-Study period: **2021-04-22 to 2026-09-10**  
-Observations: **1,347**
+### Sample & Sequence Construction
+- **Active Sequence Observations ($N$)**: 1,347
+- **Engineered Feature Dimension ($D$)**: 125 features (standardized strictly on training-sample statistics)
+- **Sequence Lookback Window ($L$)**: 20 historical periods
+- **Chronological Data Partitioning**:
+  - **Training Partition ($N_{\mathrm{train}}$)**: 914 sequence instances
+  - **Validation Partition ($N_{\mathrm{val}}$)**: 196 sequence instances
+  - **Out-of-Sample Test Partition ($N_{\mathrm{test}}$)**: 197 sequence instances
 
-The final model uses **125 engineered features** and a sequence length of 20.
+---
 
-## Model
+## Architecture
 
-The primary architecture combines:
+The forecasting architecture combines representation learning blocks with economic factor heads:
 
-- Transformer
-- CNN
-- Bidirectional LSTM
-- Three affine yield-curve factors:
-  - Economic Level
-  - Economic Slope
-  - Economic Curvature
-- Six Treasury yield outputs
-- One volatility output
+- **Transformer Block**: Multi-head self-attention layer for long-range temporal dependencies
+- **1D CNN Layer**: Convolutional filtering for localized pattern extraction
+- **Bidirectional LSTM (BiLSTM)**: Recurrent neural network capturing non-linear sequential memory
+- **Multi-Target Output Heads**:
+  - **Affine Factors (3 outputs)**: Economic Level, Economic Slope, and Economic Curvature
+  - **Affine Pricing (6 outputs)**: DTB3, DGS2, DGS5, DGS7, DGS10, DGS30
+  - **Volatility (1 output)**: Scalar conditional yield volatility proxy ($v_{t+1}$)
 
-The canonical model contains **253,962 parameters**.
+### Parameter Configuration
+- **Trainable Parameters**: 253,450
+- **Non-Trainable Parameters**: 512
+- **Total Compiled Parameters**: **253,962**
 
-## Sampling
+---
 
-Four training strategies are evaluated:
+## Sampling Strategies
 
-1. Chronological sampling
-2. Uniform replay
-3. Entropy-based adaptive sampling
-4. Prioritized experience replay (PER)
+Four experience-sampling mechanisms are evaluated:
 
-Canonical PER settings:
+1. **Chronological Sampling**: Baseline sequential training in historical order
+2. **Uniform Replay**: Random uniform sampling of historical sequence instances
+3. **Entropy-based Adaptive Sampling**: Replay prioritisation combining cross-sectional yield entropy and distribution variance ($\alpha = 0.50$, 10-epoch warm-up)
+4. **Prioritized Experience Replay (PER)**: Replay prioritisation based on one-step yield prediction loss magnitudes ($\alpha_{\mathrm{PER}} = 0.60$, $\beta_{\mathrm{IS}} = 0.40$)
 
-- `alpha = 0.6`
-- `beta = 0.4`
-
-PER priorities are based on one-step prediction error, not temporal-difference
-(TD) error.
+---
 
 ## Main Results
 
-Among the replay-based methods, entropy sampling achieves the lowest aggregate
-yield forecasting error:
+### Out-of-Sample Performance Ranking ($N_{\mathrm{test}} = 197$)
 
-| Method | Yield RMSE | Yield MAE |
-|---|---:|---:|
-| Uniform | 0.3218 | 0.2693 |
-| Entropy | **0.3087** | **0.2500** |
-| PER | 0.3290 | 0.2608 |
+All experience-replay strategies significantly outperform standard Chronological training ($p < 10^{-15}$, Diebold--Mariano stat $> 24.0$). Among the replay-based methods, **Entropy-based Adaptive Replay** achieves the best overall yield-forecasting accuracy:
 
-Forecasting performance varies substantially across maturities. The 30-year
-yield is generally the most difficult maturity to predict.
+| Rank | Model Sampling Strategy | Overall Yield RMSE (% p.a.) | Overall Yield MAE (% p.a.) | Overall Yield MAPE (%) |
+| :---: | :--- | :---: | :---: | :---: |
+| **1** | **Entropy-based Replay** | **0.3280** | 0.2635 | **6.0712%** |
+| **2** | **Uniform Replay** | 0.3296 | 0.2706 | 6.4268% |
+| **3** | **Prioritized Experience Replay (PER)** | 0.3297 | **0.2620** | 6.1929% |
 
-Adaptive sampling does not uniformly improve every maturity or prediction
-target.
+### Key Empirical Takeaways
 
-## Evaluation
+- **Target-Specific Trade-offs**:
+  - **Entropy Sampling**: Delivers the highest aggregate yield precision (RMSE **0.3280**) and superior latent factor estimation (Factor RMSE **0.2863**).
+  - **Prioritized Replay (PER)**: Achieves the lowest overall yield MAE (**0.2620**) and conditional volatility prediction error (Volatility RMSE **0.0277**).
+  - **Uniform Replay**: Achieves the lowest Affine Consistency Error ($0.1779 \times 10^{-2}$).
+- **Maturity Heterogeneity**:
+  - Short-term ($\mathrm{DTB3}$, RMSE **0.2786**) and 2-year ($\mathrm{DGS2}$, RMSE **0.2024**) yields are best predicted by Entropy sampling.
+  - Intermediate maturities ($\mathrm{DGS5}$, RMSE **0.1755**; $\mathrm{DGS7}$, RMSE **0.1676**) achieve optimal precision under PER sampling.
+  - Long-term benchmark yields ($\mathrm{DGS10}$, RMSE **0.1618**; $\mathrm{DGS30}$, RMSE **0.5745**) achieve lowest error under Uniform sampling.
+  - The 30-year maturity remains the most challenging segment to forecast across all non-linear specifications.
 
-The study reports:
+---
 
-- RMSE, MAE, and MAPE
-- Maturity-specific forecast errors
-- Factor and volatility errors
-- Diebold--Mariano tests
-- Statistical forecasting benchmarks
-- Economic-regime performance
-- Affine consistency diagnostics
-- Yield-curve monotonicity diagnostics
+## Diagnostics & Economic Coherence
 
-The affine representation provides a structured representation of the yield
-curve and associated structural diagnostics. It does **not**, by itself,
-constitute a complete arbitrage-free term-structure model or prove
-no-arbitrage.
+- **Structural Monotonicity**: Zero out-of-sample maturity-monotonicity violations ($0.0000$) across all experience-replay strategies, confirming consistent cross-sectional curve ordering.
+- **Economic Price Errors**: Duration-based evaluation on the 10-year Treasury note ($D^* = 8.0$ years) yields a Mean Absolute Duration Price Error of **1.22%** and an RMSE Price Error of **1.46%**.
+- **Diebold--Mariano Tests**: Confirm the aggregate superiority of replay mechanisms over chronological baselines ($p < 10^{-15}$). Pairwise comparisons among Uniform, Entropy, and PER show statistically indistinguishable aggregate MSE differentials ($p > 0.05$).
+- **No-Arbitrage Penalty Sensitivity ($\lambda_{\mathrm{NA}}$)**: Moderate penalty levels ($\lambda_{\mathrm{NA}} \in [0.050, 0.100]$) optimize pricing alignment without over-constraining feature representations.
 
-## Reproducibility
+---
 
-Main experimental settings:
+## Reproducibility & Settings
 
-- Sequence length: 20
-- Forecast horizon: 1 day
-- Train/validation/test: 914/196/197
-- Principal seed: 123
-- Adam learning rate: 0.0005
+- **Sequence Lookback ($L$)**: 20 days
+- **Forecast Horizon ($H$)**: 1 day ahead
+- **Splits ($N_{\mathrm{train}} / N_{\mathrm{val}} / N_{\mathrm{test}}$)**: 914 / 196 / 197
+- **Random Seed**: `123` (Tested across seeds `123`, `456`, `789`, `2026`, `2027` in the 40-run robustness framework)
+- **Optimizer**: Adam ($\text{lr} = 5 \times 10^{-4}$, patience $= 15$, factor $= 0.5$, floor $= 10^{-6}$)
+- **Batch Size**: 32
 
-See the individual R scripts and configuration files for the complete
-implementation and experimental settings.
+Refer to `13_plots.R`, `Final_Model_Ranking.csv`, and individual CSV registry files for complete pipeline validation and detailed metric outputs.

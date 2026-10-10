@@ -1,0 +1,8 @@
+"Experiment","lambda_NA","NoArbitragePenalty","Penalty_Level","N_Yields","N_Factors","Reference"
+"NA_001",0,FALSE,"None",6,3,TRUE
+"NA_002",0.001,TRUE,"Weak",6,3,FALSE
+"NA_003",0.01,TRUE,"Weak",6,3,FALSE
+"NA_004",0.05,TRUE,"Moderate",6,3,FALSE
+"NA_005",0.1,TRUE,"Moderate",6,3,FALSE
+"NA_006",0.5,TRUE,"Strong",6,3,FALSE
+"NA_007",1,TRUE,"Strong",6,3,FALSE

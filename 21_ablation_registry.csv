@@ -1,0 +1,7 @@
+"Experiment","AffineFactors","NoArbitrage","MultiTarget","Transformer","Replay","Disabled_Component","Experiment_ID","N_Yields","N_Factors"
+"Full",TRUE,TRUE,TRUE,TRUE,TRUE,"None","ABL_01_Full",6,3
+"NoAffineFactors",FALSE,TRUE,TRUE,TRUE,TRUE,"AffineFactors","ABL_02_NoAffineFactors",6,3
+"NoNoArbitrage",TRUE,FALSE,TRUE,TRUE,TRUE,"NoArbitrage","ABL_03_NoNoArbitrage",6,3
+"NoMultiTarget",TRUE,TRUE,FALSE,TRUE,TRUE,"MultiTarget","ABL_04_NoMultiTarget",6,3
+"NoTransformer",TRUE,TRUE,TRUE,FALSE,TRUE,"Transformer","ABL_05_NoTransformer",6,3
+"NoReplay",TRUE,TRUE,TRUE,TRUE,FALSE,"Replay","ABL_06_NoReplay",6,3

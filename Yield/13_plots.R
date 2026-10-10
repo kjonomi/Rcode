@@ -261,7 +261,7 @@ load_history_object <- function(file_name, preferred_names = character(0)) {
   }
   for (object_name in loaded_names) {
     object <- get(object_name, envir = history_env, inherits = FALSE)
-    if (is.data.frame(object) || is.list(object)) return(object)
+    if (is.data.frame(object) || is.list(object) || is.numeric(object)) return(object)
   }
   NULL
 }
@@ -457,13 +457,26 @@ p_vol <- ggplot(df_vol, aes(x = Time, y = Vol, color = Model)) +
 # -----------------------------------------------------------------------------
 # Figure 7: Entropy Weights / Sampling Diagnostics
 # -----------------------------------------------------------------------------
-entropy_obj <- load_history_object(ENTROPY_HISTORY_FILE, c("entropy_weight", "sampling_probability"))
-if (!is.null(entropy_obj) && is.numeric(entropy_obj)) {
-  df_weights <- data.frame(Index = seq_along(entropy_obj), Weight = as.numeric(entropy_obj))
-  p_weights  <- ggplot(df_weights, aes(x = Index, y = Weight)) +
-    geom_histogram(bins = 30, fill = "steelblue", color = "black") +
-    labs(title = "Figure 7: Distribution of Entropy Adaptive Weights", x = "Weight", y = "Frequency") +
-    publication_theme
+entropy_obj <- load_history_object(ENTROPY_HISTORY_FILE, c("entropy_weight", "sampling_probability", "PER_weights"))
+
+if (!is.null(entropy_obj)) {
+  weights_vec <- as.numeric(as.matrix(entropy_obj))
+  weights_vec <- weights_vec[is.finite(weights_vec)]
+  
+  if (length(weights_vec) > 0) {
+    df_weights <- data.frame(Weight = weights_vec)
+    
+    p_weights <- ggplot(df_weights, aes(x = Weight)) +
+      geom_histogram(bins = 30, fill = "steelblue", color = "black") +
+      labs(
+        title = "Figure 7: Distribution of Entropy Adaptive Weights",
+        x = "Weight Value",
+        y = "Frequency"
+      ) +
+      publication_theme
+  } else {
+    p_weights <- ggplot() + ggtitle("Figure 7: Entropy Weights") + publication_theme
+  }
 } else {
   p_weights <- ggplot() + ggtitle("Figure 7: Entropy Weights") + publication_theme
 }

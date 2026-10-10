@@ -476,3 +476,310 @@ p_box <- ggplot(results_long, aes(x = reorder(Model, C_Index, FUN = median), y =
 ggsave(filename = "figure1_comprehensive_10model_benchmark_1966.pdf", plot = p_box, width = 10.0, height = 6.5, device = "pdf")
 
 grid.arrange(p_box)
+# ==============================================================================
+# 3A. DESCRIPTIVE STATISTICS AND DATA SUMMARY
+# ==============================================================================
+
+cat("\n")
+cat("============================================================\n")
+cat("DESCRIPTIVE STATISTICS: U.S. MACROECONOMIC DATA, 1966-2026\n")
+cat("============================================================\n")
+
+# Create output directory
+summary_dir <- "descriptive_statistics"
+if (!dir.exists(summary_dir)) {
+  dir.create(summary_dir, recursive = TRUE)
+}
+
+# ------------------------------------------------------------------------------
+# 1. Sample information
+# ------------------------------------------------------------------------------
+
+sample_summary <- data.frame(
+  Sample_Start = min(macro_data$Month, na.rm = TRUE),
+  Sample_End = max(macro_data$Month, na.rm = TRUE),
+  Number_of_Months = nrow(macro_data),
+  Number_of_Years = round(
+    nrow(macro_data) / 12, 2
+  ),
+  Number_of_Recession_Months = sum(
+    macro_data$USREC == 1, na.rm = TRUE
+  ),
+  Number_of_Expansion_Months = sum(
+    macro_data$USREC == 0, na.rm = TRUE
+  ),
+  Recession_Percentage = 100 * mean(
+    macro_data$USREC == 1, na.rm = TRUE
+  )
+)
+
+print(sample_summary)
+
+write.csv(
+  sample_summary,
+  file.path(summary_dir, "sample_information.csv"),
+  row.names = FALSE
+)
+
+# ------------------------------------------------------------------------------
+# 2. Continuous-variable descriptive statistics
+# ------------------------------------------------------------------------------
+
+continuous_vars <- c(
+  "INDPRO",
+  "CPIAUCSL",
+  "UNRATE",
+  "FEDFUNDS",
+  "GS10",
+  "GS1",
+  "TB3MS",
+  "HOUST",
+  "BAA",
+  "Term_Spread_EM",
+  "Term_Spread_10Y1Y",
+  "IP_Growth",
+  "CPI_Inflation",
+  "Unemployment_Change",
+  "FedFunds_Change",
+  "FedFunds_3M_Change",
+  "Housing_Growth",
+  "Credit_Spread"
+)
+
+# Retain only variables available in the analysis dataset
+continuous_vars <- intersect(
+  continuous_vars,
+  names(macro_data)
+)
+
+descriptive_stats <- do.call(
+  rbind,
+  lapply(continuous_vars, function(v) {
+
+    x <- macro_data[[v]]
+    x <- x[is.finite(x)]
+
+    if (length(x) == 0) {
+      return(data.frame(
+        Variable = v,
+        N = 0,
+        Mean = NA_real_,
+        SD = NA_real_,
+        Minimum = NA_real_,
+        Q1 = NA_real_,
+        Median = NA_real_,
+        Q3 = NA_real_,
+        Maximum = NA_real_,
+        IQR = NA_real_
+      ))
+    }
+
+    q <- quantile(
+      x,
+      probs = c(0, 0.25, 0.50, 0.75, 1),
+      na.rm = TRUE,
+      names = FALSE
+    )
+
+    data.frame(
+      Variable = v,
+      N = length(x),
+      Mean = mean(x),
+      SD = if (length(x) > 1) sd(x) else NA_real_,
+      Minimum = q[1],
+      Q1 = q[2],
+      Median = q[3],
+      Q3 = q[4],
+      Maximum = q[5],
+      IQR = IQR(x)
+    )
+  })
+)
+
+# Round numeric summaries for display
+descriptive_stats_print <- descriptive_stats
+numeric_cols <- vapply(
+  descriptive_stats_print,
+  is.numeric,
+  logical(1)
+)
+descriptive_stats_print[numeric_cols] <-
+  lapply(
+    descriptive_stats_print[numeric_cols],
+    function(x) round(x, 4)
+  )
+
+print(
+  knitr::kable(
+    descriptive_stats_print,
+    format = "simple",
+    row.names = FALSE,
+    caption = "Descriptive Statistics for Macroeconomic Variables"
+  )
+)
+
+write.csv(
+  descriptive_stats,
+  file.path(summary_dir, "macroeconomic_descriptive_statistics.csv"),
+  row.names = FALSE
+)
+
+# ------------------------------------------------------------------------------
+# 3. Binary-variable frequencies
+# ------------------------------------------------------------------------------
+
+binary_vars <- intersect(
+  c("USREC", "USREC_12M", "Monetary_Tightening",
+    "Financial_Stress", "recession_status"),
+  names(macro_data)
+)
+
+binary_summary <- do.call(
+  rbind,
+  lapply(binary_vars, function(v) {
+
+    x <- macro_data[[v]]
+    valid <- !is.na(x)
+
+    data.frame(
+      Variable = v,
+      N_Valid = sum(valid),
+      N_Missing = sum(!valid),
+      Count_Zero = sum(x[valid] == 0),
+      Count_One = sum(x[valid] == 1),
+      Percent_One = if (sum(valid) > 0) {
+        100 * mean(x[valid] == 1)
+      } else {
+        NA_real_
+      }
+    )
+  })
+)
+
+print(
+  knitr::kable(
+    binary_summary,
+    digits = 2,
+    format = "simple",
+    row.names = FALSE,
+    caption = "Frequency Statistics for Binary Variables"
+  )
+)
+
+write.csv(
+  binary_summary,
+  file.path(summary_dir, "binary_variable_frequencies.csv"),
+  row.names = FALSE
+)
+
+# ------------------------------------------------------------------------------
+# 4. Recession episodes
+# ------------------------------------------------------------------------------
+
+recession_indicator <- macro_data$USREC
+recession_indicator[is.na(recession_indicator)] <- 0
+
+recession_starts <- which(
+  recession_indicator == 1 &
+    c(TRUE, head(recession_indicator, -1) == 0)
+)
+
+recession_ends <- which(
+  recession_indicator == 1 &
+    c(tail(recession_indicator, -1) == 0, TRUE)
+)
+
+if (length(recession_starts) > 0) {
+
+  recession_episodes <- data.frame(
+    Episode = seq_along(recession_starts),
+    Start_Date = macro_data$Month[recession_starts],
+    End_Date = macro_data$Month[recession_ends],
+    Duration_Months = recession_ends - recession_starts + 1
+  )
+
+} else {
+
+  recession_episodes <- data.frame(
+    Episode = integer(),
+    Start_Date = as.Date(character()),
+    End_Date = as.Date(character()),
+    Duration_Months = integer()
+  )
+}
+
+print(recession_episodes)
+
+write.csv(
+  recession_episodes,
+  file.path(summary_dir, "recession_episode_summary.csv"),
+  row.names = FALSE
+)
+
+# ------------------------------------------------------------------------------
+# 5. Correlation matrix for continuous economic predictors
+# ------------------------------------------------------------------------------
+
+correlation_vars <- intersect(
+  c(
+    "Term_Spread_EM",
+    "IP_Growth",
+    "CPI_Inflation",
+    "UNRATE",
+    "Unemployment_Change",
+    "FedFunds_Change",
+    "Credit_Spread",
+    "Housing_Growth"
+  ),
+  names(macro_data)
+)
+
+correlation_matrix <- cor(
+  macro_data[, correlation_vars, drop = FALSE],
+  use = "pairwise.complete.obs",
+  method = "pearson"
+)
+
+print(round(correlation_matrix, 3))
+
+write.csv(
+  correlation_matrix,
+  file.path(summary_dir, "economic_predictor_correlation_matrix.csv")
+)
+
+# ------------------------------------------------------------------------------
+# 6. Export LaTeX-ready summary table
+# ------------------------------------------------------------------------------
+
+latex_summary <- knitr::kable(
+  descriptive_stats_print,
+  format = "latex",
+  booktabs = TRUE,
+  row.names = FALSE,
+  caption = paste(
+    "Descriptive Statistics for U.S. Macroeconomic Variables,",
+    "January 1966--August 2026"
+  ),
+  label = "tab:macro_descriptive_statistics",
+  escape = TRUE
+)
+
+writeLines(
+  latex_summary,
+  con = file.path(
+    summary_dir,
+    "macro_descriptive_statistics.tex"
+  )
+)
+
+cat("\nDescriptive statistics completed.\n")
+cat("Output directory:", summary_dir, "\n")
+cat("Files created:\n")
+cat("  1. sample_information.csv\n")
+cat("  2. macroeconomic_descriptive_statistics.csv\n")
+cat("  3. binary_variable_frequencies.csv\n")
+cat("  4. recession_episode_summary.csv\n")
+cat("  5. economic_predictor_correlation_matrix.csv\n")
+cat("  6. macro_descriptive_statistics.tex\n")
+cat("============================================================\n")
+             

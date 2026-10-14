@@ -1,29 +1,10 @@
 # =============================================================================
 # Revised simulation study: neural competing-risks models with censoring-aware
 # discrete-time likelihood, coherent CIFs, and standard survival benchmarks.
-#
-# IMPORTANT INTERPRETATION:
-#   * The simulation generates latent event times from a specified copula.
-#   * The observed competing-risks data reveal min(T1,T2,C), not both latent
-#     event times. A latent-time copula parameter is therefore a simulation
-#     truth, not generally identifiable from observed first-event data alone.
-#   * This script does NOT call a penalty on clipped sigmoid predictions a
-#     copula likelihood. The primary neural comparison includes lambda = 0.
-#     Add a dependence likelihood only after defining identifiable coupled
-#     variables and a valid likelihood for the observed-data estimand.
-#
-# Models:
-#   MLP, CNN-only, LSTM-only, CNN-LSTM (lambda = 0), RSF,
-#   cause-specific Cox (via riskRegression::CSC), Fine-Gray (via FGR).
-#
-# Metrics:
-#   Cause-specific concordance, time-dependent AUC, IPCW Brier scores and IBS.
-#   Monte Carlo SD and SE are reported separately.
-#
-# Required packages:
-#   keras3, tensorflow, MASS, survival, randomForestSRC, riskRegression,
-#   prodlim, timeROC, dplyr, tidyr, ggplot2
 # =============================================================================
+
+# Disable GPU initialization errors if CUDA drivers are unconfigured
+Sys.setenv(CUDA_VISIBLE_DEVICES = "-1")
 
 suppressPackageStartupMessages({
   library(keras3)
@@ -113,11 +94,9 @@ generate_event_times <- function(
     rho_used <- copula_rho
   }
 
-  # Inverse conditional Weibull survival functions.
   T1 <- (-log(U[, 1L]) / (scale1 * exp(eta1)))^(1 / shape1)
   T2 <- (-log(U[, 2L]) / (scale2 * exp(eta2)))^(1 / shape2)
 
-  # Independent Weibull censoring: S_C(t) = exp(-censor_rate*t^censor_shape).
   Uc <- runif(n)
   C <- (-log(Uc) / censor_rate)^(1 / censor_shape)
 
@@ -139,12 +118,9 @@ generate_data <- function(n, p, copula_type, copula_rho) {
 }
 
 # ----------------------- Discrete-time data construction ----------------------
-# Cut points are estimated from training follow-up times only. Intervals are
-# (breaks[k], breaks[k+1]], with the first interval beginning at zero.
 make_time_grid <- function(train_time, n_intervals = 30L) {
   probs <- seq(0, 1, length.out = n_intervals + 1L)
-  br <- as.numeric(quantile(train_time, probs = probs, na.rm = TRUE,
-                            type = 8))
+  br <- as.numeric(quantile(train_time, probs = probs, na.rm = TRUE, type = 8))
   br[1L] <- 0
   br <- sort(unique(br[is.finite(br)]))
   if (length(br) < 3L) stop("Too few unique training times for time grid.")
@@ -152,9 +128,6 @@ make_time_grid <- function(train_time, n_intervals = 30L) {
   br
 }
 
-# For each subject and interval, class 1/2 is the event cause in that interval;
-# class 3 is event-free through that interval. sample_weight is one only for
-# intervals observed to be at risk. It is zero after an event or censoring.
 make_person_period <- function(time, status, breaks) {
   n <- length(time)
   K <- length(breaks) - 1L
@@ -181,9 +154,6 @@ make_person_period <- function(time, status, breaks) {
       } else {
         w[i, k] <- 0
       }
-      # A subject censored/event-free inside this interval contributes only
-      # the observed portion as event-free; discrete-time approximation uses
-      # the interval indicator and is documented in the manuscript.
       if (time[i] <= right && status[i] == 0L) break
     }
   }
@@ -191,8 +161,6 @@ make_person_period <- function(time, status, breaks) {
 }
 
 # ------------------------------ Neural models --------------------------------
-# All neural architectures output K x 3 softmax probabilities. This guarantees
-# mutually exclusive causes and event-free status within each discrete interval.
 build_neural_model <- function(architecture, p, K) {
   input <- keras_input(shape = c(p, 1L), name = "static_covariates")
 
@@ -235,8 +203,7 @@ build_neural_model <- function(architecture, p, K) {
 }
 
 fit_neural_model <- function(model, X_train, pp, epochs = EPOCHS) {
-  X_arr <- array(as.numeric(X_train),
-                 dim = c(nrow(X_train), ncol(X_train), 1L))
+  X_arr <- array(as.numeric(X_train), dim = c(nrow(X_train), ncol(X_train), 1L))
   model |> fit(
     x = X_arr,
     y = pp$y,
@@ -273,7 +240,6 @@ predict_cif_neural <- function(model, X, breaks) {
 }
 
 # -------------------------- Metrics with censoring ----------------------------
-# Kaplan-Meier estimate of G(t) = P(C >= t), treating censoring as the event.
 censor_survival <- function(train_time, train_status, times) {
   fit <- survfit(Surv(train_time, train_status == 0L) ~ 1)
   ss <- summary(fit, times = times, extend = TRUE)
@@ -282,13 +248,9 @@ censor_survival <- function(train_time, train_status, times) {
   pmax(out, 1e-4)
 }
 
-ipcw_brier_at <- function(time, status, pred, t0, train_time, train_status,
-                          cause) {
-  # IPCW competing-risks Brier score for CIF at t0. Competing events before
-  # t0 are observed controls; subjects censored before t0 are omitted.
+ipcw_brier_at <- function(time, status, pred, t0, train_time, train_status, cause) {
   G_t <- censor_survival(train_time, train_status, t0)[1L]
-  G_event <- censor_survival(train_time, train_status,
-                             pmax(time, 1e-8))
+  G_event <- censor_survival(train_time, train_status, pmax(time, 1e-8))
   y <- as.numeric(status == cause & time <= t0)
   w <- numeric(length(time))
   case <- time <= t0 & status != 0L
@@ -303,8 +265,7 @@ ipcw_brier_at <- function(time, status, pred, t0, train_time, train_status,
 ipcw_ibs <- function(time, status, pred_cif, pred_times, train_time,
                      train_status, cause, eval_times = NULL) {
   if (is.null(eval_times)) {
-    qs <- quantile(time[time > 0], probs = c(.2, .4, .6, .8),
-                   na.rm = TRUE, names = FALSE)
+    qs <- quantile(time[time > 0], probs = c(.2, .4, .6, .8), na.rm = TRUE, names = FALSE)
     eval_times <- sort(unique(qs[is.finite(qs) & qs > 0]))
   }
   if (length(eval_times) < 2L) return(NA_real_)
@@ -316,41 +277,44 @@ ipcw_ibs <- function(time, status, pred_cif, pred_times, train_time,
   ok <- is.finite(brier)
   if (sum(ok) < 2L) return(NA_real_)
   diff(range(eval_times[ok]))^-1 *
-    sum(diff(eval_times[ok]) *
-          (head(brier[ok], -1L) + tail(brier[ok], -1L)) / 2)
+    sum(diff(eval_times[ok]) * (head(brier[ok], -1L) + tail(brier[ok], -1L)) / 2)
 }
 
 cause_specific_cindex <- function(time, status, risk, cause) {
-  event <- status == cause
+  event <- as.integer(status == cause)
   fit <- tryCatch(
-    survival::concordance(Surv(time, event) ~ risk,
-                          reverse = TRUE, timewt = "n"),
+    survival::concordance(Surv(time, event) ~ risk, reverse = TRUE, timewt = "n"),
     error = function(e) NULL
   )
   if (is.null(fit)) return(NA_real_)
   as.numeric(fit$concordance)
 }
 
+# Fixed cause_auc using cause-specific binary status indicator
 cause_auc <- function(time, status, risk, cause, eval_times) {
-  # timeROC handles competing events through its competing-risks definition.
+  delta_binary <- as.integer(status == cause)
   fit <- tryCatch(
-    timeROC::timeROC(T = time, delta = status, marker = risk,
-                     cause = cause, weighting = "marginal",
-                     times = eval_times, iid = FALSE),
+    timeROC::timeROC(
+      T = time,
+      delta = delta_binary,
+      marker = as.numeric(risk),
+      cause = 1,
+      weighting = "marginal",
+      times = eval_times,
+      iid = FALSE
+    ),
     error = function(e) NULL
   )
-  if (is.null(fit)) return(NA_real_)
+  if (is.null(fit) || is.null(fit$AUC)) return(NA_real_)
   mean(fit$AUC, na.rm = TRUE)
 }
 
 # ------------------------------- One replicate -------------------------------
 run_one_simulation <- function(sim_id, copula_type, copula_rho) {
-  message(sprintf("Replicate %d | %s | rho=%s",
-                  sim_id, copula_type, copula_rho))
+  message(sprintf("Replicate %d | %s | rho=%s", sim_id, copula_type, copula_rho))
   dat <- generate_data(N, P, copula_type, copula_rho)
   feature_names <- paste0("X", seq_len(P))
 
-  # Random split; all preprocessing and time-grid estimation use training data.
   train_id <- sample.int(nrow(dat), floor(TRAIN_FRACTION * nrow(dat)))
   tr <- dat[train_id, , drop = FALSE]
   te <- dat[-train_id, , drop = FALSE]
@@ -367,13 +331,13 @@ run_one_simulation <- function(sim_id, copula_type, copula_rho) {
   pp <- make_person_period(tr$time, tr$status, breaks)
   pred_times <- breaks[-1L]
   eval_times <- as.numeric(quantile(te$time[te$time > 0],
-                                    probs = c(.25, .50, .75),
-                                    na.rm = TRUE))
+                                    probs = c(.25, .50, .75), na.rm = TRUE))
   eval_times <- sort(unique(eval_times[is.finite(eval_times) & eval_times > 0]))
   eval_times <- eval_times[eval_times <= max(pred_times)]
-  if (length(eval_times) < 2L) eval_times <- pred_times[
-    unique(round(seq(1, length(pred_times), length.out =
-                       min(3L, length(pred_times)))))]
+  if (length(eval_times) < 2L) {
+    eval_times <- pred_times[unique(round(seq(1, length(pred_times),
+                                              length.out = min(3L, length(pred_times)))))]
+  }
 
   out <- list()
   model_names <- c("MLP", "CNN", "LSTM", "CNN_LSTM_lambda0")
@@ -387,7 +351,6 @@ run_one_simulation <- function(sim_id, copula_type, copula_rho) {
     for (cause in 1:2) {
       risk <- pr$cif[, length(pred_times), cause]
       auc <- cause_auc(te$time, te$status, risk, cause, eval_times)
-      # Full time-varying CIF for IPCW IBS.
       ibs <- ipcw_ibs(te$time, te$status, pr$cif, pred_times,
                       tr$time, tr$status, cause, eval_times)
       out[[length(out) + 1L]] <- data.frame(
@@ -399,13 +362,11 @@ run_one_simulation <- function(sim_id, copula_type, copula_rho) {
     }
   }
 
-  # Random survival forest with competing-risk CIF.
-  rsf_formula <- as.formula(paste0(
-    "Surv(time, status) ~ ", paste(feature_names, collapse = " + ")))
+  # Random survival forest
+  rsf_formula <- as.formula(paste0("Surv(time, status) ~ ", paste(feature_names, collapse = " + ")))
   rsf <- randomForestSRC::rfsrc(
     rsf_formula, data = tr[, c("time", "status", feature_names)],
-    ntree = 500, nodesize = 15, splitrule = "logrankCR",
-    importance = FALSE
+    ntree = 500, nodesize = 15, splitrule = "logrankCR", importance = FALSE
   )
   rsf_pr <- predict(rsf, newdata = te[, feature_names, drop = FALSE])
   rsf_cif <- rsf_pr$cif
@@ -416,11 +377,9 @@ run_one_simulation <- function(sim_id, copula_type, copula_rho) {
     for (cause in 1:2) {
       kk <- which.min(abs(rsf_times - max(pred_times)))
       risk <- rsf_cif[, kk, cause]
-      # Interpolate RSF CIF onto neural prediction grid.
       cif_interp <- matrix(NA_real_, nrow(te), length(pred_times))
       for (i in seq_len(nrow(te))) {
-        cif_interp[i, ] <- approx(rsf_times, rsf_cif[i, , cause],
-                                  xout = pred_times, rule = 2)$y
+        cif_interp[i, ] <- approx(rsf_times, rsf_cif[i, , cause], xout = pred_times, rule = 2)$y
       }
       arr <- array(0, c(nrow(te), length(pred_times), 2L))
       arr[, , cause] <- cif_interp
@@ -429,73 +388,50 @@ run_one_simulation <- function(sim_id, copula_type, copula_rho) {
         CopulaRho = copula_rho, Model = "RSF", Cause = cause,
         Cindex = cause_specific_cindex(te$time, te$status, risk, cause),
         AUC = cause_auc(te$time, te$status, risk, cause, eval_times),
-        IBS = ipcw_ibs(te$time, te$status, arr, pred_times,
-                       tr$time, tr$status, cause, eval_times)
+        IBS = ipcw_ibs(te$time, te$status, arr, pred_times, tr$time, tr$status, cause, eval_times)
       )
     }
   }
 
-  # Standard benchmarks via riskRegression. Predictions are CIFs at horizons.
-  # CSC fits cause-specific Cox models and combines hazards into CIFs.
+  # Cause-Specific Cox
   csc_fit <- tryCatch(
-    riskRegression::CSC(Hist(time, status) ~ ., data =
-      tr[, c("time", "status", feature_names), drop = FALSE]),
+    riskRegression::CSC(Hist(time, status) ~ ., data = tr[, c("time", "status", feature_names), drop = FALSE]),
     error = function(e) NULL
   )
-  fg_fits <- lapply(1:2, function(cause) {
-    tryCatch(
-      riskRegression::FGR(
-        Hist(time, status) ~ .,
-        data = tr[, c("time", "status", feature_names), drop = FALSE],
-        cause = cause
-      ),
-      error = function(e) NULL
-    )
-  })
-
+  
   if (!is.null(csc_fit)) {
-    pred <- tryCatch(
-      riskRegression::predictRisk(csc_fit,
-        newdata = te[, feature_names, drop = FALSE],
-        times = pred_times, cause = 1:2),
-      error = function(e) NULL
-    )
-    if (!is.null(pred)) {
-      # predictRisk commonly returns an n x time matrix for a selected cause;
-      # use cause-specific fits below if API/version differs.
-      for (cause in 1:2) {
-        pc <- tryCatch(
-          riskRegression::predictRisk(csc_fit,
-            newdata = te[, feature_names, drop = FALSE],
-            times = pred_times, cause = cause),
-          error = function(e) NULL
-        )
-        if (is.null(pc)) next
-        pc <- as.matrix(pc)
-        if (nrow(pc) != nrow(te) && ncol(pc) == nrow(te)) pc <- t(pc)
-        if (nrow(pc) != nrow(te)) next
-        risk <- pc[, ncol(pc)]
-        arr <- array(0, c(nrow(te), ncol(pc), 2L))
-        arr[, , cause] <- pc
-        out[[length(out) + 1L]] <- data.frame(
-          Simulation = sim_id, Scenario = copula_type,
-          CopulaRho = copula_rho, Model = "CauseSpecificCox", Cause = cause,
-          Cindex = cause_specific_cindex(te$time, te$status, risk, cause),
-          AUC = cause_auc(te$time, te$status, risk, cause, eval_times),
-          IBS = ipcw_ibs(te$time, te$status, arr, pred_times,
-                         tr$time, tr$status, cause, eval_times)
-        )
-      }
+    for (cause in 1:2) {
+      pc <- tryCatch(
+        riskRegression::predictRisk(csc_fit, newdata = te[, feature_names, drop = FALSE],
+                                    times = pred_times, cause = cause),
+        error = function(e) NULL
+      )
+      if (is.null(pc)) next
+      pc <- as.matrix(pc)
+      if (nrow(pc) != nrow(te) && ncol(pc) == nrow(te)) pc <- t(pc)
+      if (nrow(pc) != nrow(te)) next
+      risk <- pc[, ncol(pc)]
+      arr <- array(0, c(nrow(te), ncol(pc), 2L))
+      arr[, , cause] <- pc
+      out[[length(out) + 1L]] <- data.frame(
+        Simulation = sim_id, Scenario = copula_type,
+        CopulaRho = copula_rho, Model = "CauseSpecificCox", Cause = cause,
+        Cindex = cause_specific_cindex(te$time, te$status, risk, cause),
+        AUC = cause_auc(te$time, te$status, risk, cause, eval_times),
+        IBS = ipcw_ibs(te$time, te$status, arr, pred_times, tr$time, tr$status, cause, eval_times)
+      )
     }
   }
 
+  # Fine-Gray
   for (cause in 1:2) {
-    fg <- fg_fits[[cause]]
+    fg <- tryCatch(
+      riskRegression::FGR(Hist(time, status) ~ ., data = tr[, c("time", "status", feature_names), drop = FALSE], cause = cause),
+      error = function(e) NULL
+    )
     if (is.null(fg)) next
     pc <- tryCatch(
-      riskRegression::predictRisk(fg,
-        newdata = te[, feature_names, drop = FALSE],
-        times = pred_times),
+      riskRegression::predictRisk(fg, newdata = te[, feature_names, drop = FALSE], times = pred_times),
       error = function(e) NULL
     )
     if (is.null(pc)) next
@@ -507,12 +443,10 @@ run_one_simulation <- function(sim_id, copula_type, copula_rho) {
     arr[, , cause] <- pc
     out[[length(out) + 1L]] <- data.frame(
       Simulation = sim_id, Scenario = copula_type,
-      CopulaRho = copula_rho, Model = paste0("FineGray_Cause", cause),
-      Cause = cause,
+      CopulaRho = copula_rho, Model = paste0("FineGray_Cause", cause), Cause = cause,
       Cindex = cause_specific_cindex(te$time, te$status, risk, cause),
       AUC = cause_auc(te$time, te$status, risk, cause, eval_times),
-      IBS = ipcw_ibs(te$time, te$status, arr, pred_times,
-                     tr$time, tr$status, cause, eval_times)
+      IBS = ipcw_ibs(te$time, te$status, arr, pred_times, tr$time, tr$status, cause, eval_times)
     )
   }
 
@@ -534,24 +468,20 @@ for (sc in seq_len(nrow(scenario_grid))) {
     set.seed(SEED + counter)
     tensorflow::set_random_seed(as.integer(SEED + counter))
     all_results[[counter]] <- tryCatch(
-      run_one_simulation(sim, scenario_grid$Scenario[sc],
-                         scenario_grid$Rho[sc]),
+      run_one_simulation(sim, scenario_grid$Scenario[sc], scenario_grid$Rho[sc]),
       error = function(e) {
         message("Replicate failed: ", conditionMessage(e))
         data.frame()
       }
     )
-    write.csv(bind_rows(all_results),
-              file.path(OUTPUT_DIR, "running_all_results.csv"),
-              row.names = FALSE)
+    write.csv(bind_rows(all_results), file.path(OUTPUT_DIR, "running_all_results.csv"), row.names = FALSE)
   }
 }
 
 results <- bind_rows(all_results)
-write.csv(results, file.path(OUTPUT_DIR, "all_simulation_results.csv"),
-          row.names = FALSE)
+write.csv(results, file.path(OUTPUT_DIR, "all_simulation_results.csv"), row.names = FALSE)
 
-# Monte Carlo summaries distinguish SD from SE(mean).
+# Summary table output
 summary_results <- results |>
   group_by(Scenario, CopulaRho, Model, Cause) |>
   summarise(
@@ -570,70 +500,37 @@ summary_results <- results |>
     .groups = "drop"
   )
 
-write.csv(summary_results,
-          file.path(OUTPUT_DIR, "simulation_summary.csv"),
-          row.names = FALSE)
+write.csv(summary_results, file.path(OUTPUT_DIR, "simulation_summary.csv"), row.names = FALSE)
 print(summary_results, n = Inf)
 
 # ---------------------------- Publication figures -----------------------------
-plot_metric <- function(dat, metric, ylab, filename) {
-  p <- ggplot(dat, aes(x = Model, y = .data[[metric]],
-                       group = interaction(Scenario, Cause),
-                       color = factor(Cause))) +
-    geom_point(position = position_dodge(width = 0.45), size = 2) +
-    geom_errorbar(aes(
-      ymin = .data[[paste0("Mean_", metric)]] -
-        .data[[paste0("SD_", metric)]],
-      ymax = .data[[paste0("Mean_", metric)]] +
-        .data[[paste0("SD_", metric)]]
-    ), position = position_dodge(width = 0.45), width = 0.2) +
-    facet_wrap(~ Scenario, scales = "free_x") +
-    labs(x = NULL, y = ylab, color = "Cause",
-         title = paste0(ylab, " across Monte Carlo replications")) +
-    theme_bw() +
-    theme(axis.text.x = element_text(angle = 45, hjust = 1))
-  ggsave(file.path(OUTPUT_DIR, filename), p, width = 10, height = 6)
-  p
-}
-
-# Plot summary means with SD error bars; keep SD distinct from SE in tables.
-p_cindex <- ggplot(summary_results,
-  aes(x = Model, y = Mean_Cindex, color = factor(Cause))) +
+p_cindex <- ggplot(summary_results, aes(x = Model, y = Mean_Cindex, color = factor(Cause))) +
   geom_point(position = position_dodge(width = .5)) +
-  geom_errorbar(aes(ymin = Mean_Cindex - SD_Cindex,
-                    ymax = Mean_Cindex + SD_Cindex),
+  geom_errorbar(aes(ymin = Mean_Cindex - SD_Cindex, ymax = Mean_Cindex + SD_Cindex),
                 position = position_dodge(width = .5), width = .2) +
   facet_wrap(~ Scenario) + theme_bw() +
   labs(x = NULL, y = "Cause-specific C-index", color = "Cause") +
   theme(axis.text.x = element_text(angle = 45, hjust = 1))
-ggsave(file.path(OUTPUT_DIR, "figure_cindex.png"),
-       p_cindex, width = 10, height = 6)
+ggsave(file.path(OUTPUT_DIR, "figure_cindex.png"), p_cindex, width = 10, height = 6)
 
-p_auc <- ggplot(summary_results,
-  aes(x = Model, y = Mean_AUC, color = factor(Cause))) +
+p_auc <- ggplot(summary_results, aes(x = Model, y = Mean_AUC, color = factor(Cause))) +
   geom_point(position = position_dodge(width = .5)) +
-  geom_errorbar(aes(ymin = Mean_AUC - SD_AUC,
-                    ymax = Mean_AUC + SD_AUC),
+  geom_errorbar(aes(ymin = Mean_AUC - SD_AUC, ymax = Mean_AUC + SD_AUC),
                 position = position_dodge(width = .5), width = .2) +
   facet_wrap(~ Scenario) + theme_bw() +
   labs(x = NULL, y = "Mean time-dependent AUC", color = "Cause") +
   theme(axis.text.x = element_text(angle = 45, hjust = 1))
-ggsave(file.path(OUTPUT_DIR, "figure_auc.png"),
-       p_auc, width = 10, height = 6)
+ggsave(file.path(OUTPUT_DIR, "figure_auc.png"), p_auc, width = 10, height = 6)
 
-p_ibs <- ggplot(summary_results,
-  aes(x = Model, y = Mean_IBS, color = factor(Cause))) +
+p_ibs <- ggplot(summary_results, aes(x = Model, y = Mean_IBS, color = factor(Cause))) +
   geom_point(position = position_dodge(width = .5)) +
-  geom_errorbar(aes(ymin = pmax(0, Mean_IBS - SD_IBS),
-                    ymax = Mean_IBS + SD_IBS),
+  geom_errorbar(aes(ymin = pmax(0, Mean_IBS - SD_IBS), ymax = Mean_IBS + SD_IBS),
                 position = position_dodge(width = .5), width = .2) +
   facet_wrap(~ Scenario) + theme_bw() +
   labs(x = NULL, y = "IPCW integrated Brier score", color = "Cause") +
   theme(axis.text.x = element_text(angle = 45, hjust = 1))
-ggsave(file.path(OUTPUT_DIR, "figure_ibs.png"),
-       p_ibs, width = 10, height = 6)
+ggsave(file.path(OUTPUT_DIR, "figure_ibs.png"), p_ibs, width = 10, height = 6)
 
-# Save simulation design details for the paper / reproducibility appendix.
 design <- data.frame(
   item = c("n", "p", "replications_per_scenario", "train_fraction",
            "rho_x", "Weibull_shape1", "Weibull_shape2",
@@ -642,7 +539,6 @@ design <- data.frame(
   value = c(N, P, N_SIM, TRAIN_FRACTION, 0.8, 2.5, 1.8, 0.5, 0.3,
             CENSOR_RATE, CENSOR_SHAPE, 30, SEED)
 )
-write.csv(design, file.path(OUTPUT_DIR, "simulation_design.csv"),
-          row.names = FALSE)
+write.csv(design, file.path(OUTPUT_DIR, "simulation_design.csv"), row.names = FALSE)
 
 message("Completed. Outputs saved in: ", normalizePath(OUTPUT_DIR))

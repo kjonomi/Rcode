@@ -1,15 +1,8 @@
 ###############################################################
 # Rotterdam Breast Cancer Dataset
-# Comprehensive Competing-Risks Benchmark Strategy
-#
-# Models Evaluated:
-#   1-4. MLP (Standard, Gaussian, Clayton, Gumbel)
-#   5-8. CNN (Standard, Gaussian, Clayton, Gumbel)
-#  9-12. LSTM (Standard, Gaussian, Clayton, Gumbel)
-# 13-16. CNN-LSTM (Standard, Gaussian, Clayton, Gumbel)
-#    17. Random Survival Forest (RSF)
-#    18. Cause-Specific Cox Models (CSC)
-#    19. Fine-Gray Models (FGR)
+# Discrete-Time Competing-Risks Multi-Model Copula Benchmark
+# Models: MLP, CNN, LSTM, CNN-LSTM, RSF, CSC, Fine-Gray
+# Penalties: Standard, Gaussian, Clayton, Gumbel
 ###############################################################
 
 # Disable CUDA GPU initialization errors if driver setup is missing/misconfigured
@@ -19,16 +12,31 @@ Sys.setenv(CUDA_VISIBLE_DEVICES = "-1")
 # 0. Packages and Configuration
 # =============================================================
 
-suppressPackageStartupMessages({
-  library(survival)
-  library(randomForestSRC)
-  library(timeROC)
-  library(cmprsk)
-  library(dplyr)
-  library(ggplot2)
-  library(keras3)
-  library(tensorflow)
-})
+required_packages <- c(
+  "survival",
+  "randomForestSRC",
+  "timeROC",
+  "cmprsk",
+  "dplyr",
+  "ggplot2",
+  "keras3",
+  "tensorflow"
+)
+
+for (pkg in required_packages) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    stop("Please install package: ", pkg)
+  }
+}
+
+library(survival)
+library(randomForestSRC)
+library(timeROC)
+library(cmprsk)
+library(dplyr)
+library(ggplot2)
+library(keras3)
+library(tensorflow)
 
 set.seed(2026)
 
@@ -103,7 +111,7 @@ status_train <- status[train_index]
 status_test  <- status[test_index]
 
 # =============================================================
-# 3. Training-only Imputation and Standardization
+# 3. Training-Only Imputation and Standardization
 # =============================================================
 
 train_medians <- vapply(X_train_raw, function(z) {
@@ -180,7 +188,7 @@ Y_train <- train_targets$y
 W_train <- train_targets$weights
 
 # =============================================================
-# 5. Copula Penalty Definitions & Custom Loss Functions
+# 5. Copula Penalty & Custom Loss Functions
 # =============================================================
 
 tf_clip <- function(x, lower = 1e-7, upper = 1 - 1e-7) {
@@ -232,7 +240,7 @@ loss_gumbel_copula <- function(y_true, y_pred) {
 }
 
 # =============================================================
-# 6. Modular Neural Architecture Generator
+# 6. Multi-Architecture Neural Network Model Builder
 # =============================================================
 
 create_nn_model <- function(architecture, copula_penalty = "Standard") {
@@ -296,7 +304,7 @@ train_model <- function(model, X, Y, sample_weights, model_name) {
 }
 
 # =============================================================
-# 7. Fit All Neural Network Models and Predict CIFs
+# 7. Fit Neural Network Models & Predict CIFs
 # =============================================================
 
 extract_cif <- function(prediction) {
@@ -562,9 +570,31 @@ print(results_df, n = 100)
 write.csv(results_df, file.path(output_dir, "Rotterdam_Competing_Risks_Results.csv"), row.names = FALSE)
 
 # =============================================================
-# 12. Publication-Quality Performance Plots
+# 12. Export Predictions & Plot Metrics
 # =============================================================
 
+prediction_df <- data.frame(
+  TestRow = test_index,
+  ObservedTime = time_test,
+  ObservedStatus = status_test
+)
+
+for (h in seq_along(candidate_horizons)) {
+  k <- horizon_index[h]
+  k_rsf <- rsf_horizon_index[h]
+  label <- gsub("\\.", "_", format(round(candidate_horizons[h], 3), nsmall = 3))
+
+  for (mod_name in names(prediction_objects)) {
+    prediction_df[[paste0(mod_name, "_CIF1_", label)]] <- prediction_objects[[mod_name]]$cif1[, k]
+    prediction_df[[paste0(mod_name, "_CIF2_", label)]] <- prediction_objects[[mod_name]]$cif2[, k]
+  }
+  prediction_df[[paste0("RSF_CIF1_", label)]] <- rsf_cif[, k_rsf, 1]
+  prediction_df[[paste0("RSF_CIF2_", label)]] <- rsf_cif[, k_rsf, 2]
+}
+
+write.csv(prediction_df, file.path(output_dir, "Rotterdam_CIF_Predictions.csv"), row.names = FALSE)
+
+# Plotting Performance Figures
 plot_df <- results_df %>%
   mutate(
     Cause = factor(Cause, levels = c(1, 2), labels = c("Cause 1 (Recurrence)", "Cause 2 (Death)")),
@@ -589,8 +619,14 @@ plot_rotterdam_metric <- function(df, metric, y_label, filename) {
   return(p)
 }
 
-plot_rotterdam_metric(plot_df, "Cindex", "Concordance Index (C-index)", "rotterdam_cindex.png")
-plot_rotterdam_metric(plot_df, "TimeAUC", "Time-Dependent AUC", "rotterdam_auc.png")
-plot_rotterdam_metric(filter(plot_df, is.finite(BrierScore)), "BrierScore", "IPCW Brier Score", "rotterdam_brier.png")
+p_cindex <- plot_rotterdam_metric(plot_df, "Cindex", "Concordance Index (C-index)", "competing_risks_cindex.png")
+p_auc    <- plot_rotterdam_metric(plot_df, "TimeAUC", "Time-Dependent AUC", "competing_risks_auc.png")
+p_brier  <- plot_rotterdam_metric(filter(plot_df, is.finite(BrierScore)), "BrierScore", "IPCW Brier Score", "competing_risks_brier.png")
 
-cat("\nAnalysis completed. Results and plots saved in:\n", normalizePath(output_dir), "\n")
+pdf(file.path(output_dir, "competing_risks_performance_plots.pdf"), width = 12, height = 8, onefile = TRUE)
+print(p_cindex)
+print(p_auc)
+print(p_brier)
+dev.off()
+
+cat("\nAnalysis completed successfully. All outputs saved in:\n", normalizePath(output_dir), "\n")

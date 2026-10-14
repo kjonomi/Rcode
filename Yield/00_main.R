@@ -1,11 +1,9 @@
 ###############################################################
-#
-# Project:
-# Deep Sequential Learning for Macro-Financial Yield Curve
-# Prediction Under No-Arbitrage Affine Term Structure Models
-#
+# Journal of Risk and Financial Management
+# Paper Title: 
+# Adaptive Deep Sequential Learning for Treasury Yield Curve Forecasting: Integrating Affine Term-Structure Factors and Experience Replay
 # File:
-# 00_main.R (REVISED END-TO-END PIPELINE)
+# 00_main.R (10/14/2026 REVISED END-TO-END PIPELINE)
 #
 ###############################################################
 

@@ -1,27 +1,53 @@
 ###############################################################
-# Copula-Penalized Competing-Risks Simulation Study
-# Models: MLP, CNN, LSTM, CNN-LSTM, RSF, CSC, Fine-Gray
-# Copulas: Independence, Gaussian, Clayton, Gumbel
+# Simulated Competing-Risks Benchmark Strategy
+# Feature: Copula-Dependent Censoring Baseline Simulation
+#
+# Models Evaluated:
+#   1-4. MLP (Standard, Gaussian, Clayton, Gumbel)
+#   5-8. CNN (Standard, Gaussian, Clayton, Gumbel)
+#  9-12. LSTM (Standard, Gaussian, Clayton, Gumbel)
+# 13-16. CNN-LSTM (Standard, Gaussian, Clayton, Gumbel)
+#    17. Random Survival Forest (RSF)
+#    18. Cause-Specific Cox Models (CSC)
+#    19. Fine-Gray Models (FGR)
 ###############################################################
 
-# Disable CUDA GPU initialization errors if driver setup is unconfigured
+# Disable CUDA GPU initialization errors if driver setup is missing/misconfigured
 Sys.setenv(CUDA_VISIBLE_DEVICES = "-1")
 
 # =============================================================
 # 0. Packages and Configuration
 # =============================================================
 
-suppressPackageStartupMessages({
-  library(survival)
-  library(randomForestSRC)
-  library(timeROC)
-  library(cmprsk)
-  library(keras3)
-  library(tensorflow)
-  library(dplyr)
-  library(tidyr)
-  library(ggplot2)
-})
+required_packages <- c(
+  "survival",
+  "randomForestSRC",
+  "timeROC",
+  "cmprsk",
+  "dplyr",
+  "tidyr",
+  "ggplot2",
+  "keras3",
+  "tensorflow",
+  "MASS"
+)
+
+for (pkg in required_packages) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    stop("Please install package: ", pkg)
+  }
+}
+
+library(survival)
+library(randomForestSRC)
+library(timeROC)
+library(cmprsk)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(keras3)
+library(tensorflow)
+library(MASS)
 
 MASTER_SEED <- 20261014
 
@@ -32,64 +58,56 @@ N_TIME_BINS <- 15
 EPOCHS <- 60
 BATCH_SIZE <- 64
 LEARNING_RATE <- 0.001
-LAMBDA_COPULA <- 0.1  # Regularization parameter for copula loss penalty
+LAMBDA_COPULA <- 0.1  # Regularization weight for copula penalty
 
 TRAIN_FRACTION <- 0.70
 EVALUATION_PROBS <- c(0.25, 0.50, 0.75)
 
-OUTPUT_DIR <- "Revised_Copula_All_Models_Simulation"
+OUTPUT_DIR <- "Simulated_Copula_Dependent_Censoring_Results"
 dir.create(OUTPUT_DIR, recursive = TRUE, showWarnings = FALSE)
 
 # =============================================================
-# 1. Copula Data Generation Functions
+# 1. Copula Data Generation (Dependent Events + Dependent Censoring)
 # =============================================================
 
-r_gaussian_copula <- function(n, rho = 0.50) {
-  z1 <- rnorm(n)
-  z2 <- rho * z1 + sqrt(1 - rho^2) * rnorm(n)
-  cbind(pnorm(z1), pnorm(z2))
+# Generates 3 dependent uniforms (U1, U2, Uc) via Gaussian Copula with censoring dependence
+r_trivariate_copula <- function(n, copula_scenario = "Gaussian", rho_events = 0.50, rho_censor = 0.30) {
+  if (copula_scenario == "Independence") {
+    return(cbind(runif(n), runif(n), runif(n)))
+  }
+  
+  # Correlation matrix between latent event 1, latent event 2, and censoring time C
+  Sigma <- matrix(c(
+    1.00,       rho_events, rho_censor,
+    rho_events, 1.00,       rho_censor,
+    rho_censor, rho_censor, 1.00
+  ), nrow = 3, ncol = 3)
+  
+  Z <- MASS::mvrnorm(n, mu = c(0, 0, 0), Sigma = Sigma)
+  U <- pnorm(Z)
+  
+  # Optional Archimedean transformations on event margins if non-Gaussian
+  if (copula_scenario == "Clayton") {
+    theta <- 1.0
+    v <- rgamma(n, shape = 1 / theta, rate = 1)
+    e1 <- rexp(n); e2 <- rexp(n)
+    U[, 1] <- (1 + e1 / v)^(-1 / theta)
+    U[, 2] <- (1 + e2 / v)^(-1 / theta)
+  } else if (copula_scenario == "Gumbel") {
+    theta <- 1.5
+    alpha <- 1 / theta
+    U_g <- runif(n, 0, pi); W <- rexp(n)
+    V <- (sin(alpha * U_g) / (sin(U_g)^(1 / alpha))) * (sin((1 - alpha) * U_g) / W)^((1 - alpha) / alpha)
+    V <- pmax(V, 1e-12)
+    E1 <- rexp(n); E2 <- rexp(n)
+    U[, 1] <- exp(-((E1 / V)^alpha))
+    U[, 2] <- exp(-((E2 / V)^alpha))
+  }
+  
+  pmin(pmax(U, 1e-10), 1 - 1e-10)
 }
 
-r_clayton_copula <- function(n, theta = 1) {
-  if (theta <= 0) stop("Clayton theta must be positive.")
-  v <- rgamma(n, shape = 1 / theta, rate = 1)
-  e1 <- rexp(n); e2 <- rexp(n)
-  u1 <- (1 + e1 / v)^(-1 / theta)
-  u2 <- (1 + e2 / v)^(-1 / theta)
-  cbind(u1, u2)
-}
-
-r_gumbel_copula <- function(n, theta = 1.5) {
-  if (theta < 1) stop("Gumbel theta must be at least 1.")
-  if (abs(theta - 1) < 1e-10) return(cbind(runif(n), runif(n)))
-  
-  alpha <- 1 / theta
-  U <- runif(n, 0, pi)
-  W <- rexp(n)
-  
-  V <- (sin(alpha * U) / (sin(U)^(1 / alpha))) * 
-       (sin((1 - alpha) * U) / W)^((1 - alpha) / alpha)
-  V <- pmax(V, 1e-12)
-  
-  E1 <- rexp(n); E2 <- rexp(n)
-  u1 <- exp(-((E1 / V)^alpha))
-  u2 <- exp(-((E2 / V)^alpha))
-  
-  cbind(pmin(pmax(u1, 1e-10), 1 - 1e-10), pmin(pmax(u2, 1e-10), 1 - 1e-10))
-}
-
-generate_uniforms <- function(n, copula_name) {
-  switch(
-    copula_name,
-    Independence = cbind(runif(n), runif(n)),
-    Gaussian     = r_gaussian_copula(n, rho = 0.50),
-    Clayton      = r_clayton_copula(n, theta = 1),
-    Gumbel       = r_gumbel_copula(n, theta = 1.5),
-    stop("Unknown copula scenario: ", copula_name)
-  )
-}
-
-simulate_competing_risks <- function(n = 1500, copula_name = "Independence", seed = 2026, censor_rate = 0.12) {
+simulate_competing_risks <- function(n = 1500, copula_name = "Gaussian", seed = 2026, censor_scale = 0.12) {
   set.seed(seed)
   
   Z <- matrix(rnorm(n * 5), nrow = n, ncol = 5)
@@ -107,16 +125,18 @@ simulate_competing_risks <- function(n = 1500, copula_name = "Independence", see
   
   eta1 <- 0.35 * X1 + 0.30 * X2 + 0.20 * log1p(nodes) + 0.15 * (grade - 2) + 0.25 * sin(X3) - 0.35 * treatment
   eta2 <- 0.25 * X1 + 0.20 * X3 + 0.20 * (grade - 2) + 0.15 * X4^2 - 0.20 * treatment
+  eta_c <- 0.20 * X1 + 0.15 * X2 - 0.20 * treatment  # Covariate effect on censoring
   
   rate1 <- exp(-2.6 + eta1)
   rate2 <- exp(-3.0 + eta2)
+  rate_c <- censor_scale * exp(eta_c)
   
-  U <- generate_uniforms(n, copula_name)
-  U <- pmin(pmax(U, 1e-10), 1 - 1e-10)
+  # Joint Uniforms with Copula-Dependent Events AND Dependent Censoring
+  U <- r_trivariate_copula(n, copula_scenario = copula_name, rho_events = 0.50, rho_censor = 0.30)
   
   latent_time1 <- -log(U[, 1]) / rate1
   latent_time2 <- -log(U[, 2]) / rate2
-  censor_time  <- rexp(n, rate = censor_rate)
+  censor_time  <- -log(U[, 3]) / rate_c
   
   time <- pmin(latent_time1, latent_time2, censor_time)
   status <- ifelse(latent_time1 <= latent_time2 & latent_time1 <= censor_time, 1L,
@@ -131,7 +151,7 @@ simulate_competing_risks <- function(n = 1500, copula_name = "Independence", see
 }
 
 # =============================================================
-# 2. Copula Penalty Definitions for Neural Loss
+# 2. Custom Copula Penalties & Loss Functions
 # =============================================================
 
 tf_clip <- function(x, lower = 1e-7, upper = 1 - 1e-7) {
@@ -183,7 +203,7 @@ loss_gumbel_copula <- function(y_true, y_pred) {
 }
 
 # =============================================================
-# 3. Preprocessing & Targets Construction
+# 3. Preprocessing & Discrete Target Pipeline
 # =============================================================
 
 prepare_split <- function(data, seed = 2026, train_fraction = 0.70) {
@@ -255,10 +275,10 @@ make_discrete_targets <- function(time, status, breaks) {
 }
 
 # =============================================================
-# 4. Neural Architecture & Training Wrapper
+# 4. Deep Learning Model Generator & CIF Extractor
 # =============================================================
 
-make_nn <- function(architecture, p, K, copula_penalty = "Standard", learning_rate = 0.001) {
+create_nn_model <- function(architecture, p, K, copula_penalty = "Standard") {
   loss_fn <- switch(
     copula_penalty,
     "Standard" = loss_standard_cce,
@@ -267,38 +287,37 @@ make_nn <- function(architecture, p, K, copula_penalty = "Standard", learning_ra
     "Gumbel"   = loss_gumbel_copula
   )
 
-  input <- keras3::keras_input(shape = c(p, 1))
-  
+  input_layer <- keras3::keras_input(shape = c(p, 1), name = "input_layer")
+
   if (architecture == "MLP") {
-    x <- input |> keras3::layer_flatten() |> keras3::layer_dense(units = 64, activation = "relu") |> keras3::layer_dropout(rate = 0.20)
+    x <- input_layer |> keras3::layer_flatten() |> keras3::layer_dense(units = 64, activation = "relu") |> keras3::layer_dropout(rate = 0.25)
   } else if (architecture == "CNN") {
-    x <- input |> keras3::layer_conv_1d(filters = 32, kernel_size = 3, padding = "same", activation = "relu") |> keras3::layer_global_average_pooling_1d()
+    x <- input_layer |> keras3::layer_conv_1d(filters = 32, kernel_size = 3, padding = "same", activation = "relu") |> keras3::layer_global_average_pooling_1d()
   } else if (architecture == "LSTM") {
-    x <- input |> keras3::layer_lstm(units = 32, return_sequences = FALSE)
+    x <- input_layer |> keras3::layer_lstm(units = 64, return_sequences = FALSE)
   } else if (architecture == "CNN_LSTM") {
-    x <- input |> keras3::layer_conv_1d(filters = 32, kernel_size = 3, padding = "same", activation = "relu") |> keras3::layer_lstm(units = 32, return_sequences = FALSE)
-  } else {
-    stop("Unknown architecture: ", architecture)
+    x <- input_layer |> keras3::layer_conv_1d(filters = 32, kernel_size = 3, padding = "same", activation = "relu") |> keras3::layer_batch_normalization() |> keras3::layer_dropout(rate = 0.25) |> keras3::layer_lstm(units = 64, return_sequences = FALSE)
   }
-  
-  output <- x |>
-    keras3::layer_dense(units = 64, activation = "relu") |>
-    keras3::layer_dense(units = K * 3) |>
-    keras3::layer_reshape(target_shape = c(K, 3)) |>
-    keras3::layer_activation(activation = "softmax")
-  
-  model <- keras3::keras_model(inputs = input, outputs = output)
+
+  output_layer <- x |> 
+    keras3::layer_dense(units = 32, activation = "relu") |> 
+    keras3::layer_dropout(rate = 0.25) |> 
+    keras3::layer_dense(units = K * 3, activation = "linear") |> 
+    keras3::layer_reshape(target_shape = c(K, 3)) |> 
+    keras3::layer_activation(activation = "softmax", name = "interval_probabilities")
+
+  model <- keras3::keras_model(inputs = input_layer, outputs = output_layer)
   model |> keras3::compile(
-    optimizer = keras3::optimizer_adam(learning_rate = learning_rate),
+    optimizer = keras3::optimizer_adam(learning_rate = LEARNING_RATE),
     loss = loss_fn
   )
-  model
+  return(model)
 }
 
 fit_nn <- function(architecture, X, y, weights, K, copula_penalty = "Standard", seed = 2026) {
   set.seed(seed)
   X_array <- array(as.numeric(X), dim = c(nrow(X), ncol(X), 1))
-  model <- make_nn(architecture, ncol(X), K, copula_penalty, LEARNING_RATE)
+  model <- create_nn_model(architecture, ncol(X), K, copula_penalty)
   
   callbacks <- list(
     keras3::callback_early_stopping(monitor = "val_loss", patience = 8, restore_best_weights = TRUE),
@@ -312,39 +331,38 @@ fit_nn <- function(architecture, X, y, weights, K, copula_penalty = "Standard", 
   list(model = model, architecture = architecture)
 }
 
-predict_cif_nn <- function(model, X, K) {
+extract_cif <- function(model, X, K) {
   X_array <- array(as.numeric(X), dim = c(nrow(X), ncol(X), 1))
   q <- predict(model, X_array, verbose = 0)
   n <- dim(q)[1]
   
   cif1 <- matrix(0, n, K)
   cif2 <- matrix(0, n, K)
-  survival_probability <- matrix(1, n, K)
+  survival_prob <- matrix(1, n, K)
   
   for (i in seq_len(n)) {
-    S <- 1; F1 <- 0; F2 <- 0
+    s_prev <- 1; f1 <- 0; f2 <- 0
     for (k in seq_len(K)) {
       q0 <- q[i, k, 1]; q1 <- q[i, k, 2]; q2 <- q[i, k, 3]
-      F1 <- F1 + S * q1
-      F2 <- F2 + S * q2
-      S  <- S * q0
-      cif1[i, k] <- F1
-      cif2[i, k] <- F2
-      survival_probability[i, k] <- S
+      f1 <- f1 + s_prev * q1
+      f2 <- f2 + s_prev * q2
+      s_prev <- s_prev * q0
+      cif1[i, k] <- f1
+      cif2[i, k] <- f2
+      survival_prob[i, k] <- s_prev
     }
   }
-  list(cif1 = cif1, cif2 = cif2, survival = survival_probability)
+  list(cif1 = cif1, cif2 = cif2, survival = survival_prob)
 }
 
 # =============================================================
-# 5. Classical Survival Benchmarks (CSC and Fine-Gray)
+# 5. Benchmarks & Evaluation Metrics
 # =============================================================
 
 fit_classical_benchmarks <- function(split) {
   train_df <- data.frame(time = split$time_train, status = split$status_train, split$X_train_raw)
   test_df  <- data.frame(time = split$time_test, status = split$status_test, split$X_test_raw)
   
-  # Cause-Specific Cox Models
   csc_models <- list()
   for (cause in 1:2) {
     csc_data <- train_df
@@ -353,7 +371,6 @@ fit_classical_benchmarks <- function(split) {
     csc_models[[cause]] <- survival::coxph(form, data = csc_data, x = TRUE)
   }
   
-  # Fine-Gray Models
   X_tr_fg <- model.matrix(reformulate(split$features), data = train_df)[, -1, drop = FALSE]
   X_te_fg <- model.matrix(reformulate(split$features), data = test_df)[, -1, drop = FALSE]
   fg_models <- list()
@@ -374,10 +391,6 @@ fit_classical_benchmarks <- function(split) {
   }
   pred_scores
 }
-
-# =============================================================
-# 6. Evaluation Metrics
-# =============================================================
 
 cause_cindex <- function(time, status, risk, cause) {
   if (length(risk) != length(time) || !any(is.finite(risk))) return(NA_real_)
@@ -428,12 +441,12 @@ ipcw_brier <- function(time_train, status_train, time_test, status_test, risk, c
 }
 
 # =============================================================
-# 7. Replication Execution Loop
+# 6. Replication Loop
 # =============================================================
 
 run_one_experiment <- function(replication, copula_name) {
   seed <- MASTER_SEED + replication * 1000 + match(copula_name, c("Independence", "Gaussian", "Clayton", "Gumbel"))
-  cat("\nReplication:", replication, "| Copula scenario:", copula_name, "\n")
+  cat("\nReplication:", replication, "| Copula scenario (with Dependent Censoring):", copula_name, "\n")
   
   data  <- simulate_competing_risks(n = N, copula_name = copula_name, seed = seed)
   split <- prepare_split(data, seed = seed + 10, train_fraction = TRAIN_FRACTION)
@@ -451,14 +464,14 @@ run_one_experiment <- function(replication, copula_name) {
   architectures <- c("MLP", "CNN", "LSTM", "CNN_LSTM")
   copula_variants <- c("Standard", "Gaussian", "Clayton", "Gumbel")
   
-  # 1. Copula-Penalized Neural Network Experiments across all Architectures
+  # 1. Neural Networks
   for (arch in architectures) {
     for (cop_p in copula_variants) {
       model_label <- if (cop_p == "Standard") arch else paste0(arch, "_", cop_p)
       
       keras3::clear_session()
       fitted <- fit_nn(arch, split$X_train, targets$y, targets$weights, K, copula_penalty = cop_p, seed = seed + 100 + row_id)
-      nn_cif <- predict_cif_nn(fitted$model, split$X_test, K)
+      nn_cif <- extract_cif(fitted$model, split$X_test, K)
       
       for (cause in 1:2) {
         risk_mat <- if (cause == 1) nn_cif$cif1 else nn_cif$cif2
@@ -478,7 +491,7 @@ run_one_experiment <- function(replication, copula_name) {
     }
   }
   
-  # 2. Random Survival Forest Benchmark
+  # 2. RSF
   rsf_train <- data.frame(time = split$time_train, status = factor(split$status_train, levels = c(0, 1, 2), labels = c("censored", "recurrence", "death")), split$X_train_raw)
   rsf_test  <- data.frame(split$X_test_raw)
   set.seed(seed + 200)
@@ -502,7 +515,7 @@ run_one_experiment <- function(replication, copula_name) {
     }
   }
   
-  # 3. Cause-Specific Cox and Fine-Gray Benchmarks
+  # 3. Cause-Specific Cox and Fine-Gray
   classical_preds <- fit_classical_benchmarks(split)
   for (model_key in names(classical_preds)) {
     cause <- as.integer(gsub(".*_Cause", "", model_key))
@@ -524,7 +537,7 @@ run_one_experiment <- function(replication, copula_name) {
 }
 
 # =============================================================
-# 8. Main Execution Loop
+# 7. Execution and Summaries
 # =============================================================
 
 scenarios <- c("Independence", "Gaussian", "Clayton", "Gumbel")
@@ -543,10 +556,6 @@ for (scenario in scenarios) {
 
 results <- bind_rows(all_results)
 write.csv(results, file.path(OUTPUT_DIR, "All_Replication_Results.csv"), row.names = FALSE)
-
-# =============================================================
-# 9. Summary & Monte Carlo Standard Errors
-# =============================================================
 
 summary_results <- results |>
   group_by(Scenario, Model, Cause, Horizon) |>
@@ -569,14 +578,12 @@ summary_results <- results |>
   )
 
 write.csv(summary_results, file.path(OUTPUT_DIR, "Repeated_Simulation_Summary.csv"), row.names = FALSE)
-cat("\nRepeated simulation summary:\n")
-print(summary_results, n = 50)
 
 # =============================================================
-# 10. Publication Plots
+# 8. Publication Plots
 # =============================================================
 
-plot_metric <- function(data, metric, y_label, filename) {
+plot_sim_metric <- function(data, metric, y_label, filename) {
   p <- ggplot(data, aes(x = Horizon, y = .data[[metric]], color = Model, linetype = Model, shape = Model, group = Model)) +
     geom_line(linewidth = 0.7, na.rm = TRUE) +
     geom_point(size = 2, na.rm = TRUE) +
@@ -589,19 +596,15 @@ plot_metric <- function(data, metric, y_label, filename) {
       strip.text = element_text(face = "bold"),
       panel.grid.minor = element_blank()
     ) +
-    guides(color = guide_legend(nrow = 3))
+    guides(color = guide_legend(nrow = 5))
   
   ggsave(filename = file.path(OUTPUT_DIR, filename), plot = p, width = 12, height = 9, dpi = 300, bg = "white")
   p
 }
 
-p_cindex <- plot_metric(summary_results, "Mean_Cindex", "Mean cause-specific C-index", "Repeated_Cindex.png")
-p_auc    <- plot_metric(summary_results, "Mean_AUC", "Mean time-dependent AUC", "Repeated_Time_AUC.png")
-p_brier  <- plot_metric(filter(summary_results, is.finite(Mean_Brier)), "Mean_Brier", "Mean IPCW Brier score", "Repeated_IPCW_Brier.png")
-
-print(p_cindex)
-print(p_auc)
-print(p_brier)
+p_cindex <- plot_sim_metric(summary_results, "Mean_Cindex", "Mean Cause-Specific C-index", "Repeated_Cindex.png")
+p_auc    <- plot_sim_metric(summary_results, "Mean_AUC", "Mean Time-Dependent AUC", "Repeated_Time_AUC.png")
+p_brier  <- plot_sim_metric(filter(summary_results, is.finite(Mean_Brier)), "Mean_Brier", "Mean IPCW Brier Score", "Repeated_IPCW_Brier.png")
 
 pdf(file.path(OUTPUT_DIR, "Repeated_Simulation_Performance.pdf"), width = 12, height = 9, onefile = TRUE)
 print(p_cindex)
@@ -609,4 +612,4 @@ print(p_auc)
 print(p_brier)
 dev.off()
 
-cat("\nSimulation completed. Results directory: ", normalizePath(OUTPUT_DIR), "\n")
+cat("\nSimulation with Copula-Dependent Censoring complete. Results saved in:\n", normalizePath(OUTPUT_DIR), "\n")

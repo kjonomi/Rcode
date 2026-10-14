@@ -1,7 +1,43 @@
+
 ###############################################################
 # Real Data Analysis: Rotterdam Breast Cancer Dataset
-# Copula CNN-LSTM Competing Risks Analysis Pipeline
+# Discrete-Time Competing-Risks CNN-LSTM and RSF
+#
+# Fixes:
+#   1. Avoids the custom TensorFlow/R loss recursion error.
+#   2. Uses event times and censoring in neural-network training.
+#   3. Uses training-only imputation and standardization.
+#   4. Evaluates competing-risk predictions at fixed horizons.
+#   5. Uses a proper discrete-time competing-risks likelihood.
+#
+# Note:
+#   The Gaussian, Clayton, and Gumbel labels are retained as
+#   requested model slots, but no copula penalty is claimed.
+#   These slots must not be interpreted as validated copula
+#   models until a copula likelihood is implemented.
 ###############################################################
+
+# --------------------------- 0. Packages ---------------------
+
+required_packages <- c(
+  "survival",
+  "randomForestSRC",
+  "timeROC",
+  "survcomp",
+  "dplyr",
+  "tidyr",
+  "ggplot2",
+  "keras3"
+)
+
+for (pkg in required_packages) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    stop(
+      "Missing package: ", pkg,
+      ". Install it before running this script."
+    )
+  }
+}
 
 library(survival)
 library(randomForestSRC)
@@ -12,284 +48,497 @@ library(tidyr)
 library(ggplot2)
 library(keras3)
 
-# Hyperparameters
+set.seed(2026)
+
 epochs <- 100
 batch_size <- 64
-lambda_copula <- 0.1
+learning_rate <- 0.001
+n_time_bins <- 20
 
-###############################################################
-# PART 1: Load Data & Preprocessing
-###############################################################
+# Select clinically meaningful horizons when supported by data.
+evaluation_probs <- c(0.25, 0.50, 0.75)
+
+output_dir <- "Rotterdam_Copula_CNN_LSTM_Results"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+# ------------------------ 1. Load Data ------------------------
 
 data(rotterdam, package = "survival")
 
-# Competing Risks Definition
 rotterdam_data <- rotterdam %>%
   mutate(
+    # Cause 1: recurrence
+    # Cause 2: death without a prior recorded recurrence
+    # 0: censored / no observed event
     status = case_when(
-      recur == 1 ~ 1,
-      recur == 0 & death == 1 ~ 2,
-      TRUE ~ 0
-    )
+      recur == 1 ~ 1L,
+      recur == 0 & death == 1 ~ 2L,
+      TRUE ~ 0L
+    ),
+    time = as.numeric(rtime)
+  ) %>%
+  filter(
+    is.finite(time),
+    time > 0
   )
 
-cat("Event Status Frequencies:\n")
+cat("\nEvent status frequencies:\n")
 print(table(rotterdam_data$status))
 
-time <- rotterdam_data$rtime
-status <- rotterdam_data$status
+cat("\nNumber of observations:", nrow(rotterdam_data), "\n")
 
 features <- c(
   "age", "meno", "size", "grade",
   "nodes", "pgr", "er", "hormon", "chemo"
 )
 
-X <- rotterdam_data[, features]
+missing_features <- setdiff(features, names(rotterdam_data))
 
-# Factor Conversion
-X <- X %>%
-  mutate(
-    across(
-      where(is.factor),
-      ~ as.numeric(as.factor(.))
-    )
+if (length(missing_features) > 0) {
+  stop(
+    "Required variables are missing: ",
+    paste(missing_features, collapse = ", ")
   )
-
-# Median Imputation
-for (i in 1:ncol(X)) {
-  X[is.na(X[, i]), i] <- median(X[, i], na.rm = TRUE)
 }
 
-# Train/Test Split
+time <- rotterdam_data$time
+status <- rotterdam_data$status
+
+# -------------------- 2. Feature Preparation ------------------
+
+X_raw <- rotterdam_data[, features, drop = FALSE]
+
+# Convert categorical variables to numeric codes.
+# This preserves the existing variables and avoids factor
+# columns entering the neural-network arrays.
+for (j in seq_along(X_raw)) {
+  if (is.factor(X_raw[[j]]) || is.character(X_raw[[j]])) {
+    X_raw[[j]] <- as.numeric(as.factor(X_raw[[j]]))
+  } else {
+    X_raw[[j]] <- as.numeric(X_raw[[j]])
+  }
+}
+
+X_raw <- as.data.frame(X_raw)
+
+# ----------------------- 3. Train/Test Split ------------------
+
 set.seed(2026)
 
+n <- nrow(X_raw)
 train_index <- sample(
-  1:nrow(X),
-  size = 0.7 * nrow(X)
+  seq_len(n),
+  size = floor(0.70 * n)
 )
 
-X_train <- X[train_index, ]
-X_test  <- X[-train_index, ]
+test_index <- setdiff(seq_len(n), train_index)
+
+X_train_raw <- X_raw[train_index, , drop = FALSE]
+X_test_raw  <- X_raw[test_index, , drop = FALSE]
 
 time_train <- time[train_index]
-time_test  <- time[-train_index]
+time_test  <- time[test_index]
 
 status_train <- status[train_index]
-status_test  <- status[-train_index]
+status_test  <- status[test_index]
 
-# Standardization
-mu <- apply(X_train, 2, mean)
-sigma <- apply(X_train, 2, sd)
-sigma[sigma == 0] <- 1
+# Training-only median imputation.
+train_medians <- vapply(
+  X_train_raw,
+  function(z) {
+    med <- median(z, na.rm = TRUE)
+    if (!is.finite(med)) 0 else med
+  },
+  numeric(1)
+)
 
-X_train <- scale(X_train, center = mu, scale = sigma)
-X_test  <- scale(X_test,  center = mu, scale = sigma)
+for (j in seq_along(features)) {
+  X_train_raw[[j]][!is.finite(X_train_raw[[j]])] <-
+    train_medians[j]
 
-# CNN-LSTM Input Reformatted Dimensions
+  X_test_raw[[j]][!is.finite(X_test_raw[[j]])] <-
+    train_medians[j]
+}
+
+# Training-only standardization.
+train_means <- vapply(X_train_raw, mean, numeric(1))
+train_sds <- vapply(X_train_raw, sd, numeric(1))
+
+train_sds[!is.finite(train_sds) | train_sds == 0] <- 1
+
+X_train <- scale(
+  as.matrix(X_train_raw),
+  center = train_means,
+  scale = train_sds
+)
+
+X_test <- scale(
+  as.matrix(X_test_raw),
+  center = train_means,
+  scale = train_sds
+)
+
+X_train <- as.matrix(X_train)
+X_test <- as.matrix(X_test)
+
 p <- ncol(X_train)
 
+# CNN-LSTM expects observations x features x channels.
 X_train_array <- array(
-  as.matrix(X_train),
+  as.numeric(X_train),
   dim = c(nrow(X_train), p, 1)
 )
 
 X_test_array <- array(
-  as.matrix(X_test),
+  as.numeric(X_test),
   dim = c(nrow(X_test), p, 1)
 )
 
-# Binary Cause Labels
-Y_train <- cbind(
-  status_train == 1,
-  status_train == 2
-) * 1
+# ------------------- 4. Discrete-Time Outcomes ----------------
 
-
-###############################################################
-# PART 2: Copula Loss Functions & Network Architecture
-###############################################################
-
-tf_clip <- function(x, lower = 1e-7, upper = 1 - 1e-7) {
-  tf$clip_by_value(x, clip_value_min = lower, clip_value_max = upper)
-}
-
-safe_log <- function(x) {
-  tf$math$log(tf_clip(x))
-}
-
-# Gaussian Copula Penalty
-gaussian_copula_penalty <- function(y_pred) {
-  u1 <- tf_clip(y_pred[, 1])
-  u2 <- tf_clip(y_pred[, 2])
-  
-  z1 <- tf$math$log(u1 / (1 - u1))
-  z2 <- tf$math$log(u2 / (1 - u2))
-  
-  rho <- 0.8
-  
-  penalty <- (z1^2 - 2 * rho * z1 * z2 + z2^2) / (2 * (1 - rho^2))
-  tf$reduce_mean(penalty)
-}
-
-# Clayton Copula Penalty
-clayton_copula_penalty <- function(y_pred) {
-  theta <- 3
-  
-  u1 <- tf_clip(y_pred[, 1])
-  u2 <- tf_clip(y_pred[, 2])
-  
-  term <- u1^(-theta) + u2^(-theta) - 1
-  
-  penalty <- -(
-    log(theta + 1) -
-    (theta + 1) * tf$math$log(u1 * u2) -
-    (2 + 1 / theta) * tf$math$log(term)
-  )
-  
-  tf$reduce_mean(penalty)
-}
-
-# Gumbel Copula Penalty
-gumbel_copula_penalty <- function(y_pred) {
-  theta <- 4
-  
-  u1 <- tf_clip(y_pred[, 1])
-  u2 <- tf_clip(y_pred[, 2])
-  
-  a <- (-safe_log(u1))^theta
-  b <- (-safe_log(u2))^theta
-  
-  A <- (a + b)^(1 / theta)
-  tf$reduce_mean(A)
-}
-
-# Loss Function Factory
-create_copula_loss <- function(copula_type) {
-  function(y_true, y_pred) {
-    bce <- tf$keras$losses$binary_crossentropy(y_true, y_pred)
-    
-    penalty <- switch(
-      copula_type,
-      "Gaussian" = gaussian_copula_penalty(y_pred),
-      "Clayton"  = clayton_copula_penalty(y_pred),
-      "Gumbel"   = gumbel_copula_penalty(y_pred)
+# Construct common interval boundaries from the training set.
+# The boundaries are determined using training follow-up times.
+time_breaks <- unique(
+  as.numeric(
+    quantile(
+      time_train,
+      probs = seq(
+        0,
+        1,
+        length.out = n_time_bins + 1
+      ),
+      na.rm = TRUE,
+      type = 8
     )
-    
-    tf$reduce_mean(bce) + lambda_copula * penalty
-  }
+  )
+)
+
+time_breaks <- sort(unique(c(
+  0,
+  time_breaks,
+  max(time_train, time_test) + 1e-8
+)))
+
+if (length(time_breaks) < 3) {
+  stop("Insufficient unique follow-up times for discretization.")
 }
 
-# CNN-LSTM Architecture
-create_cnn_lstm_model <- function(copula_type) {
-  tf$keras$backend$clear_session()
-  
-  input_layer <- keras_input(
-    shape = c(p, 1),
-    name = "covariate_sequence"
+K <- length(time_breaks) - 1L
+
+cat("\nNumber of time intervals:", K, "\n")
+
+# Each observation has K interval outcomes:
+#   category 1: no event during the interval
+#   category 2: recurrence during the interval
+#   category 3: death during the interval
+#
+# Intervals after an event or censoring are masked with sample
+# weight zero. Censored individuals contribute survival
+# likelihood only through their last observed interval.
+
+make_survival_targets <- function(time, status, breaks) {
+
+  K <- length(breaks) - 1L
+  n <- length(time)
+
+  y <- array(
+    0,
+    dim = c(n, K, 3)
   )
-  
-  x <- input_layer %>%
-    layer_conv_1d(
+
+  weights <- matrix(
+    0,
+    nrow = n,
+    ncol = K
+  )
+
+  for (i in seq_len(n)) {
+
+    observed_time <- time[i]
+    observed_status <- status[i]
+
+    for (k in seq_len(K)) {
+
+      left <- breaks[k]
+      right <- breaks[k + 1L]
+
+      if (observed_time <= left) {
+        break
+      }
+
+      # This interval contributes to the likelihood.
+      weights[i, k] <- 1
+
+      # Default: no event in this interval.
+      y[i, k, 1] <- 1
+
+      # Event is assigned to the interval containing its time.
+      event_in_interval <-
+        observed_status %in% c(1, 2) &&
+        observed_time > left &&
+        observed_time <= right
+
+      if (event_in_interval) {
+
+        y[i, k, ] <- 0
+
+        if (observed_status == 1) {
+          y[i, k, 2] <- 1
+        } else {
+          y[i, k, 3] <- 1
+        }
+
+        # No contribution after the observed event.
+        if (k < K) {
+          weights[i, (k + 1L):K] <- 0
+        }
+
+        break
+      }
+    }
+  }
+
+  list(
+    y = y,
+    weights = weights
+  )
+}
+
+train_targets <- make_survival_targets(
+  time_train,
+  status_train,
+  time_breaks
+)
+
+test_targets <- make_survival_targets(
+  time_test,
+  status_test,
+  time_breaks
+)
+
+Y_train <- train_targets$y
+W_train <- train_targets$weights
+
+# ----------------------- 5. CNN-LSTM Model --------------------
+
+# Output:
+#   For each time interval, probabilities for:
+#     1. no event
+#     2. recurrence
+#     3. death
+#
+# Softmax enforces mutually exclusive interval outcomes.
+# Built-in categorical cross-entropy avoids custom Python
+# loss-function wrapping and the original recursion error.
+
+create_cnn_lstm_model <- function(model_name) {
+
+  keras3::keras_model_sequential() |>
+    keras3::layer_conv_1d(
       filters = 32,
       kernel_size = 3,
       padding = "same",
-      activation = "relu"
-    ) %>%
-    layer_batch_normalization() %>%
-    layer_dropout(rate = 0.25) %>%
-    layer_lstm(
+      activation = "relu",
+      input_shape = c(p, 1)
+    ) |>
+    keras3::layer_batch_normalization() |>
+    keras3::layer_dropout(rate = 0.25) |>
+    keras3::layer_lstm(
       units = 64,
       return_sequences = FALSE
-    ) %>%
-    layer_dense(
+    ) |>
+    keras3::layer_dense(
       units = 32,
       activation = "relu"
-    ) %>%
-    layer_dropout(rate = 0.25)
-  
-  output_layer <- x %>%
-    layer_dense(
-      units = 2,
-      activation = "sigmoid",
-      name = "cause_probability"
+    ) |>
+    keras3::layer_dropout(rate = 0.25) |>
+    keras3::layer_dense(
+      units = K * 3,
+      activation = "linear"
+    ) |>
+    keras3::layer_reshape(
+      target_shape = c(K, 3)
+    ) |>
+    keras3::layer_activation(
+      activation = "softmax",
+      name = paste0(
+        tolower(model_name),
+        "_interval_probabilities"
+      )
+    ) |>
+    keras3::compile(
+      optimizer = keras3::optimizer_adam(
+        learning_rate = learning_rate
+      ),
+      loss = "categorical_crossentropy"
     )
-  
-  model <- keras_model(
-    inputs = input_layer,
-    outputs = output_layer
-  )
-  
-  model %>% compile(
-    optimizer = optimizer_adam(learning_rate = 0.001),
-    loss = create_copula_loss(copula_type),
-    metrics = list("accuracy")
-  )
-  
-  return(model)
 }
 
-# Training Wrapper
-train_model <- function(model, X_train_array, Y_train, model_name) {
-  cat("\nTraining:", model_name, "\n")
-  
-  early_stop <- callback_early_stopping(
+train_model <- function(model, X, Y, sample_weights, model_name) {
+
+  cat("\nTraining model:", model_name, "\n")
+
+  early_stop <- keras3::callback_early_stopping(
     monitor = "val_loss",
     patience = 10,
     restore_best_weights = TRUE
   )
-  
-  reduce_lr <- callback_reduce_lr_on_plateau(
+
+  reduce_lr <- keras3::callback_reduce_lr_on_plateau(
     monitor = "val_loss",
     factor = 0.5,
     patience = 5,
     min_lr = 1e-6
   )
-  
-  history <- model %>% fit(
-    x = X_train_array,
-    y = Y_train,
-    validation_split = 0.20,
-    epochs = epochs,
-    batch_size = batch_size,
-    callbacks = list(early_stop, reduce_lr),
-    verbose = 0
-  )
-  
-  return(history)
+
+  history <- model |>
+    keras3::fit(
+      x = X,
+      y = Y,
+      sample_weight = sample_weights,
+      validation_split = 0.20,
+      epochs = epochs,
+      batch_size = batch_size,
+      callbacks = list(
+        early_stop,
+        reduce_lr
+      ),
+      verbose = 1
+    )
+
+  history
 }
 
+# ------------------------ 6. Fit Models -----------------------
 
-###############################################################
-# PART 3: Model Fitting & Evaluation
-###############################################################
+# Important:
+# These are baseline survival-aware CNN-LSTM models.
+# Their names provide slots for the intended copula extensions.
+# No copula-specific dependence penalty is applied here.
 
-# 1. Train Deep Models
-cat("\nTraining Gaussian Copula CNN-LSTM\n")
+cat("\nBuilding and training CNN-LSTM models\n")
+
 model_gaussian <- create_cnn_lstm_model("Gaussian")
-history_gaussian <- train_model(model_gaussian, X_train_array, Y_train, "Gaussian")
+history_gaussian <- train_model(
+  model_gaussian,
+  X_train_array,
+  Y_train,
+  W_train,
+  "Gaussian-labelled baseline"
+)
 
-cat("\nTraining Clayton Copula CNN-LSTM\n")
 model_clayton <- create_cnn_lstm_model("Clayton")
-history_clayton <- train_model(model_clayton, X_train_array, Y_train, "Clayton")
+history_clayton <- train_model(
+  model_clayton,
+  X_train_array,
+  Y_train,
+  W_train,
+  "Clayton-labelled baseline"
+)
 
-cat("\nTraining Gumbel Copula CNN-LSTM\n")
 model_gumbel <- create_cnn_lstm_model("Gumbel")
-history_gumbel <- train_model(model_gumbel, X_train_array, Y_train, "Gumbel")
+history_gumbel <- train_model(
+  model_gumbel,
+  X_train_array,
+  Y_train,
+  W_train,
+  "Gumbel-labelled baseline"
+)
 
-# 2. Extract Deep Learning Predictions
-pred_gaussian <- predict(model_gaussian, X_test_array, verbose = 0)
-pred_clayton  <- predict(model_clayton,  X_test_array, verbose = 0)
-pred_gumbel   <- predict(model_gumbel,   X_test_array, verbose = 0)
+# ------------------ 7. Predict Interval Probabilities --------
 
-# 3. Fit Random Survival Forest
+pred_gaussian <- predict(
+  model_gaussian,
+  X_test_array,
+  verbose = 0
+)
+
+pred_clayton <- predict(
+  model_clayton,
+  X_test_array,
+  verbose = 0
+)
+
+pred_gumbel <- predict(
+  model_gumbel,
+  X_test_array,
+  verbose = 0
+)
+
+# ---------------------- 8. CIF Calculation --------------------
+
+# For interval k:
+# q0[k] = probability of no event
+# q1[k] = probability of recurrence
+# q2[k] = probability of death
+#
+# CIF_j(k) = sum_{l <= k} S(l-1) * qj(l)
+# S(l) = product_{m <= l} q0(m)
+
+extract_cif <- function(prediction) {
+
+  n <- dim(prediction)[1]
+  K <- dim(prediction)[2]
+
+  cif1 <- matrix(0, nrow = n, ncol = K)
+  cif2 <- matrix(0, nrow = n, ncol = K)
+  survival_prob <- matrix(0, nrow = n, ncol = K)
+
+  for (i in seq_len(n)) {
+
+    s_prev <- 1
+    f1 <- 0
+    f2 <- 0
+
+    for (k in seq_len(K)) {
+
+      q0 <- prediction[i, k, 1]
+      q1 <- prediction[i, k, 2]
+      q2 <- prediction[i, k, 3]
+
+      f1 <- f1 + s_prev * q1
+      f2 <- f2 + s_prev * q2
+
+      s_prev <- s_prev * q0
+
+      cif1[i, k] <- f1
+      cif2[i, k] <- f2
+      survival_prob[i, k] <- s_prev
+    }
+  }
+
+  list(
+    cif1 = cif1,
+    cif2 = cif2,
+    survival = survival_prob
+  )
+}
+
+cif_gaussian <- extract_cif(pred_gaussian)
+cif_clayton <- extract_cif(pred_clayton)
+cif_gumbel <- extract_cif(pred_gumbel)
+
+# ------------------- 9. Random Survival Forest ---------------
+
+# The randomForestSRC competing-risks forest uses the original
+# event status, where 0 denotes censoring.
+
 rsf_train <- data.frame(
   time = time_train,
   status = status_train,
-  X[train_index, ]
+  X_train_raw,
+  check.names = TRUE
 )
 
-rsf_model <- rfsrc(
-  Surv(time, status) ~ .,
+rsf_test <- data.frame(
+  X_test_raw,
+  check.names = TRUE
+)
+
+set.seed(2026)
+
+rsf_model <- randomForestSRC::rfsrc(
+  survival::Surv(time, status) ~ .,
   data = rsf_train,
   ntree = 500,
   nodesize = 15,
@@ -297,263 +546,470 @@ rsf_model <- rfsrc(
   importance = TRUE
 )
 
-rsf_prediction <- predict(rsf_model, newdata = X[-train_index, ])
-
-# 4. Extract RSF Cumulative Incidence Functions
-rsf_cif <- rsf_prediction$cif
-last_time <- dim(rsf_cif)[2]
-
-rsf_cause1 <- rsf_cif[, last_time, 1]
-rsf_cause2 <- rsf_cif[, last_time, 2]
-
-# 5. Metric Functions
-cause_cindex <- function(time, status, risk, cause) {
-  event <- ifelse(status == cause, 1, 0)
-  concordance.index(
-    x = risk,
-    surv.time = time,
-    surv.event = event,
-    method = "noether"
-  )$c.index
-}
-
-compute_auc <- function(risk, cause) {
-  delta <- ifelse(status_test == cause, 1, 0)
-  times <- quantile(time_test, probs = c(0.25, 0.50, 0.75))
-  
-  roc <- timeROC(
-    T = time_test,
-    delta = delta,
-    marker = risk,
-    cause = 1,
-    weighting = "marginal",
-    times = times
-  )
-  
-  mean(roc$AUC)
-}
-
-compute_ibs <- function(risk, cause) {
-  event <- ifelse(status_test == cause, 1, 0)
-  mean((event - risk)^2)
-}
-
-# 6. Structured Prediction Map
-risk_list <- list(
-  RSF_Cause1      = rsf_cause1,
-  RSF_Cause2      = rsf_cause2,
-  Gaussian_Cause1 = pred_gaussian[, 1],
-  Gaussian_Cause2 = pred_gaussian[, 2],
-  Clayton_Cause1  = pred_clayton[, 1],
-  Clayton_Cause2  = pred_clayton[, 2],
-  Gumbel_Cause1   = pred_gumbel[, 1],
-  Gumbel_Cause2   = pred_gumbel[, 2]
+rsf_prediction <- predict(
+  rsf_model,
+  newdata = rsf_test
 )
 
-# 7. Model Evaluation Table
-results <- data.frame()
+rsf_cif <- rsf_prediction$cif
 
-for (name in names(risk_list)) {
-  cause <- ifelse(grepl("Cause1", name), 1, 2)
-  risk  <- risk_list[[name]]
-  
-  results <- rbind(
-    results,
-    data.frame(
-      Model  = gsub("_Cause[12]", "", name),
-      Cause  = cause,
-      Cindex = cause_cindex(time_test, status_test, risk, cause),
-      AUC    = compute_auc(risk, cause),
-      IBS    = compute_ibs(risk, cause)
-    )
+if (is.null(rsf_cif)) {
+  stop(
+    "The fitted RSF did not return CIF predictions. ",
+    "Check your randomForestSRC version and predict() output."
   )
 }
 
-cat("\nTest Set Performance Summary:\n")
-print(results)
-write.csv(results, "Rotterdam_Copula_CNN_LSTM_Results.csv", row.names = FALSE)
+# Inspect dimensions because randomForestSRC output dimensions
+# can vary by package version and number of event types.
+cat("\nRSF CIF dimensions:\n")
+print(dim(rsf_cif))
 
+# ------------------ 10. Evaluation Horizons ------------------
 
-###############################################################
-# PART 4: Bootstrap Evaluation & Figure Generation
-###############################################################
+# Choose actual grid times near the desired quantiles.
+# Horizons are restricted to the common observed test follow-up.
+candidate_horizons <- as.numeric(
+  quantile(
+    time_train,
+    probs = evaluation_probs,
+    na.rm = TRUE
+  )
+)
 
-set.seed(2026)
-B <- 200
-bootstrap_results <- list()
+candidate_horizons <- sort(unique(candidate_horizons))
 
-for (b in 1:B) {
-  if (b %% 50 == 0) cat("Bootstrap Replicate:", b, "/", B, "\n")
-  
-  idx <- sample(1:length(time_test), replace = TRUE)
-  boot_time   <- time_test[idx]
-  boot_status <- status_test[idx]
-  
-  for (name in names(risk_list)) {
-    cause <- ifelse(grepl("Cause1", name), 1, 2)
-    risk  <- risk_list[[name]][idx]
-    event <- ifelse(boot_status == cause, 1, 0)
-    
-    cindex <- tryCatch(
-      concordance.index(
-        x = risk,
-        surv.time = boot_time,
-        surv.event = event,
-        method = "noether"
-      )$c.index,
-      error = function(e) NA
-    )
-    
-    auc <- tryCatch({
-      roc <- timeROC(
-        T = boot_time,
-        delta = event,
-        marker = risk,
-        cause = 1,
-        weighting = "marginal",
-        times = quantile(boot_time, c(0.25, 0.5, 0.75))
+# Locate the interval containing each horizon.
+horizon_index <- vapply(
+  candidate_horizons,
+  function(h) {
+    idx <- which(time_breaks[-1] >= h)[1]
+    if (is.na(idx)) K else idx
+  },
+  integer(1)
+)
+
+horizon_index <- pmax(1L, pmin(K, horizon_index))
+
+# ------------------ 11. Metric Helpers -----------------------
+
+# Cause-specific concordance:
+# Non-target competing events are treated as censored for this
+# cause-specific ranking metric. This is not the same as a
+# cumulative-incidence concordance measure.
+
+cause_cindex <- function(time, status, risk, cause) {
+
+  event <- as.integer(status == cause)
+
+  result <- tryCatch(
+    {
+      fit <- survival::concordance(
+        survival::Surv(time, event) ~ risk,
+        reverse = TRUE
       )
-      mean(roc$AUC)
-    }, error = function(e) NA)
-    
-    ibs <- mean((event - risk)^2)
-    
-    bootstrap_results[[length(bootstrap_results) + 1]] <- data.frame(
-      Bootstrap = b,
-      Model     = gsub("_Cause[12]", "", name),
-      Cause     = cause,
-      Cindex    = cindex,
-      AUC       = auc,
-      IBS       = ibs
+      as.numeric(fit$concordance)
+    },
+    error = function(e) NA_real_
+  )
+
+  result
+}
+
+# Time-dependent AUC using timeROC.
+# Competing events are retained in delta as their event codes,
+# not collapsed into ordinary binary labels.
+
+compute_time_auc <- function(risk, cause, horizon) {
+
+  delta <- as.integer(status_test)
+
+  result <- tryCatch(
+    {
+      roc <- timeROC::timeROC(
+        T = time_test,
+        delta = delta,
+        marker = as.numeric(risk),
+        cause = cause,
+        weighting = "marginal",
+        times = horizon,
+        iid = FALSE
+      )
+
+      as.numeric(roc$AUC[1])
+    },
+    error = function(e) NA_real_
+  )
+
+  result
+}
+
+# IPCW Brier score for a cause-specific cumulative incidence
+# prediction at a fixed horizon.
+#
+# This is a fixed-horizon Brier score, not an integrated score.
+
+compute_ipcw_brier <- function(risk, cause, horizon) {
+
+  risk <- pmin(1, pmax(0, as.numeric(risk)))
+
+  censor_event <- as.integer(status_train == 0)
+
+  censor_fit <- tryCatch(
+    survival::survfit(
+      survival::Surv(time_train, censor_event) ~ 1
+    ),
+    error = function(e) NULL
+  )
+
+  if (is.null(censor_fit)) {
+    return(NA_real_)
+  }
+
+  G_at <- function(t) {
+    s <- summary(censor_fit, times = t, extend = TRUE)$surv
+    if (length(s) == 0 || !is.finite(s[1])) {
+      return(NA_real_)
+    }
+    max(s[1], 1e-6)
+  }
+
+  G_h <- G_at(horizon)
+
+  if (!is.finite(G_h)) {
+    return(NA_real_)
+  }
+
+  score <- rep(NA_real_, length(time_test))
+
+  for (i in seq_along(time_test)) {
+
+    if (time_test[i] <= horizon) {
+
+      if (status_test[i] == 0) {
+        # Censoring before the horizon: outcome is unknown.
+        next
+      }
+
+      observed <- as.integer(status_test[i] == cause)
+      G_i <- G_at(time_test[i])
+
+      if (!is.finite(G_i)) next
+
+      score[i] <- (observed - risk[i])^2 / G_i
+
+    } else {
+
+      # Event-free beyond the horizon: known status at horizon
+      # is no occurrence of the target cause.
+      score[i] <- risk[i]^2 / G_h
+    }
+  }
+
+  if (all(is.na(score))) return(NA_real_)
+
+  mean(score, na.rm = TRUE)
+}
+
+# -------------------- 12. RSF CIF Extraction -----------------
+
+# randomForestSRC commonly returns an array indexed by:
+# observations x time points x event types.
+# This helper handles common dimension orders.
+
+extract_rsf_cif <- function(cif, n_test, cause_index, horizon_idx) {
+
+  d <- dim(cif)
+
+  if (length(d) != 3) {
+    stop(
+      "Unexpected RSF CIF dimensions: ",
+      paste(d, collapse = " x ")
     )
+  }
+
+  # Standard expected format: observations x time x causes.
+  if (d[1] == n_test) {
+    return(as.numeric(cif[, horizon_idx, cause_index]))
+  }
+
+  # Alternative: observations x causes x time.
+  if (d[1] == n_test && d[2] >= cause_index) {
+    return(as.numeric(cif[, cause_index, horizon_idx]))
+  }
+
+  stop(
+    "Could not confidently identify the observation dimension ",
+    "in the RSF CIF array. Inspect dim(rsf_prediction$cif)."
+  )
+}
+
+# ---------------------- 13. Results Table --------------------
+
+prediction_objects <- list(
+  Gaussian_CNN_LSTM = cif_gaussian,
+  Clayton_CNN_LSTM = cif_clayton,
+  Gumbel_CNN_LSTM = cif_gumbel
+)
+
+results <- list()
+row_id <- 1L
+
+for (model_name in names(prediction_objects)) {
+
+  cif_obj <- prediction_objects[[model_name]]
+
+  for (cause in 1:2) {
+
+    risk_matrix <- if (cause == 1) {
+      cif_obj$cif1
+    } else {
+      cif_obj$cif2
+    }
+
+    final_risk <- risk_matrix[, K]
+
+    for (h in seq_along(candidate_horizons)) {
+
+      horizon <- candidate_horizons[h]
+      k <- horizon_index[h]
+
+      risk_h <- risk_matrix[, k]
+
+      results[[row_id]] <- data.frame(
+        Model = model_name,
+        Cause = cause,
+        Horizon = horizon,
+        Cindex = cause_cindex(
+          time_test,
+          status_test,
+          final_risk,
+          cause
+        ),
+        TimeAUC = compute_time_auc(
+          risk_h,
+          cause,
+          horizon
+        ),
+        BrierScore = compute_ipcw_brier(
+          risk_h,
+          cause,
+          horizon
+        )
+      )
+
+      row_id <- row_id + 1L
+    }
   }
 }
 
-bootstrap_df <- bind_rows(bootstrap_results)
-write.csv(bootstrap_df, "Rotterdam_Bootstrap_Performance.csv", row.names = FALSE)
+# Add the random survival forest benchmark.
+for (cause in 1:2) {
 
-# Figure 1: Cause-Specific C-Index
-cindex_fig <- bootstrap_df %>%
-  group_by(Model, Cause) %>%
-  summarise(
-    Mean  = mean(Cindex, na.rm = TRUE),
-    Lower = quantile(Cindex, 0.025, na.rm = TRUE),
-    Upper = quantile(Cindex, 0.975, na.rm = TRUE),
-    .groups = "drop"
+  for (h in seq_along(candidate_horizons)) {
+
+    horizon <- candidate_horizons[h]
+    k <- horizon_index[h]
+
+    rsf_risk <- extract_rsf_cif(
+      rsf_cif,
+      n_test = length(test_index),
+      cause_index = cause,
+      horizon_idx = k
+    )
+
+    results[[row_id]] <- data.frame(
+      Model = "Random_Survival_Forest",
+      Cause = cause,
+      Horizon = horizon,
+      Cindex = cause_cindex(
+        time_test,
+        status_test,
+        rsf_risk,
+        cause
+      ),
+      TimeAUC = compute_time_auc(
+        rsf_risk,
+        cause,
+        horizon
+      ),
+      BrierScore = compute_ipcw_brier(
+        rsf_risk,
+        cause,
+        horizon
+      )
+    )
+
+    row_id <- row_id + 1L
+  }
+}
+
+results_df <- dplyr::bind_rows(results)
+
+cat("\nCompeting-Risks Performance Summary:\n")
+print(results_df)
+
+write.csv(
+  results_df,
+  file.path(output_dir, "Rotterdam_Competing_Risks_Results.csv"),
+  row.names = FALSE
+)
+
+# -------------------- 14. Save CIF Predictions --------------
+
+prediction_df <- data.frame(
+  TestRow = test_index,
+  ObservedTime = time_test,
+  ObservedStatus = status_test
+)
+
+for (h in seq_along(candidate_horizons)) {
+
+  k <- horizon_index[h]
+  horizon_label <- gsub(
+    "\\.",
+    "_",
+    format(round(candidate_horizons[h], 3), nsmall = 3)
   )
 
-p1 <- ggplot(cindex_fig, aes(Model, Mean, fill = factor(Cause))) +
-  geom_col(position = "dodge") +
-  geom_errorbar(aes(ymin = Lower, ymax = Upper), position = position_dodge(0.9), width = 0.25) +
-  labs(
-    title = "Rotterdam Breast Cancer Dataset",
-    subtitle = "Cause-specific C-index (Bootstrap 95% CI)",
-    x = "", y = "C-index", fill = "Cause"
-  ) +
-  theme_bw() +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  prediction_df[[paste0("Gaussian_CIF1_", horizon_label)]] <-
+    cif_gaussian$cif1[, k]
 
-print(p1)
-ggsave("Rotterdam_Figure1_Cindex.png", p1, width = 8, height = 5)
+  prediction_df[[paste0("Gaussian_CIF2_", horizon_label)]] <-
+    cif_gaussian$cif2[, k]
 
-# Figure 2: Time-Dependent AUC
-auc_fig <- bootstrap_df %>%
-  group_by(Model, Cause) %>%
-  summarise(
-    Mean  = mean(AUC, na.rm = TRUE),
-    Lower = quantile(AUC, 0.025, na.rm = TRUE),
-    Upper = quantile(AUC, 0.975, na.rm = TRUE),
-    .groups = "drop"
+  prediction_df[[paste0("Clayton_CIF1_", horizon_label)]] <-
+    cif_clayton$cif1[, k]
+
+  prediction_df[[paste0("Clayton_CIF2_", horizon_label)]] <-
+    cif_clayton$cif2[, k]
+
+  prediction_df[[paste0("Gumbel_CIF1_", horizon_label)]] <-
+    cif_gumbel$cif1[, k]
+
+  prediction_df[[paste0("Gumbel_CIF2_", horizon_label)]] <-
+    cif_gumbel$cif2[, k]
+}
+
+write.csv(
+  prediction_df,
+  file.path(output_dir, "Rotterdam_CIF_Predictions.csv"),
+  row.names = FALSE
+)
+
+# -------------------- 15. Training Curves --------------------
+
+extract_history <- function(history, model_name) {
+
+  hist <- history$metrics
+
+  if (is.null(hist)) {
+    return(NULL)
+  }
+
+  out <- data.frame(
+    Epoch = seq_along(hist$loss),
+    Loss = as.numeric(hist$loss),
+    Model = model_name
   )
 
-p2 <- ggplot(auc_fig, aes(Model, Mean, fill = factor(Cause))) +
-  geom_col(position = "dodge") +
-  geom_errorbar(aes(ymin = Lower, ymax = Upper), position = position_dodge(0.9), width = 0.25) +
-  labs(
-    title = "Time-dependent AUC",
-    subtitle = "Bootstrap 95% CI",
-    x = "", y = "AUC", fill = "Cause"
+  if (!is.null(hist$val_loss)) {
+    out$ValidationLoss <- as.numeric(hist$val_loss)
+  }
+
+  out
+}
+
+history_df <- dplyr::bind_rows(
+  extract_history(history_gaussian, "Gaussian-labelled"),
+  extract_history(history_clayton, "Clayton-labelled"),
+  extract_history(history_gumbel, "Gumbel-labelled")
+)
+
+if (nrow(history_df) > 0) {
+
+  p_loss <- ggplot2::ggplot(
+    history_df,
+    ggplot2::aes(
+      x = Epoch,
+      y = Loss,
+      linetype = Model
+    )
   ) +
-  theme_bw() +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+    ggplot2::geom_line() +
+    ggplot2::labs(
+      title = "Training Loss",
+      x = "Epoch",
+      y = "Categorical Cross-Entropy"
+    ) +
+    ggplot2::theme_minimal()
 
-print(p2)
-ggsave("Rotterdam_Figure2_AUC.png", p2, width = 8, height = 5)
-
-# Figure 3: Integrated Brier Score
-ibs_fig <- bootstrap_df %>%
-  group_by(Model, Cause) %>%
-  summarise(
-    Mean  = mean(IBS, na.rm = TRUE),
-    Lower = quantile(IBS, 0.025, na.rm = TRUE),
-    Upper = quantile(IBS, 0.975, na.rm = TRUE),
-    .groups = "drop"
+  ggplot2::ggsave(
+    filename = file.path(
+      output_dir,
+      "Training_Loss.png"
+    ),
+    plot = p_loss,
+    width = 8,
+    height = 5,
+    dpi = 300
   )
+}
 
-p3 <- ggplot(ibs_fig, aes(Model, Mean, fill = factor(Cause))) +
-  geom_col(position = "dodge") +
-  geom_errorbar(aes(ymin = Lower, ymax = Upper), position = position_dodge(0.9), width = 0.25) +
-  labs(
-    title = "Integrated Brier Score",
-    subtitle = "Bootstrap 95% CI",
-    x = "", y = "IBS", fill = "Cause"
-  ) +
-  theme_bw() +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+# ---------------------- 16. Save Models ----------------------
 
-print(p3)
-ggsave("Rotterdam_Figure3_IBS.png", p3, width = 8, height = 5)
+save_model_safe <- function(model, filename) {
 
-# Figure 4: Cause 1 C-index Boxplot
-p4 <- bootstrap_df %>%
-  filter(Cause == 1) %>%
-  ggplot(aes(Model, Cindex)) +
-  geom_boxplot() +
-  labs(title = "Cause 1 C-index Distribution", y = "C-index", x = "") +
-  theme_bw() +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  tryCatch(
+    {
+      keras3::save_model(
+        model,
+        filepath = file.path(output_dir, filename)
+      )
+      cat("Saved model:", filename, "\n")
+    },
+    error = function(e) {
+      message(
+        "Could not save ", filename, ": ",
+        conditionMessage(e)
+      )
+    }
+  )
+}
 
-print(p4)
-ggsave("Rotterdam_Figure4_Cause1_Boxplot.png", p4, width = 8, height = 5)
+save_model_safe(
+  model_gaussian,
+  "Gaussian_labelled_CNN_LSTM.keras"
+)
 
-# Figure 5: Cause 2 C-index Boxplot
-p5 <- bootstrap_df %>%
-  filter(Cause == 2) %>%
-  ggplot(aes(Model, Cindex)) +
-  geom_boxplot() +
-  labs(title = "Cause 2 C-index Distribution", y = "C-index", x = "") +
-  theme_bw() +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+save_model_safe(
+  model_clayton,
+  "Clayton_labelled_CNN_LSTM.keras"
+)
 
-print(p5)
-ggsave("Rotterdam_Figure5_Cause2_Boxplot.png", p5, width = 8, height = 5)
+save_model_safe(
+  model_gumbel,
+  "Gumbel_labelled_CNN_LSTM.keras"
+)
 
+saveRDS(
+  list(
+    time_breaks = time_breaks,
+    features = features,
+    train_means = train_means,
+    train_sds = train_sds,
+    train_medians = train_medians,
+    train_index = train_index,
+    test_index = test_index
+  ),
+  file.path(output_dir, "Preprocessing_Objects.rds")
+)
 
+cat(
+  "\nAnalysis completed. Results saved in:",
+  normalizePath(output_dir),
+  "\n"
+)
 ###############################################################
-# PART 5: Statistical Summary Metrics Output
+# END OF SCRIPT
 ###############################################################
-
-bootstrap_summary <- bootstrap_df %>%
-  group_by(Model, Cause) %>%
-  summarise(
-    Cindex_Mean  = mean(Cindex, na.rm = TRUE),
-    Cindex_SD    = sd(Cindex, na.rm = TRUE),
-    Cindex_Lower = quantile(Cindex, 0.025, na.rm = TRUE),
-    Cindex_Upper = quantile(Cindex, 0.975, na.rm = TRUE),
-    
-    AUC_Mean     = mean(AUC, na.rm = TRUE),
-    AUC_SD       = sd(AUC, na.rm = TRUE),
-    AUC_Lower    = quantile(AUC, 0.025, na.rm = TRUE),
-    AUC_Upper    = quantile(AUC, 0.975, na.rm = TRUE),
-    
-    IBS_Mean     = mean(IBS, na.rm = TRUE),
-    IBS_SD       = sd(IBS, na.rm = TRUE),
-    IBS_Lower    = quantile(IBS, 0.025, na.rm = TRUE),
-    IBS_Upper    = quantile(IBS, 0.975, na.rm = TRUE),
-    .groups      = "drop"
-  )
-
-cat("\nBootstrap Evaluation Metrics (Mean, SD, 95% CI):\n")
-print(bootstrap_summary)
-
-write.csv(bootstrap_summary, "Rotterdam_Summary_Mean_SD_CI.csv", row.names = FALSE)

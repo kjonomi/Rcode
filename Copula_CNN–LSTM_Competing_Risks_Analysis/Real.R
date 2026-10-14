@@ -607,72 +607,100 @@ horizon_index <- pmax(
   pmin(K, horizon_index)
 )
 
+
 # =============================================================
-# 11. Metrics
+# 11. Robust metric functions
 # =============================================================
+
+safe_numeric <- function(x, default = NA_real_) {
+  if (length(x) == 0L || !is.finite(x[1])) {
+    return(default)
+  }
+
+  as.numeric(x[1])
+}
 
 cause_cindex <- function(time, status, risk, cause) {
 
-  event <- as.integer(status == cause)
-
-  tryCatch(
-    {
-      fit <- survival::concordance(
-        Surv(time, event) ~ risk,
-        reverse = TRUE
-      )
-
-      as.numeric(fit$concordance)
-    },
-    error = function(e) NA_real_
-  )
-}
-
-compute_time_auc <- function(
-    risk,
-    cause,
-    horizon) {
-
-  if (!requireNamespace("timeROC", quietly = TRUE)) {
+  if (length(risk) != length(time) ||
+      length(status) != length(time) ||
+      length(risk) == 0L) {
     return(NA_real_)
   }
 
-  tryCatch(
-    {
-      roc <- timeROC::timeROC(
-        T = time_test,
-        delta = status_test,
-        marker = as.numeric(risk),
-        cause = cause,
-        weighting = "marginal",
-        times = horizon,
-        iid = FALSE
-      )
+  event <- as.integer(status == cause)
 
-      as.numeric(roc$AUC[1])
-    },
-    error = function(e) NA_real_
-  )
+  if (sum(event) == 0L || sum(event) == length(event)) {
+    return(NA_real_)
+  }
+
+  tryCatch({
+    fit <- survival::concordance(
+      survival::Surv(time, event) ~ risk,
+      reverse = TRUE
+    )
+
+    safe_numeric(fit$concordance)
+  }, error = function(e) {
+    NA_real_
+  })
 }
 
-# Fixed-horizon IPCW Brier score.
-# This is not an integrated Brier score.
+compute_time_auc <- function(risk, cause, horizon) {
 
-compute_ipcw_brier <- function(
-    risk,
-    cause,
-    horizon) {
+  if (length(risk) != length(time_test) ||
+      length(risk) == 0L ||
+      !is.finite(horizon) ||
+      !any(status_test == cause) ||
+      !any(time_test > horizon)) {
+    return(NA_real_)
+  }
 
-  risk <- pmin(
-    1,
-    pmax(0, as.numeric(risk))
-  )
+  result <- tryCatch({
+    roc <- timeROC::timeROC(
+      T = time_test,
+      delta = as.integer(status_test),
+      marker = as.numeric(risk),
+      cause = cause,
+      weighting = "marginal",
+      times = horizon,
+      iid = FALSE
+    )
+
+    # Find the AUC corresponding to the requested horizon.
+    auc <- roc$AUC
+
+    if (length(auc) == 0L) {
+      return(NA_real_)
+    }
+
+    safe_numeric(auc[which.min(
+      abs(roc$times - horizon)
+    )])
+  }, error = function(e) {
+    NA_real_
+  })
+
+  safe_numeric(result)
+}
+
+compute_ipcw_brier <- function(risk, cause, horizon) {
+
+  risk <- as.numeric(risk)
+
+  if (length(risk) != length(time_test) ||
+      length(risk) == 0L ||
+      !is.finite(horizon)) {
+    return(NA_real_)
+  }
+
+  risk <- pmin(1, pmax(0, risk))
 
   censor_event <- as.integer(status_train == 0)
 
   censor_fit <- tryCatch(
     survival::survfit(
-      Surv(time_train, censor_event) ~ 1
+      survival::Surv(time_train, censor_event) ~ 1
     ),
     error = function(e) NULL
   )
@@ -683,17 +711,20 @@ compute_ipcw_brier <- function(
 
   G_at <- function(t) {
 
-    z <- summary(
-      censor_fit,
-      times = t,
-      extend = TRUE
-    )$surv
+    s <- tryCatch(
+      summary(
+        censor_fit,
+        times = t,
+        extend = TRUE
+      )$surv,
+      error = function(e) numeric(0)
+    )
 
-    if (length(z) == 0 || !is.finite(z[1])) {
+    if (length(s) == 0L || !is.finite(s[1])) {
       return(NA_real_)
     }
 
-    max(z[1], 1e-6)
+    max(s[1], 1e-6)
   }
 
   G_h <- G_at(horizon)
@@ -702,38 +733,30 @@ compute_ipcw_brier <- function(
     return(NA_real_)
   }
 
-  score <- rep(
-    NA_real_,
-    length(time_test)
-  )
+  score <- rep(NA_real_, length(time_test))
 
   for (i in seq_along(time_test)) {
 
     if (time_test[i] <= horizon) {
 
-      # Censored before horizon: status at horizon unknown.
-      if (status_test[i] == 0) {
+      # Censoring before the horizon leaves the outcome unknown.
+      if (status_test[i] == 0L) {
         next
       }
 
-      observed <- as.integer(
-        status_test[i] == cause
-      )
-
+      observed <- as.integer(status_test[i] == cause)
       G_i <- G_at(time_test[i])
 
       if (!is.finite(G_i)) {
         next
       }
 
-      score[i] <- (
-        observed - risk[i]
-      )^2 / G_i
+      score[i] <- (observed - risk[i])^2 / G_i
 
     } else {
 
-      # Observed beyond the horizon: target cause has not
-      # occurred by this horizon.
+      # Subject is known to be free of the target event
+      # at the specified horizon.
       score[i] <- risk[i]^2 / G_h
     }
   }
@@ -744,6 +767,7 @@ compute_ipcw_brier <- function(
 
   mean(score, na.rm = TRUE)
 }
+
 
 # =============================================================
 # 12. Extract RSF CIF at a specified time
@@ -812,8 +836,9 @@ if (is.null(rsf_time_grid)) {
 
 rsf_time_grid <- as.numeric(rsf_time_grid)
 
+
 # =============================================================
-# 13. Build performance table
+# 13. Build performance table -- robust version
 # =============================================================
 
 prediction_objects <- list(
@@ -839,31 +864,48 @@ for (model_name in names(prediction_objects)) {
 
     for (h in seq_along(candidate_horizons)) {
 
-      horizon <- candidate_horizons[h]
-      k <- horizon_index[h]
+      horizon <- as.numeric(candidate_horizons[h])
+      k <- as.integer(horizon_index[h])
 
-      risk_h <- risk_matrix[, k]
+      if (length(horizon) == 0L ||
+          !is.finite(horizon) ||
+          ncol(risk_matrix) < k) {
+        warning(
+          "Skipping invalid horizon for ",
+          model_name, ", cause ", cause
+        )
+        next
+      }
+
+      risk_h <- as.numeric(risk_matrix[, k])
+
+      # Guarantee scalar results for all metrics.
+      c_index <- safe_numeric(
+        cause_cindex(
+          time_test, status_test, risk_h, cause
+        )
+      )
+
+      auc_value <- safe_numeric(
+        compute_time_auc(
+          risk_h, cause, horizon
+        )
+      )
+
+      brier_value <- safe_numeric(
+        compute_ipcw_brier(
+          risk_h, cause, horizon
+        )
+      )
 
       results[[row_id]] <- data.frame(
-        Model = model_name,
-        Cause = cause,
+        Model = as.character(model_name),
+        Cause = as.integer(cause),
         Horizon = horizon,
-        Cindex = cause_cindex(
-          time_test,
-          status_test,
-          risk_h,
-          cause
-        ),
-        TimeAUC = compute_time_auc(
-          risk_h,
-          cause,
-          horizon
-        ),
-        BrierScore = compute_ipcw_brier(
-          risk_h,
-          cause,
-          horizon
-        )
+        Cindex = c_index,
+        TimeAUC = auc_value,
+        BrierScore = brier_value,
+        stringsAsFactors = FALSE
       )
 
       row_id <- row_id + 1L
@@ -871,55 +913,11 @@ for (model_name in names(prediction_objects)) {
   }
 }
 
-# Add RSF benchmark using the RSF-specific time grid.
-# The CIF cause dimension must correspond to recurrence and
-# death, respectively, in the installed package output.
-
-for (cause in 1:2) {
-
-  for (h in seq_along(candidate_horizons)) {
-
-    horizon <- candidate_horizons[h]
-
-    rsf_k <- which(
-      rsf_time_grid >= horizon
-    )[1]
-
-    if (is.na(rsf_k)) {
-      rsf_k <- length(rsf_time_grid)
-    }
-
-    rsf_risk <- extract_rsf_cif(
-      rsf_cif,
-      n_test = length(test_index),
-      cause_index = cause,
-      time_index = rsf_k
-    )
-
-    results[[row_id]] <- data.frame(
-      Model = "Random_Survival_Forest",
-      Cause = cause,
-      Horizon = horizon,
-      Cindex = cause_cindex(
-        time_test,
-        status_test,
-        rsf_risk,
-        cause
-      ),
-      TimeAUC = compute_time_auc(
-        rsf_risk,
-        cause,
-        horizon
-      ),
-      BrierScore = compute_ipcw_brier(
-        rsf_risk,
-        cause,
-        horizon
-      )
-    )
-
-    row_id <- row_id + 1L
-  }
+if (length(results) == 0L) {
+  stop(
+    "No performance rows were generated. ",
+    "Check candidate_horizons and the CIF matrices."
+  )
 }
 
 results_df <- dplyr::bind_rows(results)
@@ -935,6 +933,7 @@ write.csv(
   ),
   row.names = FALSE
 )
+
 
 # =============================================================
 # 14. Save predictions

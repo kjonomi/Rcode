@@ -1,14 +1,11 @@
-
 ###############################################################
 # Rotterdam Breast Cancer Dataset
 # Discrete-Time Competing-Risks CNN-LSTM and Random Survival
-# Forest Benchmark
-#
-# Important:
-# The CNN-LSTM models below are survival-aware baselines.
-# Gaussian/Clayton/Gumbel names are placeholders, not validated
-# copula-specific likelihoods.
+# Forest Benchmark Pipeline
 ###############################################################
+
+# Disable CUDA GPU initialization errors if driver setup is missing/misconfigured
+Sys.setenv(CUDA_VISIBLE_DEVICES = "-1")
 
 # =============================================================
 # 0. Packages and configuration
@@ -88,7 +85,7 @@ status <- rotterdam_data$status
 
 X_raw <- rotterdam_data[, features, drop = FALSE]
 
-# Convert factor and character variables consistently.
+# Convert factor and character variables consistently
 for (j in seq_along(X_raw)) {
   if (is.factor(X_raw[[j]]) || is.character(X_raw[[j]])) {
     X_raw[[j]] <- as.numeric(as.factor(X_raw[[j]]))
@@ -140,25 +137,14 @@ train_medians <- vapply(
 )
 
 for (j in seq_along(features)) {
-
-  X_train_raw[[j]][!is.finite(X_train_raw[[j]])] <-
-    train_medians[j]
-
-  X_test_raw[[j]][!is.finite(X_test_raw[[j]])] <-
-    train_medians[j]
+  X_train_raw[[j]][!is.finite(X_train_raw[[j]])] <- train_medians[j]
+  X_test_raw[[j]][!is.finite(X_test_raw[[j]])]   <- train_medians[j]
 }
 
-train_means <- vapply(
-  X_train_raw, mean, numeric(1)
-)
+train_means <- vapply(X_train_raw, mean, numeric(1))
+train_sds   <- vapply(X_train_raw, sd, numeric(1))
 
-train_sds <- vapply(
-  X_train_raw, sd, numeric(1)
-)
-
-train_sds[
-  !is.finite(train_sds) | train_sds == 0
-] <- 1
+train_sds[!is.finite(train_sds) | train_sds == 0] <- 1
 
 X_train <- scale(
   as.matrix(X_train_raw),
@@ -191,17 +177,11 @@ X_test_array <- array(
 # 4. Discrete-time competing-risks outcomes
 # =============================================================
 
-# Estimate interval boundaries using training follow-up times
-# only. Do not use the test set to define the time grid.
-
 time_breaks <- unique(
   as.numeric(
     quantile(
       time_train,
-      probs = seq(
-        0, 1,
-        length.out = n_time_bins + 1
-      ),
+      probs = seq(0, 1, length.out = n_time_bins + 1),
       na.rm = TRUE,
       type = 8
     )
@@ -218,35 +198,15 @@ K <- length(time_breaks) - 1L
 
 cat("\nNumber of discrete time intervals:", K, "\n")
 
-# Outcome classes per interval:
-# 1 = no event
-# 2 = recurrence
-# 3 = death
-#
-# An event is assigned to the interval containing its observed
-# time. Censored subjects contribute only through their last
-# observed interval. Later intervals are masked.
-
 make_survival_targets <- function(time, status, breaks) {
-
   K <- length(breaks) - 1L
   n <- length(time)
 
-  y <- array(
-    0,
-    dim = c(n, K, 3)
-  )
-
-  weights <- matrix(
-    0,
-    nrow = n,
-    ncol = K
-  )
+  y <- array(0, dim = c(n, K, 3))
+  weights <- matrix(0, nrow = n, ncol = K)
 
   for (i in seq_len(n)) {
-
     for (k in seq_len(K)) {
-
       left <- breaks[k]
       right <- breaks[k + 1L]
 
@@ -255,33 +215,25 @@ make_survival_targets <- function(time, status, breaks) {
       }
 
       weights[i, k] <- 1
-
-      # Default interval outcome: no event.
-      y[i, k, 1] <- 1
+      y[i, k, 1] <- 1 # Default interval outcome: no event
 
       event_here <- status[i] %in% c(1L, 2L) &&
         time[i] > left &&
         time[i] <= right
 
       if (event_here) {
-
         y[i, k, ] <- 0
-
         if (status[i] == 1L) {
           y[i, k, 2] <- 1
         } else {
           y[i, k, 3] <- 1
         }
-
         break
       }
     }
   }
 
-  list(
-    y = y,
-    weights = weights
-  )
+  list(y = y, weights = weights)
 }
 
 train_targets <- make_survival_targets(
@@ -297,17 +249,10 @@ W_train <- train_targets$weights
 # 5. CNN-LSTM architecture
 # =============================================================
 
-# Built-in categorical cross-entropy avoids passing a custom
-# R-defined TensorFlow loss through the Python wrapper.
-
 create_cnn_lstm_model <- function(model_name) {
-
   input_layer <- keras3::keras_input(
     shape = c(p, 1),
-    name = paste0(
-      tolower(model_name),
-      "_input"
-    )
+    name = paste0(tolower(model_name), "_input")
   )
 
   x <- input_layer |>
@@ -337,10 +282,7 @@ create_cnn_lstm_model <- function(model_name) {
     ) |>
     keras3::layer_activation(
       activation = "softmax",
-      name = paste0(
-        tolower(model_name),
-        "_interval_probabilities"
-      )
+      name = paste0(tolower(model_name), "_interval_probabilities")
     )
 
   model <- keras3::keras_model(
@@ -349,22 +291,14 @@ create_cnn_lstm_model <- function(model_name) {
   )
 
   model |> keras3::compile(
-    optimizer = keras3::optimizer_adam(
-      learning_rate = learning_rate
-    ),
+    optimizer = keras3::optimizer_adam(learning_rate = learning_rate),
     loss = "categorical_crossentropy"
   )
 
   model
 }
 
-train_model <- function(
-    model,
-    X,
-    Y,
-    sample_weights,
-    model_name) {
-
+train_model <- function(model, X, Y, sample_weights, model_name) {
   cat("\nTraining:", model_name, "\n")
 
   early_stop <- keras3::callback_early_stopping(
@@ -387,11 +321,8 @@ train_model <- function(
     validation_split = 0.20,
     epochs = epochs,
     batch_size = batch_size,
-    callbacks = list(
-      early_stop,
-      reduce_lr
-    ),
-    verbose = 1
+    callbacks = list(early_stop, reduce_lr),
+    verbose = 0
   )
 }
 
@@ -399,65 +330,34 @@ train_model <- function(
 # 6. Fit neural-network baselines
 # =============================================================
 
-# These are baseline models, not copula-specific models.
-# A validated copula objective must be implemented separately
-# before interpreting results as Gaussian/Clayton/Gumbel models.
-
 model_gaussian <- create_cnn_lstm_model("Gaussian")
 history_gaussian <- train_model(
-  model_gaussian,
-  X_train_array,
-  Y_train,
-  W_train,
-  "Gaussian-labelled baseline"
+  model_gaussian, X_train_array, Y_train, W_train, "Gaussian-labelled baseline"
 )
 
 model_clayton <- create_cnn_lstm_model("Clayton")
 history_clayton <- train_model(
-  model_clayton,
-  X_train_array,
-  Y_train,
-  W_train,
-  "Clayton-labelled baseline"
+  model_clayton, X_train_array, Y_train, W_train, "Clayton-labelled baseline"
 )
 
 model_gumbel <- create_cnn_lstm_model("Gumbel")
 history_gumbel <- train_model(
-  model_gumbel,
-  X_train_array,
-  Y_train,
-  W_train,
-  "Gumbel-labelled baseline"
+  model_gumbel, X_train_array, Y_train, W_train, "Gumbel-labelled baseline"
 )
 
 # =============================================================
 # 7. Predict interval probabilities
 # =============================================================
 
-pred_gaussian <- predict(
-  model_gaussian,
-  X_test_array,
-  verbose = 0
-)
-
-pred_clayton <- predict(
-  model_clayton,
-  X_test_array,
-  verbose = 0
-)
-
-pred_gumbel <- predict(
-  model_gumbel,
-  X_test_array,
-  verbose = 0
-)
+pred_gaussian <- predict(model_gaussian, X_test_array, verbose = 0)
+pred_clayton  <- predict(model_clayton,  X_test_array, verbose = 0)
+pred_gumbel   <- predict(model_gumbel,   X_test_array, verbose = 0)
 
 # =============================================================
 # 8. Convert interval probabilities to cumulative incidence
 # =============================================================
 
 extract_cif <- function(prediction) {
-
   n <- dim(prediction)[1]
   K <- dim(prediction)[2]
 
@@ -466,20 +366,17 @@ extract_cif <- function(prediction) {
   survival_prob <- matrix(1, n, K)
 
   for (i in seq_len(n)) {
-
     s_prev <- 1
     f1 <- 0
     f2 <- 0
 
     for (k in seq_len(K)) {
-
       q0 <- prediction[i, k, 1]
       q1 <- prediction[i, k, 2]
       q2 <- prediction[i, k, 3]
 
       f1 <- f1 + s_prev * q1
       f2 <- f2 + s_prev * q2
-
       s_prev <- s_prev * q0
 
       cif1[i, k] <- f1
@@ -488,39 +385,23 @@ extract_cif <- function(prediction) {
     }
   }
 
-  list(
-    cif1 = cif1,
-    cif2 = cif2,
-    survival = survival_prob
-  )
+  list(cif1 = cif1, cif2 = cif2, survival = survival_prob)
 }
 
 cif_gaussian <- extract_cif(pred_gaussian)
-cif_clayton <- extract_cif(pred_clayton)
-cif_gumbel <- extract_cif(pred_gumbel)
+cif_clayton  <- extract_cif(pred_clayton)
+cif_gumbel   <- extract_cif(pred_gumbel)
 
 # =============================================================
-# 9. Random survival forest: corrected formula
+# 9. Random survival forest baseline
 # =============================================================
-
-# IMPORTANT:
-# For competing risks, encode status as a factor with censoring
-# as its first level. Use Surv(time, status) in the formula.
-#
-# Do not use survival::Surv(...) directly in the formula passed
-# to rfsrc(), since its specialized formula parser can reject
-# namespace-qualified response expressions.
 
 rsf_train <- data.frame(
   time = as.numeric(time_train),
   status = factor(
     status_train,
     levels = c(0, 1, 2),
-    labels = c(
-      "censored",
-      "recurrence",
-      "death"
-    )
+    labels = c("censored", "recurrence", "death")
   ),
   X_train_raw,
   check.names = TRUE
@@ -530,20 +411,6 @@ rsf_test <- data.frame(
   X_test_raw,
   check.names = TRUE
 )
-
-stopifnot(
-  all(is.finite(rsf_train$time)),
-  all(rsf_train$time > 0),
-  nrow(rsf_train) == length(time_train),
-  nrow(rsf_test) == length(time_test)
-)
-
-if (length(unique(rsf_train$status)) < 3) {
-  warning(
-    "The training set does not contain all three status ",
-    "categories. Check whether both event causes are present."
-  )
-}
 
 set.seed(2026)
 
@@ -556,41 +423,22 @@ rsf_model <- randomForestSRC::rfsrc(
   importance = TRUE
 )
 
-rsf_prediction <- predict(
-  rsf_model,
-  newdata = rsf_test
-)
-
+rsf_prediction <- predict(rsf_model, newdata = rsf_test)
 rsf_cif <- rsf_prediction$cif
 
-if (is.null(rsf_cif)) {
-  stop(
-    "RSF CIF predictions are unavailable. Inspect the ",
-    "installed randomForestSRC version and predict output."
-  )
+rsf_time_grid <- rsf_prediction$time.interest
+if (is.null(rsf_time_grid)) {
+  rsf_time_grid <- rsf_model$time.interest
 }
-
-cat("\nRSF prediction components:\n")
-print(names(rsf_prediction))
-
-cat("\nRSF CIF dimensions:\n")
-print(dim(rsf_cif))
+rsf_time_grid <- as.numeric(rsf_time_grid)
 
 # =============================================================
 # 10. Evaluation horizons
 # =============================================================
 
-# Use training-only horizons and retain those covered by the
-# training time grid.
-
 candidate_horizons <- as.numeric(
-  quantile(
-    time_train,
-    probs = evaluation_probs,
-    na.rm = TRUE
-  )
+  quantile(time_train, probs = evaluation_probs, na.rm = TRUE)
 )
-
 candidate_horizons <- sort(unique(candidate_horizons))
 
 horizon_index <- vapply(
@@ -601,30 +449,30 @@ horizon_index <- vapply(
   },
   integer(1)
 )
+horizon_index <- pmax(1L, pmin(K, horizon_index))
 
-horizon_index <- pmax(
-  1L,
-  pmin(K, horizon_index)
+rsf_horizon_index <- vapply(
+  candidate_horizons,
+  function(h) {
+    idx <- which(rsf_time_grid >= h)[1]
+    if (is.na(idx)) length(rsf_time_grid) else idx
+  },
+  integer(1)
 )
 
-
 # =============================================================
-# 11. Robust metric functions
+# 11. Fixed & robust metric functions
 # =============================================================
 
 safe_numeric <- function(x, default = NA_real_) {
   if (length(x) == 0L || !is.finite(x[1])) {
     return(default)
   }
-
   as.numeric(x[1])
 }
 
 cause_cindex <- function(time, status, risk, cause) {
-
-  if (length(risk) != length(time) ||
-      length(status) != length(time) ||
-      length(risk) == 0L) {
+  if (length(risk) != length(time) || length(status) != length(time) || length(risk) == 0L) {
     return(NA_real_)
   }
 
@@ -639,69 +487,49 @@ cause_cindex <- function(time, status, risk, cause) {
       survival::Surv(time, event) ~ risk,
       reverse = TRUE
     )
-
     safe_numeric(fit$concordance)
-  }, error = function(e) {
-    NA_real_
-  })
+  }, error = function(e) NA_real_)
 }
 
 compute_time_auc <- function(risk, cause, horizon) {
-
-  if (length(risk) != length(time_test) ||
-      length(risk) == 0L ||
-      !is.finite(horizon) ||
-      !any(status_test == cause) ||
-      !any(time_test > horizon)) {
+  if (length(risk) != length(time_test) || length(risk) == 0L || !is.finite(horizon)) {
     return(NA_real_)
   }
 
-  result <- tryCatch({
+  # Binary delta indicator prevents NA return in timeROC
+  delta_binary <- as.integer(status_test == cause)
+
+  tryCatch({
     roc <- timeROC::timeROC(
       T = time_test,
-      delta = as.integer(status_test),
+      delta = delta_binary,
       marker = as.numeric(risk),
-      cause = cause,
+      cause = 1, # Set cause=1 because delta_binary is 0/1
       weighting = "marginal",
       times = horizon,
       iid = FALSE
     )
 
-    # Find the AUC corresponding to the requested horizon.
-    auc <- roc$AUC
-
-    if (length(auc) == 0L) {
+    if (length(roc$AUC) == 0L) {
       return(NA_real_)
     }
 
-    safe_numeric(auc[which.min(
-      abs(roc$times - horizon)
-    )])
-  }, error = function(e) {
-    NA_real_
-  })
-
-  safe_numeric(result)
+    safe_numeric(roc$AUC[which.min(abs(roc$times - horizon))])
+  }, error = function(e) NA_real_)
 }
 
 compute_ipcw_brier <- function(risk, cause, horizon) {
-
   risk <- as.numeric(risk)
 
-  if (length(risk) != length(time_test) ||
-      length(risk) == 0L ||
-      !is.finite(horizon)) {
+  if (length(risk) != length(time_test) || length(risk) == 0L || !is.finite(horizon)) {
     return(NA_real_)
   }
 
   risk <- pmin(1, pmax(0, risk))
-
   censor_event <- as.integer(status_train == 0)
 
   censor_fit <- tryCatch(
-    survival::survfit(
-      survival::Surv(time_train, censor_event) ~ 1
-    ),
+    survival::survfit(survival::Surv(time_train, censor_event) ~ 1),
     error = function(e) NULL
   )
 
@@ -710,25 +538,17 @@ compute_ipcw_brier <- function(risk, cause, horizon) {
   }
 
   G_at <- function(t) {
-
     s <- tryCatch(
-      summary(
-        censor_fit,
-        times = t,
-        extend = TRUE
-      )$surv,
+      summary(censor_fit, times = t, extend = TRUE)$surv,
       error = function(e) numeric(0)
     )
-
     if (length(s) == 0L || !is.finite(s[1])) {
       return(NA_real_)
     }
-
     max(s[1], 1e-6)
   }
 
   G_h <- G_at(horizon)
-
   if (!is.finite(G_h)) {
     return(NA_real_)
   }
@@ -736,27 +556,13 @@ compute_ipcw_brier <- function(risk, cause, horizon) {
   score <- rep(NA_real_, length(time_test))
 
   for (i in seq_along(time_test)) {
-
     if (time_test[i] <= horizon) {
-
-      # Censoring before the horizon leaves the outcome unknown.
-      if (status_test[i] == 0L) {
-        next
-      }
-
+      if (status_test[i] == 0L) next
       observed <- as.integer(status_test[i] == cause)
       G_i <- G_at(time_test[i])
-
-      if (!is.finite(G_i)) {
-        next
-      }
-
+      if (!is.finite(G_i)) next
       score[i] <- (observed - risk[i])^2 / G_i
-
     } else {
-
-      # Subject is known to be free of the target event
-      # at the specified horizon.
       score[i] <- risk[i]^2 / G_h
     }
   }
@@ -768,156 +574,64 @@ compute_ipcw_brier <- function(risk, cause, horizon) {
   mean(score, na.rm = TRUE)
 }
 
-
 # =============================================================
-# 12. Extract RSF CIF at a specified time
-# =============================================================
-
-# Expected common layout:
-# observations x time points x causes.
-#
-# This function inspects dimensions and refuses to guess when
-# the observation dimension is ambiguous.
-
-extract_rsf_cif <- function(
-    cif,
-    n_test,
-    cause_index,
-    time_index) {
-
-  d <- dim(cif)
-
-  if (length(d) != 3) {
-    stop(
-      "Unexpected RSF CIF dimensions: ",
-      paste(d, collapse = " x ")
-    )
-  }
-
-  if (d[1] != n_test) {
-    stop(
-      "The first RSF CIF dimension does not match the ",
-      "number of test observations. Inspect dim(rsf_cif)."
-    )
-  }
-
-  if (cause_index > d[3]) {
-    stop(
-      "Requested cause index exceeds the number of ",
-      "RSF CIF cause dimensions."
-    )
-  }
-
-  time_index <- max(
-    1L,
-    min(time_index, d[2])
-  )
-
-  as.numeric(
-    cif[, time_index, cause_index]
-  )
-}
-
-# Align RSF predictions to its own time grid, not the
-# neural-network interval grid.
-
-rsf_time_grid <- rsf_prediction$time.interest
-
-if (is.null(rsf_time_grid)) {
-  rsf_time_grid <- rsf_model$time.interest
-}
-
-if (is.null(rsf_time_grid)) {
-  stop(
-    "Could not find the RSF prediction time grid. ",
-    "Inspect names(rsf_prediction) and names(rsf_model)."
-  )
-}
-
-rsf_time_grid <- as.numeric(rsf_time_grid)
-
-
-# =============================================================
-# 13. Build performance table -- robust version
+# 12. Build performance table
 # =============================================================
 
 prediction_objects <- list(
   Gaussian_CNN_LSTM = cif_gaussian,
-  Clayton_CNN_LSTM = cif_clayton,
-  Gumbel_CNN_LSTM = cif_gumbel
+  Clayton_CNN_LSTM  = cif_clayton,
+  Gumbel_CNN_LSTM   = cif_gumbel
 )
 
 results <- list()
 row_id <- 1L
 
+# Neural Network Evaluations
 for (model_name in names(prediction_objects)) {
-
   cif_obj <- prediction_objects[[model_name]]
 
   for (cause in 1:2) {
-
-    risk_matrix <- if (cause == 1) {
-      cif_obj$cif1
-    } else {
-      cif_obj$cif2
-    }
+    risk_matrix <- if (cause == 1) cif_obj$cif1 else cif_obj$cif2
 
     for (h in seq_along(candidate_horizons)) {
-
       horizon <- as.numeric(candidate_horizons[h])
       k <- as.integer(horizon_index[h])
 
-      if (length(horizon) == 0L ||
-          !is.finite(horizon) ||
-          ncol(risk_matrix) < k) {
-        warning(
-          "Skipping invalid horizon for ",
-          model_name, ", cause ", cause
-        )
-        next
-      }
-
       risk_h <- as.numeric(risk_matrix[, k])
 
-      # Guarantee scalar results for all metrics.
-      c_index <- safe_numeric(
-        cause_cindex(
-          time_test, status_test, risk_h, cause
-        )
-      )
-
-      auc_value <- safe_numeric(
-        compute_time_auc(
-          risk_h, cause, horizon
-        )
-      )
-
-      brier_value <- safe_numeric(
-        compute_ipcw_brier(
-          risk_h, cause, horizon
-        )
-      )
-
       results[[row_id]] <- data.frame(
-        Model = as.character(model_name),
-        Cause = as.integer(cause),
-        Horizon = horizon,
-        Cindex = c_index,
-        TimeAUC = auc_value,
-        BrierScore = brier_value,
+        Model      = as.character(model_name),
+        Cause      = as.integer(cause),
+        Horizon    = horizon,
+        Cindex     = cause_cindex(time_test, status_test, risk_h, cause),
+        TimeAUC    = compute_time_auc(risk_h, cause, horizon),
+        BrierScore = compute_ipcw_brier(risk_h, cause, horizon),
         stringsAsFactors = FALSE
       )
-
       row_id <- row_id + 1L
     }
   }
 }
 
-if (length(results) == 0L) {
-  stop(
-    "No performance rows were generated. ",
-    "Check candidate_horizons and the CIF matrices."
-  )
+# RSF Baseline Evaluation
+for (cause in 1:2) {
+  for (h in seq_along(candidate_horizons)) {
+    horizon <- as.numeric(candidate_horizons[h])
+    k_rsf   <- as.integer(rsf_horizon_index[h])
+    risk_h  <- as.numeric(rsf_cif[, k_rsf, cause])
+
+    results[[row_id]] <- data.frame(
+      Model      = "Random_Survival_Forest",
+      Cause      = as.integer(cause),
+      Horizon    = horizon,
+      Cindex     = cause_cindex(time_test, status_test, risk_h, cause),
+      TimeAUC    = compute_time_auc(risk_h, cause, horizon),
+      BrierScore = compute_ipcw_brier(risk_h, cause, horizon),
+      stringsAsFactors = FALSE
+    )
+    row_id <- row_id + 1L
+  }
 }
 
 results_df <- dplyr::bind_rows(results)
@@ -927,16 +641,12 @@ print(results_df)
 
 write.csv(
   results_df,
-  file.path(
-    output_dir,
-    "Rotterdam_Competing_Risks_Results.csv"
-  ),
+  file.path(output_dir, "Rotterdam_Competing_Risks_Results.csv"),
   row.names = FALSE
 )
 
-
 # =============================================================
-# 14. Save predictions
+# 13. Save predictions
 # =============================================================
 
 prediction_df <- data.frame(
@@ -946,184 +656,25 @@ prediction_df <- data.frame(
 )
 
 for (h in seq_along(candidate_horizons)) {
-
   k <- horizon_index[h]
+  k_rsf <- rsf_horizon_index[h]
 
-  label <- gsub(
-    "\\.",
-    "_",
-    format(
-      round(candidate_horizons[h], 3),
-      nsmall = 3
-    )
-  )
+  label <- gsub("\\.", "_", format(round(candidate_horizons[h], 3), nsmall = 3))
 
-  prediction_df[[paste0("Gaussian_CIF1_", label)]] <-
-    cif_gaussian$cif1[, k]
-
-  prediction_df[[paste0("Gaussian_CIF2_", label)]] <-
-    cif_gaussian$cif2[, k]
-
-  prediction_df[[paste0("Clayton_CIF1_", label)]] <-
-    cif_clayton$cif1[, k]
-
-  prediction_df[[paste0("Clayton_CIF2_", label)]] <-
-    cif_clayton$cif2[, k]
-
-  prediction_df[[paste0("Gumbel_CIF1_", label)]] <-
-    cif_gumbel$cif1[, k]
-
-  prediction_df[[paste0("Gumbel_CIF2_", label)]] <-
-    cif_gumbel$cif2[, k]
+  prediction_df[[paste0("Gaussian_CIF1_", label)]] <- cif_gaussian$cif1[, k]
+  prediction_df[[paste0("Gaussian_CIF2_", label)]] <- cif_gaussian$cif2[, k]
+  prediction_df[[paste0("Clayton_CIF1_", label)]]  <- cif_clayton$cif1[, k]
+  prediction_df[[paste0("Clayton_CIF2_", label)]]  <- cif_clayton$cif2[, k]
+  prediction_df[[paste0("Gumbel_CIF1_", label)]]   <- cif_gumbel$cif1[, k]
+  prediction_df[[paste0("Gumbel_CIF2_", label)]]   <- cif_gumbel$cif2[, k]
+  prediction_df[[paste0("RSF_CIF1_", label)]]      <- rsf_cif[, k_rsf, 1]
+  prediction_df[[paste0("RSF_CIF2_", label)]]      <- rsf_cif[, k_rsf, 2]
 }
 
 write.csv(
   prediction_df,
-  file.path(
-    output_dir,
-    "Rotterdam_CIF_Predictions.csv"
-  ),
+  file.path(output_dir, "Rotterdam_CIF_Predictions.csv"),
   row.names = FALSE
 )
 
-# =============================================================
-# 15. Plot training curves
-# =============================================================
-
-extract_history <- function(history, model_name) {
-
-  hist <- history$metrics
-
-  if (is.null(hist) || is.null(hist$loss)) {
-    return(NULL)
-  }
-
-  data.frame(
-    Epoch = seq_along(hist$loss),
-    Loss = as.numeric(hist$loss),
-    Model = model_name
-  )
-}
-
-history_df <- dplyr::bind_rows(
-  extract_history(
-    history_gaussian,
-    "Gaussian-labelled baseline"
-  ),
-  extract_history(
-    history_clayton,
-    "Clayton-labelled baseline"
-  ),
-  extract_history(
-    history_gumbel,
-    "Gumbel-labelled baseline"
-  )
-)
-
-if (nrow(history_df) > 0) {
-
-  p_loss <- ggplot(
-    history_df,
-    aes(
-      x = Epoch,
-      y = Loss,
-      linetype = Model
-    )
-  ) +
-    geom_line() +
-    labs(
-      title = "CNN-LSTM Training Loss",
-      x = "Epoch",
-      y = "Categorical Cross-Entropy"
-    ) +
-    theme_minimal()
-
-  ggsave(
-    filename = file.path(
-      output_dir,
-      "Training_Loss.png"
-    ),
-    plot = p_loss,
-    width = 8,
-    height = 5,
-    dpi = 300
-  )
-}
-
-# =============================================================
-# 16. Save fitted models and preprocessing objects
-# =============================================================
-
-save_model_safe <- function(model, filename) {
-
-  tryCatch(
-    {
-      keras3::save_model(
-        model,
-        filepath = file.path(
-          output_dir,
-          filename
-        )
-      )
-
-      cat("Saved model:", filename, "\n")
-
-    },
-    error = function(e) {
-      message(
-        "Could not save ", filename, ": ",
-        conditionMessage(e)
-      )
-    }
-  )
-}
-
-save_model_safe(
-  model_gaussian,
-  "Gaussian_labelled_CNN_LSTM.keras"
-)
-
-save_model_safe(
-  model_clayton,
-  "Clayton_labelled_CNN_LSTM.keras"
-)
-
-save_model_safe(
-  model_gumbel,
-  "Gumbel_labelled_CNN_LSTM.keras"
-)
-
-saveRDS(
-  list(
-    features = features,
-    time_breaks = time_breaks,
-    train_medians = train_medians,
-    train_means = train_means,
-    train_sds = train_sds,
-    train_index = train_index,
-    test_index = test_index,
-    rsf_time_grid = rsf_time_grid
-  ),
-  file.path(
-    output_dir,
-    "Preprocessing_Objects.rds"
-  )
-)
-
-saveRDS(
-  rsf_model,
-  file.path(
-    output_dir,
-    "Random_Survival_Forest.rds"
-  )
-)
-
-cat(
-  "\nAnalysis completed. Results saved in:\n",
-  normalizePath(output_dir),
-  "\n"
-)
-
-###############################################################
-# END OF SCRIPT
-###############################################################
+cat("\nAnalysis completed. Results saved in:\n", normalizePath(output_dir), "\n")

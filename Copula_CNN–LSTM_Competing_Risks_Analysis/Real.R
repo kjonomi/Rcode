@@ -676,5 +676,302 @@ write.csv(
   file.path(output_dir, "Rotterdam_CIF_Predictions.csv"),
   row.names = FALSE
 )
+# ============================================================
+# Competing-Risks Model Performance Visualization
+# Rotterdam Breast Cancer Dataset
+# Copula CNN-LSTM vs. Random Survival Forest
+# ============================================================
 
+library(ggplot2)
+library(dplyr)
+
+# ------------------------------------------------------------
+# 1. Define output directory
+# ------------------------------------------------------------
+
+output_dir <- "/home/jongmink/Rotterdam_Copula_CNN_LSTM_Results"
+
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir, recursive = TRUE)
+}
+
+# ------------------------------------------------------------
+# 2. Load performance results
+# ------------------------------------------------------------
+
+results_file <- file.path(
+  output_dir,
+  "Rotterdam_Competing_Risks_Results.csv"
+)
+
+if (!file.exists(results_file)) {
+  stop(
+    "Results file not found: ", results_file,
+    "\nPlease check the filename and output directory."
+  )
+}
+
+results <- read.csv(
+  results_file,
+  stringsAsFactors = FALSE
+)
+
+# Validate required columns
+required_columns <- c(
+  "Model", "Cause", "Horizon",
+  "Cindex", "TimeAUC", "BrierScore"
+)
+
+missing_columns <- setdiff(
+  required_columns,
+  names(results)
+)
+
+if (length(missing_columns) > 0) {
+  stop(
+    "Missing required columns: ",
+    paste(missing_columns, collapse = ", ")
+  )
+}
+
+# Remove incomplete or non-finite metric observations
+metric_columns <- c("Cindex", "TimeAUC", "BrierScore")
+
+for (column in c("Cause", "Horizon", metric_columns)) {
+  results[[column]] <- suppressWarnings(
+    as.numeric(results[[column]])
+  )
+}
+
+results <- results[
+  is.finite(results$Cause) &
+    is.finite(results$Horizon) &
+    apply(
+      results[, metric_columns, drop = FALSE],
+      1,
+      function(x) all(is.finite(x))
+    ),
+  ,
+  drop = FALSE
+]
+
+if (nrow(results) == 0) {
+  stop("No complete, finite performance observations remain.")
+}
+
+# ------------------------------------------------------------
+# 3. Format model names and competing causes
+# ------------------------------------------------------------
+
+model_labels <- c(
+  Gaussian_CNN_LSTM = "Gaussian CNN-LSTM",
+  Clayton_CNN_LSTM = "Clayton CNN-LSTM",
+  Gumbel_CNN_LSTM = "Gumbel CNN-LSTM",
+  Random_Survival_Forest = "Random Survival Forest"
+)
+
+unknown_models <- setdiff(
+  unique(results$Model),
+  names(model_labels)
+)
+
+if (length(unknown_models) > 0) {
+  stop(
+    "Unrecognized model names: ",
+    paste(unknown_models, collapse = ", ")
+  )
+}
+
+results$Model <- factor(
+  results$Model,
+  levels = names(model_labels),
+  labels = unname(model_labels)
+)
+
+results$Cause <- factor(
+  results$Cause,
+  levels = c(1, 2),
+  labels = c("Cause 1", "Cause 2")
+)
+
+# Preserve chronological horizon ordering.
+# Use a numeric x-axis so unequal time intervals are represented
+# proportionally.
+results$Horizon <- as.numeric(results$Horizon)
+
+results <- results %>%
+  arrange(Cause, Model, Horizon)
+
+# ------------------------------------------------------------
+# 4. Define publication-quality plotting function
+# ------------------------------------------------------------
+
+plot_metric <- function(
+    data,
+    metric,
+    y_label,
+    filename
+) {
+
+  p <- ggplot(
+    data,
+    aes(
+      x = Horizon,
+      y = .data[[metric]],
+      group = Model,
+      linetype = Model,
+      shape = Model
+    )
+  ) +
+    geom_line(linewidth = 0.8, na.rm = TRUE) +
+    geom_point(size = 2.5, na.rm = TRUE) +
+    facet_wrap(
+      ~ Cause,
+      scales = "free_y"
+    ) +
+    scale_x_continuous(
+      breaks = sort(unique(data$Horizon))
+    ) +
+    labs(
+      x = "Prediction horizon",
+      y = y_label,
+      linetype = "Model",
+      shape = "Model",
+      title = y_label
+    ) +
+    theme_bw(base_size = 11) +
+    theme(
+      plot.title = element_text(
+        face = "bold",
+        hjust = 0.5
+      ),
+      axis.title = element_text(face = "bold"),
+      axis.text.x = element_text(
+        angle = 25,
+        hjust = 1
+      ),
+      strip.text = element_text(face = "bold"),
+      legend.position = "bottom",
+      legend.title = element_text(face = "bold"),
+      legend.box = "vertical",
+      panel.grid.minor = element_blank()
+    ) +
+    guides(
+      linetype = guide_legend(nrow = 2),
+      shape = guide_legend(nrow = 2)
+    )
+
+  ggsave(
+    filename = file.path(output_dir, filename),
+    plot = p,
+    width = 9,
+    height = 5.8,
+    dpi = 300,
+    bg = "white"
+  )
+
+  return(p)
+}
+
+# ------------------------------------------------------------
+# 5. Generate C-index plot
+# ------------------------------------------------------------
+
+p_cindex <- plot_metric(
+  data = results,
+  metric = "Cindex",
+  y_label = "Concordance index (C-index)",
+  filename = "competing_risks_cindex.png"
+)
+
+# ------------------------------------------------------------
+# 6. Generate time-dependent AUC plot
+# ------------------------------------------------------------
+
+p_auc <- plot_metric(
+  data = results,
+  metric = "TimeAUC",
+  y_label = "Time-dependent AUC",
+  filename = "competing_risks_auc.png"
+)
+
+# ------------------------------------------------------------
+# 7. Generate Brier score plot
+# ------------------------------------------------------------
+
+p_brier <- plot_metric(
+  data = results,
+  metric = "BrierScore",
+  y_label = "Brier score",
+  filename = "competing_risks_brier.png"
+)
+
+# ------------------------------------------------------------
+# 8. Display plots
+# ------------------------------------------------------------
+
+print(p_cindex)
+print(p_auc)
+print(p_brier)
+
+# ------------------------------------------------------------
+# 9. Save a PDF containing all three plots
+# ------------------------------------------------------------
+
+pdf_file <- file.path(
+  output_dir,
+  "competing_risks_performance_plots.pdf"
+)
+
+pdf(
+  file = pdf_file,
+  width = 10,
+  height = 6.5,
+  onefile = TRUE
+)
+
+print(p_cindex)
+print(p_auc)
+print(p_brier)
+
+dev.off()
+
+# ------------------------------------------------------------
+# 10. Save the processed results
+# ------------------------------------------------------------
+
+write.csv(
+  results,
+  file = file.path(
+    output_dir,
+    "competing_risks_results_processed.csv"
+  ),
+  row.names = FALSE
+)
+
+# ------------------------------------------------------------
+# 11. Confirm completion
+# ------------------------------------------------------------
+
+cat(
+  "\nAnalysis completed. Results saved in:\n",
+  normalizePath(output_dir),
+  "\n"
+)
+
+cat("\nGenerated files:\n")
+
+cat(
+  paste0(
+    " - ", c(
+      "competing_risks_cindex.png",
+      "competing_risks_auc.png",
+      "competing_risks_brier.png",
+      "competing_risks_performance_plots.pdf",
+      "competing_risks_results_processed.csv"
+    ),
+    collapse = "\n"
+  ),
+  "\n"
+)
 cat("\nAnalysis completed. Results saved in:\n", normalizePath(output_dir), "\n")

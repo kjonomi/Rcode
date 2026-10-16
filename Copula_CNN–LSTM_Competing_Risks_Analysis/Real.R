@@ -31,7 +31,7 @@ set.seed(2026)
 epochs <- 100
 batch_size <- 64
 learning_rate <- 0.001
-lambda_copula <- 0.1  # Regularization parameter for copula loss penalty
+lambda_copula <- 0.001  # Adjusted scale to prevent penalty gradient domination
 n_time_bins <- 20
 evaluation_probs <- c(0.25, 0.50, 0.75)
 B_BOOTSTRAP <- 200
@@ -119,9 +119,6 @@ X_train <- as.matrix(X_train)
 X_test  <- as.matrix(X_test)
 p <- ncol(X_train)
 
-X_train_array <- array(as.numeric(X_train), dim = c(nrow(X_train), p, 1))
-X_test_array  <- array(as.numeric(X_test),  dim = c(nrow(X_test), p, 1))
-
 # =============================================================
 # 4. Discrete-Time Competing-Risks Targets
 # =============================================================
@@ -168,7 +165,7 @@ Y_train <- train_targets$y
 W_train <- train_targets$weights
 
 # =============================================================
-# 5. TensorFlow Safe Copula Loss Functions
+# 5. TensorFlow Safe Vectorized Copula Loss Functions
 # =============================================================
 
 tf_clip <- function(x, lower = 1e-7, upper = 1 - 1e-7) {
@@ -185,8 +182,10 @@ loss_standard_cce <- function(y_true, y_pred) {
 
 loss_gaussian_copula <- function(y_true, y_pred) {
   cce <- tf$keras$losses$categorical_crossentropy(y_true, y_pred)
-  u1 <- tf_clip(y_pred[, 1, 2])
-  u2 <- tf_clip(y_pred[, 1, 3])
+  
+  # u1, u2 over all K time intervals: shape (batch_size, K)
+  u1 <- tf_clip(y_pred[, , 2])
+  u2 <- tf_clip(y_pred[, , 3])
   
   z1 <- tf$math$log(u1 / (1 - u1))
   z2 <- tf$math$log(u2 / (1 - u2))
@@ -199,28 +198,28 @@ loss_gaussian_copula <- function(y_true, y_pred) {
 loss_clayton_copula <- function(y_true, y_pred) {
   cce <- tf$keras$losses$categorical_crossentropy(y_true, y_pred)
   theta <- 3.0
-  u1 <- tf_clip(y_pred[, 1, 2])
-  u2 <- tf_clip(y_pred[, 1, 3])
+  u1 <- tf_clip(y_pred[, , 2])
+  u2 <- tf_clip(y_pred[, , 3])
   
-  term <- u1^(-theta) + u2^(-theta) - 1.0
-  penalty <- -(log(theta + 1) - (theta + 1) * tf$math$log(u1 * u2) - (2 + 1 / theta) * tf$math$log(term))
+  term <- tf$math$maximum(u1^(-theta) + u2^(-theta) - 1.0, 1e-7)
+  penalty <- -(log(theta + 1.0) - (theta + 1.0) * tf$math$log(u1 * u2) - (2.0 + 1.0 / theta) * tf$math$log(term))
   tf$reduce_mean(cce) + lambda_copula * tf$reduce_mean(penalty)
 }
 
 loss_gumbel_copula <- function(y_true, y_pred) {
   cce <- tf$keras$losses$categorical_crossentropy(y_true, y_pred)
   theta <- 4.0
-  u1 <- tf_clip(y_pred[, 1, 2])
-  u2 <- tf_clip(y_pred[, 1, 3])
+  u1 <- tf_clip(y_pred[, , 2])
+  u2 <- tf_clip(y_pred[, , 3])
   
   a <- (-safe_log(u1))^theta
   b <- (-safe_log(u2))^theta
-  A <- (a + b)^(1 / theta)
+  A <- (a + b)^(1.0 / theta)
   tf$reduce_mean(cce) + lambda_copula * tf$reduce_mean(A)
 }
 
 # =============================================================
-# 6. Neural Architecture & Fit Functions
+# 6. Neural Architecture with Sequence Projection
 # =============================================================
 
 create_nn_model <- function(architecture, copula_penalty = "Standard") {
@@ -232,22 +231,28 @@ create_nn_model <- function(architecture, copula_penalty = "Standard") {
     "Gumbel"   = loss_gumbel_copula
   )
 
-  input_layer <- keras3::keras_input(shape = c(p, 1), name = "input_layer")
+  input_layer <- keras3::keras_input(shape = c(p), name = "input_layer")
 
   if (architecture == "MLP") {
     x <- input_layer |> 
-      keras3::layer_flatten() |> 
       keras3::layer_dense(units = 64, activation = "relu") |> 
       keras3::layer_dropout(rate = 0.25)
   } else if (architecture == "CNN") {
+    # Project tabular features into sequence space (seq_len=8, features=16)
     x <- input_layer |> 
+      keras3::layer_dense(units = 128, activation = "relu") |> 
+      keras3::layer_reshape(target_shape = c(8, 16)) |> 
       keras3::layer_conv_1d(filters = 32, kernel_size = 3, padding = "same", activation = "relu") |> 
       keras3::layer_global_average_pooling_1d()
   } else if (architecture == "LSTM") {
     x <- input_layer |> 
+      keras3::layer_dense(units = 128, activation = "relu") |> 
+      keras3::layer_reshape(target_shape = c(8, 16)) |> 
       keras3::layer_lstm(units = 64, return_sequences = FALSE)
   } else if (architecture == "CNN_LSTM") {
     x <- input_layer |> 
+      keras3::layer_dense(units = 128, activation = "relu") |> 
+      keras3::layer_reshape(target_shape = c(8, 16)) |> 
       keras3::layer_conv_1d(filters = 32, kernel_size = 3, padding = "same", activation = "relu") |> 
       keras3::layer_batch_normalization() |> 
       keras3::layer_dropout(rate = 0.25) |> 
@@ -321,8 +326,8 @@ for (arch in architectures) {
     model_key <- if (cop_p == "Standard") arch else paste0(arch, "_", cop_p)
     keras3::clear_session()
     nn_mod <- create_nn_model(arch, copula_penalty = cop_p)
-    train_model(nn_mod, X_train_array, Y_train, W_train, model_key)
-    pred_raw <- predict(nn_mod, X_test_array, verbose = 0)
+    train_model(nn_mod, X_train, Y_train, W_train, model_key)
+    pred_raw <- predict(nn_mod, X_test, verbose = 0)
     prediction_objects[[model_key]] <- extract_cif(pred_raw)
   }
 }
@@ -529,18 +534,18 @@ write.csv(bootstrap_df, file.path(output_dir, "Rotterdam_Bootstrap_Replicates.cs
 bootstrap_summary <- bootstrap_df %>%
   group_by(Model, Cause, Horizon) %>%
   summarise(
-    Cindex_Mean  = mean(Cindex, na.rm = TRUE),
-    Cindex_SD    = sd(Cindex, na.rm = TRUE),
+    Cindex_Mean   = mean(Cindex, na.rm = TRUE),
+    Cindex_SD     = sd(Cindex, na.rm = TRUE),
     Cindex_Lower = quantile(Cindex, 0.025, na.rm = TRUE),
     Cindex_Upper = quantile(Cindex, 0.975, na.rm = TRUE),
     
-    AUC_Mean  = mean(TimeAUC, na.rm = TRUE),
-    AUC_SD    = sd(TimeAUC, na.rm = TRUE),
+    AUC_Mean   = mean(TimeAUC, na.rm = TRUE),
+    AUC_SD     = sd(TimeAUC, na.rm = TRUE),
     AUC_Lower = quantile(TimeAUC, 0.025, na.rm = TRUE),
     AUC_Upper = quantile(TimeAUC, 0.975, na.rm = TRUE),
     
-    Brier_Mean  = mean(BrierScore, na.rm = TRUE),
-    Brier_SD    = sd(BrierScore, na.rm = TRUE),
+    Brier_Mean   = mean(BrierScore, na.rm = TRUE),
+    Brier_SD     = sd(BrierScore, na.rm = TRUE),
     Brier_Lower = quantile(BrierScore, 0.025, na.rm = TRUE),
     Brier_Upper = quantile(BrierScore, 0.975, na.rm = TRUE),
     .groups = "drop"

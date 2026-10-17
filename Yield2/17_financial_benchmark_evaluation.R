@@ -42,10 +42,19 @@
 rm(list = ls())
 
 options(
-    stringsAsFactors = FALSE
+    stringsAsFactors = FALSE,
+    scipen = 999
 )
 
 set.seed(20260914)
+
+cat("\n")
+cat("============================================================\n")
+cat("17_FINANCIAL_BENCHMARK_EVALUATION.R\n")
+cat("Economic & Financial Benchmark Evaluation\n")
+cat("============================================================\n")
+cat("\n")
+
 
 ###############################################################
 # 1. PACKAGES
@@ -68,122 +77,73 @@ missing_packages <- required_packages[
 ]
 
 if (length(missing_packages) > 0) {
-
     stop(
         paste(
             "Missing required packages:",
-            paste(
-                missing_packages,
-                collapse = ", "
-            )
+            paste(missing_packages, collapse = ", ")
         )
     )
 }
 
+suppressPackageStartupMessages({
+    library(dplyr)
+    library(tidyr)
+    library(ggplot2)
+    library(readr)
+})
+
+
 ###############################################################
-# 2. INPUT FILE
+# 2. PATHS & INPUT FILE RESOLUTION
 ###############################################################
 
-INPUT_FILE <-
-    "15_Financial_Decision_Results.RData"
-
-if (!file.exists(INPUT_FILE)) {
-
-    stop(
-        paste(
-            "Input file not found:",
-            INPUT_FILE,
-            "\nRun 15_financial_decision.R first."
-        )
-    )
+OUTPUT_DIR <- "17_Financial_Benchmark_Evaluation"
+if (!dir.exists(OUTPUT_DIR)) {
+    dir.create(OUTPUT_DIR, recursive = TRUE, showWarnings = FALSE)
 }
+
+candidate_files <- c(
+    "15_Financial_Decision_Results.RData",
+    file.path("15_Financial_Decision", "15_Financial_Decision_Results.RData")
+)
+
+INPUT_FILE <- candidate_files[file.exists(candidate_files)][1]
+
+if (is.na(INPUT_FILE) || !file.exists(INPUT_FILE)) {
+    stop("Input file 15_Financial_Decision_Results.RData not found. Run 15_financial_decision.R first.")
+}
+
 
 ###############################################################
 # 3. LOAD RESULTS
 ###############################################################
 
-financial_env <-
-    new.env(
-        parent = emptyenv()
-    )
+financial_env <- new.env(parent = emptyenv())
+load(INPUT_FILE, envir = financial_env)
 
-load(
-    INPUT_FILE,
-    envir = financial_env
-)
+loaded_objects <- ls(envir = financial_env)
+cat("Loaded objects from: ", INPUT_FILE, "\n", sep = "")
 
-loaded_objects <-
-    ls(
-        envir = financial_env
-    )
-
-cat("\n============================================================\n")
-cat("LOADED OBJECTS\n")
-cat("============================================================\n")
-
-print(
-    loaded_objects
-)
 
 ###############################################################
-# 4. REQUIRED OBJECTS
+# 4. REQUIRED OBJECT VALIDATION
 ###############################################################
 
-if (
-    !"financial_decision_detail" %in%
-    loaded_objects
-) {
-
-    stop(
-        "financial_decision_detail was not found in the input RData file."
-    )
+if (!"financial_decision_detail" %in% loaded_objects) {
+    stop("financial_decision_detail was not found in the input RData file.")
 }
 
-financial_decision_detail <-
-    get(
-        "financial_decision_detail",
-        envir = financial_env
-    )
-
-if (
-    !is.data.frame(
-        financial_decision_detail
-    )
-) {
-
-    stop(
-        "financial_decision_detail must be a data.frame or tibble."
-    )
+financial_decision_detail <- get("financial_decision_detail", envir = financial_env)
+if (!is.data.frame(financial_decision_detail)) {
+    financial_decision_detail <- as.data.frame(financial_decision_detail)
 }
 
-###############################################################
-# 5. OPTIONAL SUMMARY OBJECT
-###############################################################
-
-if (
-    "financial_decision_summary" %in%
-    loaded_objects
-) {
-
-    financial_decision_summary <-
-        get(
-            "financial_decision_summary",
-            envir = financial_env
-        )
-
-} else {
-
-    financial_decision_summary <-
-        NULL
-}
-
-###############################################################
-# 6. REQUIRED COLUMNS
-###############################################################
+financial_decision_summary <- if ("financial_decision_summary" %in% loaded_objects) {
+    get("financial_decision_summary", envir = financial_env)
+} else NULL
 
 required_detail_columns <- c(
     "TestIndex",
-    "Date",
     "Model",
     "SelectedPortfolio",
     "SelectedExpectedReturn",
@@ -195,1646 +155,392 @@ required_detail_columns <- c(
     "NetRealizedReturn"
 )
 
-missing_detail_columns <-
-    required_detail_columns[
-        !required_detail_columns %in%
-            names(financial_decision_detail)
-    ]
+missing_detail_columns <- required_detail_columns[!required_detail_columns %in% names(financial_decision_detail)]
 
-if (
-    length(missing_detail_columns) > 0
-) {
-
-    stop(
-        paste(
-            "The following required columns are missing:",
-            paste(
-                missing_detail_columns,
-                collapse = ", "
-            )
-        )
-    )
+if (length(missing_detail_columns) > 0) {
+    stop(paste("Missing required columns:", paste(missing_detail_columns, collapse = ", ")))
 }
 
+
 ###############################################################
-# 7. STANDARDIZE DATA
+# 5. STANDARDIZE DATA & PARAMETERS
 ###############################################################
 
-financial_decision_detail <-
-    financial_decision_detail %>%
-    dplyr::arrange(
-        Model,
-        TestIndex
-    )
+if (!"Date" %in% names(financial_decision_detail)) {
+    financial_decision_detail$Date <- financial_decision_detail$TestIndex
+}
+
+financial_decision_detail <- financial_decision_detail %>%
+    dplyr::arrange(Model, TestIndex)
 
 numeric_columns <- c(
-    "SelectedExpectedReturn",
-    "SelectedRealizedReturn",
-    "RealizedReturn_Short",
-    "RealizedReturn_Intermediate",
-    "RealizedReturn_Long",
-    "TransactionCost",
-    "NetRealizedReturn"
+    "SelectedExpectedReturn", "SelectedRealizedReturn",
+    "RealizedReturn_Short", "RealizedReturn_Intermediate", "RealizedReturn_Long",
+    "TransactionCost", "NetRealizedReturn"
 )
 
-for (
-    column_name in numeric_columns
-) {
-
-    financial_decision_detail[[column_name]] <-
-        as.numeric(
-            financial_decision_detail[[column_name]]
-        )
+for (col in numeric_columns) {
+    financial_decision_detail[[col]] <- as.numeric(financial_decision_detail[[col]])
 }
 
-###############################################################
-# 8. GLOBAL PARAMETERS
-###############################################################
+HOLDING_PERIOD   <- if ("HOLDING_PERIOD" %in% loaded_objects) get("HOLDING_PERIOD", envir = financial_env) else 1 / 12
+TRANSACTION_COST <- if ("TRANSACTION_COST" %in% loaded_objects) get("TRANSACTION_COST", envir = financial_env) else 0.0010
 
-if (
-    "HOLDING_PERIOD" %in%
-    loaded_objects
-) {
-
-    HOLDING_PERIOD <-
-        get(
-            "HOLDING_PERIOD",
-            envir = financial_env
-        )
-
-} else {
-
-    HOLDING_PERIOD <-
-        1 / 12
-}
-
-if (
-    "TRANSACTION_COST" %in%
-    loaded_objects
-) {
-
-    TRANSACTION_COST <-
-        get(
-            "TRANSACTION_COST",
-            envir = financial_env
-        )
-
-} else {
-
-    TRANSACTION_COST <-
-        0.0010
-}
 
 ###############################################################
-# 9. HELPER FUNCTIONS
+# 6. HELPER FUNCTIONS
 ###############################################################
 
 safe_mean <- function(x) {
-
-    x <- x[
-        is.finite(x)
-    ]
-
-    if (
-        length(x) == 0
-    ) {
-
-        return(
-            NA_real_
-        )
-    }
-
+    x <- x[is.finite(x)]
+    if (length(x) == 0) return(NA_real_)
     mean(x)
 }
 
 safe_sd <- function(x) {
-
-    x <- x[
-        is.finite(x)
-    ]
-
-    if (
-        length(x) < 2
-    ) {
-
-        return(
-            NA_real_
-        )
-    }
-
+    x <- x[is.finite(x)]
+    if (length(x) < 2) return(NA_real_)
     stats::sd(x)
 }
 
 safe_cumulative_return <- function(x) {
-
-    x <- x[
-        is.finite(x)
-    ]
-
-    if (
-        length(x) == 0
-    ) {
-
-        return(
-            NA_real_
-        )
-    }
-
-    if (
-        any(
-            1 + x <= 0
-        )
-    ) {
-
-        return(
-            NA_real_
-        )
-    }
-
-    prod(
-        1 + x
-    ) - 1
+    x <- x[is.finite(x)]
+    if (length(x) == 0 || any(1 + x <= 0)) return(NA_real_)
+    prod(1 + x) - 1
 }
 
-safe_annualized_return <- function(
-    x,
-    periods_per_year = 12
-) {
-
-    x <- x[
-        is.finite(x)
-    ]
-
-    if (
-        length(x) == 0
-    ) {
-
-        return(
-            NA_real_
-        )
-    }
-
-    if (
-        any(
-            1 + x <= 0
-        )
-    ) {
-
-        return(
-            NA_real_
-        )
-    }
-
-    total_wealth <-
-        prod(
-            1 + x
-        )
-
-    total_wealth^(
-        periods_per_year /
-            length(x)
-    ) - 1
+safe_annualized_return <- function(x, periods_per_year = 12) {
+    x <- x[is.finite(x)]
+    if (length(x) == 0 || any(1 + x <= 0)) return(NA_real_)
+    prod(1 + x)^(periods_per_year / length(x)) - 1
 }
 
-safe_annualized_volatility <- function(
-    x,
-    periods_per_year = 12
-) {
-
-    x <- x[
-        is.finite(x)
-    ]
-
-    if (
-        length(x) < 2
-    ) {
-
-        return(
-            NA_real_
-        )
-    }
-
-    stats::sd(x) *
-        sqrt(
-            periods_per_year
-        )
+safe_annualized_volatility <- function(x, periods_per_year = 12) {
+    x <- x[is.finite(x)]
+    if (length(x) < 2) return(NA_real_)
+    stats::sd(x) * sqrt(periods_per_year)
 }
 
-safe_sharpe <- function(
-    x,
-    periods_per_year = 12
-) {
-
-    x <- x[
-        is.finite(x)
-    ]
-
-    if (
-        length(x) < 2
-    ) {
-
-        return(
-            NA_real_
-        )
-    }
-
-    s <-
-        stats::sd(x)
-
-    if (
-        !is.finite(s) ||
-        s == 0
-    ) {
-
-        return(
-            NA_real_
-        )
-    }
-
-    mean(x) /
-        s *
-        sqrt(
-            periods_per_year
-        )
+safe_sharpe <- function(x, periods_per_year = 12) {
+    x <- x[is.finite(x)]
+    if (length(x) < 2) return(NA_real_)
+    s <- stats::sd(x)
+    if (!is.finite(s) || s == 0) return(NA_real_)
+    mean(x) / s * sqrt(periods_per_year)
 }
 
 safe_max_drawdown <- function(x) {
-
-    x <- x[
-        is.finite(x)
-    ]
-
-    if (
-        length(x) == 0
-    ) {
-
-        return(
-            NA_real_
-        )
-    }
-
-    if (
-        any(
-            1 + x <= 0
-        )
-    ) {
-
-        return(
-            NA_real_
-        )
-    }
-
-    wealth <-
-        cumprod(
-            1 + x
-        )
-
-    running_max <-
-        cummax(
-            wealth
-        )
-
-    drawdown <-
-        wealth /
-        running_max -
-        1
-
-    min(
-        drawdown,
-        na.rm = TRUE
-    )
+    x <- x[is.finite(x)]
+    if (length(x) == 0 || any(1 + x <= 0)) return(NA_real_)
+    wealth <- cumprod(1 + x)
+    running_max <- cummax(wealth)
+    drawdown <- wealth / running_max - 1
+    min(drawdown, na.rm = TRUE)
 }
 
 safe_calmar <- function(x) {
-
-    annualized_return <-
-        safe_annualized_return(
-            x
-        )
-
-    maximum_drawdown <-
-        safe_max_drawdown(
-            x
-        )
-
-    if (
-        !is.finite(
-            annualized_return
-        ) ||
-        !is.finite(
-            maximum_drawdown
-        ) ||
-        maximum_drawdown >= 0
-    ) {
-
-        return(
-            NA_real_
-        )
-    }
-
-    annualized_return /
-        abs(
-            maximum_drawdown
-        )
+    ann_ret <- safe_annualized_return(x)
+    mdd <- safe_max_drawdown(x)
+    if (!is.finite(ann_ret) || !is.finite(mdd) || mdd >= 0) return(NA_real_)
+    ann_ret / abs(mdd)
 }
 
 safe_hit_rate <- function(x) {
-
-    x <- x[
-        is.finite(x)
-    ]
-
-    if (
-        length(x) == 0
-    ) {
-
-        return(
-            NA_real_
-        )
-    }
-
-    mean(
-        x > 0
-    )
+    x <- x[is.finite(x)]
+    if (length(x) == 0) return(NA_real_)
+    mean(x > 0)
 }
 
-###############################################################
-# 10. IDENTIFY LEARNED MODELS
-###############################################################
-
-learned_models <-
-    unique(
-        financial_decision_detail$Model
-    )
-
-learned_models <-
-    learned_models[
-        !is.na(learned_models) &
-            learned_models != ""
-    ]
-
-if (
-    length(learned_models) == 0
-) {
-
-    stop(
-        "No forecasting models were found."
-    )
-}
-
-cat(
-    "\nForecasting models identified:\n"
-)
-
-print(
-    learned_models
-)
 
 ###############################################################
-# 11. CONSTRUCT LEARNED STRATEGY RETURNS
+# 7. CONSTRUCT STRATEGY & BENCHMARK RETURNS
 ###############################################################
 
-learned_strategy_returns <-
-    financial_decision_detail %>%
+learned_models <- unique(financial_decision_detail$Model)
+learned_models <- learned_models[!is.na(learned_models) & learned_models != ""]
+
+learned_strategy_returns <- financial_decision_detail %>%
     dplyr::transmute(
         TestIndex = TestIndex,
         Date = Date,
-        Strategy =
-            paste0(
-                "Model: ",
-                Model
-            ),
-        GrossReturn =
-            SelectedRealizedReturn,
-        TransactionCost =
-            TransactionCost,
-        NetReturn =
-            NetRealizedReturn
+        Strategy = paste0("Model: ", Model),
+        GrossReturn = SelectedRealizedReturn,
+        TransactionCost = TransactionCost,
+        NetReturn = NetRealizedReturn
     )
 
-###############################################################
-# 12. CONSTRUCT ONE ROW PER TEST DATE
-###############################################################
+benchmark_source <- financial_decision_detail %>%
+    dplyr::select(TestIndex, Date, RealizedReturn_Short, RealizedReturn_Intermediate, RealizedReturn_Long) %>%
+    dplyr::distinct(TestIndex, .keep_all = TRUE) %>%
+    dplyr::arrange(TestIndex)
 
-benchmark_source <-
-    financial_decision_detail %>%
-    dplyr::select(
-        TestIndex,
-        Date,
-        RealizedReturn_Short,
-        RealizedReturn_Intermediate,
-        RealizedReturn_Long
-    ) %>%
-    dplyr::distinct(
-        TestIndex,
-        .keep_all = TRUE
-    ) %>%
-    dplyr::arrange(
-        TestIndex
-    )
+fixed_short <- benchmark_source %>%
+    dplyr::transmute(TestIndex, Date, Strategy = "Fixed Short", GrossReturn = RealizedReturn_Short, TransactionCost = 0, NetReturn = RealizedReturn_Short)
 
-###############################################################
-# 13. FIXED SHORT BENCHMARK
-###############################################################
+fixed_intermediate <- benchmark_source %>%
+    dplyr::transmute(TestIndex, Date, Strategy = "Fixed Intermediate", GrossReturn = RealizedReturn_Intermediate, TransactionCost = 0, NetReturn = RealizedReturn_Intermediate)
 
-fixed_short <-
-    benchmark_source %>%
+fixed_long <- benchmark_source %>%
+    dplyr::transmute(TestIndex, Date, Strategy = "Fixed Long", GrossReturn = RealizedReturn_Long, TransactionCost = 0, NetReturn = RealizedReturn_Long)
+
+fixed_equal_weight <- benchmark_source %>%
     dplyr::transmute(
-        TestIndex = TestIndex,
-        Date = Date,
-        Strategy = "Fixed Short",
-        GrossReturn =
-            RealizedReturn_Short,
+        TestIndex, Date, Strategy = "Equal Weight",
+        GrossReturn = rowMeans(cbind(RealizedReturn_Short, RealizedReturn_Intermediate, RealizedReturn_Long), na.rm = TRUE),
         TransactionCost = 0,
-        NetReturn =
-            RealizedReturn_Short
+        NetReturn = rowMeans(cbind(RealizedReturn_Short, RealizedReturn_Intermediate, RealizedReturn_Long), na.rm = TRUE)
     )
 
+all_strategy_returns <- dplyr::bind_rows(learned_strategy_returns, fixed_short, fixed_intermediate, fixed_long, fixed_equal_weight) %>%
+    dplyr::arrange(Strategy, TestIndex)
+
+
 ###############################################################
-# 14. FIXED INTERMEDIATE BENCHMARK
+# 8. PERFORMANCE SUMMARIES & SWITCHING ANALYSIS
 ###############################################################
 
-fixed_intermediate <-
-    benchmark_source %>%
-    dplyr::transmute(
-        TestIndex = TestIndex,
-        Date = Date,
-        Strategy = "Fixed Intermediate",
-        GrossReturn =
-            RealizedReturn_Intermediate,
-        TransactionCost = 0,
-        NetReturn =
-            RealizedReturn_Intermediate
+strategy_performance <- all_strategy_returns %>%
+    dplyr::group_by(Strategy) %>%
+    dplyr::summarise(
+        N                    = sum(is.finite(NetReturn)),
+        MeanMonthlyReturn    = safe_mean(NetReturn),
+        SDMonthlyReturn      = safe_sd(NetReturn),
+        AnnualizedReturn     = safe_annualized_return(NetReturn),
+        AnnualizedVolatility = safe_annualized_volatility(NetReturn),
+        SharpeRatio          = safe_sharpe(NetReturn),
+        MaximumDrawdown      = safe_max_drawdown(NetReturn),
+        CalmarRatio          = safe_calmar(NetReturn),
+        CumulativeNetReturn  = safe_cumulative_return(NetReturn),
+        HitRate              = safe_hit_rate(NetReturn),
+        MeanTransactionCost  = safe_mean(TransactionCost),
+        TotalTransactionCost = sum(TransactionCost[is.finite(TransactionCost)], na.rm = TRUE),
+        .groups              = "drop"
     )
 
-###############################################################
-# 15. FIXED LONG BENCHMARK
-###############################################################
-
-fixed_long <-
-    benchmark_source %>%
-    dplyr::transmute(
-        TestIndex = TestIndex,
-        Date = Date,
-        Strategy = "Fixed Long",
-        GrossReturn =
-            RealizedReturn_Long,
-        TransactionCost = 0,
-        NetReturn =
-            RealizedReturn_Long
-    )
-
-###############################################################
-# 16. EQUAL-WEIGHT BENCHMARK
-###############################################################
-
-fixed_equal_weight <-
-    benchmark_source %>%
-    dplyr::transmute(
-        TestIndex = TestIndex,
-        Date = Date,
-        Strategy = "Equal Weight",
-        GrossReturn =
-            rowMeans(
-                cbind(
-                    RealizedReturn_Short,
-                    RealizedReturn_Intermediate,
-                    RealizedReturn_Long
-                ),
-                na.rm = TRUE
-            ),
-        TransactionCost = 0,
-        NetReturn =
-            rowMeans(
-                cbind(
-                    RealizedReturn_Short,
-                    RealizedReturn_Intermediate,
-                    RealizedReturn_Long
-                ),
-                na.rm = TRUE
-            )
-    )
-
-###############################################################
-# 17. COMBINE ALL STRATEGIES
-###############################################################
-
-fixed_benchmarks <-
-    dplyr::bind_rows(
-        fixed_short,
-        fixed_intermediate,
-        fixed_long,
-        fixed_equal_weight
-    )
-
-all_strategy_returns <-
-    dplyr::bind_rows(
-        learned_strategy_returns,
-        fixed_benchmarks
-    ) %>%
-    dplyr::arrange(
-        Strategy,
-        TestIndex
-    )
-
-###############################################################
-# 18. VERIFY DATA
-###############################################################
-
-cat("\n============================================================\n")
-cat("STRATEGY COUNTS\n")
-cat("============================================================\n")
-
-strategy_counts <-
-    all_strategy_returns %>%
-    dplyr::group_by(
-        Strategy
+learned_switching <- financial_decision_detail %>%
+    dplyr::arrange(Model, TestIndex) %>%
+    dplyr::group_by(Model) %>%
+    dplyr::mutate(
+        PreviousPortfolio = dplyr::lag(SelectedPortfolio),
+        PortfolioSwitch   = !is.na(PreviousPortfolio) & SelectedPortfolio != PreviousPortfolio
     ) %>%
     dplyr::summarise(
-        N = n(),
-        FiniteN =
-            sum(
-                is.finite(
-                    NetReturn
-                )
-            ),
-        .groups = "drop"
-    )
-
-print(
-    strategy_counts
-)
-
-###############################################################
-# 19. PERFORMANCE SUMMARY
-###############################################################
-
-strategy_performance <-
-    all_strategy_returns %>%
-    dplyr::group_by(
-        Strategy
+        NumberOfSwitches = sum(PortfolioSwitch, na.rm = TRUE),
+        SwitchingRate    = safe_mean(PortfolioSwitch[!is.na(PreviousPortfolio)]),
+        .groups          = "drop"
     ) %>%
-    dplyr::summarise(
-        N =
-            sum(
-                is.finite(
-                    NetReturn
-                )
-            ),
+    dplyr::mutate(Strategy = paste0("Model: ", Model))
 
-        MeanMonthlyReturn =
-            safe_mean(
-                NetReturn
-            ),
-
-        SDMonthlyReturn =
-            safe_sd(
-                NetReturn
-            ),
-
-        AnnualizedReturn =
-            safe_annualized_return(
-                NetReturn
-            ),
-
-        AnnualizedVolatility =
-            safe_annualized_volatility(
-                NetReturn
-            ),
-
-        SharpeRatio =
-            safe_sharpe(
-                NetReturn
-            ),
-
-        MaximumDrawdown =
-            safe_max_drawdown(
-                NetReturn
-            ),
-
-        CalmarRatio =
-            safe_calmar(
-                NetReturn
-            ),
-
-        CumulativeNetReturn =
-            safe_cumulative_return(
-                NetReturn
-            ),
-
-        HitRate =
-            safe_hit_rate(
-                NetReturn
-            ),
-
-        MeanTransactionCost =
-            safe_mean(
-                TransactionCost
-            ),
-
-        TotalTransactionCost =
-            sum(
-                TransactionCost[
-                    is.finite(
-                        TransactionCost
-                    )
-                ],
-                na.rm = TRUE
-            ),
-
-        .groups = "drop"
-    )
-
-###############################################################
-# 20. PORTFOLIO SWITCHING FOR LEARNED MODELS
-###############################################################
-
-learned_switching <-
-    financial_decision_detail %>%
-    dplyr::arrange(
-        Model,
-        TestIndex
-    ) %>%
-    dplyr::group_by(
-        Model
-    ) %>%
+strategy_performance <- strategy_performance %>%
+    dplyr::left_join(learned_switching %>% dplyr::select(Strategy, NumberOfSwitches, SwitchingRate), by = "Strategy") %>%
     dplyr::mutate(
-        PreviousPortfolio =
-            dplyr::lag(
-                SelectedPortfolio
-            ),
+        NumberOfSwitches = dplyr::coalesce(NumberOfSwitches, 0),
+        SwitchingRate    = dplyr::coalesce(SwitchingRate, 0)
+    )
 
-        PortfolioSwitch =
-            !is.na(
-                PreviousPortfolio
-            ) &
-            SelectedPortfolio !=
-                PreviousPortfolio
-    ) %>%
-    dplyr::summarise(
-        NumberOfSwitches =
-            sum(
-                PortfolioSwitch,
-                na.rm = TRUE
-            ),
 
-        SwitchingRate =
-            safe_mean(
-                PortfolioSwitch[
-                    !is.na(
-                        PreviousPortfolio
-                    )
-                ]
-            ),
+###############################################################
+# 9. STRATEGY RANKINGS & BENCHMARK COMPARISON
+###############################################################
 
-        .groups = "drop"
-    ) %>%
+strategy_performance <- strategy_performance %>%
     dplyr::mutate(
-        Strategy =
-            paste0(
-                "Model: ",
-                Model
-            )
-    )
-
-###############################################################
-# 21. ADD SWITCHING INFORMATION
-###############################################################
-
-strategy_performance <-
-    strategy_performance %>%
-    dplyr::left_join(
-        learned_switching %>%
-            dplyr::select(
-                Strategy,
-                NumberOfSwitches,
-                SwitchingRate
-            ),
-        by = "Strategy"
+        Rank_CumulativeReturn = rank(-CumulativeNetReturn, ties.method = "min", na.last = "keep"),
+        Rank_Sharpe           = rank(-SharpeRatio, ties.method = "min", na.last = "keep"),
+        Rank_Drawdown         = rank(abs(MaximumDrawdown), ties.method = "min", na.last = "keep"),
+        OverallRankScore      = rowMeans(cbind(Rank_CumulativeReturn, Rank_Sharpe, Rank_Drawdown), na.rm = TRUE),
+        OverallRank           = rank(OverallRankScore, ties.method = "min", na.last = "keep")
     ) %>%
-    dplyr::mutate(
-        NumberOfSwitches =
-            dplyr::coalesce(
-                NumberOfSwitches,
-                0
-            ),
+    dplyr::arrange(OverallRank)
 
-        SwitchingRate =
-            dplyr::coalesce(
-                SwitchingRate,
-                0
+fixed_strategy_names <- c("Fixed Short", "Fixed Intermediate", "Fixed Long", "Equal Weight")
+fixed_perf           <- strategy_performance %>% dplyr::filter(Strategy %in% fixed_strategy_names)
+
+best_fixed_strategy <- if (nrow(fixed_perf) > 0) {
+    valid_fixed <- fixed_perf %>% dplyr::filter(is.finite(CumulativeNetReturn))
+    if (nrow(valid_fixed) > 0) valid_fixed$Strategy[which.max(valid_fixed$CumulativeNetReturn)] else NA_character_
+} else NA_character_
+
+cat("Best fixed benchmark:", best_fixed_strategy, "\n")
+
+
+###############################################################
+# 10. PAIRED COMPARISONS & BOOTSTRAP TESTING
+###############################################################
+
+strategy_names <- unique(all_strategy_returns$Strategy)
+comparison_list <- list()
+comp_idx <- 1
+
+if (length(strategy_names) >= 2) {
+    for (i in seq_len(length(strategy_names) - 1)) {
+        for (j in (i + 1):length(strategy_names)) {
+            s1 <- strategy_names[i]
+            s2 <- strategy_names[j]
+
+            d1 <- all_strategy_returns %>% dplyr::filter(Strategy == s1) %>% dplyr::select(TestIndex, Return_1 = NetReturn)
+            d2 <- all_strategy_returns %>% dplyr::filter(Strategy == s2) %>% dplyr::select(TestIndex, Return_2 = NetReturn)
+
+            paired <- dplyr::inner_join(d1, d2, by = "TestIndex") %>% dplyr::filter(is.finite(Return_1) & is.finite(Return_2))
+            if (nrow(paired) < 5) next
+
+            paired$Difference <- paired$Return_1 - paired$Return_2
+
+            comparison_list[[comp_idx]] <- data.frame(
+                Strategy_1      = s1,
+                Strategy_2      = s2,
+                N               = nrow(paired),
+                MeanDifference  = safe_mean(paired$Difference),
+                SDDifference    = safe_sd(paired$Difference),
+                Paired_t_pvalue = tryCatch(stats::t.test(paired$Return_1, paired$Return_2, paired = TRUE)$p.value, error = function(e) NA_real_),
+                Wilcoxon_pvalue = tryCatch(stats::wilcox.test(paired$Return_1, paired$Return_2, paired = TRUE, exact = FALSE)$p.value, error = function(e) NA_real_),
+                stringsAsFactors = FALSE
             )
-    )
-
-###############################################################
-# 22. RANK STRATEGIES
-###############################################################
-
-strategy_performance <-
-    strategy_performance %>%
-    dplyr::mutate(
-        Rank_CumulativeReturn =
-            rank(
-                -CumulativeNetReturn,
-                ties.method = "min",
-                na.last = "keep"
-            ),
-
-        Rank_Sharpe =
-            rank(
-                -SharpeRatio,
-                ties.method = "min",
-                na.last = "keep"
-            ),
-
-        Rank_Drawdown =
-            rank(
-                abs(
-                    MaximumDrawdown
-                ),
-                ties.method = "min",
-                na.last = "keep"
-            )
-    )
-
-strategy_performance <-
-    strategy_performance %>%
-    dplyr::mutate(
-        OverallRankScore =
-            rowMeans(
-                cbind(
-                    Rank_CumulativeReturn,
-                    Rank_Sharpe,
-                    Rank_Drawdown
-                ),
-                na.rm = TRUE
-            ),
-
-        OverallRank =
-            rank(
-                OverallRankScore,
-                ties.method = "min",
-                na.last = "keep"
-            )
-    ) %>%
-    dplyr::arrange(
-        OverallRank
-    )
-
-###############################################################
-# 23. FIND BEST FIXED BENCHMARK
-###############################################################
-
-fixed_strategy_names <- c(
-    "Fixed Short",
-    "Fixed Intermediate",
-    "Fixed Long",
-    "Equal Weight"
-)
-
-fixed_performance <-
-    strategy_performance %>%
-    dplyr::filter(
-        Strategy %in%
-            fixed_strategy_names
-    )
-
-if (
-    nrow(fixed_performance) == 0
-) {
-
-    best_fixed_strategy <-
-        NA_character_
-
-} else {
-
-    valid_fixed <-
-        fixed_performance %>%
-        dplyr::filter(
-            is.finite(
-                CumulativeNetReturn
-            )
-        )
-
-    if (
-        nrow(valid_fixed) == 0
-    ) {
-
-        best_fixed_strategy <-
-            NA_character_
-
-    } else {
-
-        best_fixed_strategy <-
-            valid_fixed$Strategy[
-                which.max(
-                    valid_fixed$CumulativeNetReturn
-                )
-            ]
-    }
-}
-
-cat(
-    "\nBest fixed benchmark:",
-    best_fixed_strategy,
-    "\n"
-)
-
-###############################################################
-# 24. PAIRED STRATEGY COMPARISONS
-###############################################################
-
-strategy_names <-
-    unique(
-        all_strategy_returns$Strategy
-    )
-
-comparison_list <-
-    list()
-
-comparison_counter <-
-    1
-
-if (
-    length(strategy_names) >= 2
-) {
-
-    for (
-        i in seq_len(
-            length(strategy_names) - 1
-        )
-    ) {
-
-        for (
-            j in (i + 1):length(
-                strategy_names
-            )
-        ) {
-
-            strategy_1 <-
-                strategy_names[i]
-
-            strategy_2 <-
-                strategy_names[j]
-
-            data_1 <-
-                all_strategy_returns %>%
-                dplyr::filter(
-                    Strategy ==
-                        strategy_1
-                ) %>%
-                dplyr::select(
-                    TestIndex,
-                    Return_1 =
-                        NetReturn
-                )
-
-            data_2 <-
-                all_strategy_returns %>%
-                dplyr::filter(
-                    Strategy ==
-                        strategy_2
-                ) %>%
-                dplyr::select(
-                    TestIndex,
-                    Return_2 =
-                        NetReturn
-                )
-
-            paired <-
-                dplyr::inner_join(
-                    data_1,
-                    data_2,
-                    by = "TestIndex"
-                ) %>%
-                dplyr::filter(
-                    is.finite(
-                        Return_1
-                    ),
-                    is.finite(
-                        Return_2
-                    )
-                )
-
-            if (
-                nrow(paired) < 5
-            ) {
-
-                next
-            }
-
-            paired$Difference <-
-                paired$Return_1 -
-                paired$Return_2
-
-            comparison_list[[comparison_counter]] <-
-                data.frame(
-                    Strategy_1 =
-                        strategy_1,
-
-                    Strategy_2 =
-                        strategy_2,
-
-                    N =
-                        nrow(paired),
-
-                    MeanDifference =
-                        safe_mean(
-                            paired$Difference
-                        ),
-
-                    SDDifference =
-                        safe_sd(
-                            paired$Difference
-                        ),
-
-                    Paired_t_pvalue =
-                        tryCatch(
-                            stats::t.test(
-                                paired$Return_1,
-                                paired$Return_2,
-                                paired = TRUE
-                            )$p.value,
-
-                            error =
-                                function(e)
-                                    NA_real_
-                        ),
-
-                    Wilcoxon_pvalue =
-                        tryCatch(
-                            stats::wilcox.test(
-                                paired$Return_1,
-                                paired$Return_2,
-                                paired = TRUE,
-                                exact = FALSE
-                            )$p.value,
-
-                            error =
-                                function(e)
-                                    NA_real_
-                        ),
-
-                    stringsAsFactors =
-                        FALSE
-                )
-
-            comparison_counter <-
-                comparison_counter + 1
+            comp_idx <- comp_idx + 1
         }
     }
 }
 
-if (
-    length(comparison_list) > 0
-) {
+paired_comparison <- if (length(comparison_list) > 0) dplyr::bind_rows(comparison_list) else data.frame()
 
-    paired_comparison <-
-        dplyr::bind_rows(
-            comparison_list
-        )
 
-} else {
+###############################################################
+# 11. BOOTSTRAP COMPARISONS
+###############################################################
 
-    paired_comparison <-
-        data.frame(
-            Strategy_1 =
-                character(),
+paired_bootstrap <- function(x, y, B = 5000, seed = 20260914) {
+    keep <- is.finite(x) & is.finite(y)
+    x <- x[keep]; y <- y[keep]
+    n <- length(x)
+    if (n < 5) return(data.frame(N = n, Estimate = NA_real_, Lower95 = NA_real_, Upper95 = NA_real_))
 
-            Strategy_2 =
-                character(),
-
-            N =
-                integer(),
-
-            MeanDifference =
-                numeric(),
-
-            SDDifference =
-                numeric(),
-
-            Paired_t_pvalue =
-                numeric(),
-
-            Wilcoxon_pvalue =
-                numeric(),
-
-            stringsAsFactors =
-                FALSE
-        )
+    set.seed(seed)
+    observed <- mean(x - y)
+    boot_vals <- numeric(B)
+    for (b in seq_len(B)) {
+        idx <- sample.int(n, size = n, replace = TRUE)
+        boot_vals[b] <- mean(x[idx] - y[idx])
+    }
+    quant <- stats::quantile(boot_vals, probs = c(0.025, 0.975), na.rm = TRUE, names = FALSE)
+    data.frame(N = n, Estimate = observed, Lower95 = quant[1], Upper95 = quant[2])
 }
 
-###############################################################
-# 25. PAIRED BOOTSTRAP
-###############################################################
+bootstrap_list <- list()
+boot_idx <- 1
 
-paired_bootstrap <- function(
-    x,
-    y,
-    B = 5000,
-    seed = 20260914
-) {
+if (length(strategy_names) >= 2) {
+    for (i in seq_len(length(strategy_names) - 1)) {
+        for (j in (i + 1):length(strategy_names)) {
+            s1 <- strategy_names[i]
+            s2 <- strategy_names[j]
 
-    keep <-
-        is.finite(x) &
-        is.finite(y)
+            d1 <- all_strategy_returns %>% dplyr::filter(Strategy == s1) %>% dplyr::select(TestIndex, Return_1 = NetReturn)
+            d2 <- all_strategy_returns %>% dplyr::filter(Strategy == s2) %>% dplyr::select(TestIndex, Return_2 = NetReturn)
+            paired <- dplyr::inner_join(d1, d2, by = "TestIndex")
 
-    x <-
-        x[keep]
-
-    y <-
-        y[keep]
-
-    n <-
-        length(x)
-
-    if (
-        n < 5
-    ) {
-
-        return(
-            data.frame(
-                N = n,
-                Estimate = NA_real_,
-                Lower95 = NA_real_,
-                Upper95 = NA_real_
-            )
-        )
-    }
-
-    set.seed(
-        seed
-    )
-
-    observed <-
-        mean(
-            x - y
-        )
-
-    bootstrap_values <-
-        numeric(
-            B
-        )
-
-    for (
-        b in seq_len(B)
-    ) {
-
-        index <-
-            sample.int(
-                n,
-                size = n,
-                replace = TRUE
-            )
-
-        bootstrap_values[b] <-
-            mean(
-                x[index] -
-                    y[index]
-            )
-    }
-
-    quantiles <-
-        stats::quantile(
-            bootstrap_values,
-            probs =
-                c(
-                    0.025,
-                    0.975
-                ),
-            na.rm = TRUE,
-            names = FALSE
-        )
-
-    data.frame(
-        N = n,
-        Estimate = observed,
-        Lower95 = quantiles[1],
-        Upper95 = quantiles[2]
-    )
-}
-
-###############################################################
-# 26. BOOTSTRAP ALL PAIRS
-###############################################################
-
-bootstrap_list <-
-    list()
-
-bootstrap_counter <-
-    1
-
-if (
-    length(strategy_names) >= 2
-) {
-
-    for (
-        i in seq_len(
-            length(strategy_names) - 1
-        )
-    ) {
-
-        for (
-            j in (i + 1):length(
-                strategy_names
-            )
-        ) {
-
-            strategy_1 <-
-                strategy_names[i]
-
-            strategy_2 <-
-                strategy_names[j]
-
-            data_1 <-
-                all_strategy_returns %>%
-                dplyr::filter(
-                    Strategy ==
-                        strategy_1
-                ) %>%
-                dplyr::select(
-                    TestIndex,
-                    Return_1 =
-                        NetReturn
-                )
-
-            data_2 <-
-                all_strategy_returns %>%
-                dplyr::filter(
-                    Strategy ==
-                        strategy_2
-                ) %>%
-                dplyr::select(
-                    TestIndex,
-                    Return_2 =
-                        NetReturn
-                )
-
-            paired <-
-                dplyr::inner_join(
-                    data_1,
-                    data_2,
-                    by = "TestIndex"
-                )
-
-            result <-
-                paired_bootstrap(
-                    paired$Return_1,
-                    paired$Return_2,
-                    B = 5000,
-                    seed =
-                        20260914 +
-                        bootstrap_counter
-                )
-
-            result$Strategy_1 <-
-                strategy_1
-
-            result$Strategy_2 <-
-                strategy_2
-
-            bootstrap_list[[bootstrap_counter]] <-
-                result
-
-            bootstrap_counter <-
-                bootstrap_counter + 1
+            res <- paired_bootstrap(paired$Return_1, paired$Return_2, B = 5000, seed = 20260914 + boot_idx)
+            res$Strategy_1 <- s1
+            res$Strategy_2 <- s2
+            bootstrap_list[[boot_idx]] <- res
+            boot_idx <- boot_idx + 1
         }
     }
 }
 
-if (
-    length(bootstrap_list) > 0
-) {
+bootstrap_comparison <- if (length(bootstrap_list) > 0) dplyr::bind_rows(bootstrap_list) %>% dplyr::select(Strategy_1, Strategy_2, dplyr::everything()) else data.frame()
 
-    bootstrap_comparison <-
-        dplyr::bind_rows(
-            bootstrap_list
-        ) %>%
-        dplyr::select(
-            Strategy_1,
-            Strategy_2,
-            dplyr::everything()
+
+###############################################################
+# 12. MODEL VS BEST FIXED BENCHMARK
+###############################################################
+
+model_vs_best_fixed <- data.frame()
+
+if (!is.na(best_fixed_strategy) && best_fixed_strategy %in% all_strategy_returns$Strategy) {
+    model_comp_list <- list()
+    m_idx <- 1
+    for (m in learned_models) {
+        strat_name <- paste0("Model: ", m)
+        m_data <- all_strategy_returns %>% dplyr::filter(Strategy == strat_name) %>% dplyr::select(TestIndex, ModelReturn = NetReturn)
+        b_data <- all_strategy_returns %>% dplyr::filter(Strategy == best_fixed_strategy) %>% dplyr::select(TestIndex, BenchmarkReturn = NetReturn)
+
+        paired_b <- dplyr::inner_join(m_data, b_data, by = "TestIndex") %>% dplyr::filter(is.finite(ModelReturn) & is.finite(BenchmarkReturn))
+        if (nrow(paired_b) < 5) next
+
+        diff_vec <- paired_b$ModelReturn - paired_b$BenchmarkReturn
+        model_comp_list[[m_idx]] <- data.frame(
+            Model           = m,
+            Benchmark       = best_fixed_strategy,
+            N               = nrow(paired_b),
+            MeanDifference  = safe_mean(diff_vec),
+            SDDifference    = safe_sd(diff_vec),
+            Paired_t_pvalue = tryCatch(stats::t.test(paired_b$ModelReturn, paired_b$BenchmarkReturn, paired = TRUE)$p.value, error = function(e) NA_real_),
+            Wilcoxon_pvalue = tryCatch(stats::wilcox.test(paired_b$ModelReturn, paired_b$BenchmarkReturn, paired = TRUE, exact = FALSE)$p.value, error = function(e) NA_real_),
+            stringsAsFactors = FALSE
         )
-
-} else {
-
-    bootstrap_comparison <-
-        data.frame(
-            Strategy_1 =
-                character(),
-
-            Strategy_2 =
-                character(),
-
-            N =
-                integer(),
-
-            Estimate =
-                numeric(),
-
-            Lower95 =
-                numeric(),
-
-            Upper95 =
-                numeric(),
-
-            stringsAsFactors =
-                FALSE
-        )
+        m_idx <- m_idx + 1
+    }
+    if (length(model_comp_list) > 0) model_vs_best_fixed <- dplyr::bind_rows(model_comp_list)
 }
 
-###############################################################
-# 27. LEARNED MODELS VS BEST FIXED BENCHMARK
-###############################################################
-
-model_vs_best_fixed <-
-    data.frame()
-
-if (
-    !is.na(best_fixed_strategy) &&
-    best_fixed_strategy %in%
-        all_strategy_returns$Strategy
-) {
-
-    model_comparison_list <-
-        list()
-
-    model_counter <-
-        1
-
-    for (
-        model_name in learned_models
-    ) {
-
-        strategy_name <-
-            paste0(
-                "Model: ",
-                model_name
-            )
-
-        model_data <-
-            all_strategy_returns %>%
-            dplyr::filter(
-                Strategy ==
-                    strategy_name
-            ) %>%
-            dplyr::select(
-                TestIndex,
-                ModelReturn =
-                    NetReturn
-            )
-
-        benchmark_data <-
-            all_strategy_returns %>%
-            dplyr::filter(
-                Strategy ==
-                    best_fixed_strategy
-            ) %>%
-            dplyr::select(
-                TestIndex,
-                BenchmarkReturn =
-                    NetReturn
-            )
-
-        paired_best <-
-            dplyr::inner_join(
-                model_data,
-                benchmark_data,
-                by = "TestIndex"
-            ) %>%
-            dplyr::filter(
-                is.finite(
-                    ModelReturn
-                ),
-                is.finite(
-                    BenchmarkReturn
-                )
-            )
-
-        if (
-            nrow(paired_best) < 5
-        ) {
-
-            next
-        }
-
-        difference <-
-            paired_best$ModelReturn -
-            paired_best$BenchmarkReturn
-
-        model_comparison_list[[model_counter]] <-
-            data.frame(
-                Model =
-                    model_name,
-
-                Benchmark =
-                    best_fixed_strategy,
-
-                N =
-                    nrow(paired_best),
-
-                MeanDifference =
-                    safe_mean(
-                        difference
-                    ),
-
-                SDDifference =
-                    safe_sd(
-                        difference
-                    ),
-
-                Paired_t_pvalue =
-                    tryCatch(
-                        stats::t.test(
-                            paired_best$ModelReturn,
-                            paired_best$BenchmarkReturn,
-                            paired = TRUE
-                        )$p.value,
-
-                        error =
-                            function(e)
-                                NA_real_
-                    ),
-
-                Wilcoxon_pvalue =
-                    tryCatch(
-                        stats::wilcox.test(
-                            paired_best$ModelReturn,
-                            paired_best$BenchmarkReturn,
-                            paired = TRUE,
-                            exact = FALSE
-                        )$p.value,
-
-                        error =
-                            function(e)
-                                NA_real_
-                    ),
-
-                stringsAsFactors =
-                    FALSE
-            )
-
-        model_counter <-
-            model_counter + 1
-    }
-
-    if (
-        length(model_comparison_list) > 0
-    ) {
-
-        model_vs_best_fixed <-
-            dplyr::bind_rows(
-                model_comparison_list
-            )
-    }
-}
 
 ###############################################################
-# 28. CUMULATIVE WEALTH
+# 13. CUMULATIVE WEALTH & VISUALIZATIONS
 ###############################################################
 
-wealth_data <-
-    all_strategy_returns %>%
-    dplyr::group_by(
-        Strategy
-    ) %>%
-    dplyr::arrange(
-        TestIndex,
-        .by_group = TRUE
-    ) %>%
-    dplyr::mutate(
-        Wealth =
-            cumprod(
-                1 + NetReturn
-            )
-    ) %>%
+wealth_data <- all_strategy_returns %>%
+    dplyr::group_by(Strategy) %>%
+    dplyr::arrange(TestIndex, .by_group = TRUE) %>%
+    dplyr::mutate(Wealth = cumprod(1 + dplyr::coalesce(NetReturn, 0))) %>%
     dplyr::ungroup()
 
-###############################################################
-# 29. CUMULATIVE WEALTH FIGURE
-###############################################################
+# 1. Cumulative Wealth Plot
+p_wealth <- ggplot2::ggplot(wealth_data, ggplot2::aes(x = TestIndex, y = Wealth, color = Strategy)) +
+    ggplot2::geom_line(linewidth = 0.8) +
+    ggplot2::labs(title = "Cumulative Wealth Growth across Strategies", x = "Test Horizon (Months)", y = "Portfolio Wealth ($1 Baseline)") +
+    ggplot2::theme_minimal() +
+    ggplot2::theme(plot.title = ggplot2::element_text(hjust = 0.5, face = "bold"))
 
-plot_cumulative <-
-    ggplot(
-        wealth_data,
-        aes(
-            x = TestIndex,
-            y = Wealth,
-            linetype = Strategy
-        )
-    ) +
+ggplot2::ggsave(file.path(OUTPUT_DIR, "17_Cumulative_Wealth_Benchmark_Comparison.png"), plot = p_wealth, width = 8, height = 5, dpi = 300)
 
-    geom_line(
-        linewidth = 0.8,
-        na.rm = TRUE
-    ) +
+# 2. Annualized Return Bar Plot
+p_ret <- ggplot2::ggplot(strategy_performance, ggplot2::aes(x = reorder(Strategy, AnnualizedReturn), y = AnnualizedReturn * 100, fill = Strategy)) +
+    ggplot2::geom_col(show.legend = FALSE) +
+    ggplot2::labs(title = "Annualized Strategy Net Returns (%)", x = "Strategy", y = "Annualized Return (%)") +
+    ggplot2::theme_minimal() +
+    ggplot2::theme(plot.title = ggplot2::element_text(hjust = 0.5, face = "bold"), axis.text.x = ggplot2::element_text(angle = 30, hjust = 1))
 
-    labs(
-        title =
-            "Out-of-Sample Cumulative Wealth",
+ggplot2::ggsave(file.path(OUTPUT_DIR, "17_Annualized_Return_Benchmark_Comparison.png"), plot = p_ret, width = 8, height = 5, dpi = 300)
 
-        x =
-            "Test Index",
+# 3. Sharpe Ratio Bar Plot
+p_sharpe <- ggplot2::ggplot(strategy_performance, ggplot2::aes(x = reorder(Strategy, SharpeRatio), y = SharpeRatio, fill = Strategy)) +
+    ggplot2::geom_col(show.legend = FALSE) +
+    ggplot2::labs(title = "Annualized Sharpe Ratios by Strategy", x = "Strategy", y = "Sharpe Ratio") +
+    ggplot2::theme_minimal() +
+    ggplot2::theme(plot.title = ggplot2::element_text(hjust = 0.5, face = "bold"), axis.text.x = ggplot2::element_text(angle = 30, hjust = 1))
 
-        y =
-            "Cumulative Wealth",
+ggplot2::ggsave(file.path(OUTPUT_DIR, "17_Sharpe_Ratio_Benchmark_Comparison.png"), plot = p_sharpe, width = 8, height = 5, dpi = 300)
 
-        linetype =
-            "Strategy"
-    ) +
+# 4. Maximum Drawdown Bar Plot
+p_mdd <- ggplot2::ggplot(strategy_performance, ggplot2::aes(x = reorder(Strategy, MaximumDrawdown), y = MaximumDrawdown * 100, fill = Strategy)) +
+    ggplot2::geom_col(show.legend = FALSE) +
+    ggplot2::labs(title = "Maximum Drawdown Comparison (%)", x = "Strategy", y = "Max Drawdown (%)") +
+    ggplot2::theme_minimal() +
+    ggplot2::theme(plot.title = ggplot2::element_text(hjust = 0.5, face = "bold"), axis.text.x = ggplot2::element_text(angle = 30, hjust = 1))
 
-    theme_bw() +
+ggplot2::ggsave(file.path(OUTPUT_DIR, "17_Maximum_Drawdown_Benchmark_Comparison.png"), plot = p_mdd, width = 8, height = 5, dpi = 300)
 
-    theme(
-        legend.position =
-            "bottom"
-    )
-
-ggsave(
-    filename =
-        "17_Cumulative_Wealth_Benchmark_Comparison.png",
-
-    plot =
-        plot_cumulative,
-
-    width =
-        10,
-
-    height =
-        6,
-
-    dpi =
-        300
-)
 
 ###############################################################
-# 30. ANNUALIZED RETURN FIGURE
+# 14. EXPORT CSV & RDATA ARTIFACTS
 ###############################################################
 
-plot_return <-
-    ggplot(
-        strategy_performance,
-        aes(
-            x =
-                reorder(
-                    Strategy,
-                    AnnualizedReturn
-                ),
-
-            y =
-                AnnualizedReturn
-        )
-    ) +
-
-    geom_col(
-        na.rm = TRUE
-    ) +
-
-    coord_flip() +
-
-    labs(
-        title =
-            "Annualized Out-of-Sample Return",
-
-        x =
-            NULL,
-
-        y =
-            "Annualized Return"
-    ) +
-
-    theme_bw()
-
-ggsave(
-    filename =
-        "17_Annualized_Return_Benchmark_Comparison.png",
-
-    plot =
-        plot_return,
-
-    width =
-        9,
-
-    height =
-        6,
-
-    dpi =
-        300
-)
-
-###############################################################
-# 31. SHARPE RATIO FIGURE
-###############################################################
-
-plot_sharpe <-
-    ggplot(
-        strategy_performance,
-        aes(
-            x =
-                reorder(
-                    Strategy,
-                    SharpeRatio
-                ),
-
-            y =
-                SharpeRatio
-        )
-    ) +
-
-    geom_col(
-        na.rm = TRUE
-    ) +
-
-    coord_flip() +
-
-    labs(
-        title =
-            "Annualized Sharpe Ratio",
-
-        x =
-            NULL,
-
-        y =
-            "Sharpe Ratio"
-    ) +
-
-    theme_bw()
-
-ggsave(
-    filename =
-        "17_Sharpe_Ratio_Benchmark_Comparison.png",
-
-    plot =
-        plot_sharpe,
-
-    width =
-        9,
-
-    height =
-        6,
-
-    dpi =
-        300
-)
-
-###############################################################
-# 32. MAXIMUM DRAWDOWN FIGURE
-###############################################################
-
-plot_drawdown <-
-    ggplot(
-        strategy_performance,
-        aes(
-            x =
-                reorder(
-                    Strategy,
-                    MaximumDrawdown
-                ),
-
-            y =
-                MaximumDrawdown
-        )
-    ) +
-
-    geom_col(
-        na.rm = TRUE
-    ) +
-
-    coord_flip() +
-
-    labs(
-        title =
-            "Maximum Drawdown",
-
-        x =
-            NULL,
-
-        y =
-            "Maximum Drawdown"
-    ) +
-
-    theme_bw()
-
-ggsave(
-    filename =
-        "17_Maximum_Drawdown_Benchmark_Comparison.png",
-
-    plot =
-        plot_drawdown,
-
-    width =
-        9,
-
-    height =
-        6,
-
-    dpi =
-        300
-)
-
-###############################################################
-# 33. SAVE RDATA
-###############################################################
+readr::write_csv(strategy_performance, file.path(OUTPUT_DIR, "17_Strategy_Performance.csv"))
+readr::write_csv(all_strategy_returns, file.path(OUTPUT_DIR, "17_All_Strategy_Returns.csv"))
+readr::write_csv(wealth_data, file.path(OUTPUT_DIR, "17_Strategy_Wealth.csv"))
+readr::write_csv(paired_comparison, file.path(OUTPUT_DIR, "17_Paired_Strategy_Comparisons.csv"))
+readr::write_csv(bootstrap_comparison, file.path(OUTPUT_DIR, "17_Bootstrap_Strategy_Comparisons.csv"))
+readr::write_csv(model_vs_best_fixed, file.path(OUTPUT_DIR, "17_Model_vs_Best_Fixed_Benchmark.csv"))
 
 save(
     strategy_performance,
@@ -1844,166 +550,20 @@ save(
     bootstrap_comparison,
     model_vs_best_fixed,
     best_fixed_strategy,
-    learned_switching,
-
-    file =
-        "17_Financial_Benchmark_Evaluation.RData"
+    file = file.path(OUTPUT_DIR, "17_Financial_Benchmark_Evaluation.RData")
 )
+
 
 ###############################################################
-# 34. SAVE CSV FILES
+# 15. CONSOLE SUMMARY
 ###############################################################
 
-readr::write_csv(
-    strategy_performance,
-    "17_Strategy_Performance.csv"
-)
-
-readr::write_csv(
-    all_strategy_returns,
-    "17_All_Strategy_Returns.csv"
-)
-
-readr::write_csv(
-    wealth_data,
-    "17_Strategy_Wealth.csv"
-)
-
-readr::write_csv(
-    paired_comparison,
-    "17_Paired_Strategy_Comparisons.csv"
-)
-
-readr::write_csv(
-    bootstrap_comparison,
-    "17_Bootstrap_Strategy_Comparisons.csv"
-)
-
-readr::write_csv(
-    model_vs_best_fixed,
-    "17_Model_vs_Best_Fixed_Benchmark.csv"
-)
-
-###############################################################
-# 35. CONSOLE OUTPUT
-###############################################################
-
-cat("\n")
+cat("\n============================================================\n")
+cat("STRATEGY PERFORMANCE OVERVIEW\n")
 cat("============================================================\n")
-cat("17 FINANCIAL BENCHMARK EVALUATION COMPLETED\n")
-cat("============================================================\n")
-
-cat(
-    "\nNumber of observations in detail object:",
-    nrow(
-        financial_decision_detail
-    ),
-    "\n"
-)
-
-cat(
-    "Number of forecasting models:",
-    length(
-        learned_models
-    ),
-    "\n"
-)
-
-cat(
-    "Models:",
-    paste(
-        learned_models,
-        collapse = ", "
-    ),
-    "\n"
-)
-
-cat(
-    "\nBest fixed benchmark:",
-    best_fixed_strategy,
-    "\n"
-)
+print(strategy_performance %>% dplyr::select(Strategy, AnnualizedReturn, SharpeRatio, MaximumDrawdown, OverallRank))
 
 cat("\n============================================================\n")
-cat("STRATEGY PERFORMANCE\n")
-cat("============================================================\n")
-
-print(
-    strategy_performance
-)
-
-cat("\n============================================================\n")
-cat("PAIRED COMPARISONS\n")
-cat("============================================================\n")
-
-print(
-    paired_comparison
-)
-
-cat("\n============================================================\n")
-cat("BOOTSTRAP COMPARISONS\n")
-cat("============================================================\n")
-
-print(
-    bootstrap_comparison
-)
-
-cat("\n============================================================\n")
-cat("LEARNED MODELS VS BEST FIXED BENCHMARK\n")
-cat("============================================================\n")
-
-print(
-    model_vs_best_fixed
-)
-
-cat("\n============================================================\n")
-cat("OUTPUT FILES\n")
-cat("============================================================\n")
-
-cat(
-    "17_Financial_Benchmark_Evaluation.RData\n"
-)
-
-cat(
-    "17_Strategy_Performance.csv\n"
-)
-
-cat(
-    "17_All_Strategy_Returns.csv\n"
-)
-
-cat(
-    "17_Strategy_Wealth.csv\n"
-)
-
-cat(
-    "17_Paired_Strategy_Comparisons.csv\n"
-)
-
-cat(
-    "17_Bootstrap_Strategy_Comparisons.csv\n"
-)
-
-cat(
-    "17_Model_vs_Best_Fixed_Benchmark.csv\n"
-)
-
-cat(
-    "17_Cumulative_Wealth_Benchmark_Comparison.png\n"
-)
-
-cat(
-    "17_Annualized_Return_Benchmark_Comparison.png\n"
-)
-
-cat(
-    "17_Sharpe_Ratio_Benchmark_Comparison.png\n"
-)
-
-cat(
-    "17_Maximum_Drawdown_Benchmark_Comparison.png\n"
-)
-
-cat("\n============================================================\n")
-cat("DONE\n")
+cat("17_FINANCIAL_BENCHMARK_EVALUATION.R COMPLETED\n")
+cat("Results saved to directory: ", OUTPUT_DIR, "\n", sep = "")
 cat("============================================================\n")

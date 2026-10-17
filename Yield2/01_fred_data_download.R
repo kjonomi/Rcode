@@ -1,9 +1,5 @@
 ###############################################################
 #
-# Project:
-# Deep Sequential Learning for Macro-Financial Yield Curve
-# Prediction Under No-Arbitrage Affine Term Structure Models
-#
 # File:
 # 01_fred_data_download.R (REVISED POST-PEER REVIEW)
 #
@@ -75,7 +71,7 @@ END_DATE_STR   <- "2026-10-16"
 # 3. DATA EXTRACTION FUNCTION
 ###############################################################
 
-fetch_fred_macro_data <- function(start_date = "1995-01-01", end_date = "2026-10-08") {
+fetch_fred_macro_data <- function(start_date = "1965-01-01", end_date = "2026-10-16") {
   
   if (inherits(start_date, "Date")) {
     start_date <- format(start_date, "%Y-%m-%d")

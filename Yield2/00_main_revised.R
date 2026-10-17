@@ -1,3 +1,4 @@
+
 Sys.setenv(CUDA_VISIBLE_DEVICES = "-1")
 options(stringsAsFactors = FALSE, scipen = 999)
 
@@ -51,6 +52,9 @@ START_DATE <- as.Date("1963-01-01")
 END_DATE <- as.Date("2026-10-15")
 
 N_FEATURES <- NA_integer_
+
+USE_GEMINI <- tolower(Sys.getenv("USE_GEMINI", "false")) %in% c("true", "1", "yes")
+GEMINI_MODEL <- Sys.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
 # =============================================================
 # 2. DATA ACQUISITION
@@ -852,6 +856,7 @@ writeLines(c(
 
 cat("\nForecasting outputs and clearly labeled stylized return-proxy diagnostics saved to:", normalizePath(OUTPUT_DIR), "\n")
 
+
 # =============================================================
 # 8. PUBLICATION-READY FIGURES (PDF)
 # =============================================================
@@ -863,14 +868,50 @@ cat("============================================================\n")
 FIGURE_DIR <- file.path(OUTPUT_DIR, "figures_pdf")
 dir.create(FIGURE_DIR, recursive = TRUE, showWarnings = FALSE)
 
+# Track successful exports from this execution only.
+EXPORTED_FIGURES <- character(0)
+
 save_figure_pdf <- function(plot, filename, width = 9, height = 6) {
-  ggplot2::ggsave(
-    filename = file.path(FIGURE_DIR, filename),
-    plot = plot, device = "pdf",
-    width = width, height = height, units = "in", dpi = 300,
-    limitsize = FALSE, bg = "white"
+
+  if (!inherits(plot, "ggplot")) {
+    warning("Skipping ", filename, ": object is not a ggplot.")
+    return(invisible(FALSE))
+  }
+
+  destination <- file.path(FIGURE_DIR, filename)
+
+  tryCatch(
+    {
+      ggplot2::ggsave(
+        filename = destination,
+        plot = plot,
+        device = "pdf",
+        width = width,
+        height = height,
+        units = "in",
+        dpi = 300,
+        limitsize = FALSE,
+        bg = "white"
+      )
+
+      if (file.exists(destination) &&
+          file.info(destination)$size > 0) {
+        EXPORTED_FIGURES <<- c(EXPORTED_FIGURES, filename)
+        message("Saved PDF figure: ", destination)
+        return(invisible(TRUE))
+      }
+
+      warning("PDF was not created successfully: ", destination)
+      invisible(FALSE)
+    },
+    error = function(e) {
+      warning(
+        "Could not export ", filename, ": ",
+        conditionMessage(e)
+      )
+      invisible(FALSE)
+    }
   )
-  message("Saved PDF figure: ", file.path(FIGURE_DIR, filename))
 }
 
 publication_theme <- ggplot2::theme_minimal(base_size = 11) +
@@ -882,161 +923,725 @@ publication_theme <- ggplot2::theme_minimal(base_size = 11) +
     panel.grid.minor = ggplot2::element_blank()
   )
 
-# Figure 1: Aggregate out-of-sample forecasting accuracy, including DNS.
-all_model_metrics <- dplyr::bind_rows(model_metrics, dns_metrics)
-metric_long <- tidyr::pivot_longer(
-  all_model_metrics, cols = c(RMSE, MAE),
-  names_to = "Metric", values_to = "Value"
-)
-p1 <- ggplot2::ggplot(metric_long,
-                       ggplot2::aes(x = reorder(Model, Value), y = Value)) +
-  ggplot2::geom_col() +
-  ggplot2::coord_flip() +
-  ggplot2::facet_wrap(~Metric, scales = "free_x") +
-  ggplot2::labs(title = "Out-of-Sample Yield-Change Forecast Accuracy",
-                subtitle = "Daily one-step-ahead forecasts; lower values indicate better accuracy",
-                x = NULL, y = "Error (percentage points)") + publication_theme
-save_figure_pdf(p1, "Figure_01_Forecast_Accuracy.pdf", 10, 6.5)
+# Helper: validate dimensions before associating rows with dates.
+as_named_matrix <- function(x, variable_names, object_name) {
 
-# Figure 2: RMSE by maturity and benchmark/model.
-p2 <- ggplot2::ggplot(per_maturity_metrics,
-                       ggplot2::aes(x = Maturity, y = RMSE, group = Model,
-                                    linetype = Model, shape = Model)) +
-  ggplot2::geom_line() + ggplot2::geom_point(size = 2.3) +
-  ggplot2::labs(title = "Forecast RMSE by Treasury Maturity",
-                x = "Treasury series", y = "RMSE (percentage points)",
-                linetype = "Model", shape = "Model") + publication_theme
-save_figure_pdf(p2, "Figure_02_RMSE_by_Maturity.pdf", 9, 6)
+  x <- as.matrix(x)
+  storage.mode(x) <- "numeric"
 
-# Figure 3: RMSE regret; the best model within each maturity has regret zero.
-p3 <- ggplot2::ggplot(per_maturity_metrics,
-                       ggplot2::aes(x = Maturity, y = RMSE_Regret,
-                                    group = Model, linetype = Model,
-                                    shape = Model)) +
-  ggplot2::geom_hline(yintercept = 0, linewidth = 0.35) +
-  ggplot2::geom_line() + ggplot2::geom_point(size = 2.2) +
-  ggplot2::labs(title = "Maturity-Specific RMSE Regret",
-                subtitle = "Regret = model RMSE minus the minimum RMSE at that maturity",
-                x = "Treasury series", y = "RMSE regret",
-                linetype = "Model", shape = "Model") + publication_theme
-save_figure_pdf(p3, "Figure_03_RMSE_Regret.pdf", 9, 6)
+  if (ncol(x) != length(variable_names)) {
+    stop(
+      object_name, " has ", ncol(x),
+      " columns; expected ", length(variable_names), "."
+    )
+  }
 
-# Figure 4: Actual versus predicted yield changes for each model and maturity.
-actual_long <- as.data.frame(Y_test$yield_out)
-names(actual_long) <- YIELD_NAMES
-actual_long$Date <- test_dates
-actual_long <- tidyr::pivot_longer(actual_long, cols = dplyr::all_of(YIELD_NAMES),
-                                   names_to = "Maturity", values_to = "Actual")
-prediction_list <- list(
-  Uniform = test_preds_uniform$yield_out,
-  Entropy = test_preds_entropy$yield_out,
-  PER = test_preds_per$yield_out,
-  DNS = dns_preds,
-  RandomWalk = random_walk_preds
-)
-pred_long <- dplyr::bind_rows(lapply(names(prediction_list), function(m) {
-  z <- as.data.frame(prediction_list[[m]])
-  names(z) <- YIELD_NAMES
-  z$Date <- test_dates
-  tidyr::pivot_longer(z, cols = dplyr::all_of(YIELD_NAMES),
-                      names_to = "Maturity", values_to = "Predicted") |>
-    dplyr::mutate(Model = m)
-}))
-actual_pred_long <- dplyr::left_join(
-  pred_long, actual_long, by = c("Date", "Maturity")
-)
-p4 <- ggplot2::ggplot(actual_pred_long,
-                       ggplot2::aes(x = Date)) +
-  ggplot2::geom_line(ggplot2::aes(y = Actual), linewidth = 0.45) +
-  ggplot2::geom_line(ggplot2::aes(y = Predicted), linewidth = 0.4,
-                     linetype = "dashed") +
-  ggplot2::facet_grid(Model ~ Maturity, scales = "free_y") +
-  ggplot2::labs(title = "Actual and Predicted Daily Yield Changes",
-                subtitle = "Solid: actual; dashed: predicted",
-                x = NULL, y = "Yield change (percentage points)") +
-  publication_theme + ggplot2::theme(legend.position = "none",
-                                      axis.text.x = ggplot2::element_text(angle = 45, hjust = 1))
-save_figure_pdf(p4, "Figure_04_Actual_vs_Predicted_Changes.pdf", 14, 10)
-
-# Figure 5: Cumulative wealth based on stylized proxy returns, not observed total returns.
-wealth_long <- dplyr::bind_rows(lapply(names(strategy_returns), function(nm) {
-  r <- as.numeric(strategy_returns[[nm]])
-  data.frame(Date = test_dates, Strategy = nm,
-             Wealth = cumprod(1 + r), stringsAsFactors = FALSE)
-}))
-p5 <- ggplot2::ggplot(wealth_long,
-                       ggplot2::aes(x = Date, y = Wealth, linetype = Strategy)) +
-  ggplot2::geom_line(linewidth = 0.65) +
-  ggplot2::labs(title = "Cumulative Wealth from Stylized Bond-Return Proxies",
-                subtitle = "Illustrative yield-based proxies only; not verified Treasury total returns",
-                x = NULL, y = "Growth of one unit", linetype = "Strategy") +
-  publication_theme
-save_figure_pdf(p5, "Figure_05_Cumulative_Proxy_Wealth.pdf", 10, 6)
-
-# Figure 6: Daily proxy returns.
-returns_long <- dplyr::bind_rows(lapply(names(strategy_returns), function(nm) {
-  data.frame(Date = test_dates, Strategy = nm,
-             Daily_Return = as.numeric(strategy_returns[[nm]]),
-             stringsAsFactors = FALSE)
-}))
-p6 <- ggplot2::ggplot(returns_long,
-                       ggplot2::aes(x = Date, y = Daily_Return, linetype = Strategy)) +
-  ggplot2::geom_line(linewidth = 0.45, na.rm = TRUE) +
-  ggplot2::labs(title = "Daily Stylized Bond-Return Proxies",
-                subtitle = "Daily frequency; return units are decimal",
-                x = NULL, y = "Daily proxy return", linetype = "Strategy") +
-  publication_theme
-save_figure_pdf(p6, "Figure_06_Daily_Proxy_Returns.pdf", 10, 6)
-
-# Figure 7: Annualized Sharpe ratios and annualized volatility.
-p7_data <- portfolio_metrics |>
-  dplyr::filter(is.finite(Sharpe_Annualized), is.finite(Annualized_Volatility))
-p7 <- ggplot2::ggplot(p7_data,
-                       ggplot2::aes(x = reorder(Strategy, Sharpe_Annualized),
-                                    y = Sharpe_Annualized)) +
-  ggplot2::geom_col() + ggplot2::coord_flip() +
-  ggplot2::labs(title = "Annualized Sharpe Ratios of Stylized Return Proxies",
-                subtitle = "Computed from daily proxy returns with zero risk-free rate and 252-day annualization",
-                x = NULL, y = "Annualized Sharpe ratio") + publication_theme
-save_figure_pdf(p7, "Figure_07_Annualized_Sharpe_Ratios.pdf", 9, 6)
-
-# Figure 8: Uniform-model maturity allocations as a time-by-maturity heatmap.
-if ("Uniform" %in% names(strategy_allocations)) {
-  alloc_long <- as.data.frame(strategy_allocations[["Uniform"]])
-  names(alloc_long) <- YIELD_NAMES
-  alloc_long$Date <- test_dates
-  alloc_long <- tidyr::pivot_longer(alloc_long,
-                                    cols = dplyr::all_of(YIELD_NAMES),
-                                    names_to = "Maturity", values_to = "Weight")
-  p8 <- ggplot2::ggplot(alloc_long,
-                        ggplot2::aes(x = Date, y = Maturity, fill = Weight)) +
-    ggplot2::geom_tile() +
-    ggplot2::labs(title = "Uniform-Replay Strategy: Maturity Allocations",
-                  subtitle = "Deterministic one-maturity-at-a-time allocation rule",
-                  x = NULL, y = "Treasury series", fill = "Weight") +
-    publication_theme
-  save_figure_pdf(p8, "Figure_08_Uniform_Maturity_Allocations.pdf", 11, 4.5)
+  colnames(x) <- variable_names
+  x
 }
 
-# Figure 9: Observed yield-curve shape at selected test dates.
-curve_rows <- unique(round(seq(1, nrow(test_level), length.out = min(6, nrow(test_level)))))
-curve_df <- dplyr::bind_rows(lapply(curve_rows, function(i) {
-  data.frame(Date = test_dates[i], Maturity_Years = as.numeric(MATURITIES),
-             Yield = as.numeric(test_level[i, YIELD_NAMES]),
-             stringsAsFactors = FALSE)
-}))
-p9 <- ggplot2::ggplot(curve_df,
-                       ggplot2::aes(x = Maturity_Years, y = Yield,
-                                    group = as.factor(Date), linetype = as.factor(Date))) +
-  ggplot2::geom_line() + ggplot2::geom_point(size = 1.8) +
-  ggplot2::scale_x_continuous(breaks = c(0.25, 2, 5, 7, 10, 30)) +
-  ggplot2::labs(title = "Observed Treasury Yield-Curve Shapes",
-                subtitle = "Selected dates from the test period; inverted curves are not automatically violations",
-                x = "Maturity (years)", y = "Yield (%)", linetype = "Date") +
-  publication_theme
-save_figure_pdf(p9, "Figure_09_Observed_Yield_Curve_Shapes.pdf", 9, 6)
+# -------------------------------------------------------------
+# Figure 1: Aggregate out-of-sample forecasting accuracy
+# -------------------------------------------------------------
 
-# Export a manifest so all figure files are easy to locate.
-figure_files <- list.files(FIGURE_DIR, pattern = "\\.pdf$", full.names = TRUE)
-writeLines(basename(figure_files), con = file.path(FIGURE_DIR, "PDF_Figure_Manifest.txt"))
-cat("Exported", length(figure_files), "PDF figure files to", normalizePath(FIGURE_DIR), "\n")
+all_model_metrics <- dplyr::bind_rows(
+  model_metrics,
+  dns_metrics
+)
+
+required_metric_cols <- c("Model", "RMSE", "MAE")
+
+if (all(required_metric_cols %in% names(all_model_metrics))) {
+
+  metric_long <- tidyr::pivot_longer(
+    all_model_metrics,
+    cols = c(RMSE, MAE),
+    names_to = "Metric",
+    values_to = "Value"
+  ) |>
+    dplyr::filter(is.finite(Value))
+
+  if (nrow(metric_long) > 0L) {
+
+    p1 <- ggplot2::ggplot(
+      metric_long,
+      ggplot2::aes(
+        x = reorder(Model, Value),
+        y = Value
+      )
+    ) +
+      ggplot2::geom_col() +
+      ggplot2::coord_flip() +
+      ggplot2::facet_wrap(~Metric, scales = "free_x") +
+      ggplot2::labs(
+        title = "Out-of-Sample Yield-Change Forecast Accuracy",
+        subtitle = paste(
+          "Daily one-step-ahead forecasts;",
+          "lower values indicate better accuracy"
+        ),
+        x = NULL,
+        y = "Error (percentage points)"
+      ) +
+      publication_theme
+
+    save_figure_pdf(
+      p1, "Figure_01_Forecast_Accuracy.pdf", 10, 6.5
+    )
+
+  } else {
+    warning("Figure 1 skipped: no finite RMSE or MAE values.")
+  }
+
+} else {
+  warning("Figure 1 skipped: model metric columns are missing.")
+}
+
+# -------------------------------------------------------------
+# Figure 2: RMSE by maturity
+# -------------------------------------------------------------
+
+if (exists("per_maturity_metrics") &&
+    all(c("Maturity", "RMSE", "Model") %in%
+        names(per_maturity_metrics))) {
+
+  p2_data <- per_maturity_metrics |>
+    dplyr::filter(is.finite(RMSE))
+
+  if (nrow(p2_data) > 0L) {
+
+    p2 <- ggplot2::ggplot(
+      p2_data,
+      ggplot2::aes(
+        x = Maturity,
+        y = RMSE,
+        group = Model,
+        linetype = Model,
+        shape = Model
+      )
+    ) +
+      ggplot2::geom_line() +
+      ggplot2::geom_point(size = 2.3) +
+      ggplot2::labs(
+        title = "Forecast RMSE by Treasury Maturity",
+        x = "Treasury series",
+        y = "RMSE (percentage points)",
+        linetype = "Model",
+        shape = "Model"
+      ) +
+      publication_theme
+
+    save_figure_pdf(
+      p2, "Figure_02_RMSE_by_Maturity.pdf", 9, 6
+    )
+  } else {
+    warning("Figure 2 skipped: no finite RMSE values.")
+  }
+} else {
+  warning("Figure 2 skipped: per-maturity metrics are unavailable.")
+}
+
+# -------------------------------------------------------------
+# Figure 3: Maturity-specific RMSE regret
+# -------------------------------------------------------------
+
+if (exists("per_maturity_metrics") &&
+    all(c("Maturity", "RMSE_Regret", "Model") %in%
+        names(per_maturity_metrics))) {
+
+  p3_data <- per_maturity_metrics |>
+    dplyr::filter(is.finite(RMSE_Regret))
+
+  if (nrow(p3_data) > 0L) {
+
+    p3 <- ggplot2::ggplot(
+      p3_data,
+      ggplot2::aes(
+        x = Maturity,
+        y = RMSE_Regret,
+        group = Model,
+        linetype = Model,
+        shape = Model
+      )
+    ) +
+      ggplot2::geom_hline(yintercept = 0, linewidth = 0.35) +
+      ggplot2::geom_line() +
+      ggplot2::geom_point(size = 2.2) +
+      ggplot2::labs(
+        title = "Maturity-Specific RMSE Regret",
+        subtitle = paste(
+          "Regret = model RMSE minus the minimum",
+          "RMSE at that maturity"
+        ),
+        x = "Treasury series",
+        y = "RMSE regret",
+        linetype = "Model",
+        shape = "Model"
+      ) +
+      publication_theme
+
+    save_figure_pdf(
+      p3, "Figure_03_RMSE_Regret.pdf", 9, 6
+    )
+  } else {
+    warning("Figure 3 skipped: no finite regret values.")
+  }
+} else {
+  warning("Figure 3 skipped: RMSE_Regret is unavailable.")
+}
+
+# -------------------------------------------------------------
+# Figure 4: Actual versus predicted yield changes
+# -------------------------------------------------------------
+
+if (exists("Y_test") &&
+    exists("YIELD_NAMES") &&
+    exists("test_dates") &&
+    exists("test_preds_uniform") &&
+    exists("test_preds_entropy") &&
+    exists("test_preds_per") &&
+    exists("dns_preds") &&
+    exists("random_walk_preds")) {
+
+  actual_matrix <- as_named_matrix(
+    Y_test$yield_out, YIELD_NAMES, "Y_test$yield_out"
+  )
+
+  if (nrow(actual_matrix) != length(test_dates)) {
+    stop("Figure 4: actual values and test_dates have different lengths.")
+  }
+
+  actual_df <- as.data.frame(actual_matrix)
+  actual_df$Date <- test_dates
+
+  actual_long <- tidyr::pivot_longer(
+    actual_df,
+    cols = dplyr::all_of(YIELD_NAMES),
+    names_to = "Maturity",
+    values_to = "Actual"
+  )
+
+  prediction_list <- list(
+    Uniform = test_preds_uniform$yield_out,
+    Entropy = test_preds_entropy$yield_out,
+    PER = test_preds_per$yield_out,
+    DNS = dns_preds,
+    RandomWalk = random_walk_preds
+  )
+
+  pred_long <- dplyr::bind_rows(
+    lapply(names(prediction_list), function(m) {
+
+      pred_matrix <- as_named_matrix(
+        prediction_list[[m]], YIELD_NAMES,
+        paste0("Prediction: ", m)
+      )
+
+      if (nrow(pred_matrix) != length(test_dates)) {
+        warning(
+          "Figure 4: skipping ", m,
+          " because its prediction length differs from test_dates."
+        )
+        return(NULL)
+      }
+
+      pred_df <- as.data.frame(pred_matrix)
+      pred_df$Date <- test_dates
+
+      tidyr::pivot_longer(
+        pred_df,
+        cols = dplyr::all_of(YIELD_NAMES),
+        names_to = "Maturity",
+        values_to = "Predicted"
+      ) |>
+        dplyr::mutate(Model = m)
+    })
+  )
+
+  if (nrow(pred_long) > 0L) {
+
+    actual_pred_long <- dplyr::left_join(
+      pred_long,
+      actual_long,
+      by = c("Date", "Maturity")
+    )
+
+    p4 <- ggplot2::ggplot(
+      actual_pred_long,
+      ggplot2::aes(x = Date)
+    ) +
+      ggplot2::geom_line(
+        ggplot2::aes(y = Actual),
+        linewidth = 0.45,
+        na.rm = TRUE
+      ) +
+      ggplot2::geom_line(
+        ggplot2::aes(y = Predicted),
+        linewidth = 0.4,
+        linetype = "dashed",
+        na.rm = TRUE
+      ) +
+      ggplot2::facet_grid(
+        Model ~ Maturity,
+        scales = "free_y"
+      ) +
+      ggplot2::labs(
+        title = "Actual and Predicted Daily Yield Changes",
+        subtitle = "Solid: actual; dashed: predicted",
+        x = NULL,
+        y = "Yield change (percentage points)"
+      ) +
+      publication_theme +
+      ggplot2::theme(
+        legend.position = "none",
+        axis.text.x = ggplot2::element_text(
+          angle = 45, hjust = 1
+        )
+      )
+
+    save_figure_pdf(
+      p4, "Figure_04_Actual_vs_Predicted_Changes.pdf", 14, 10
+    )
+  }
+} else {
+  warning("Figure 4 skipped: one or more prediction objects are unavailable.")
+}
+
+# -------------------------------------------------------------
+# Figure 5: Cumulative wealth from stylized proxy returns
+# -------------------------------------------------------------
+
+if (exists("strategy_returns") &&
+    exists("test_dates") &&
+    length(strategy_returns) > 0L) {
+
+  wealth_long <- dplyr::bind_rows(
+    lapply(names(strategy_returns), function(nm) {
+
+      r <- as.numeric(strategy_returns[[nm]])
+
+      if (length(r) != length(test_dates)) {
+        warning(
+          "Figure 5: skipping ", nm,
+          " because its return length differs from test_dates."
+        )
+        return(NULL)
+      }
+
+      wealth <- rep(NA_real_, length(r))
+      current_wealth <- 1
+      active <- TRUE
+
+      for (i in seq_along(r)) {
+
+        if (!is.finite(r[i]) || r[i] <= -1 || !active) {
+          active <- FALSE
+          next
+        }
+
+        current_wealth <- current_wealth * (1 + r[i])
+
+        if (!is.finite(current_wealth)) {
+          active <- FALSE
+          next
+        }
+
+        wealth[i] <- current_wealth
+      }
+
+      data.frame(
+        Date = test_dates,
+        Strategy = nm,
+        Wealth = wealth
+      )
+    })
+  )
+
+  if (nrow(wealth_long) > 0L &&
+      any(is.finite(wealth_long$Wealth))) {
+
+    p5 <- ggplot2::ggplot(
+      wealth_long,
+      ggplot2::aes(
+        x = Date,
+        y = Wealth,
+        linetype = Strategy
+      )
+    ) +
+      ggplot2::geom_line(
+        linewidth = 0.65,
+        na.rm = TRUE
+      ) +
+      ggplot2::labs(
+        title = "Cumulative Wealth from Stylized Bond-Return Proxies",
+        subtitle = paste(
+          "Illustrative yield-based proxies only;",
+          "not verified Treasury total returns"
+        ),
+        x = NULL,
+        y = "Growth of one unit",
+        linetype = "Strategy"
+      ) +
+      publication_theme
+
+    save_figure_pdf(
+      p5, "Figure_05_Cumulative_Proxy_Wealth.pdf", 10, 6
+    )
+  } else {
+    warning("Figure 5 skipped: no valid cumulative wealth values.")
+  }
+} else {
+  warning("Figure 5 skipped: strategy_returns is unavailable.")
+}
+
+# -------------------------------------------------------------
+# Figure 6: Daily proxy returns
+# -------------------------------------------------------------
+
+if (exists("strategy_returns") &&
+    exists("test_dates") &&
+    length(strategy_returns) > 0L) {
+
+  returns_long <- dplyr::bind_rows(
+    lapply(names(strategy_returns), function(nm) {
+
+      r <- as.numeric(strategy_returns[[nm]])
+
+      if (length(r) != length(test_dates)) {
+        warning(
+          "Figure 6: skipping ", nm,
+          " because its return length differs from test_dates."
+        )
+        return(NULL)
+      }
+
+      data.frame(
+        Date = test_dates,
+        Strategy = nm,
+        Daily_Return = r
+      )
+    })
+  )
+
+  if (nrow(returns_long) > 0L &&
+      any(is.finite(returns_long$Daily_Return))) {
+
+    p6 <- ggplot2::ggplot(
+      returns_long,
+      ggplot2::aes(
+        x = Date,
+        y = Daily_Return,
+        linetype = Strategy
+      )
+    ) +
+      ggplot2::geom_line(
+        linewidth = 0.45,
+        na.rm = TRUE
+      ) +
+      ggplot2::labs(
+        title = "Daily Stylized Bond-Return Proxies",
+        subtitle = "Daily frequency; return units are decimal",
+        x = NULL,
+        y = "Daily proxy return",
+        linetype = "Strategy"
+      ) +
+      publication_theme
+
+    save_figure_pdf(
+      p6, "Figure_06_Daily_Proxy_Returns.pdf", 10, 6
+    )
+  } else {
+    warning("Figure 6 skipped: no finite daily proxy returns.")
+  }
+} else {
+  warning("Figure 6 skipped: strategy_returns is unavailable.")
+}
+
+# -------------------------------------------------------------
+# Figure 7: Annualized Sharpe ratios and volatility
+# -------------------------------------------------------------
+
+# Recompute metrics directly. Do not rely on a column named
+# Sharpe_Annualized, which may not exist in the previous object.
+# Assumptions: decimal daily returns, 252 trading days, zero
+# risk-free rate. These are stylized proxy diagnostics.
+
+if (exists("strategy_returns") &&
+    length(strategy_returns) > 0L) {
+
+  portfolio_metrics <- dplyr::bind_rows(
+    lapply(names(strategy_returns), function(nm) {
+
+      r <- as.numeric(strategy_returns[[nm]])
+      r <- r[is.finite(r)]
+
+      if (length(r) < 2L) {
+        return(data.frame(
+          Strategy = nm,
+          Observations = length(r),
+          Mean_Daily_Return = NA_real_,
+          Daily_Volatility = NA_real_,
+          Annualized_Return = NA_real_,
+          Annualized_Volatility = NA_real_,
+          Sharpe_Ratio_Annualized = NA_real_
+        ))
+      }
+
+      daily_mean <- mean(r)
+      daily_sd <- stats::sd(r)
+
+      annualized_volatility <- sqrt(252) * daily_sd
+
+      sharpe <- if (
+        is.finite(daily_sd) && daily_sd > 0
+      ) {
+        sqrt(252) * daily_mean / daily_sd
+      } else {
+        NA_real_
+      }
+
+      data.frame(
+        Strategy = nm,
+        Observations = length(r),
+        Mean_Daily_Return = daily_mean,
+        Daily_Volatility = daily_sd,
+        Annualized_Return = 252 * daily_mean,
+        Annualized_Volatility = annualized_volatility,
+        Sharpe_Ratio_Annualized = sharpe
+      )
+    })
+  )
+
+  utils::write.csv(
+    portfolio_metrics,
+    file.path(OUTPUT_DIR, "Portfolio_Proxy_Return_Metrics.csv"),
+    row.names = FALSE
+  )
+
+  p7_data <- dplyr::bind_rows(
+    portfolio_metrics |>
+      dplyr::filter(is.finite(Sharpe_Ratio_Annualized)) |>
+      dplyr::transmute(
+        Strategy,
+        Metric = "Annualized Sharpe Ratio",
+        Value = Sharpe_Ratio_Annualized
+      ),
+    portfolio_metrics |>
+      dplyr::filter(is.finite(Annualized_Volatility)) |>
+      dplyr::transmute(
+        Strategy,
+        Metric = "Annualized Volatility",
+        Value = Annualized_Volatility
+      )
+  )
+
+  if (nrow(p7_data) > 0L) {
+
+    p7 <- ggplot2::ggplot(
+      p7_data,
+      ggplot2::aes(
+        x = reorder(Strategy, Value),
+        y = Value
+      )
+    ) +
+      ggplot2::geom_col() +
+      ggplot2::coord_flip() +
+      ggplot2::facet_wrap(
+        ~Metric,
+        scales = "free_x"
+      ) +
+      ggplot2::labs(
+        title = "Risk-Adjusted Performance of Stylized Strategies",
+        subtitle = paste(
+          "252-day annualization and zero risk-free rate;",
+          "yield-based proxies, not verified total returns"
+        ),
+        x = NULL,
+        y = "Annualized metric"
+      ) +
+      publication_theme
+
+    save_figure_pdf(
+      p7,
+      "Figure_07_Annualized_Sharpe_and_Volatility.pdf",
+      11, 6.5
+    )
+
+  } else {
+    warning(
+      "Figure 7 skipped: no finite annualized metrics. ",
+      "Inspect Portfolio_Proxy_Return_Metrics.csv and ",
+      "the upstream strategy return construction."
+    )
+  }
+} else {
+  warning("Figure 7 skipped: strategy_returns is unavailable.")
+}
+
+# -------------------------------------------------------------
+# Figure 8: Uniform-model maturity allocation heatmap
+# -------------------------------------------------------------
+
+if (exists("strategy_allocations") &&
+    "Uniform" %in% names(strategy_allocations) &&
+    exists("YIELD_NAMES") &&
+    exists("test_dates")) {
+
+  alloc_matrix <- as_named_matrix(
+    strategy_allocations[["Uniform"]],
+    YIELD_NAMES,
+    "strategy_allocations[['Uniform']]"
+  )
+
+  if (nrow(alloc_matrix) == length(test_dates)) {
+
+    alloc_long <- as.data.frame(alloc_matrix)
+    alloc_long$Date <- test_dates
+
+    alloc_long <- tidyr::pivot_longer(
+      alloc_long,
+      cols = dplyr::all_of(YIELD_NAMES),
+      names_to = "Maturity",
+      values_to = "Weight"
+    ) |>
+      dplyr::filter(is.finite(Weight))
+
+    if (nrow(alloc_long) > 0L) {
+
+      p8 <- ggplot2::ggplot(
+        alloc_long,
+        ggplot2::aes(
+          x = Date,
+          y = Maturity,
+          fill = Weight
+        )
+      ) +
+        ggplot2::geom_tile() +
+        ggplot2::labs(
+          title = "Uniform-Replay Strategy: Maturity Allocations",
+          subtitle = "Deterministic one-maturity-at-a-time allocation rule",
+          x = NULL,
+          y = "Treasury series",
+          fill = "Weight"
+        ) +
+        publication_theme
+
+      save_figure_pdf(
+        p8, "Figure_08_Uniform_Maturity_Allocations.pdf", 11, 4.5
+      )
+    }
+  } else {
+    warning("Figure 8 skipped: allocation rows do not match test_dates.")
+  }
+} else {
+  warning("Figure 8 skipped: Uniform allocations are unavailable.")
+}
+
+# -------------------------------------------------------------
+# Figure 9: Observed yield-curve shapes at selected test dates
+# -------------------------------------------------------------
+
+if (exists("test_level") &&
+    exists("test_dates") &&
+    exists("MATURITIES") &&
+    exists("YIELD_NAMES")) {
+
+  test_level_matrix <- as_named_matrix(
+    test_level,
+    YIELD_NAMES,
+    "test_level"
+  )
+
+  if (nrow(test_level_matrix) == length(test_dates) &&
+      length(MATURITIES) == length(YIELD_NAMES) &&
+      nrow(test_level_matrix) > 0L) {
+
+    curve_rows <- unique(
+      round(seq(
+        1,
+        nrow(test_level_matrix),
+        length.out = min(6, nrow(test_level_matrix))
+      ))
+    )
+
+    curve_df <- dplyr::bind_rows(
+      lapply(curve_rows, function(i) {
+
+        data.frame(
+          Date = test_dates[i],
+          Maturity_Years = as.numeric(MATURITIES),
+          Yield = as.numeric(test_level_matrix[i, ]),
+          stringsAsFactors = FALSE
+        )
+      })
+    ) |>
+      dplyr::filter(
+        is.finite(Maturity_Years),
+        is.finite(Yield)
+      )
+
+    if (nrow(curve_df) > 0L) {
+
+      p9 <- ggplot2::ggplot(
+        curve_df,
+        ggplot2::aes(
+          x = Maturity_Years,
+          y = Yield,
+          group = as.factor(Date),
+          linetype = as.factor(Date)
+        )
+      ) +
+        ggplot2::geom_line() +
+        ggplot2::geom_point(size = 1.8) +
+        ggplot2::scale_x_continuous(
+          breaks = c(0.25, 2, 5, 7, 10, 30)
+        ) +
+        ggplot2::labs(
+          title = "Observed Treasury Yield-Curve Shapes",
+          subtitle = paste(
+            "Selected test-period dates;",
+            "inverted curves are not automatically violations"
+          ),
+          x = "Maturity (years)",
+          y = "Yield (%)",
+          linetype = "Date"
+        ) +
+        publication_theme
+
+      save_figure_pdf(
+        p9, "Figure_09_Observed_Yield_Curve_Shapes.pdf", 9, 6
+      )
+    }
+  } else {
+    warning(
+      "Figure 9 skipped: yield levels, dates, or maturities ",
+      "have inconsistent dimensions."
+    )
+  }
+} else {
+  warning("Figure 9 skipped: required yield-curve inputs are unavailable.")
+}
+
+# -------------------------------------------------------------
+# Export manifest and summary
+# -------------------------------------------------------------
+
+EXPORTED_FIGURES <- unique(EXPORTED_FIGURES)
+
+writeLines(
+  EXPORTED_FIGURES,
+  con = file.path(FIGURE_DIR, "PDF_Figure_Manifest.txt")
+)
+
+cat("\n============================================================\n")
+cat("PDF FIGURE EXPORT SUMMARY\n")
+cat("============================================================\n")
+cat("Figures successfully exported:", length(EXPORTED_FIGURES), "\n")
+cat("Output directory:", normalizePath(FIGURE_DIR), "\n")
+
+if (length(EXPORTED_FIGURES) > 0L) {
+  cat("\nExported files:\n")
+  cat(paste0("  - ", EXPORTED_FIGURES, collapse = "\n"), "\n")
+}
+
+cat("Manifest:", file.path(FIGURE_DIR, "PDF_Figure_Manifest.txt"), "\n")
+cat("============================================================\n")

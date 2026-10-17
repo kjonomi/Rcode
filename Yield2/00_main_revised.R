@@ -1,4 +1,3 @@
-
 Sys.setenv(CUDA_VISIBLE_DEVICES = "-1")
 options(stringsAsFactors = FALSE, scipen = 999)
 
@@ -52,9 +51,6 @@ START_DATE <- as.Date("1963-01-01")
 END_DATE <- as.Date("2026-10-15")
 
 N_FEATURES <- NA_integer_
-
-USE_GEMINI <- tolower(Sys.getenv("USE_GEMINI", "false")) %in% c("true", "1", "yes")
-GEMINI_MODEL <- Sys.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
 # =============================================================
 # 2. DATA ACQUISITION

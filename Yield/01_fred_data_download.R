@@ -67,22 +67,27 @@ SERIES_MAP <- c(
   "DGS30" = "DGS30"   # 30-Year Treasury Constant Maturity
 )
 
-START_DATE_STR <- "1965-01-01"
+START_DATE_STR <- "1995-01-01"
+END_DATE_STR   <- "2026-10-16"
 
 
 ###############################################################
 # 3. DATA EXTRACTION FUNCTION
 ###############################################################
 
-fetch_fred_macro_data <- function(start_date = "1965-01-01") {
+fetch_fred_macro_data <- function(start_date = "1995-01-01", end_date = "2026-10-08") {
   
   if (inherits(start_date, "Date")) {
     start_date <- format(start_date, "%Y-%m-%d")
   }
+  if (inherits(end_date, "Date")) {
+    end_date <- format(end_date, "%Y-%m-%d")
+  }
   
-  cat("Fetching yield curve series from FRED starting from:", start_date, "\n")
+  cat("Fetching yield curve series from FRED starting from:", start_date, "to:", end_date, "\n")
   
   start_dt <- as.Date(start_date)
+  end_dt   <- as.Date(end_date)
   
   raw_data_list <- map2(
     names(SERIES_MAP),
@@ -93,7 +98,8 @@ fetch_fred_macro_data <- function(start_date = "1965-01-01") {
       df <- tryCatch({
         res <- fredr(
           series_id = series_id,
-          observation_start = start_dt
+          observation_start = start_dt,
+          observation_end   = end_dt
         )
         
         # Explicit namespace scoping to prevent mask collisions
@@ -128,11 +134,11 @@ fetch_fred_macro_data <- function(start_date = "1965-01-01") {
 # 4. EXECUTE PIPELINE & EXPORT DATA
 ###############################################################
 
-yield_data <- fetch_fred_macro_data(start_date = START_DATE_STR)
+yield_data <- fetch_fred_macro_data(start_date = START_DATE_STR, end_date = END_DATE_STR)
 
 cat("\nSummary of extracted data:\n")
-cat("  Date Range:  ", as.character(min(yield_data$date)), "to", as.character(max(yield_data$date)), "\n")
-cat("  Total Days:  ", nrow(yield_data), "\n")
+cat("  Date Range:   ", as.character(min(yield_data$date)), "to", as.character(max(yield_data$date)), "\n")
+cat("  Total Days:   ", nrow(yield_data), "\n")
 cat("  Yield Series:", paste(names(SERIES_MAP), collapse = ", "), "\n\n")
 
 # Save Output 1: FRED_SixMaturity.csv
@@ -142,7 +148,7 @@ cat("Exported CSV file:", csv_filename, "\n")
 
 # Save Output 2: FRED_SixMaturity_Data.RData
 rdata_filename <- "FRED_SixMaturity_Data.RData"
-save(yield_data, SERIES_MAP, START_DATE_STR, file = rdata_filename)
+save(yield_data, SERIES_MAP, START_DATE_STR, END_DATE_STR, file = rdata_filename)
 cat("Exported RData file:", rdata_filename, "\n\n")
 
 cat("============================================================\n")

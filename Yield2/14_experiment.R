@@ -33,6 +33,8 @@ options(
   scipen = 999
 )
 
+set.seed(20260914)
+
 cat("\n")
 cat("============================================================\n")
 cat("14_experiment.R\n")
@@ -169,8 +171,26 @@ factor_RMSE_by_factor <- if (exists("factor_RMSE_by_factor", envir = results_env
 
 
 ###############################################################
-# 5. METHOD-NAME NORMALIZATION
+# 5. ROBUST HELPER FUNCTIONS (NA-PREVENTATIVE)
 ###############################################################
+
+safe_mean <- function(x) {
+  x <- x[is.finite(x)]
+  if (length(x) == 0L) return(NA_real_)
+  mean(x)
+}
+
+safe_sd <- function(x) {
+  x <- x[is.finite(x)]
+  if (length(x) < 2L) return(NA_real_)
+  stats::sd(x)
+}
+
+safe_min <- function(x) {
+  x <- x[is.finite(x)]
+  if (length(x) == 0L) return(NA_real_)
+  min(x)
+}
 
 normalize_method <- function(x) {
   x <- as.character(x)
@@ -228,13 +248,17 @@ current_yield <- results_yield %>%
   ) %>%
   dplyr::group_by(Model, SamplingStrategy) %>%
   dplyr::summarise(
-    RMSE = mean(RMSE, na.rm = TRUE),
-    MAE  = mean(MAE, na.rm = TRUE),
-    MAPE = if ("MAPE" %in% names(results_yield)) mean(MAPE, na.rm = TRUE) else NA_real_,
+    RMSE = safe_mean(RMSE),
+    MAE  = safe_mean(MAE),
+    MAPE = if ("MAPE" %in% names(results_yield)) safe_mean(MAPE) else NA_real_,
     .groups = "drop"
-  ) %>%
+  )
+
+min_rmse_val <- safe_min(current_yield$RMSE)
+
+current_yield <- current_yield %>%
   dplyr::mutate(
-    RMSE_Regret = RMSE - min(RMSE, na.rm = TRUE)
+    RMSE_Regret = if (is.finite(min_rmse_val)) RMSE - min_rmse_val else NA_real_
   ) %>%
   dplyr::arrange(RMSE)
 
@@ -243,16 +267,25 @@ current_yield <- results_yield %>%
 # 9. IDENTIFY BEST FORECASTING STRATEGY
 ###############################################################
 
-best_model_index       <- which.min(current_yield$RMSE)
-best_model             <- current_yield$Model[best_model_index]
-best_sampling_strategy <- current_yield$SamplingStrategy[best_model_index]
-best_RMSE              <- current_yield$RMSE[best_model_index]
+valid_rmse_indices <- which(is.finite(current_yield$RMSE))
+
+if (length(valid_rmse_indices) > 0L) {
+  best_model_index       <- valid_rmse_indices[which.min(current_yield$RMSE[valid_rmse_indices])]
+  best_model             <- current_yield$Model[best_model_index]
+  best_sampling_strategy <- current_yield$SamplingStrategy[best_model_index]
+  best_RMSE              <- current_yield$RMSE[best_model_index]
+} else {
+  best_model_index       <- NA_integer_
+  best_model             <- NA_character_
+  best_sampling_strategy <- NA_character_
+  best_RMSE              <- NA_real_
+}
 
 cat("\n============================================================\n")
 cat("BEST FORECASTING STRATEGY\n")
 cat("============================================================\n")
-cat("Best strategy by test RMSE:", best_sampling_strategy, "\n")
-cat("Best RMSE:", sprintf("%.6f", best_RMSE), "\n")
+cat("Best strategy by test RMSE:", ifelse(is.na(best_sampling_strategy), "NONE", best_sampling_strategy), "\n")
+cat("Best RMSE:", ifelse(is.na(best_RMSE), "N/A", sprintf("%.6f", best_RMSE)), "\n")
 
 
 ###############################################################
@@ -278,6 +311,7 @@ if ("Maturity" %in% names(results_yield)) {
       Model = normalize_method(Model),
       SamplingStrategy = Model
     ) %>%
+    dplyr::filter(is.finite(RMSE)) %>%
     dplyr::select(Model, SamplingStrategy, Maturity, RMSE, MAE, dplyr::everything())
   
   maturity_best <- maturity_rmse_long %>%
@@ -366,11 +400,13 @@ readr::write_csv(pairwise_rmse, file.path(OUTPUT_DIR, "14_Pairwise_RMSE_Comparis
 # 14. RELATIVE IMPROVEMENT VERSUS UNIFORM
 ###############################################################
 
-uniform_rmse <- current_yield %>%
+uniform_rmse_vec <- current_yield %>%
   dplyr::filter(SamplingStrategy == "Uniform") %>%
   dplyr::pull(RMSE)
 
-if (length(uniform_rmse) == 1L && is.finite(uniform_rmse) && uniform_rmse != 0) {
+uniform_rmse <- safe_mean(uniform_rmse_vec)
+
+if (is.finite(uniform_rmse) && uniform_rmse > 0) {
   relative_improvement <- current_yield %>%
     dplyr::mutate(
       Relative_RMSE_Improvement_vs_Uniform = 100 * (uniform_rmse - RMSE) / uniform_rmse
@@ -390,10 +426,11 @@ readr::write_csv(relative_improvement, file.path(OUTPUT_DIR, "14_Relative_RMSE_I
 ###############################################################
 
 ranking_summary <- current_yield %>%
+  dplyr::filter(is.finite(RMSE)) %>%
   dplyr::arrange(RMSE) %>%
   dplyr::mutate(
     RMSE_Rank = dplyr::row_number(),
-    BestForecastingStrategy = (SamplingStrategy == best_sampling_strategy)
+    BestForecastingStrategy = (!is.na(best_sampling_strategy) & SamplingStrategy == best_sampling_strategy)
   )
 
 readr::write_csv(ranking_summary, file.path(OUTPUT_DIR, "14_Model_Ranking.csv"))
@@ -404,26 +441,30 @@ readr::write_csv(ranking_summary, file.path(OUTPUT_DIR, "14_Model_Ranking.csv"))
 ###############################################################
 
 # 1. Aggregate RMSE Plot
-p_rmse <- ggplot2::ggplot(
-  current_yield,
-  ggplot2::aes(x = reorder(SamplingStrategy, RMSE), y = RMSE, fill = SamplingStrategy)
-) +
-  ggplot2::geom_col(show.legend = FALSE) +
-  ggplot2::labs(
-    title = "Test RMSE by Sampling Strategy & Benchmark",
-    x = "Model / Sampling Strategy",
-    y = "Yield-Curve RMSE"
-  ) +
-  ggplot2::theme_minimal() +
-  ggplot2::theme(plot.title = ggplot2::element_text(hjust = 0.5, face = "bold"))
+valid_yield_plot <- current_yield %>% dplyr::filter(is.finite(RMSE))
 
-ggplot2::ggsave(
-  filename = file.path(OUTPUT_DIR, "14_RMSE_by_Sampling_Strategy.png"),
-  plot = p_rmse, width = 7, height = 5, dpi = 300
-)
+if (nrow(valid_yield_plot) > 0L) {
+  p_rmse <- ggplot2::ggplot(
+    valid_yield_plot,
+    ggplot2::aes(x = reorder(SamplingStrategy, RMSE), y = RMSE, fill = SamplingStrategy)
+  ) +
+    ggplot2::geom_col(show.legend = FALSE) +
+    ggplot2::labs(
+      title = "Test RMSE by Sampling Strategy & Benchmark",
+      x = "Model / Sampling Strategy",
+      y = "Yield-Curve RMSE"
+    ) +
+    ggplot2::theme_minimal() +
+    ggplot2::theme(plot.title = ggplot2::element_text(hjust = 0.5, face = "bold"))
+
+  ggplot2::ggsave(
+    filename = file.path(OUTPUT_DIR, "14_RMSE_by_Sampling_Strategy.png"),
+    plot = p_rmse, width = 7, height = 5, dpi = 300
+  )
+}
 
 # 2. Maturity-Specific Line Plot
-if (!is.null(maturity_rmse_long)) {
+if (!is.null(maturity_rmse_long) && nrow(maturity_rmse_long) > 0L) {
   p_maturity <- ggplot2::ggplot(
     maturity_rmse_long,
     ggplot2::aes(x = Maturity, y = RMSE, group = SamplingStrategy, color = SamplingStrategy)
@@ -478,6 +519,6 @@ cat("\n============================================================\n")
 cat("14_EXPERIMENT COMPLETED SUCCESSFULLY\n")
 cat("Input File:", RESULTS_FILE, "\n")
 cat("Output Directory:", OUTPUT_DIR, "\n")
-cat("Best Strategy:", best_sampling_strategy, "\n")
-cat("Best RMSE:", sprintf("%.6f", best_RMSE), "\n")
+cat("Best Strategy:", ifelse(is.na(best_sampling_strategy), "NONE", best_sampling_strategy), "\n")
+cat("Best RMSE:", ifelse(is.na(best_RMSE), "N/A", sprintf("%.6f", best_RMSE)), "\n")
 cat("============================================================\n")

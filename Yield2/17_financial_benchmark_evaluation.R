@@ -10,13 +10,14 @@
 #
 # Purpose:
 # Economic benchmark evaluation of forecasting-driven
-# financial decision strategies with robust NA prevention.
+# financial decision strategies with robust NA prevention,
+# calibrated annualization, and paired statistical testing.
 #
 # Comparisons:
 #   1. Learned forecasting-model strategies
-#   2. Fixed Short strategy
-#   3. Fixed Intermediate strategy
-#   4. Fixed Long strategy
+#   2. Fixed Short strategy (3M T-Bills / Cash)
+#   3. Fixed Intermediate strategy (2Y, 5Y, 7Y)
+#   4. Fixed Long strategy (10Y, 30Y)
 #   5. Equal-Weight strategy
 #
 # Input:
@@ -188,7 +189,7 @@ TRANSACTION_COST <- if ("TRANSACTION_COST" %in% loaded_objects) get("TRANSACTION
 
 
 ###############################################################
-# 6. ROBUST HELPER FUNCTIONS (NA-PREVENTATIVE)
+# 6. ROBUST HELPER FUNCTIONS (NA-PREVENTATIVE & CALIBRATED)
 ###############################################################
 
 safe_mean <- function(x) {
@@ -203,7 +204,7 @@ safe_sd <- function(x) {
   stats::sd(x)
 }
 
-# Robust Cumulative Compounded Return (floors wealth multipliers at 1e-8 to avoid negative logs or NA collapse)
+# Robust Cumulative Compounded Return
 safe_cumulative_return <- function(x) {
   x <- x[is.finite(x)]
   if (length(x) == 0) return(NA_real_)
@@ -227,12 +228,13 @@ safe_annualized_volatility <- function(x, periods_per_year = 12) {
   stats::sd(x) * sqrt(periods_per_year)
 }
 
-safe_sharpe <- function(x, periods_per_year = 12) {
+# Calibrated Annualized Sharpe Ratio: (Mean_monthly - Rf_monthly) / SD_monthly * sqrt(12)
+safe_sharpe <- function(x, rf_monthly = 0, periods_per_year = 12) {
   x <- x[is.finite(x)]
   if (length(x) < 2) return(NA_real_)
   s <- stats::sd(x)
-  if (!is.finite(s) || s == 0) return(NA_real_)
-  mean(x) / s * sqrt(periods_per_year)
+  if (!is.finite(s) || s <= 1e-8) return(NA_real_)
+  (mean(x - rf_monthly) / s) * sqrt(periods_per_year)
 }
 
 # Robust Maximum Drawdown
@@ -282,12 +284,12 @@ learned_models <- learned_models[!is.na(learned_models) & learned_models != ""]
 
 learned_strategy_returns <- financial_decision_detail %>%
   dplyr::transmute(
-    TestIndex = TestIndex,
-    Date = Date,
-    Strategy = paste0("Model: ", Model),
-    GrossReturn = SelectedRealizedReturn,
+    TestIndex       = TestIndex,
+    Date            = Date,
+    Strategy        = paste0("Model: ", Model),
+    GrossReturn     = SelectedRealizedReturn,
     TransactionCost = TransactionCost,
-    NetReturn = NetRealizedReturn
+    NetReturn       = NetRealizedReturn
   )
 
 benchmark_source <- financial_decision_detail %>%
@@ -396,7 +398,7 @@ cat("Best fixed benchmark:", best_fixed_strategy, "\n")
 
 
 ###############################################################
-# 10. PAIRED COMPARISONS & BOOTSTRAP TESTING
+# 10. PAIRED COMPARISONS & STATISTICAL TESTING
 ###############################################################
 
 strategy_names <- unique(all_strategy_returns$Strategy)
@@ -436,7 +438,7 @@ paired_comparison <- if (length(comparison_list) > 0) dplyr::bind_rows(compariso
 
 
 ###############################################################
-# 11. BOOTSTRAP COMPARISONS
+# 11. BOOTSTRAP COMPARISONS (5,000 RESAMPLES)
 ###############################################################
 
 paired_bootstrap <- function(x, y, B = 5000, seed = 20260914) {
@@ -596,11 +598,11 @@ save(
 ###############################################################
 
 cat("\n============================================================\n")
-cat("STRATEGY PERFORMANCE OVERVIEW\n")
+cat("STRATEGY PERFORMANCE OVERVIEW (CALIBRATED)\n")
 cat("============================================================\n")
 print(strategy_performance %>% dplyr::select(Strategy, AnnualizedReturn, SharpeRatio, MaximumDrawdown, OverallRank))
 
 cat("\n============================================================\n")
-cat("17_FINANCIAL_BENCHMARK_EVALUATION.R COMPLETED\n")
+cat("17_FINANCIAL_BENCHMARK_EVALUATION.R COMPLETED SUCCESSFULLY\n")
 cat("Results saved to directory: ", OUTPUT_DIR, "\n", sep = "")
 cat("============================================================\n")

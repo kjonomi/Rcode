@@ -20,6 +20,12 @@ The study emphasizes three complementary dimensions of model performance:
 2. Yield-curve structural consistency
 3. Financial economic value
 
+## Data
+## Run 01_fred_data_download.R code to get the data first and then run main 00_main.R code
+## You change the data time period from 01_fred_data_download.R code
+## Modify fetch_fred_macro_data <- function(start_date = "1995-01-01", end_date = "2026-10-08") 
+## You can get the more related R codes from https://github.com/kjonomi/Rcode/edit/main/Yield
+
 ## Framework
 
 **Affine Term Structure → Transformer–CNN–BiLSTM → Adaptive Experience Replay → Yield Forecasts → Financial Strategies**

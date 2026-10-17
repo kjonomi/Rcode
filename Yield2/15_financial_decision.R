@@ -10,18 +10,19 @@
 #
 # Purpose:
 # Convert out-of-sample yield forecasts into a financial
-# decision-making strategy with robust NA handling.
+# decision-making strategy with robust NA handling and calibrated
+# bond pricing, duration exposure, and risk metrics.
 #
 # Portfolio segments:
-#   Short:        DTB3
-#   Intermediate: DGS2, DGS5, DGS7
-#   Long:         DGS10, DGS30
+#   Short:        DTB3  (Duration ~ 0.25 years)
+#   Intermediate: DGS2, DGS5, DGS7 (Duration ~ 4.50 years)
+#   Long:         DGS10, DGS30 (Duration ~ 17.50 years)
 #
 # Decision rule:
 #   Select the portfolio segment with the largest predicted
 #   one-month holding-period return.
 #
-# Approximate one-month bond return:
+# One-month bond return:
 #   r_hat(t+1) = y_t / 12 - D * [y_hat(t+1) - y_t]
 #
 # Realized return:
@@ -124,7 +125,7 @@ if (!is.na(DETAILED_FILE) && file.exists(DETAILED_FILE)) {
 ###############################################################
 
 if (!exists("test_yield_predictions")) {
-  stop("Object 'test_yield_predictions' not found. Run the updated 11_evaluation.R first.")
+  stop("Object 'test_yield_predictions' not found. Run 11_evaluation.R first.")
 }
 
 test_yield_predictions <- as.data.frame(test_yield_predictions)
@@ -177,15 +178,14 @@ DURATION <- c(
   Long         = 17.50
 )
 
-HOLDING_PERIOD           <- 1 / 12
-TRANSACTION_COST         <- 0.0010
+HOLDING_PERIOD           <- 1 / 12     # 1-Month Holding Horizon
+TRANSACTION_COST         <- 0.0010     # 10 bps Friction on Rebalancing Switches
 INITIAL_TRANSACTION_COST <- FALSE
 
-cat("\nFinancial parameters\n")
+cat("\nFinancial Parameters\n")
 cat("--------------------\n")
-cat("Holding period: ", HOLDING_PERIOD, " year\n", sep = "")
-cat("Transaction cost: ", TRANSACTION_COST, "\n", sep = "")
-cat("Initial transaction cost: ", INITIAL_TRANSACTION_COST, "\n", sep = "")
+cat("Holding Period: ", HOLDING_PERIOD, " year (1 Month)\n", sep = "")
+cat("Transaction Cost: ", TRANSACTION_COST * 10000, " bps\n", sep = "")
 
 
 ###############################################################
@@ -200,12 +200,26 @@ calculate_portfolio_yield <- function(data, yield_columns) {
   result
 }
 
-# Robust Compounded Return (floors wealth multipliers at 1e-8 to prevent NA propagation)
+# Compounded Total Return (floors wealth multipliers at 1e-8 to prevent NA propagation)
 safe_cumulative_return <- function(x) {
   x <- x[is.finite(x)]
   if (length(x) == 0) return(NA_real_)
   mult <- pmax(1 + x, 1e-8)
   exp(sum(log(mult))) - 1
+}
+
+# Annualized Sharpe Ratio calculation (Monthly returns -> Annualized)
+calculate_annualized_sharpe <- function(returns, rf_monthly = 0) {
+  valid_r <- returns[is.finite(returns)]
+  if (length(valid_r) < 2) return(NA_real_)
+  
+  excess_returns <- valid_r - rf_monthly
+  mean_excess <- mean(excess_returns, na.rm = TRUE)
+  sd_returns <- sd(valid_r, na.rm = TRUE)
+  
+  if (is.na(sd_returns) || sd_returns <= 1e-8) return(NA_real_)
+  
+  (mean_excess / sd_returns) * sqrt(12)
 }
 
 current_portfolio_yields <- data.frame(TestIndex = seq_len(nrow(test_current_yields)))
@@ -224,12 +238,12 @@ for (portfolio_name in names(PORTFOLIOS)) {
 ###############################################################
 
 model_names <- unique(test_yield_predictions$Model)
-cat("\nModels found: ", paste(model_names, collapse = ", "), "\n", sep = "")
+cat("\nModels Found: ", paste(model_names, collapse = ", "), "\n", sep = "")
 
 decision_list <- list()
 
 for (model_name in model_names) {
-  cat("\nProcessing model: ", model_name, "\n", sep = "")
+  cat("\nProcessing Model: ", model_name, "\n", sep = "")
   
   model_data <- test_yield_predictions %>%
     dplyr::filter(Model == model_name) %>%
@@ -251,18 +265,23 @@ for (model_name in model_names) {
     model_data[[paste0("Actual_", portfolio_name)]]    <- calculate_portfolio_yield(model_data, act_cols)
   }
   
-  # Calculate Expected & Realized Returns
+  # Calculate Expected & Realized Monthly Returns (Converted from percentage yields)
   for (portfolio_name in names(PORTFOLIOS)) {
     current_col   <- paste0("Current_", portfolio_name)
     pred_col      <- paste0("Predicted_", portfolio_name)
     act_col       <- paste0("Actual_", portfolio_name)
     dur           <- DURATION[portfolio_name]
     
+    # Converts yield levels (%/100) into 1-month coupon carry + duration-driven price return
+    y_curr <- model_data[[current_col]] / 100
+    y_pred <- model_data[[pred_col]] / 100
+    y_act  <- model_data[[act_col]] / 100
+    
     model_data[[paste0("ExpectedReturn_", portfolio_name)]] <- 
-      model_data[[current_col]] * HOLDING_PERIOD - dur * (model_data[[pred_col]] - model_data[[current_col]])
+      (y_curr * HOLDING_PERIOD) - dur * (y_pred - y_curr)
     
     model_data[[paste0("RealizedReturn_", portfolio_name)]] <- 
-      model_data[[current_col]] * HOLDING_PERIOD - dur * (model_data[[act_col]] - model_data[[current_col]])
+      (y_curr * HOLDING_PERIOD) - dur * (y_act - y_curr)
   }
   
   # Portfolio Selection (Max Expected Return Rule)
@@ -302,13 +321,13 @@ for (model_name in model_names) {
 
 
 ###############################################################
-# 9. COMBINE & EVALUATE STRATEGY RETURNS
+# 9. COMBINE & EVALUATE STRATEGY RETURNS WITH FRICTION
 ###############################################################
 
 financial_decision_detail <- dplyr::bind_rows(decision_list)
 
 if (nrow(financial_decision_detail) == 0) {
-  stop("No financial-decision observations were generated.")
+  stop("No financial decision observations generated.")
 }
 
 financial_decision_detail <- financial_decision_detail %>%
@@ -330,7 +349,7 @@ financial_decision_detail <- financial_decision_detail %>%
 
 
 ###############################################################
-# 10. MODEL-LEVEL FINANCIAL SUMMARIES
+# 10. MODEL-LEVEL FINANCIAL SUMMARIES & CALIBRATED SHARPE
 ###############################################################
 
 financial_decision_summary <- financial_decision_detail %>%
@@ -343,10 +362,8 @@ financial_decision_summary <- financial_decision_detail %>%
     SDNetReturn        = ifelse(sum(is.finite(NetRealizedReturn)) > 1, sd(NetRealizedReturn[is.finite(NetRealizedReturn)], na.rm = TRUE), NA_real_),
     TotalGrossReturn   = safe_cumulative_return(SelectedRealizedReturn),
     TotalNetReturn     = safe_cumulative_return(NetRealizedReturn),
-    SharpeLike         = ifelse(is.finite(sd(NetRealizedReturn[is.finite(NetRealizedReturn)], na.rm = TRUE)) && 
-                                  sd(NetRealizedReturn[is.finite(NetRealizedReturn)], na.rm = TRUE) > 0,
-                                mean(NetRealizedReturn[is.finite(NetRealizedReturn)], na.rm = TRUE) / sd(NetRealizedReturn[is.finite(NetRealizedReturn)], na.rm = TRUE), NA_real_),
-    PortfolioSwitches  = sum(PortfolioSwitch, na.rm = TRUE),
+    AnnualizedSharpe   = calculate_annualized_sharpe(NetRealizedReturn),
+    PortfolioSwitches = sum(PortfolioSwitch, na.rm = TRUE),
     SwitchingRate      = mean(PortfolioSwitch, na.rm = TRUE),
     ShortRate          = mean(SelectedPortfolio == "Short", na.rm = TRUE),
     IntermediateRate   = mean(SelectedPortfolio == "Intermediate", na.rm = TRUE),
@@ -376,6 +393,7 @@ portfolio_performance_summary <- financial_decision_detail %>%
     N                = sum(is.finite(RealizedReturn)),
     MeanReturn       = mean(RealizedReturn[is.finite(RealizedReturn)], na.rm = TRUE),
     SDReturn         = ifelse(sum(is.finite(RealizedReturn)) > 1, sd(RealizedReturn[is.finite(RealizedReturn)], na.rm = TRUE), NA_real_),
+    AnnualizedSharpe = calculate_annualized_sharpe(RealizedReturn),
     CumulativeReturn = safe_cumulative_return(RealizedReturn),
     .groups          = "drop"
   )
@@ -399,8 +417,8 @@ p1 <- ggplot2::ggplot(
 ) +
   ggplot2::geom_line(linewidth = 0.8) +
   ggplot2::labs(
-    title = "Cumulative Net Financial Decision Return",
-    x = "Test Observation", y = "Cumulative Net Return", color = "Model"
+    title = "Cumulative Net Financial Decision Return Across Models",
+    x = "Test Observation (Months)", y = "Cumulative Net Return", color = "Model / Strategy"
   ) +
   ggplot2::theme_minimal() +
   ggplot2::theme(plot.title = ggplot2::element_text(hjust = 0.5, face = "bold"))
@@ -414,8 +432,8 @@ p2 <- ggplot2::ggplot(
 ) +
   ggplot2::geom_col(position = "dodge") +
   ggplot2::labs(
-    title = "Portfolio Selection Distribution by Model",
-    x = "Portfolio Segment", y = "Number of Months Selected", fill = "Model"
+    title = "Portfolio Selection Allocation Frequency by Model",
+    x = "Portfolio Segment", y = "Number of Months Selected", fill = "Model / Strategy"
   ) +
   ggplot2::theme_minimal() +
   ggplot2::theme(plot.title = ggplot2::element_text(hjust = 0.5, face = "bold"))
@@ -458,7 +476,7 @@ save(
 cat("\n============================================================\n")
 cat("FINANCIAL DECISION ANALYSIS COMPLETED\n")
 cat("============================================================\n")
-cat("Best Strategy Model:", best_model, "\n")
-cat("Best Total Net Return:", sprintf("%.4f%%", best_total_net_return * 100), "\n")
+cat("Top Investment Model Strategy:", best_model, "\n")
+cat("Best Total Net Portfolio Return:", sprintf("%.4f%%", best_total_net_return * 100), "\n")
 cat("Results saved to directory:", OUTPUT_DIR, "\n")
 cat("============================================================\n")

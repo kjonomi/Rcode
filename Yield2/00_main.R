@@ -1,9 +1,5 @@
 ###############################################################
 # Journal of Risk and Financial Management
-# Title:
-# Adaptive Deep Sequential Learning for Treasury Yield Curve Forecasting: Integrating Affine Term-Structure
-# Factors and Experience Replay
-# File:
 # 00_main_combined.R (SELF-CONTAINED END-TO-END PIPELINE)
 #
 # IMPORTANT:

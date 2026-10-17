@@ -141,13 +141,7 @@ load(input_file, envir = results_env)
 
 required_objects <- c(
     "strategy_performance",
-    "all_strategy_returns",
-    "wealth_data",
-    "paired_comparison",
-    "bootstrap_comparison",
-    "model_vs_best_fixed",
-    "best_fixed_strategy",
-    "learned_switching"
+    "all_strategy_returns"
 )
 
 missing_objects <- required_objects[
@@ -172,12 +166,13 @@ if (length(missing_objects) > 0) {
 
 strategy_performance <- get("strategy_performance", envir = results_env)
 all_strategy_returns <- get("all_strategy_returns", envir = results_env)
-wealth_data          <- get("wealth_data", envir = results_env)
-paired_comparison    <- get("paired_comparison", envir = results_env)
-bootstrap_comparison <- get("bootstrap_comparison", envir = results_env)
-model_vs_best_fixed  <- get("model_vs_best_fixed", envir = results_env)
-best_fixed_strategy  <- get("best_fixed_strategy", envir = results_env)
-learned_switching    <- get("learned_switching", envir = results_env)
+
+wealth_data          <- if (exists("wealth_data", envir = results_env)) get("wealth_data", envir = results_env) else data.frame()
+paired_comparison    <- if (exists("paired_comparison", envir = results_env)) get("paired_comparison", envir = results_env) else data.frame()
+bootstrap_comparison <- if (exists("bootstrap_comparison", envir = results_env)) get("bootstrap_comparison", envir = results_env) else data.frame()
+model_vs_best_fixed  <- if (exists("model_vs_best_fixed", envir = results_env)) get("model_vs_best_fixed", envir = results_env) else data.frame()
+best_fixed_strategy  <- if (exists("best_fixed_strategy", envir = results_env)) get("best_fixed_strategy", envir = results_env) else NA_character_
+learned_switching    <- if (exists("learned_switching", envir = results_env)) get("learned_switching", envir = results_env) else data.frame()
 
 
 ###############################################################
@@ -197,7 +192,7 @@ if (length(missing_return_columns) > 0) {
 
 
 ###############################################################
-# 6. STRATEGY IDENTIFICATION
+# 6. STRATEGY IDENTIFICATION & BENCHMARK SELECTION
 ###############################################################
 
 strategy_names <- unique(as.character(all_strategy_returns$Strategy))
@@ -231,7 +226,7 @@ cat("Best fixed benchmark: ", ifelse(is.na(best_fixed_strategy), "NONE", best_fi
 
 
 ###############################################################
-# 7. SAFE HELPER FUNCTIONS
+# 7. SAFE HELPER FUNCTIONS (NA-PREVENTATIVE)
 ###############################################################
 
 safe_mean   <- function(x) { x <- x[is.finite(x)]; if (length(x) == 0) NA_real_ else mean(x) }
@@ -242,6 +237,35 @@ safe_quantile <- function(x, probability) {
     x <- x[is.finite(x)]
     if (length(x) == 0) return(NA_real_)
     as.numeric(stats::quantile(x, probs = probability, names = FALSE, type = 7, na.rm = TRUE))
+}
+
+# Robust Compounded Annualized Return (floors wealth multipliers to 1e-8)
+safe_annualized_return <- function(x, periods_per_year = 12) {
+    x <- x[is.finite(x)]
+    n <- length(x)
+    if (n == 0L) return(NA_real_)
+    mult <- pmax(1 + x, 1e-8)
+    total_wealth <- exp(sum(log(mult)))
+    total_wealth^(periods_per_year / n) - 1
+}
+
+# Robust Maximum Drawdown
+safe_max_drawdown <- function(x) {
+    x <- x[is.finite(x)]
+    if (length(x) == 0L) return(NA_real_)
+    mult <- pmax(1 + x, 1e-8)
+    wealth <- cumprod(mult)
+    running_max <- cummax(wealth)
+    drawdown <- wealth / running_max - 1
+    min(drawdown, na.rm = TRUE)
+}
+
+# Robust Calmar Ratio
+safe_calmar <- function(x) {
+    ann_ret <- safe_annualized_return(x)
+    mdd <- safe_max_drawdown(x)
+    if (!is.finite(ann_ret) || !is.finite(mdd) || mdd >= 0) return(NA_real_)
+    ann_ret / abs(mdd)
 }
 
 safe_t_test <- function(x) {
@@ -319,7 +343,31 @@ safe_rank <- function(x, decreasing = TRUE) {
 
 
 ###############################################################
-# 8. STRATEGY-LEVEL STATISTICAL INFERENCE
+# 8. RE-POPULATE MISSING PERFORMANCE METRICS
+###############################################################
+
+# Update any NA columns in strategy_performance directly from returns
+recalculated_perf <- all_strategy_returns %>%
+    dplyr::group_by(Strategy) %>%
+    dplyr::summarise(
+        AnnualizedReturn_Calc = safe_annualized_return(NetReturn),
+        MaximumDrawdown_Calc  = safe_max_drawdown(NetReturn),
+        CalmarRatio_Calc      = safe_calmar(NetReturn),
+        .groups               = "drop"
+    )
+
+strategy_performance <- strategy_performance %>%
+    dplyr::left_join(recalculated_perf, by = "Strategy") %>%
+    dplyr::mutate(
+        AnnualizedReturn = ifelse(is.na(AnnualizedReturn), AnnualizedReturn_Calc, AnnualizedReturn),
+        MaximumDrawdown  = ifelse(is.na(MaximumDrawdown), MaximumDrawdown_Calc, MaximumDrawdown),
+        CalmarRatio      = ifelse(is.na(CalmarRatio), CalmarRatio_Calc, CalmarRatio)
+    ) %>%
+    dplyr::select(-ends_with("_Calc"))
+
+
+###############################################################
+# 9. STRATEGY-LEVEL STATISTICAL INFERENCE
 ###############################################################
 
 strategy_inference_list <- list()
@@ -361,7 +409,7 @@ if (nrow(strategy_inference) > 0) {
 
 
 ###############################################################
-# 9. NEWEY--WEST HAC INFERENCE
+# 10. NEWEY--WEST HAC INFERENCE
 ###############################################################
 
 NW_LAG <- 3
@@ -396,7 +444,7 @@ if (nrow(newey_west_inference) > 0) {
 
 
 ###############################################################
-# 10. LEARNED MODEL VS BEST FIXED BENCHMARK
+# 11. LEARNED MODEL VS BEST FIXED BENCHMARK
 ###############################################################
 
 model_vs_best_list <- list()
@@ -440,7 +488,7 @@ if (nrow(model_vs_best_inference) > 0) {
 
 
 ###############################################################
-# 11. LEARNED MODEL VS ALL FIXED BENCHMARKS
+# 12. LEARNED MODEL VS ALL FIXED BENCHMARKS
 ###############################################################
 
 model_vs_all_list <- list()
@@ -486,7 +534,7 @@ if (nrow(model_vs_all_inference) > 0) {
 
 
 ###############################################################
-# 12. STRATEGY ROBUSTNESS RANKING
+# 13. STRATEGY ROBUSTNESS RANKING
 ###############################################################
 
 robustness_data <- strategy_performance %>%
@@ -512,7 +560,7 @@ robustness_data <- strategy_performance %>%
 
 
 ###############################################################
-# 13. FIGURES & VISUALIZATIONS
+# 14. FIGURES & VISUALIZATIONS
 ###############################################################
 
 # Figure 1: Return Difference Confidence Intervals
@@ -580,7 +628,7 @@ if (nrow(nw_plot_data) > 0) {
 
 
 ###############################################################
-# 14. EXPORT CSV ARTIFACTS & RDATA
+# 15. EXPORT CSV ARTIFACTS & FULL RDATA (FOR MODULE 19)
 ###############################################################
 
 readr::write_csv(strategy_inference, file.path(OUTPUT_DIR, "18_Strategy_Inference.csv"))
@@ -589,18 +637,29 @@ readr::write_csv(model_vs_all_inference, file.path(OUTPUT_DIR, "18_Model_vs_All_
 readr::write_csv(robustness_data, file.path(OUTPUT_DIR, "18_Strategy_Robustness.csv"))
 readr::write_csv(newey_west_inference, file.path(OUTPUT_DIR, "18_Newey_West_Inference.csv"))
 
+# Save both Module 18 inference outputs and Module 17 baseline objects
 save(
+    strategy_performance,
+    all_strategy_returns,
+    wealth_data,
+    paired_comparison,
+    bootstrap_comparison,
+    model_vs_best_fixed,
+    best_fixed_strategy,
+    learned_switching,
     strategy_inference,
     newey_west_inference,
     model_vs_best_inference,
     model_vs_all_inference,
     robustness_data,
+    learned_strategies,
+    fixed_strategies,
     file = file.path(OUTPUT_DIR, "18_Financial_Strategy_Inference.RData")
 )
 
 
 ###############################################################
-# 15. CONSOLE SUMMARY
+# 16. CONSOLE SUMMARY
 ###############################################################
 
 cat("============================================================\n")

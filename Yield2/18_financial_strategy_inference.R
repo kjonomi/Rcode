@@ -18,8 +18,8 @@
 #   1. Strategy-level descriptive inference
 #   2. One-sample t-tests
 #   3. Wilcoxon signed-rank tests
-#   4. Bootstrap confidence intervals
-#   5. Newey--West HAC inference
+#   4. Bootstrap confidence intervals (5,000 resamples)
+#   5. Newey--West HAC inference (lag = 3)
 #   6. Learned-model versus best fixed benchmark
 #   7. Learned-model versus all fixed benchmarks
 #   8. Benjamini--Hochberg multiple-testing adjustment
@@ -50,8 +50,8 @@
 rm(list = ls())
 
 options(
-    stringsAsFactors = FALSE,
-    scipen = 999
+  stringsAsFactors = FALSE,
+  scipen = 999
 )
 
 set.seed(20260914)
@@ -69,40 +69,40 @@ cat("\n")
 ###############################################################
 
 required_packages <- c(
-    "dplyr",
-    "tidyr",
-    "ggplot2",
-    "readr",
-    "sandwich",
-    "lmtest"
+  "dplyr",
+  "tidyr",
+  "ggplot2",
+  "readr",
+  "sandwich",
+  "lmtest"
 )
 
 missing_packages <- required_packages[
-    !vapply(
-        required_packages,
-        requireNamespace,
-        logical(1),
-        quietly = TRUE
-    )
+  !vapply(
+    required_packages,
+    requireNamespace,
+    logical(1),
+    quietly = TRUE
+  )
 ]
 
 if (length(missing_packages) > 0) {
-    stop(
-        paste0(
-            "The following required packages are missing: ",
-            paste(missing_packages, collapse = ", "),
-            "\nPlease install them before running this script."
-        )
+  stop(
+    paste0(
+      "The following required packages are missing: ",
+      paste(missing_packages, collapse = ", "),
+      "\nPlease install them before running this script."
     )
+  )
 }
 
 suppressPackageStartupMessages({
-    library(dplyr)
-    library(tidyr)
-    library(ggplot2)
-    library(readr)
-    library(sandwich)
-    library(lmtest)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(readr)
+  library(sandwich)
+  library(lmtest)
 })
 
 
@@ -112,18 +112,18 @@ suppressPackageStartupMessages({
 
 OUTPUT_DIR <- "18_Financial_Strategy_Inference"
 if (!dir.exists(OUTPUT_DIR)) {
-    dir.create(OUTPUT_DIR, recursive = TRUE, showWarnings = FALSE)
+  dir.create(OUTPUT_DIR, recursive = TRUE, showWarnings = FALSE)
 }
 
 candidate_files <- c(
-    "17_Financial_Benchmark_Evaluation.RData",
-    file.path("17_Financial_Benchmark_Evaluation", "17_Financial_Benchmark_Evaluation.RData")
+  "17_Financial_Benchmark_Evaluation.RData",
+  file.path("17_Financial_Benchmark_Evaluation", "17_Financial_Benchmark_Evaluation.RData")
 )
 
 input_file <- candidate_files[file.exists(candidate_files)][1]
 
 if (is.na(input_file) || !file.exists(input_file)) {
-    stop("Input file not found: 17_Financial_Benchmark_Evaluation.RData. Run 17_financial_benchmark_evaluation.R first.")
+  stop("Input file not found: 17_Financial_Benchmark_Evaluation.RData. Run 17_financial_benchmark_evaluation.R first.")
 }
 
 
@@ -140,28 +140,28 @@ load(input_file, envir = results_env)
 ###############################################################
 
 required_objects <- c(
-    "strategy_performance",
-    "all_strategy_returns"
+  "strategy_performance",
+  "all_strategy_returns"
 )
 
 missing_objects <- required_objects[
-    !vapply(
-        required_objects,
-        exists,
-        logical(1),
-        envir = results_env,
-        inherits = FALSE
-    )
+  !vapply(
+    required_objects,
+    exists,
+    logical(1),
+    envir = results_env,
+    inherits = FALSE
+  )
 ]
 
 if (length(missing_objects) > 0) {
-    stop(
-        paste0(
-            "The following required objects are missing from ",
-            input_file, ": ",
-            paste(missing_objects, collapse = ", ")
-        )
+  stop(
+    paste0(
+      "The following required objects are missing from ",
+      input_file, ": ",
+      paste(missing_objects, collapse = ", ")
     )
+  )
 }
 
 strategy_performance <- get("strategy_performance", envir = results_env)
@@ -180,14 +180,14 @@ learned_switching    <- if (exists("learned_switching", envir = results_env)) ge
 ###############################################################
 
 if (!is.data.frame(strategy_performance) || !is.data.frame(all_strategy_returns)) {
-    stop("strategy_performance and all_strategy_returns must be data frames.")
+  stop("strategy_performance and all_strategy_returns must be data frames.")
 }
 
 required_return_columns <- c("Strategy", "NetReturn")
 missing_return_columns  <- setdiff(required_return_columns, names(all_strategy_returns))
 
 if (length(missing_return_columns) > 0) {
-    stop(paste0("all_strategy_returns is missing required columns: ", paste(missing_return_columns, collapse = ", ")))
+  stop(paste0("all_strategy_returns is missing required columns: ", paste(missing_return_columns, collapse = ", ")))
 }
 
 
@@ -203,21 +203,21 @@ fixed_strategies   <- c("Fixed Short", "Fixed Intermediate", "Fixed Long", "Equa
 fixed_strategies   <- fixed_strategies[fixed_strategies %in% strategy_names]
 
 if (length(best_fixed_strategy) == 0 || is.null(best_fixed_strategy) || is.na(best_fixed_strategy[1])) {
-    best_fixed_strategy <- NA_character_
+  best_fixed_strategy <- NA_character_
 } else {
-    best_fixed_strategy <- as.character(best_fixed_strategy[1])
+  best_fixed_strategy <- as.character(best_fixed_strategy[1])
 }
 
 if (is.na(best_fixed_strategy) && length(fixed_strategies) > 0) {
-    if ("SharpeRatio" %in% names(strategy_performance)) {
-        candidate_best <- strategy_performance %>%
-            dplyr::filter(Strategy %in% fixed_strategies, is.finite(SharpeRatio)) %>%
-            dplyr::arrange(dplyr::desc(SharpeRatio))
-
-        if (nrow(candidate_best) > 0) {
-            best_fixed_strategy <- as.character(candidate_best$Strategy[1])
-        }
+  if ("SharpeRatio" %in% names(strategy_performance)) {
+    candidate_best <- strategy_performance %>%
+      dplyr::filter(Strategy %in% fixed_strategies, is.finite(SharpeRatio)) %>%
+      dplyr::arrange(dplyr::desc(SharpeRatio))
+    
+    if (nrow(candidate_best) > 0) {
+      best_fixed_strategy <- as.character(candidate_best$Strategy[1])
     }
+  }
 }
 
 cat("Learned strategies: ", ifelse(length(learned_strategies) == 0, "NONE", paste(learned_strategies, collapse = ", ")), "\n")
@@ -226,7 +226,7 @@ cat("Best fixed benchmark: ", ifelse(is.na(best_fixed_strategy), "NONE", best_fi
 
 
 ###############################################################
-# 7. SAFE HELPER FUNCTIONS (NA-PREVENTATIVE)
+# 7. SAFE HELPER FUNCTIONS (NA-PREVENTATIVE & CALIBRATED)
 ###############################################################
 
 safe_mean   <- function(x) { x <- x[is.finite(x)]; if (length(x) == 0) NA_real_ else mean(x) }
@@ -234,111 +234,111 @@ safe_median <- function(x) { x <- x[is.finite(x)]; if (length(x) == 0) NA_real_ 
 safe_sd     <- function(x) { x <- x[is.finite(x)]; if (length(x) < 2) NA_real_ else sd(x) }
 
 safe_quantile <- function(x, probability) {
-    x <- x[is.finite(x)]
-    if (length(x) == 0) return(NA_real_)
-    as.numeric(stats::quantile(x, probs = probability, names = FALSE, type = 7, na.rm = TRUE))
+  x <- x[is.finite(x)]
+  if (length(x) == 0) return(NA_real_)
+  as.numeric(stats::quantile(x, probs = probability, names = FALSE, type = 7, na.rm = TRUE))
 }
 
-# Robust Compounded Annualized Return (floors wealth multipliers to 1e-8)
+# Robust Compounded Annualized Return
 safe_annualized_return <- function(x, periods_per_year = 12) {
-    x <- x[is.finite(x)]
-    n <- length(x)
-    if (n == 0L) return(NA_real_)
-    mult <- pmax(1 + x, 1e-8)
-    total_wealth <- exp(sum(log(mult)))
-    total_wealth^(periods_per_year / n) - 1
+  x <- x[is.finite(x)]
+  n <- length(x)
+  if (n == 0L) return(NA_real_)
+  mult <- pmax(1 + x, 1e-8)
+  total_wealth <- exp(sum(log(mult)))
+  total_wealth^(periods_per_year / n) - 1
 }
 
 # Robust Maximum Drawdown
 safe_max_drawdown <- function(x) {
-    x <- x[is.finite(x)]
-    if (length(x) == 0L) return(NA_real_)
-    mult <- pmax(1 + x, 1e-8)
-    wealth <- cumprod(mult)
-    running_max <- cummax(wealth)
-    drawdown <- wealth / running_max - 1
-    min(drawdown, na.rm = TRUE)
+  x <- x[is.finite(x)]
+  if (length(x) == 0L) return(NA_real_)
+  mult <- pmax(1 + x, 1e-8)
+  wealth <- cumprod(mult)
+  running_max <- cummax(wealth)
+  drawdown <- wealth / running_max - 1
+  min(drawdown, na.rm = TRUE)
 }
 
 # Robust Calmar Ratio
 safe_calmar <- function(x) {
-    ann_ret <- safe_annualized_return(x)
-    mdd <- safe_max_drawdown(x)
-    if (!is.finite(ann_ret) || !is.finite(mdd) || mdd >= 0) return(NA_real_)
-    ann_ret / abs(mdd)
+  ann_ret <- safe_annualized_return(x)
+  mdd <- safe_max_drawdown(x)
+  if (!is.finite(ann_ret) || !is.finite(mdd) || mdd >= 0) return(NA_real_)
+  ann_ret / abs(mdd)
 }
 
 safe_t_test <- function(x) {
-    x <- x[is.finite(x)]
-    if (length(x) < 2) return(NA_real_)
-    x_sd <- safe_sd(x)
-    if (!is.finite(x_sd)) return(NA_real_)
-    if (x_sd == 0) return(ifelse(safe_mean(x) == 0, 1, 0))
-    res <- tryCatch(stats::t.test(x, mu = 0), error = function(e) NULL)
-    if (is.null(res)) NA_real_ else as.numeric(res$p.value)
+  x <- x[is.finite(x)]
+  if (length(x) < 2) return(NA_real_)
+  x_sd <- safe_sd(x)
+  if (!is.finite(x_sd)) return(NA_real_)
+  if (x_sd == 0) return(ifelse(safe_mean(x) == 0, 1, 0))
+  res <- tryCatch(stats::t.test(x, mu = 0), error = function(e) NULL)
+  if (is.null(res)) NA_real_ else as.numeric(res$p.value)
 }
 
 safe_wilcoxon <- function(x) {
-    x <- x[is.finite(x)]
-    if (length(x) < 2) return(NA_real_)
-    if (all(x == 0)) return(1)
-    res <- tryCatch(suppressWarnings(stats::wilcox.test(x, mu = 0, exact = FALSE)), error = function(e) NULL)
-    if (is.null(res)) NA_real_ else as.numeric(res$p.value)
+  x <- x[is.finite(x)]
+  if (length(x) < 2) return(NA_real_)
+  if (all(x == 0)) return(1)
+  res <- tryCatch(suppressWarnings(stats::wilcox.test(x, mu = 0, exact = FALSE)), error = function(e) NULL)
+  if (is.null(res)) NA_real_ else as.numeric(res$p.value)
 }
 
 safe_bootstrap_mean <- function(x, B = 5000) {
-    x <- x[is.finite(x)]
-    if (length(x) == 0) return(data.frame(Estimate = NA_real_, Lower = NA_real_, Upper = NA_real_))
-    if (length(x) == 1) return(data.frame(Estimate = x[1], Lower = x[1], Upper = x[1]))
-
-    bootstrap_values <- replicate(B, mean(sample(x, size = length(x), replace = TRUE)))
-    data.frame(
-        Estimate = mean(x),
-        Lower    = as.numeric(stats::quantile(bootstrap_values, 0.025, names = FALSE, na.rm = TRUE)),
-        Upper    = as.numeric(stats::quantile(bootstrap_values, 0.975, names = FALSE, na.rm = TRUE))
-    )
+  x <- x[is.finite(x)]
+  if (length(x) == 0) return(data.frame(Estimate = NA_real_, Lower = NA_real_, Upper = NA_real_))
+  if (length(x) == 1) return(data.frame(Estimate = x[1], Lower = x[1], Upper = x[1]))
+  
+  bootstrap_values <- replicate(B, mean(sample(x, size = length(x), replace = TRUE)))
+  data.frame(
+    Estimate = mean(x),
+    Lower    = as.numeric(stats::quantile(bootstrap_values, 0.025, names = FALSE, na.rm = TRUE)),
+    Upper    = as.numeric(stats::quantile(bootstrap_values, 0.975, names = FALSE, na.rm = TRUE))
+  )
 }
 
 safe_p_adjust <- function(p, method = "BH") {
-    output <- rep(NA_real_, length(p))
-    valid  <- is.finite(p)
-    if (any(valid)) output[valid] <- stats::p.adjust(p[valid], method = method)
-    output
+  output <- rep(NA_real_, length(p))
+  valid  <- is.finite(p)
+  if (any(valid)) output[valid] <- stats::p.adjust(p[valid], method = method)
+  output
 }
 
 safe_hac_inference <- function(x, lag = 3) {
-    x <- x[is.finite(x)]
-    n <- length(x)
-    if (n < 5) return(data.frame(N = n, MeanReturn = safe_mean(x), HAC_SE = NA_real_, HAC_t = NA_real_, HAC_p = NA_real_))
-
-    fit <- tryCatch(stats::lm(x ~ 1), error = function(e) NULL)
-    if (is.null(fit)) return(data.frame(N = n, MeanReturn = safe_mean(x), HAC_SE = NA_real_, HAC_t = NA_real_, HAC_p = NA_real_))
-
-    vcov_hac <- tryCatch(sandwich::NeweyWest(fit, lag = lag, prewhite = FALSE, adjust = TRUE), error = function(e) NULL)
-    if (is.null(vcov_hac)) return(data.frame(N = n, MeanReturn = safe_mean(x), HAC_SE = NA_real_, HAC_t = NA_real_, HAC_p = NA_real_))
-
-    test <- tryCatch(lmtest::coeftest(fit, vcov. = vcov_hac), error = function(e) NULL)
-    if (is.null(test)) return(data.frame(N = n, MeanReturn = safe_mean(x), HAC_SE = NA_real_, HAC_t = NA_real_, HAC_p = NA_real_))
-
-    data.frame(
-        N          = n,
-        MeanReturn = as.numeric(coef(fit)[1]),
-        HAC_SE     = as.numeric(test[1, 2]),
-        HAC_t      = as.numeric(test[1, 3]),
-        HAC_p      = as.numeric(test[1, 4])
-    )
+  x <- x[is.finite(x)]
+  n <- length(x)
+  if (n < 5) return(data.frame(N = n, MeanReturn = safe_mean(x), HAC_SE = NA_real_, HAC_t = NA_real_, HAC_p = NA_real_))
+  
+  fit <- tryCatch(stats::lm(x ~ 1), error = function(e) NULL)
+  if (is.null(fit)) return(data.frame(N = n, MeanReturn = safe_mean(x), HAC_SE = NA_real_, HAC_t = NA_real_, HAC_p = NA_real_))
+  
+  vcov_hac <- tryCatch(sandwich::NeweyWest(fit, lag = lag, prewhite = FALSE, adjust = TRUE), error = function(e) NULL)
+  if (is.null(vcov_hac)) return(data.frame(N = n, MeanReturn = safe_mean(x), HAC_SE = NA_real_, HAC_t = NA_real_, HAC_p = NA_real_))
+  
+  test <- tryCatch(lmtest::coeftest(fit, vcov. = vcov_hac), error = function(e) NULL)
+  if (is.null(test)) return(data.frame(N = n, MeanReturn = safe_mean(x), HAC_SE = NA_real_, HAC_t = NA_real_, HAC_p = NA_real_))
+  
+  data.frame(
+    N          = n,
+    MeanReturn = as.numeric(coef(fit)[1]),
+    HAC_SE     = as.numeric(test[1, 2]),
+    HAC_t      = as.numeric(test[1, 3]),
+    HAC_p      = as.numeric(test[1, 4])
+  )
 }
 
 safe_rank <- function(x, decreasing = TRUE) {
-    output <- rep(NA_real_, length(x))
-    valid  <- is.finite(x)
-    if (!any(valid)) return(output)
-    if (decreasing) {
-        output[valid] <- rank(-x[valid], ties.method = "average")
-    } else {
-        output[valid] <- rank(x[valid], ties.method = "average")
-    }
-    output
+  output <- rep(NA_real_, length(x))
+  valid  <- is.finite(x)
+  if (!any(valid)) return(output)
+  if (decreasing) {
+    output[valid] <- rank(-x[valid], ties.method = "average")
+  } else {
+    output[valid] <- rank(x[valid], ties.method = "average")
+  }
+  output
 }
 
 
@@ -346,24 +346,23 @@ safe_rank <- function(x, decreasing = TRUE) {
 # 8. RE-POPULATE MISSING PERFORMANCE METRICS
 ###############################################################
 
-# Update any NA columns in strategy_performance directly from returns
 recalculated_perf <- all_strategy_returns %>%
-    dplyr::group_by(Strategy) %>%
-    dplyr::summarise(
-        AnnualizedReturn_Calc = safe_annualized_return(NetReturn),
-        MaximumDrawdown_Calc  = safe_max_drawdown(NetReturn),
-        CalmarRatio_Calc      = safe_calmar(NetReturn),
-        .groups               = "drop"
-    )
+  dplyr::group_by(Strategy) %>%
+  dplyr::summarise(
+    AnnualizedReturn_Calc = safe_annualized_return(NetReturn),
+    MaximumDrawdown_Calc  = safe_max_drawdown(NetReturn),
+    CalmarRatio_Calc      = safe_calmar(NetReturn),
+    .groups               = "drop"
+  )
 
 strategy_performance <- strategy_performance %>%
-    dplyr::left_join(recalculated_perf, by = "Strategy") %>%
-    dplyr::mutate(
-        AnnualizedReturn = ifelse(is.na(AnnualizedReturn), AnnualizedReturn_Calc, AnnualizedReturn),
-        MaximumDrawdown  = ifelse(is.na(MaximumDrawdown), MaximumDrawdown_Calc, MaximumDrawdown),
-        CalmarRatio      = ifelse(is.na(CalmarRatio), CalmarRatio_Calc, CalmarRatio)
-    ) %>%
-    dplyr::select(-ends_with("_Calc"))
+  dplyr::left_join(recalculated_perf, by = "Strategy") %>%
+  dplyr::mutate(
+    AnnualizedReturn = ifelse(is.na(AnnualizedReturn), AnnualizedReturn_Calc, AnnualizedReturn),
+    MaximumDrawdown  = ifelse(is.na(MaximumDrawdown), MaximumDrawdown_Calc, MaximumDrawdown),
+    CalmarRatio      = ifelse(is.na(CalmarRatio), CalmarRatio_Calc, CalmarRatio)
+  ) %>%
+  dplyr::select(-ends_with("_Calc"))
 
 
 ###############################################################
@@ -374,42 +373,42 @@ strategy_inference_list <- list()
 inference_counter <- 0
 
 for (strat in strategy_names) {
-    x <- all_strategy_returns %>%
-        dplyr::filter(Strategy == strat, is.finite(NetReturn)) %>%
-        dplyr::pull(NetReturn)
-
-    if (length(x) == 0) next
-    inference_counter <- inference_counter + 1
-    boot_res <- safe_bootstrap_mean(x, B = 5000)
-
-    strategy_inference_list[[inference_counter]] <- data.frame(
-        Strategy           = strat,
-        N                  = length(x),
-        MeanReturn         = safe_mean(x),
-        MedianReturn       = safe_median(x),
-        SDReturn           = safe_sd(x),
-        Q025               = safe_quantile(x, 0.025),
-        Q975               = safe_quantile(x, 0.975),
-        TTestPValue        = safe_t_test(x),
-        WilcoxonPValue     = safe_wilcoxon(x),
-        BootstrapMean      = boot_res$Estimate,
-        BootstrapLower     = boot_res$Lower,
-        BootstrapUpper     = boot_res$Upper,
-        PositiveReturnRate = mean(x > 0, na.rm = TRUE),
-        stringsAsFactors   = FALSE
-    )
+  x <- all_strategy_returns %>%
+    dplyr::filter(Strategy == strat, is.finite(NetReturn)) %>%
+    dplyr::pull(NetReturn)
+  
+  if (length(x) == 0) next
+  inference_counter <- inference_counter + 1
+  boot_res <- safe_bootstrap_mean(x, B = 5000)
+  
+  strategy_inference_list[[inference_counter]] <- data.frame(
+    Strategy           = strat,
+    N                  = length(x),
+    MeanReturn         = safe_mean(x),
+    MedianReturn       = safe_median(x),
+    SDReturn           = safe_sd(x),
+    Q025               = safe_quantile(x, 0.025),
+    Q975               = safe_quantile(x, 0.975),
+    TTestPValue        = safe_t_test(x),
+    WilcoxonPValue     = safe_wilcoxon(x),
+    BootstrapMean      = boot_res$Estimate,
+    BootstrapLower     = boot_res$Lower,
+    BootstrapUpper     = boot_res$Upper,
+    PositiveReturnRate = mean(x > 0, na.rm = TRUE),
+    stringsAsFactors   = FALSE
+  )
 }
 
 strategy_inference <- dplyr::bind_rows(strategy_inference_list)
 
 if (nrow(strategy_inference) > 0) {
-    strategy_inference$TTestBH    <- safe_p_adjust(strategy_inference$TTestPValue, method = "BH")
-    strategy_inference$WilcoxonBH <- safe_p_adjust(strategy_inference$WilcoxonPValue, method = "BH")
+  strategy_inference$TTestBH    <- safe_p_adjust(strategy_inference$TTestPValue, method = "BH")
+  strategy_inference$WilcoxonBH <- safe_p_adjust(strategy_inference$WilcoxonPValue, method = "BH")
 }
 
 
 ###############################################################
-# 10. NEWEY--WEST HAC INFERENCE
+# 10. NEWEY--WEST HAC INFERENCE (LAG = 3)
 ###############################################################
 
 NW_LAG <- 3
@@ -417,29 +416,29 @@ newey_west_list <- list()
 nw_counter <- 0
 
 for (strat in strategy_names) {
-    x <- all_strategy_returns %>%
-        dplyr::filter(Strategy == strat, is.finite(NetReturn)) %>%
-        dplyr::pull(NetReturn)
-
-    if (length(x) == 0) next
-    hac_res <- safe_hac_inference(x, lag = NW_LAG)
-
-    nw_counter <- nw_counter + 1
-    newey_west_list[[nw_counter]] <- data.frame(
-        Strategy   = strat,
-        N          = hac_res$N,
-        MeanReturn = hac_res$MeanReturn,
-        HAC_SE     = hac_res$HAC_SE,
-        HAC_t      = hac_res$HAC_t,
-        HAC_p      = hac_res$HAC_p,
-        NW_Lag     = NW_LAG,
-        stringsAsFactors = FALSE
-    )
+  x <- all_strategy_returns %>%
+    dplyr::filter(Strategy == strat, is.finite(NetReturn)) %>%
+    dplyr::pull(NetReturn)
+  
+  if (length(x) == 0) next
+  hac_res <- safe_hac_inference(x, lag = NW_LAG)
+  
+  nw_counter <- nw_counter + 1
+  newey_west_list[[nw_counter]] <- data.frame(
+    Strategy   = strat,
+    N          = hac_res$N,
+    MeanReturn = hac_res$MeanReturn,
+    HAC_SE     = hac_res$HAC_SE,
+    HAC_t      = hac_res$HAC_t,
+    HAC_p      = hac_res$HAC_p,
+    NW_Lag     = NW_LAG,
+    stringsAsFactors = FALSE
+  )
 }
 
 newey_west_inference <- dplyr::bind_rows(newey_west_list)
 if (nrow(newey_west_inference) > 0) {
-    newey_west_inference$HAC_BH <- safe_p_adjust(newey_west_inference$HAC_p, method = "BH")
+  newey_west_inference$HAC_BH <- safe_p_adjust(newey_west_inference$HAC_p, method = "BH")
 }
 
 
@@ -451,39 +450,39 @@ model_vs_best_list <- list()
 best_counter <- 0
 
 if (length(learned_strategies) > 0 && length(fixed_strategies) > 0 && !is.na(best_fixed_strategy)) {
-    for (m_name in learned_strategies) {
-        model_x     <- all_strategy_returns %>% dplyr::filter(Strategy == m_name, is.finite(NetReturn)) %>% dplyr::pull(NetReturn)
-        benchmark_x <- all_strategy_returns %>% dplyr::filter(Strategy == best_fixed_strategy, is.finite(NetReturn)) %>% dplyr::pull(NetReturn)
-
-        n <- min(length(model_x), length(benchmark_x))
-        if (n < 2) next
-
-        diff_vec <- model_x[seq_len(n)] - benchmark_x[seq_len(n)]
-        boot_res <- safe_bootstrap_mean(diff_vec, B = 5000)
-
-        best_counter <- best_counter + 1
-        model_vs_best_list[[best_counter]] <- data.frame(
-            Model                  = m_name,
-            Benchmark              = best_fixed_strategy,
-            N                      = n,
-            MeanDifference         = safe_mean(diff_vec),
-            MedianDifference       = safe_median(diff_vec),
-            SDDifference           = safe_sd(diff_vec),
-            TTestPValue            = safe_t_test(diff_vec),
-            WilcoxonPValue         = safe_wilcoxon(diff_vec),
-            BootstrapMean          = boot_res$Estimate,
-            BootstrapLower         = boot_res$Lower,
-            BootstrapUpper         = boot_res$Upper,
-            PositiveDifferenceRate = mean(diff_vec > 0, na.rm = TRUE),
-            stringsAsFactors       = FALSE
-        )
-    }
+  for (m_name in learned_strategies) {
+    model_x     <- all_strategy_returns %>% dplyr::filter(Strategy == m_name, is.finite(NetReturn)) %>% dplyr::pull(NetReturn)
+    benchmark_x <- all_strategy_returns %>% dplyr::filter(Strategy == best_fixed_strategy, is.finite(NetReturn)) %>% dplyr::pull(NetReturn)
+    
+    n <- min(length(model_x), length(benchmark_x))
+    if (n < 2) next
+    
+    diff_vec <- model_x[seq_len(n)] - benchmark_x[seq_len(n)]
+    boot_res <- safe_bootstrap_mean(diff_vec, B = 5000)
+    
+    best_counter <- best_counter + 1
+    model_vs_best_list[[best_counter]] <- data.frame(
+      Model                  = m_name,
+      Benchmark              = best_fixed_strategy,
+      N                      = n,
+      MeanDifference         = safe_mean(diff_vec),
+      MedianDifference       = safe_median(diff_vec),
+      SDDifference           = safe_sd(diff_vec),
+      TTestPValue            = safe_t_test(diff_vec),
+      WilcoxonPValue         = safe_wilcoxon(diff_vec),
+      BootstrapMean          = boot_res$Estimate,
+      BootstrapLower         = boot_res$Lower,
+      BootstrapUpper         = boot_res$Upper,
+      PositiveDifferenceRate = mean(diff_vec > 0, na.rm = TRUE),
+      stringsAsFactors       = FALSE
+    )
+  }
 }
 
 model_vs_best_inference <- dplyr::bind_rows(model_vs_best_list)
 if (nrow(model_vs_best_inference) > 0) {
-    model_vs_best_inference$TTestBH    <- safe_p_adjust(model_vs_best_inference$TTestPValue, method = "BH")
-    model_vs_best_inference$WilcoxonBH <- safe_p_adjust(model_vs_best_inference$WilcoxonPValue, method = "BH")
+  model_vs_best_inference$TTestBH    <- safe_p_adjust(model_vs_best_inference$TTestPValue, method = "BH")
+  model_vs_best_inference$WilcoxonBH <- safe_p_adjust(model_vs_best_inference$WilcoxonPValue, method = "BH")
 }
 
 
@@ -495,41 +494,41 @@ model_vs_all_list <- list()
 all_counter <- 0
 
 if (length(learned_strategies) > 0 && length(fixed_strategies) > 0) {
-    for (m_name in learned_strategies) {
-        for (b_name in fixed_strategies) {
-            model_x     <- all_strategy_returns %>% dplyr::filter(Strategy == m_name, is.finite(NetReturn)) %>% dplyr::pull(NetReturn)
-            benchmark_x <- all_strategy_returns %>% dplyr::filter(Strategy == b_name, is.finite(NetReturn)) %>% dplyr::pull(NetReturn)
-
-            n <- min(length(model_x), length(benchmark_x))
-            if (n < 2) next
-
-            diff_vec <- model_x[seq_len(n)] - benchmark_x[seq_len(n)]
-            boot_res <- safe_bootstrap_mean(diff_vec, B = 5000)
-
-            all_counter <- all_counter + 1
-            model_vs_all_list[[all_counter]] <- data.frame(
-                Model                  = m_name,
-                Benchmark              = b_name,
-                N                      = n,
-                MeanDifference         = safe_mean(diff_vec),
-                MedianDifference       = safe_median(diff_vec),
-                SDDifference           = safe_sd(diff_vec),
-                TTestPValue            = safe_t_test(diff_vec),
-                WilcoxonPValue         = safe_wilcoxon(diff_vec),
-                BootstrapMean          = boot_res$Estimate,
-                BootstrapLower         = boot_res$Lower,
-                BootstrapUpper         = boot_res$Upper,
-                PositiveDifferenceRate = mean(diff_vec > 0, na.rm = TRUE),
-                stringsAsFactors       = FALSE
-            )
-        }
+  for (m_name in learned_strategies) {
+    for (b_name in fixed_strategies) {
+      model_x     <- all_strategy_returns %>% dplyr::filter(Strategy == m_name, is.finite(NetReturn)) %>% dplyr::pull(NetReturn)
+      benchmark_x <- all_strategy_returns %>% dplyr::filter(Strategy == b_name, is.finite(NetReturn)) %>% dplyr::pull(NetReturn)
+      
+      n <- min(length(model_x), length(benchmark_x))
+      if (n < 2) next
+      
+      diff_vec <- model_x[seq_len(n)] - benchmark_x[seq_len(n)]
+      boot_res <- safe_bootstrap_mean(diff_vec, B = 5000)
+      
+      all_counter <- all_counter + 1
+      model_vs_all_list[[all_counter]] <- data.frame(
+        Model                  = m_name,
+        Benchmark              = b_name,
+        N                      = n,
+        MeanDifference         = safe_mean(diff_vec),
+        MedianDifference       = safe_median(diff_vec),
+        SDDifference           = safe_sd(diff_vec),
+        TTestPValue            = safe_t_test(diff_vec),
+        WilcoxonPValue         = safe_wilcoxon(diff_vec),
+        BootstrapMean          = boot_res$Estimate,
+        BootstrapLower         = boot_res$Lower,
+        BootstrapUpper         = boot_res$Upper,
+        PositiveDifferenceRate = mean(diff_vec > 0, na.rm = TRUE),
+        stringsAsFactors       = FALSE
+      )
     }
+  }
 }
 
 model_vs_all_inference <- dplyr::bind_rows(model_vs_all_list)
 if (nrow(model_vs_all_inference) > 0) {
-    model_vs_all_inference$TTestBH    <- safe_p_adjust(model_vs_all_inference$TTestPValue, method = "BH")
-    model_vs_all_inference$WilcoxonBH <- safe_p_adjust(model_vs_all_inference$WilcoxonPValue, method = "BH")
+  model_vs_all_inference$TTestBH    <- safe_p_adjust(model_vs_all_inference$TTestPValue, method = "BH")
+  model_vs_all_inference$WilcoxonBH <- safe_p_adjust(model_vs_all_inference$WilcoxonPValue, method = "BH")
 }
 
 
@@ -538,25 +537,25 @@ if (nrow(model_vs_all_inference) > 0) {
 ###############################################################
 
 robustness_data <- strategy_performance %>%
-    dplyr::select(Strategy, AnnualizedReturn, SharpeRatio, MaximumDrawdown, CalmarRatio, HitRate) %>%
-    dplyr::mutate(
-        ReturnRank   = safe_rank(AnnualizedReturn, decreasing = TRUE),
-        SharpeRank   = safe_rank(SharpeRatio, decreasing = TRUE),
-        DrawdownRank = safe_rank(abs(MaximumDrawdown), decreasing = FALSE),
-        CalmarRank   = safe_rank(CalmarRatio, decreasing = TRUE),
-        HitRateRank  = safe_rank(HitRate, decreasing = TRUE)
-    ) %>%
-    dplyr::rowwise() %>%
-    dplyr::mutate(
-        RobustnessScore = if (all(is.na(c(ReturnRank, SharpeRank, DrawdownRank, CalmarRank, HitRateRank)))) {
-            NA_real_
-        } else {
-            mean(c(ReturnRank, SharpeRank, DrawdownRank, CalmarRank, HitRateRank), na.rm = TRUE)
-        }
-    ) %>%
-    dplyr::ungroup() %>%
-    dplyr::arrange(RobustnessScore) %>%
-    dplyr::mutate(RobustnessRank = dplyr::row_number())
+  dplyr::select(Strategy, AnnualizedReturn, SharpeRatio, MaximumDrawdown, CalmarRatio, HitRate) %>%
+  dplyr::mutate(
+    ReturnRank   = safe_rank(AnnualizedReturn, decreasing = TRUE),
+    SharpeRank   = safe_rank(SharpeRatio, decreasing = TRUE),
+    DrawdownRank = safe_rank(abs(MaximumDrawdown), decreasing = FALSE),
+    CalmarRank   = safe_rank(CalmarRatio, decreasing = TRUE),
+    HitRateRank  = safe_rank(HitRate, decreasing = TRUE)
+  ) %>%
+  dplyr::rowwise() %>%
+  dplyr::mutate(
+    RobustnessScore = if (all(is.na(c(ReturnRank, SharpeRank, DrawdownRank, CalmarRank, HitRateRank)))) {
+      NA_real_
+    } else {
+      mean(c(ReturnRank, SharpeRank, DrawdownRank, CalmarRank, HitRateRank), na.rm = TRUE)
+    }
+  ) %>%
+  dplyr::ungroup() %>%
+  dplyr::arrange(RobustnessScore) %>%
+  dplyr::mutate(RobustnessRank = dplyr::row_number())
 
 
 ###############################################################
@@ -565,70 +564,70 @@ robustness_data <- strategy_performance %>%
 
 # Figure 1: Return Difference Confidence Intervals
 if (nrow(model_vs_best_inference) > 0) {
-    p1 <- ggplot2::ggplot(model_vs_best_inference, ggplot2::aes(x = reorder(Model, MeanDifference), y = MeanDifference)) +
-        ggplot2::geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
-        ggplot2::geom_errorbar(ggplot2::aes(ymin = BootstrapLower, ymax = BootstrapUpper), width = 0.20, color = "navy") +
-        ggplot2::geom_point(size = 3, color = "navy") +
-        ggplot2::coord_flip() +
-        ggplot2::labs(
-            title    = "Learned Model vs Best Fixed Benchmark",
-            subtitle = paste0("Bootstrap 95% Confidence Intervals (Benchmark: ", best_fixed_strategy, ")"),
-            x        = "Learned Strategy",
-            y        = "Mean Return Difference"
-        ) +
-        ggplot2::theme_minimal(base_size = 12) +
-        ggplot2::theme(plot.title = ggplot2::element_text(face = "bold"))
-
-    ggplot2::ggsave(filename = file.path(OUTPUT_DIR, "18_Return_Difference_Confidence_Intervals.png"), plot = p1, width = 9, height = 6, dpi = 300)
+  p1 <- ggplot2::ggplot(model_vs_best_inference, ggplot2::aes(x = reorder(Model, MeanDifference), y = MeanDifference)) +
+    ggplot2::geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+    ggplot2::geom_errorbar(ggplot2::aes(ymin = BootstrapLower, ymax = BootstrapUpper), width = 0.20, color = "navy") +
+    ggplot2::geom_point(size = 3, color = "navy") +
+    ggplot2::coord_flip() +
+    ggplot2::labs(
+      title    = "Learned Model vs Best Fixed Benchmark",
+      subtitle = paste0("Bootstrap 95% Confidence Intervals (Benchmark: ", best_fixed_strategy, ")"),
+      x        = "Learned Strategy",
+      y        = "Mean Return Difference"
+    ) +
+    ggplot2::theme_minimal(base_size = 12) +
+    ggplot2::theme(plot.title = ggplot2::element_text(face = "bold"))
+  
+  ggplot2::ggsave(filename = file.path(OUTPUT_DIR, "18_Return_Difference_Confidence_Intervals.png"), plot = p1, width = 9, height = 6, dpi = 300)
 }
 
 # Figure 2: Strategy Robustness Ranking
 robustness_plot_data <- robustness_data %>% dplyr::filter(is.finite(RobustnessScore))
 if (nrow(robustness_plot_data) > 0) {
-    p2 <- ggplot2::ggplot(robustness_plot_data, ggplot2::aes(x = reorder(Strategy, -RobustnessScore), y = RobustnessScore, fill = Strategy)) +
-        ggplot2::geom_col(show.legend = FALSE) +
-        ggplot2::coord_flip() +
-        ggplot2::labs(
-            title    = "Financial Strategy Robustness Ranking",
-            subtitle = "Lower robustness score indicates a stronger overall rank",
-            x        = "Strategy",
-            y        = "Average Rank Across Metrics"
-        ) +
-        ggplot2::theme_minimal(base_size = 12) +
-        ggplot2::theme(plot.title = ggplot2::element_text(face = "bold"))
-
-    ggplot2::ggsave(filename = file.path(OUTPUT_DIR, "18_Strategy_Robustness.png"), plot = p2, width = 9, height = 7, dpi = 300)
+  p2 <- ggplot2::ggplot(robustness_plot_data, ggplot2::aes(x = reorder(Strategy, -RobustnessScore), y = RobustnessScore, fill = Strategy)) +
+    ggplot2::geom_col(show.legend = FALSE) +
+    ggplot2::coord_flip() +
+    ggplot2::labs(
+      title    = "Financial Strategy Robustness Ranking",
+      subtitle = "Lower robustness score indicates a stronger overall rank",
+      x        = "Strategy",
+      y        = "Average Rank Across Metrics"
+    ) +
+    ggplot2::theme_minimal(base_size = 12) +
+    ggplot2::theme(plot.title = ggplot2::element_text(face = "bold"))
+  
+  ggplot2::ggsave(filename = file.path(OUTPUT_DIR, "18_Strategy_Robustness.png"), plot = p2, width = 9, height = 7, dpi = 300)
 }
 
 # Figure 3: Newey--West Mean Return CIs
 nw_plot_data <- newey_west_inference %>% dplyr::filter(is.finite(MeanReturn))
 if (nrow(nw_plot_data) > 0) {
-    nw_plot_data <- nw_plot_data %>%
-        dplyr::mutate(
-            Lower = MeanReturn - 1.96 * HAC_SE,
-            Upper = MeanReturn + 1.96 * HAC_SE
-        )
-
-    p3 <- ggplot2::ggplot(nw_plot_data, ggplot2::aes(x = reorder(Strategy, MeanReturn), y = MeanReturn)) +
-        ggplot2::geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
-        ggplot2::geom_errorbar(ggplot2::aes(ymin = Lower, ymax = Upper), width = 0.20, color = "darkred") +
-        ggplot2::geom_point(size = 3, color = "darkred") +
-        ggplot2::coord_flip() +
-        ggplot2::labs(
-            title    = "Mean Strategy Return with Newey--West 95% CI",
-            subtitle = paste0("HAC Bandwidth Lag = ", NW_LAG),
-            x        = "Strategy",
-            y        = "Mean Net Monthly Return"
-        ) +
-        ggplot2::theme_minimal(base_size = 12) +
-        ggplot2::theme(plot.title = ggplot2::element_text(face = "bold"))
-
-    ggplot2::ggsave(filename = file.path(OUTPUT_DIR, "18_Newey_West_Mean_Return.png"), plot = p3, width = 9, height = 6, dpi = 300)
+  nw_plot_data <- nw_plot_data %>%
+    dplyr::mutate(
+      Lower = MeanReturn - 1.96 * HAC_SE,
+      Upper = MeanReturn + 1.96 * HAC_SE
+    )
+  
+  p3 <- ggplot2::ggplot(nw_plot_data, ggplot2::aes(x = reorder(Strategy, MeanReturn), y = MeanReturn)) +
+    ggplot2::geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+    ggplot2::geom_errorbar(ggplot2::aes(ymin = Lower, ymax = Upper), width = 0.20, color = "darkred") +
+    ggplot2::geom_point(size = 3, color = "darkred") +
+    ggplot2::coord_flip() +
+    ggplot2::labs(
+      title    = "Mean Strategy Return with Newey--West 95% CI",
+      subtitle = paste0("HAC Bandwidth Lag = ", NW_LAG),
+      x        = "Strategy",
+      y        = "Mean Net Monthly Return"
+    ) +
+    ggplot2::theme_minimal(base_size = 12) +
+    ggplot2::theme(plot.title = ggplot2::element_text(face = "bold"))
+  
+  ggplot2::ggsave(filename = file.path(OUTPUT_DIR, "18_Newey_West_Mean_Return.png"), plot = p3, width = 9, height = 6, dpi = 300)
 }
 
 
 ###############################################################
-# 15. EXPORT CSV ARTIFACTS & FULL RDATA (FOR MODULE 19)
+# 15. EXPORT CSV ARTIFACTS & FULL RDATA (FOR DOWNSTREAM MODULES)
 ###############################################################
 
 readr::write_csv(strategy_inference, file.path(OUTPUT_DIR, "18_Strategy_Inference.csv"))
@@ -637,24 +636,23 @@ readr::write_csv(model_vs_all_inference, file.path(OUTPUT_DIR, "18_Model_vs_All_
 readr::write_csv(robustness_data, file.path(OUTPUT_DIR, "18_Strategy_Robustness.csv"))
 readr::write_csv(newey_west_inference, file.path(OUTPUT_DIR, "18_Newey_West_Inference.csv"))
 
-# Save both Module 18 inference outputs and Module 17 baseline objects
 save(
-    strategy_performance,
-    all_strategy_returns,
-    wealth_data,
-    paired_comparison,
-    bootstrap_comparison,
-    model_vs_best_fixed,
-    best_fixed_strategy,
-    learned_switching,
-    strategy_inference,
-    newey_west_inference,
-    model_vs_best_inference,
-    model_vs_all_inference,
-    robustness_data,
-    learned_strategies,
-    fixed_strategies,
-    file = file.path(OUTPUT_DIR, "18_Financial_Strategy_Inference.RData")
+  strategy_performance,
+  all_strategy_returns,
+  wealth_data,
+  paired_comparison,
+  bootstrap_comparison,
+  model_vs_best_fixed,
+  best_fixed_strategy,
+  learned_switching,
+  strategy_inference,
+  newey_west_inference,
+  model_vs_best_inference,
+  model_vs_all_inference,
+  robustness_data,
+  learned_strategies,
+  fixed_strategies,
+  file = file.path(OUTPUT_DIR, "18_Financial_Strategy_Inference.RData")
 )
 
 
@@ -671,12 +669,12 @@ cat("\n============================================================\n")
 cat("MODEL VS BEST FIXED BENCHMARK INFERENCE\n")
 cat("============================================================\n")
 if (nrow(model_vs_best_inference) > 0) {
-    print(model_vs_best_inference %>% dplyr::select(Model, Benchmark, MeanDifference, TTestPValue, TTestBH))
+  print(model_vs_best_inference %>% dplyr::select(Model, Benchmark, MeanDifference, TTestPValue, TTestBH))
 } else {
-    cat("No valid paired comparisons generated.\n")
+  cat("No valid paired comparisons generated.\n")
 }
 
 cat("\n============================================================\n")
-cat("18_FINANCIAL_STRATEGY_INFERENCE.R COMPLETED\n")
+cat("18_FINANCIAL_STRATEGY_INFERENCE.R COMPLETED SUCCESSFULLY\n")
 cat("Results saved to directory: ", OUTPUT_DIR, "\n", sep = "")
 cat("============================================================\n")

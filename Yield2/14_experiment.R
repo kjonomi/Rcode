@@ -22,6 +22,7 @@
 #   - Retains "Model" for legacy compatibility while adding
 #     "SamplingStrategy" for experimental clarity.
 #   - Evaluates forecasting performance across all horizons.
+#   - Corrects zero-min RMSE Regret calculations.
 #   - Fully namespaced dplyr and tidyr operations.
 #
 ###############################################################
@@ -157,16 +158,8 @@ results_yield  <- get("results_yield", envir = results_env)
 results_factor <- get("results_factor", envir = results_env)
 results_vol    <- get("results_vol", envir = results_env)
 
-yield_RMSE_by_maturity <- if (exists("yield_RMSE_by_maturity", envir = results_env)) {
-  get("yield_RMSE_by_maturity", envir = results_env)
-} else NULL
-
-yield_MAE_by_maturity <- if (exists("yield_MAE_by_maturity", envir = results_env)) {
-  get("yield_MAE_by_maturity", envir = results_env)
-} else NULL
-
-factor_RMSE_by_factor <- if (exists("factor_RMSE_by_factor", envir = results_env)) {
-  get("factor_RMSE_by_factor", envir = results_env)
+DM_summary <- if (exists("DM_summary", envir = results_env)) {
+  get("DM_summary", envir = results_env)
 } else NULL
 
 
@@ -217,7 +210,7 @@ sampling_strategy_order <- c(
 
 
 ###############################################################
-# 7. VALIDATE RESULTS_YIELD METRICS
+# 7. VALIDATE RESULTS_YIELD METRICS & RE-CALIBRATE REGRET
 ###############################################################
 
 if (!is.data.frame(results_yield)) {
@@ -236,6 +229,16 @@ for (col in numeric_yield_columns) {
   results_yield[[col]] <- suppressWarnings(as.numeric(results_yield[[col]]))
 }
 
+# Ensure Zero-Min RMSE Regret per maturity (Reviewer 2, Comment 3)
+if ("Maturity" %in% names(results_yield)) {
+  results_yield <- results_yield %>%
+    dplyr::group_by(Maturity) %>%
+    dplyr::mutate(
+      RMSE_Regret = RMSE - safe_min(RMSE)
+    ) %>%
+    dplyr::ungroup()
+}
+
 
 ###############################################################
 # 8. CURRENT YIELD-FORECASTING SUMMARY
@@ -248,18 +251,16 @@ current_yield <- results_yield %>%
   ) %>%
   dplyr::group_by(Model, SamplingStrategy) %>%
   dplyr::summarise(
-    RMSE = safe_mean(RMSE),
-    MAE  = safe_mean(MAE),
-    MAPE = if ("MAPE" %in% names(results_yield)) safe_mean(MAPE) else NA_real_,
-    .groups = "drop"
+    RMSE        = safe_mean(RMSE),
+    MAE         = safe_mean(MAE),
+    MAPE        = if ("MAPE" %in% names(results_yield)) safe_mean(MAPE) else NA_real_,
+    RMSE_Regret = if ("RMSE_Regret" %in% names(results_yield)) safe_mean(RMSE_Regret) else NA_real_,
+    .groups     = "drop"
   )
 
 min_rmse_val <- safe_min(current_yield$RMSE)
 
 current_yield <- current_yield %>%
-  dplyr::mutate(
-    RMSE_Regret = if (is.finite(min_rmse_val)) RMSE - min_rmse_val else NA_real_
-  ) %>%
   dplyr::arrange(RMSE)
 
 
@@ -312,7 +313,7 @@ if ("Maturity" %in% names(results_yield)) {
       SamplingStrategy = Model
     ) %>%
     dplyr::filter(is.finite(RMSE)) %>%
-    dplyr::select(Model, SamplingStrategy, Maturity, RMSE, MAE, dplyr::everything())
+    dplyr::select(Model, SamplingStrategy, Maturity, RMSE, MAE, RMSE_Regret, dplyr::everything())
   
   maturity_best <- maturity_rmse_long %>%
     dplyr::group_by(Maturity) %>%
@@ -377,14 +378,14 @@ if (length(observed_models) >= 2L) {
       if (nrow(row1) == 1L && nrow(row2) == 1L) {
         pair_counter <- pair_counter + 1L
         pairwise_results[[pair_counter]] <- data.frame(
-          Model_1 = m1,
-          Model_2 = m2,
-          RMSE_Model_1 = row1$RMSE,
-          RMSE_Model_2 = row2$RMSE,
+          Model_1         = m1,
+          Model_2         = m2,
+          RMSE_Model_1    = row1$RMSE,
+          RMSE_Model_2    = row2$RMSE,
           RMSE_Difference = row1$RMSE - row2$RMSE,
-          MAE_Model_1 = row1$MAE,
-          MAE_Model_2 = row2$MAE,
-          MAE_Difference = row1$MAE - row2$MAE,
+          MAE_Model_1     = row1$MAE,
+          MAE_Model_2     = row2$MAE,
+          MAE_Difference  = row1$MAE - row2$MAE,
           stringsAsFactors = FALSE
         )
       }
@@ -503,6 +504,7 @@ save(
   pairwise_rmse,
   relative_improvement,
   ranking_summary,
+  DM_summary,
   best_model,
   best_sampling_strategy,
   best_RMSE,

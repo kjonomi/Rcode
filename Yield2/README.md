@@ -26,9 +26,12 @@ The study emphasizes three complementary dimensions of model performance:
 ## Modify fetch_fred_macro_data <- function(start_date = "1995-01-01", end_date = "2026-10-08") 
 ## You can get the more related R codes from https://github.com/kjonomi/Rcode/edit/main/Yield
 
+
 ## Framework
 
 **Affine Term Structure → Transformer–CNN–BiLSTM → Adaptive Experience Replay → Yield Forecasts → Financial Strategies**
+
+The framework uses U.S. Treasury yield data across multiple maturities and constructs the corresponding **level, slope, and curvature** factors for forecasting and financial analysis.
 
 ## Main Components
 
@@ -38,10 +41,6 @@ The study emphasizes three complementary dimensions of model performance:
 - **BiLSTM:** Models sequential dynamics.
 - **Adaptive replay:** Compares uniform, entropy-based, and PER sampling.
 - **Financial decision layer:** Converts yield forecasts into systematic maturity-allocation strategies.
-
-## Data
-
-The framework uses U.S. Treasury yield data across multiple maturities and constructs the corresponding **level, slope, and curvature** factors for forecasting and financial analysis.
 
 ## Keywords
 

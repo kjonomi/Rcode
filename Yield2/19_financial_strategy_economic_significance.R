@@ -9,26 +9,21 @@
 # 19_financial_strategy_economic_significance.R
 #
 # Purpose:
-# Economic-significance analysis of financial strategies.
+# Economic-significance analysis of financial strategies
+# with robust NA handling and bankruptcy flooring.
 #
 # Input:
 #   18_Financial_Strategy_Inference.RData
 #
-# Main analyses:
-#   1. Load Module 18 inference results
-#   2. Validate strategy-level inference
-#   3. Economic significance of learned strategies
-#   4. Benchmark-relative performance
-#   5. Annualized excess-return analysis
-#   6. Sharpe-ratio comparison
-#   7. Maximum-drawdown comparison
-#   8. Calmar-ratio comparison
-#   9. Hit-rate comparison
-#  10. Model versus best fixed benchmark
-#  11. Bootstrap confidence intervals for economic gains
-#  12. Statistical/economic significance classification
-#  13. Strategy ranking
-#  14. Publication-quality figures
+# Outputs:
+#   19_Financial_Strategy_Economic_Significance.RData
+#   19_Economic_Significance.csv
+#   19_Benchmark_Relative_Performance.csv
+#   19_Model_Economic_Gains.csv
+#   19_Strategy_Ranking.csv
+#   19_Economic_Gain_Confidence_Intervals.png
+#   19_Strategy_Economic_Ranking.png
+#   19_Benchmark_Relative_Return.png
 #
 ###############################################################
 
@@ -192,17 +187,54 @@ cat("Learned strategies:   ", length(learned_strategies), "\n", sep = "")
 
 
 ###############################################################
-# 5. HELPER FUNCTIONS
+# 5. ROBUST HELPER FUNCTIONS (NA-PREVENTATIVE)
 ###############################################################
 
-safe_mean     <- function(x) { x <- x[is.finite(x)]; if (length(x) == 0L) NA_real_ else mean(x) }
-safe_sd       <- function(x) { x <- x[is.finite(x)]; if (length(x) < 2L) NA_real_ else stats::sd(x) }
-safe_median   <- function(x) { x <- x[is.finite(x)]; if (length(x) == 0L) NA_real_ else stats::median(x) }
+safe_mean   <- function(x) { x <- x[is.finite(x)]; if (length(x) == 0L) NA_real_ else mean(x) }
+safe_sd     <- function(x) { x <- x[is.finite(x)]; if (length(x) < 2L) NA_real_ else stats::sd(x) }
+safe_median <- function(x) { x <- x[is.finite(x)]; if (length(x) == 0L) NA_real_ else stats::median(x) }
 
 safe_quantile <- function(x, probability) {
     x <- x[is.finite(x)]
     if (length(x) == 0L) return(NA_real_)
     as.numeric(stats::quantile(x, probs = probability, names = FALSE, type = 7, na.rm = TRUE))
+}
+
+# Robust Compounded Return (floors wealth multipliers to 1e-8 to avoid negative log / NA crashes)
+safe_cumulative_return <- function(x) {
+    x <- x[is.finite(x)]
+    if (length(x) == 0L) return(NA_real_)
+    mult <- pmax(1 + x, 1e-8)
+    exp(sum(log(mult))) - 1
+}
+
+# Robust Annualized Return
+safe_annualized_return <- function(x, periods_per_year = 12) {
+    x <- x[is.finite(x)]
+    n <- length(x)
+    if (n == 0L) return(NA_real_)
+    mult <- pmax(1 + x, 1e-8)
+    total_wealth <- exp(sum(log(mult)))
+    total_wealth^(periods_per_year / n) - 1
+}
+
+# Robust Maximum Drawdown
+safe_max_drawdown <- function(x) {
+    x <- x[is.finite(x)]
+    if (length(x) == 0L) return(NA_real_)
+    mult <- pmax(1 + x, 1e-8)
+    wealth <- cumprod(mult)
+    running_max <- cummax(wealth)
+    drawdown <- wealth / running_max - 1
+    min(drawdown, na.rm = TRUE)
+}
+
+# Robust Calmar Ratio
+safe_calmar <- function(x) {
+    ann_ret <- safe_annualized_return(x)
+    mdd <- safe_max_drawdown(x)
+    if (!is.finite(ann_ret) || !is.finite(mdd) || mdd >= 0) return(NA_real_)
+    ann_ret / abs(mdd)
 }
 
 safe_bootstrap_mean <- function(x, B = 5000L, seed = 20260914L) {
@@ -236,7 +268,31 @@ extract_strategy_returns <- function(return_data, strategy_name) {
 
 
 ###############################################################
-# 6. STRATEGY-LEVEL ECONOMIC SIGNIFICANCE
+# 6. RE-CALCULATE STRATEGY PERFORMANCE WITH ROBUST COMPOUNDING
+###############################################################
+
+# Update any NA columns in strategy_performance using the return vectors in all_strategy_returns
+strategy_performance <- all_strategy_returns %>%
+    dplyr::group_by(Strategy) %>%
+    dplyr::summarise(
+        N                    = sum(is.finite(NetReturn)),
+        MeanMonthlyReturn    = safe_mean(NetReturn),
+        SDMonthlyReturn      = safe_sd(NetReturn),
+        AnnualizedReturn     = safe_annualized_return(NetReturn),
+        AnnualizedVolatility = safe_sd(NetReturn) * sqrt(12),
+        SharpeRatio          = if (safe_sd(NetReturn) > 0) (safe_mean(NetReturn) / safe_sd(NetReturn)) * sqrt(12) else NA_real_,
+        MaximumDrawdown      = safe_max_drawdown(NetReturn),
+        CalmarRatio          = safe_calmar(NetReturn),
+        CumulativeNetReturn  = safe_cumulative_return(NetReturn),
+        HitRate              = mean(NetReturn > 0, na.rm = TRUE),
+        MeanTransactionCost  = safe_mean(TransactionCost),
+        TotalTransactionCost = sum(TransactionCost[is.finite(TransactionCost)], na.rm = TRUE),
+        .groups              = "drop"
+    )
+
+
+###############################################################
+# 7. STRATEGY-LEVEL ECONOMIC SIGNIFICANCE
 ###############################################################
 
 economic_significance <- strategy_performance %>%
@@ -287,16 +343,16 @@ economic_significance <- economic_significance %>%
             TRUE                                                     ~ "Unfavorable"
         ),
         OverallEvidence = dplyr::case_when(
-            StatisticalSignificance %in% c("Strong", "Significant") & EconomicSignificance == "Favorable" ~ "Strong Economic Evidence",
-            StatisticalSignificance %in% c("Strong", "Significant")                                     ~ "Statistically Significant",
-            EconomicSignificance %in% c("Favorable", "Moderately Favorable")                             ~ "Economically Favorable",
-            TRUE                                                                                        ~ "Limited Evidence"
+            StatisticalSignificance %in% c("Strong", "Significant") & EconomicSignificance %in% c("Favorable", "Moderately Favorable") ~ "Strong Economic Evidence",
+            StatisticalSignificance %in% c("Strong", "Significant")                                                                     ~ "Statistically Significant",
+            EconomicSignificance %in% c("Favorable", "Moderately Favorable")                                                             ~ "Economically Favorable",
+            TRUE                                                                                                                        ~ "Limited Evidence"
         )
     )
 
 
 ###############################################################
-# 7. BENCHMARK-RELATIVE PERFORMANCE
+# 8. BENCHMARK-RELATIVE PERFORMANCE
 ###############################################################
 
 benchmark_relative_list <- list()
@@ -343,7 +399,7 @@ benchmark_relative_performance <- if (length(benchmark_relative_list) > 0L) dply
 
 
 ###############################################################
-# 8. MODEL ECONOMIC GAINS
+# 9. MODEL ECONOMIC GAINS
 ###############################################################
 
 model_economic_gain_list <- list()
@@ -373,7 +429,7 @@ for (model_name in learned_strategies) {
         DrawdownImprovement         = abs(benchmark_row$MaximumDrawdown) - abs(model_row$MaximumDrawdown),
         CalmarRatio_Model           = model_row$CalmarRatio,
         CalmarRatio_Benchmark       = benchmark_row$CalmarRatio,
-        CalmarRatio_Gain            = model_row$CalmarRatio - benchmark_row$CalmarRatio,
+        CalmarRatio_Gain            = dplyr::coalesce(model_row$CalmarRatio - benchmark_row$CalmarRatio, NA_real_),
         HitRate_Model               = model_row$HitRate,
         HitRate_Benchmark           = benchmark_row$HitRate,
         HitRate_Gain                = model_row$HitRate - benchmark_row$HitRate,
@@ -410,17 +466,17 @@ if (!"BenchmarkInferencePValue" %in% names(model_economic_gains)) {
 
 
 ###############################################################
-# 9. ECONOMIC GAIN CLASSIFICATION
+# 10. ECONOMIC GAIN CLASSIFICATION
 ###############################################################
 
 if (nrow(model_economic_gains) > 0L) {
     model_economic_gains <- model_economic_gains %>%
         dplyr::mutate(
-            ReturnGainPositive   = AnnualizedReturn_Gain > 0,
-            SharpeGainPositive   = SharpeRatio_Gain > 0,
-            DrawdownImproved     = DrawdownImprovement > 0,
-            CalmarGainPositive   = CalmarRatio_Gain > 0,
-            HitRateGainPositive  = HitRate_Gain > 0,
+            ReturnGainPositive   = dplyr::coalesce(AnnualizedReturn_Gain > 0, FALSE),
+            SharpeGainPositive   = dplyr::coalesce(SharpeRatio_Gain > 0, FALSE),
+            DrawdownImproved     = dplyr::coalesce(DrawdownImprovement > 0, FALSE),
+            CalmarGainPositive   = dplyr::coalesce(CalmarRatio_Gain > 0, FALSE),
+            HitRateGainPositive  = dplyr::coalesce(HitRate_Gain > 0, FALSE),
             StatisticalSignificance = dplyr::case_when(
                 is.na(BenchmarkInferencePValue) ~ "Not Available",
                 BenchmarkInferencePValue < 0.01 ~ "Strong",
@@ -445,7 +501,7 @@ if (nrow(model_economic_gains) > 0L) {
 
 
 ###############################################################
-# 10. STRATEGY ECONOMIC RANKING
+# 11. STRATEGY ECONOMIC RANKING (COMPLETE WITH NA-SAFE RANKING)
 ###############################################################
 
 ranking_required <- c("Strategy", "AnnualizedReturn", "SharpeRatio", "MaximumDrawdown", "CalmarRatio", "HitRate")
@@ -454,14 +510,21 @@ strategy_ranking <- strategy_performance %>%
     dplyr::filter(Strategy %in% c(learned_strategies, fixed_strategies)) %>%
     dplyr::select(dplyr::all_of(ranking_required)) %>%
     dplyr::mutate(
-        ReturnRank   = rank(-AnnualizedReturn, ties.method = "average", na.last = "keep"),
-        SharpeRank   = rank(-SharpeRatio, ties.method = "average", na.last = "keep"),
-        DrawdownRank = rank(abs(MaximumDrawdown), ties.method = "average", na.last = "keep"),
-        CalmarRank   = rank(-CalmarRatio, ties.method = "average", na.last = "keep"),
-        HitRateRank  = rank(-HitRate, ties.method = "average", na.last = "keep"),
-        EconomicScore = rowMeans(cbind(ReturnRank, SharpeRank, DrawdownRank, CalmarRank, HitRateRank), na.rm = TRUE),
-        EconomicRank  = rank(EconomicScore, ties.method = "average", na.last = "keep"),
-        StrategyType  = dplyr::case_when(
+        Rank_CumulativeReturn = rank(-AnnualizedReturn, ties.method = "average", na.last = "keep"),
+        Rank_Sharpe           = rank(-SharpeRatio, ties.method = "average", na.last = "keep"),
+        Rank_Drawdown         = rank(abs(MaximumDrawdown), ties.method = "average", na.last = "keep"),
+        Rank_Calmar           = rank(-CalmarRatio, ties.method = "average", na.last = "keep"),
+        Rank_HitRate          = rank(-HitRate, ties.method = "average", na.last = "keep")
+    ) %>%
+    dplyr::rowwise() %>%
+    dplyr::mutate(
+        EconomicScore = mean(c(Rank_CumulativeReturn, Rank_Sharpe, Rank_Drawdown, Rank_HitRate), na.rm = TRUE),
+        OverallRank   = EconomicScore
+    ) %>%
+    dplyr::ungroup() %>%
+    dplyr::mutate(
+        EconomicRank = rank(EconomicScore, ties.method = "average", na.last = "keep"),
+        StrategyType = dplyr::case_when(
             Strategy %in% learned_strategies ~ "Learned Model",
             Strategy %in% fixed_strategies   ~ "Fixed Benchmark",
             TRUE                             ~ "Other"
@@ -469,9 +532,32 @@ strategy_ranking <- strategy_performance %>%
     ) %>%
     dplyr::arrange(EconomicRank)
 
+# Update strategy_performance with complete rankings
+strategy_performance <- strategy_performance %>%
+    dplyr::select(-dplyr::any_of(c("Rank_CumulativeReturn", "Rank_Sharpe", "Rank_Drawdown", "OverallRankScore", "OverallRank"))) %>%
+    dplyr::left_join(
+        strategy_ranking %>% dplyr::select(Strategy, Rank_CumulativeReturn, Rank_Sharpe, Rank_Drawdown, OverallRankScore = EconomicScore, OverallRank = EconomicRank),
+        by = "Strategy"
+    )
+
+# Clean economic_significance table for final export
+economic_significance <- strategy_performance %>%
+    dplyr::filter(Strategy %in% c(learned_strategies, fixed_strategies)) %>%
+    dplyr::mutate(
+        StrategyType = dplyr::case_when(
+            Strategy %in% learned_strategies ~ "Learned Model",
+            Strategy %in% fixed_strategies   ~ "Fixed Benchmark",
+            TRUE                             ~ "Other"
+        )
+    ) %>%
+    dplyr::left_join(
+        economic_significance %>% dplyr::select(Strategy, InferencePValue, StatisticalSignificance, EconomicSignificance, OverallEvidence),
+        by = "Strategy"
+    )
+
 
 ###############################################################
-# 11. WRITE CSV ARTIFACTS
+# 12. WRITE CSV ARTIFACTS
 ###############################################################
 
 readr::write_csv(economic_significance, OUTPUT_ECONOMIC_SIGNIFICANCE)
@@ -481,7 +567,7 @@ readr::write_csv(strategy_ranking, OUTPUT_STRATEGY_RANKING)
 
 
 ###############################################################
-# 12. FIGURES & VISUALIZATIONS
+# 13. FIGURES & VISUALIZATIONS
 ###############################################################
 
 # Figure 1: Economic Gain Confidence Intervals
@@ -549,7 +635,7 @@ if (nrow(benchmark_relative_performance) > 0L) {
 
 
 ###############################################################
-# 13. SAVE WORKSPACE & CONSOLE SUMMARY
+# 14. SAVE WORKSPACE & CONSOLE SUMMARY
 ###############################################################
 
 save(

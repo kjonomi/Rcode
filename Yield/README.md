@@ -7,6 +7,9 @@ This repository provides an economically structured deep sequential learning fra
 ---
 
 ## Data
+## Run 01_fred_data_download.R code to get the data first and then run main 00_main.R code
+## You change the data time period from 01_fred_data_download.R code
+## Modify fetch_fred_macro_data <- function(start_date = "1995-01-01", end_date = "2026-10-08") 
 
 The empirical sample incorporates U.S. Treasury yields and macro-financial indicators drawn from a historical dataset with a start date of **1965**:
 

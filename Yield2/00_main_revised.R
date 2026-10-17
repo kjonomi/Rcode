@@ -21,8 +21,14 @@ suppressPackageStartupMessages({
 MASTER_SEED <- 20261014L
 set.seed(MASTER_SEED)
 tf$random$set_seed(as.integer(MASTER_SEED))
+# Best-effort deterministic TensorFlow operations. This cannot guarantee bitwise
+# reproducibility across all hardware, drivers, libraries, or TensorFlow versions.
+tryCatch(
+  tf$config$experimental$enable_op_determinism(),
+  error = function(e) message("TensorFlow deterministic-op mode unavailable: ", conditionMessage(e))
+)
 
-OUTPUT_DIR <- "Affine_Transformer_CNN_BiLSTM_Gemini_Results"
+OUTPUT_DIR <- "YieldCurve_Transformer_CNN_BiLSTM_Results"
 dir.create(OUTPUT_DIR, recursive = TRUE, showWarnings = FALSE)
 
 # =============================================================
@@ -39,11 +45,16 @@ N_YIELDS <- length(YIELD_NAMES)
 N_FACTORS <- length(FACTOR_NAMES)
 BATCH_SIZE <- 32L
 EPOCHS <- 35L
+EARLY_STOPPING_PATIENCE <- 6L
+MIN_VALIDATION_IMPROVEMENT <- 1e-6
 LEARNING_RATE <- 0.0005
 START_DATE <- as.Date("1963-01-01")
 END_DATE <- as.Date("2026-10-15")
 
 N_FEATURES <- NA_integer_
+
+USE_GEMINI <- tolower(Sys.getenv("USE_GEMINI", "false")) %in% c("true", "1", "yes")
+GEMINI_MODEL <- Sys.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
 # =============================================================
 # 2. DATA ACQUISITION
@@ -112,14 +123,14 @@ if (nrow(yield_df) <= SEQUENCE_LENGTH + 20L) {
 }
 
 # =============================================================
-# 3. THREE-FACTOR TERM-STRUCTURE REPRESENTATION
+# 3. DETERMINISTIC THREE-FACTOR TERM-STRUCTURE FEATURES
 # =============================================================
 
 cat("\n============================================================\n")
-cat("2. EXTRACTING LEVEL, SLOPE, AND CURVATURE FACTORS\n")
+cat("2. CONSTRUCTING DETERMINISTIC LEVEL, SLOPE, AND CURVATURE FEATURES\n")
 cat("============================================================\n")
 
-estimate_affine_factors <- function(Y) {
+construct_deterministic_factors <- function(Y) {
   stopifnot(all(YIELD_NAMES %in% colnames(Y)))
   level <- rowMeans(Y)
   slope <- Y[, "DGS30"] - Y[, "DTB3"]
@@ -127,7 +138,7 @@ estimate_affine_factors <- function(Y) {
   cbind(Level = level, Slope = slope, Curvature = curvature)
 }
 
-affine_factors <- estimate_affine_factors(yield_mat)
+term_structure_factors <- construct_deterministic_factors(yield_mat)
 
 # =============================================================
 # 4. DETERMINISTIC FEATURE ENGINEERING AND TARGETS
@@ -207,14 +218,14 @@ build_feature_matrix <- function(Y, F_mat) {
   X
 }
 
-X_raw <- build_feature_matrix(yield_mat, affine_factors)
+X_raw <- build_feature_matrix(yield_mat, term_structure_factors)
 N_FEATURES <- ncol(X_raw)
 cat("Deterministic feature count:", N_FEATURES, "\n")
 
 Y_yield_diff <- rbind(matrix(0, 1L, N_YIELDS), diff(yield_mat))
 colnames(Y_yield_diff) <- YIELD_NAMES
 
-Y_factor_diff <- rbind(matrix(0, 1L, N_FACTORS), diff(affine_factors))
+Y_factor_diff <- rbind(matrix(0, 1L, N_FACTORS), diff(term_structure_factors))
 colnames(Y_factor_diff) <- FACTOR_NAMES
 
 Y_volatility <- matrix(apply(Y_yield_diff, 1L, stats::sd), ncol = 1L)
@@ -392,8 +403,22 @@ cat("============================================================\n")
 # not a claim that it is identical to every entropy-replay algorithm in the literature.
 # PER: proportional prioritization p_i proportional to (epsilon + |error_i|)^alpha,
 # with normalized importance weights (N p_i)^(-beta) in the training loss.
+validation_objective <- function(model) {
+  pred <- model |> predict(X_valid, verbose = 0)
+  pred_y <- extract_named_prediction(pred, "yield_out", 1L)
+  pred_f <- extract_named_prediction(pred, "factor_out", 2L)
+  pred_v <- extract_named_prediction(pred, "vol_out", 3L)
+  mse_y <- mean((Y_valid$yield_out - pred_y)^2, na.rm = TRUE)
+  mse_f <- mean((Y_valid$factor_out - pred_f)^2, na.rm = TRUE)
+  mse_v <- mean((Y_valid$vol_out - pred_v)^2, na.rm = TRUE)
+  1.0 * mse_y + 0.5 * mse_f + 0.2 * mse_v
+}
+
 train_with_experience_replay <- function(strategy = c("Uniform", "Entropy", "PER")) {
   strategy <- match.arg(strategy)
+  strategy_seed <- MASTER_SEED + match(strategy, c("Uniform", "Entropy", "PER"))
+  set.seed(as.integer(strategy_seed))
+  tf$random$set_seed(as.integer(strategy_seed))
   cat("\n---> Training model with strategy:", strategy, "\n")
   n_train_samples <- dim(X_train)[1L]
   model <- build_transformer_cnn_bilstm()
@@ -401,6 +426,10 @@ train_with_experience_replay <- function(strategy = c("Uniform", "Entropy", "PER
   alpha_per <- 0.6
   beta_is <- 0.4
   eps_priority <- 1e-5
+  best_val <- Inf
+  best_weights <- NULL
+  best_epoch <- 0L
+  stale_epochs <- 0L
 
   for (ep in seq_len(EPOCHS)) {
     probs <- switch(strategy,
@@ -416,8 +445,6 @@ train_with_experience_replay <- function(strategy = c("Uniform", "Entropy", "PER
     )
     sample_indices <- sample.int(n_train_samples, n_train_samples,
                                  replace = TRUE, prob = probs)
-    # Importance weights correct the nonuniform sampling distribution.
-    # For Uniform, all weights equal one.
     if (strategy == "Uniform") {
       isw <- rep(1, length(sample_indices))
     } else {
@@ -447,7 +474,6 @@ train_with_experience_replay <- function(strategy = c("Uniform", "Entropy", "PER
       if (strategy == "PER") {
         priorities <- pmax(abs_err, eps_priority)
       } else {
-        # Estimate empirical surprisal of each residual using quantile bins.
         br <- unique(as.numeric(stats::quantile(
           abs_err, probs = seq(0, 1, length.out = 11), na.rm = TRUE,
           names = FALSE, type = 8
@@ -457,16 +483,38 @@ train_with_experience_replay <- function(strategy = c("Uniform", "Entropy", "PER
         } else {
           bin <- cut(abs_err, breaks = br, include.lowest = TRUE, labels = FALSE)
           bin[is.na(bin)] <- 1L
-          freq <- tabulate(bin, nbins = max(bin, na.rm = TRUE)) / n_train_samples
+          n_bins <- max(bin, na.rm = TRUE)
+          freq <- tabulate(bin, nbins = n_bins) / n_train_samples
           priorities <- -log(pmax(freq[pmin(bin, length(freq))], eps_priority))
           priorities[!is.finite(priorities)] <- 0
           priorities <- priorities + eps_priority
         }
       }
     }
-    if (ep == 1L || ep %% 5L == 0L)
-      cat("Epoch", ep, "of", EPOCHS, "| Strategy:", strategy, "\n")
+
+    val_now <- validation_objective(model)
+    if (is.finite(val_now) && val_now < best_val - MIN_VALIDATION_IMPROVEMENT) {
+      best_val <- val_now
+      best_weights <- model$get_weights()
+      best_epoch <- ep
+      stale_epochs <- 0L
+    } else {
+      stale_epochs <- stale_epochs + 1L
+    }
+    if (ep == 1L || ep %% 5L == 0L) {
+      cat("Epoch", ep, "of", EPOCHS, "| Strategy:", strategy,
+          "| Validation objective:", signif(val_now, 6), "\n")
+    }
+    if (stale_epochs >= EARLY_STOPPING_PATIENCE) {
+      cat("Early stopping for", strategy, "at epoch", ep,
+          "| best epoch:", best_epoch, "| best validation objective:",
+          signif(best_val, 6), "\n")
+      break
+    }
   }
+  if (!is.null(best_weights)) model$set_weights(best_weights)
+  cat("Selected epoch for", strategy, ":", best_epoch,
+      "| validation objective:", signif(best_val, 6), "\n")
   model
 }
 
@@ -509,7 +557,8 @@ test_preds_entropy <- list(
   vol_out = extract_named_prediction(test_preds_entropy_raw, "vol_out", 3L)
 )
 
-# Benchmark: Diebold-Li DNS
+# Benchmark: Diebold-Li dynamic Nelson-Siegel (DNS). This is a forecasting benchmark,
+# not a jointly estimated no-arbitrage affine pricing model.
 fit_dns_benchmark <- function(Y, train_target_rows, test_target_rows) {
   mats <- MATURITIES
   lambda <- 0.0609
@@ -602,7 +651,7 @@ write.csv(dns_metrics, file.path(OUTPUT_DIR, "Diebold_Li_DNS_Metrics.csv"), row.
 
 
 # =============================================================
-# 7. REVIEWER-REQUESTED DIAGNOSTICS AND ECONOMIC BACKTEST
+# 7. REVIEWER-REQUESTED FORECAST DIAGNOSTICS AND STYLIZED RETURN-PROXY ANALYSIS
 # =============================================================
 
 # Per-maturity metrics and correctly defined RMSE regret:
@@ -649,21 +698,27 @@ write.csv(dm_table, file.path(OUTPUT_DIR, "DM_Test_Comparisons.csv"), row.names 
 
 # IMPORTANT ECONOMIC INTERPRETATION:
 # Yield-only FRED series do not contain observed bond total-return data.
-# The following is explicitly a stylized constant-maturity bond proxy, not
-# an investable historical Treasury total-return series. A coupon bond is
-# priced from its fixed coupon and the observed constant-maturity yield.
-# For each daily interval, the coupon is set to the prior day's yield;
-# price changes are repriced at the next day's yield, with daily coupon carry.
-# No leverage or transaction costs are assumed. Results must be labelled
-# approximate and should not be presented as verified market portfolio returns.
+# The following is an illustrative, assumption-dependent return proxy only; it is
+# not an economic backtest or an investable historical Treasury total-return series.
+# The DTB3 series is a bank-discount-rate quote, so the 3-month instrument is
+# priced using a Treasury-bill discount convention rather than semiannual coupons.
+# Longer maturities use a simplified fixed-coupon repricing approximation. These
+# proxies are not suitable evidence of financial superiority without validation
+# against observed total-return indices, transaction costs, and risk controls.
 bond_price <- function(yield_pct, maturity_years, coupon_rate, face = 100) {
-  y <- pmax(as.numeric(yield_pct) / 100, -0.0099)
-  n_pay <- max(1L, ceiling(maturity_years * 2))
-  times <- seq_len(n_pay)
-  # Semiannual cash flows; final cash flow includes principal.
+  y_pct <- as.numeric(yield_pct)
+  # DTB3 is quoted as a bank-discount rate. Approximate a 91-day Treasury bill
+  # price directly; do not impose a semiannual coupon period on a 3-month bill.
+  if (maturity_years <= 0.25 + 1e-8) {
+    discount_rate <- y_pct / 100
+    return(face * (1 - discount_rate * 91 / 360))
+  }
+  y <- pmax(y_pct / 100, -0.0099)
+  n_pay <- max(1L, as.integer(round(maturity_years * 2)))
+  coupon_periods <- seq_len(n_pay)
   cf <- rep(face * coupon_rate / 2, n_pay)
   cf[n_pay] <- cf[n_pay] + face
-  discount <- (1 + y / 2)^(2 * maturity_years * times / n_pay)
+  discount <- (1 + y / 2)^coupon_periods
   sum(cf / discount)
 }
 
@@ -694,8 +749,15 @@ for (j in seq_len(N_YIELDS)) {
     coupon <- max(0, y0 / 100)
     p0 <- bond_price(y0, mat, coupon)
     p1 <- bond_price(y1, mat, coupon)
-    coupon_carry <- 100 * coupon / 252
-    proxy_returns[i, j] <- (p1 - p0 + coupon_carry) / p0
+    if (mat <= 0.25 + 1e-8) {
+      # Approximate daily bill carry separately; this remains a rolled,
+      # constant-maturity yield proxy rather than a historical bill total return.
+      daily_carry <- max(0, y0 / 100) / 360
+      proxy_returns[i, j] <- (p1 - p0) / p0 + daily_carry
+    } else {
+      coupon_carry <- 100 * coupon / 252
+      proxy_returns[i, j] <- (p1 - p0 + coupon_carry) / p0
+    }
   }
 }
 
@@ -774,17 +836,25 @@ write.csv(return_df, file.path(OUTPUT_DIR, "Daily_Proxy_Return_Series.csv"), row
 # business-day observations; they are not monthly observations.
 writeLines(c(
   paste("Data source:", data_source_label),
-  paste("Observation frequency: daily business-day FRED observations (or synthetic fallback; inspect source label)"),
-  paste("Train/validation/test sequence counts:", N_TRAIN, N_VALID, N_TEST),
+  paste("Observation frequency: daily business-day FRED observations; no synthetic fallback is permitted"),
+  paste("Train/validation/test sequence counts (validation used for early stopping):", N_TRAIN, N_VALID, N_TEST),
   paste("Test dates:", min(test_dates), "to", max(test_dates)),
   "Forecast target: one-day change in Treasury yields, percentage points.",
-  "Economic outputs: stylized constant-maturity coupon-bond proxy returns, not observed Treasury total returns.",
-  "Portfolio assumptions: daily rebalancing, zero transaction costs, zero risk-free rate, no leverage.",
+  "Factor features: deterministic level/slope/curvature transformations; not latent affine pricing factors.",
+  "No-arbitrage status: no jointly estimated affine pricing model or risk-neutral pricing restrictions are implemented.",
+  "DNS benchmark: dynamic Nelson-Siegel forecasting benchmark, not a no-arbitrage affine term-structure model.",
+  "Economic outputs: stylized yield-based return proxies only; not observed Treasury total returns and not an economic backtest.",
+  "The validation split is used for early stopping; no broad hyperparameter search is performed.",
+  "Neural results may vary across hardware, TensorFlow versions, and nondeterministic operations despite fixed seeds.",
+  "Forecast metrics and stylized return-proxy metrics answer different questions and must not be conflated.",
+  "Portfolio proxy assumptions: daily rebalancing, zero transaction costs, zero risk-free rate, no leverage.",
+  "The 3-month bill proxy uses a 91-day/360 bank-discount convention and separate approximate daily carry.",
+  "Longer-maturity proxy pricing uses simplified semiannual fixed-coupon repricing; it is not validated against total-return index data.",
   "Annualization: 252 trading days; Sharpe = mean daily excess return / daily SD * sqrt(252).",
   "RMSE regret is model RMSE minus the minimum RMSE for the same maturity; the minimum is zero."
 ), con = file.path(OUTPUT_DIR, "Reviewer_Revision_Methodology_Notes.txt"))
 
-cat("\nReviewer-response outputs saved to:", normalizePath(OUTPUT_DIR), "\n")
+cat("\nForecasting outputs and clearly labeled stylized return-proxy diagnostics saved to:", normalizePath(OUTPUT_DIR), "\n")
 
 # =============================================================
 # 8. PUBLICATION-READY FIGURES (PDF)
@@ -902,7 +972,7 @@ p5 <- ggplot2::ggplot(wealth_long,
                        ggplot2::aes(x = Date, y = Wealth, linetype = Strategy)) +
   ggplot2::geom_line(linewidth = 0.65) +
   ggplot2::labs(title = "Cumulative Wealth from Stylized Bond-Return Proxies",
-                subtitle = "Illustrative yield-based proxies; not verified Treasury total returns",
+                subtitle = "Illustrative yield-based proxies only; not verified Treasury total returns",
                 x = NULL, y = "Growth of one unit", linetype = "Strategy") +
   publication_theme
 save_figure_pdf(p5, "Figure_05_Cumulative_Proxy_Wealth.pdf", 10, 6)
@@ -929,7 +999,7 @@ p7 <- ggplot2::ggplot(p7_data,
                        ggplot2::aes(x = reorder(Strategy, Sharpe_Annualized),
                                     y = Sharpe_Annualized)) +
   ggplot2::geom_col() + ggplot2::coord_flip() +
-  ggplot2::labs(title = "Annualized Sharpe Ratios",
+  ggplot2::labs(title = "Annualized Sharpe Ratios of Stylized Return Proxies",
                 subtitle = "Computed from daily proxy returns with zero risk-free rate and 252-day annualization",
                 x = NULL, y = "Annualized Sharpe ratio") + publication_theme
 save_figure_pdf(p7, "Figure_07_Annualized_Sharpe_Ratios.pdf", 9, 6)

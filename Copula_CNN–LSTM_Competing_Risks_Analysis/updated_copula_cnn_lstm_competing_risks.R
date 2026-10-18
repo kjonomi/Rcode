@@ -1,6 +1,6 @@
 ###############################################################
 # Simulated Competing-Risks Benchmark Strategy
-# Copula-Dependent Events and Censoring (Updated & Fixed)
+# Copula-Dependent Events and Non-informative Censoring
 #
 # Models:
 #   MLP, CNN, LSTM, CNN-LSTM
@@ -59,30 +59,24 @@ dir.create(OUTPUT_DIR, recursive = TRUE, showWarnings = FALSE)
 # 1. Copula Data Generation
 # =============================================================
 
-r_trivariate_copula <- function(
+# 이벤트 T1과 T2 간의 2변량 Copula 균등분포 (U1, U2) 생성
+r_bivariate_copula <- function(
     n,
     copula_scenario = "Gaussian",
-    rho_events = 0.50,
-    rho_censor = 0.30) {
+    rho_events = 0.50) {
 
   if (copula_scenario == "Independence") {
-    return(cbind(runif(n), runif(n), runif(n)))
+    return(cbind(runif(n), runif(n)))
   }
 
-  Sigma <- matrix(c(
-    1, rho_events, rho_censor,
-    rho_events, 1, rho_censor,
-    rho_censor, rho_censor, 1
-  ), nrow = 3, byrow = TRUE)
+  U <- matrix(0, nrow = n, ncol = 2)
 
-  if (any(eigen(Sigma, symmetric = TRUE, only.values = TRUE)$values <= 0)) {
-    stop("Copula correlation matrix must be positive definite.")
-  }
+  if (copula_scenario == "Gaussian") {
+    Sigma <- matrix(c(1, rho_events, rho_events, 1), nrow = 2)
+    Z <- MASS::mvrnorm(n, mu = c(0, 0), Sigma = Sigma)
+    U <- pnorm(Z)
 
-  Z <- MASS::mvrnorm(n, mu = rep(0, 3), Sigma = Sigma)
-  U <- pnorm(Z)
-
-  if (copula_scenario == "Clayton") {
+  } else if (copula_scenario == "Clayton") {
     theta <- 1
     v <- rgamma(n, shape = 1 / theta, rate = 1)
     U[, 1] <- (1 + rexp(n) / v)^(-1 / theta)
@@ -109,7 +103,8 @@ simulate_competing_risks <- function(
     n = 1500,
     copula_name = "Gaussian",
     seed = 2026,
-    censor_scale = 0.12) {
+    shape_events = 1.5,   # Weibull 형상파라미터 (phi != 1 적용, e.g., 0.5, 1.5, 2.0)
+    censor_rate = 0.1) {  # Non-informative censoring: C ~ Exponential(a = 0.1)
 
   set.seed(seed)
 
@@ -132,17 +127,18 @@ simulate_competing_risks <- function(
 
   eta2 <- 0.25 * X1 + 0.20 * X3 + 0.20 * (grade - 2) + 0.15 * X4^2 - 0.20 * treatment
 
-  eta_c <- 0.20 * X1 + 0.15 * X2 - 0.20 * treatment
-
   rate1 <- exp(-2.6 + eta1)
   rate2 <- exp(-3.0 + eta2)
-  rate_c <- censor_scale * exp(eta_c)
 
-  U <- r_trivariate_copula(n, copula_scenario = copula_name, rho_events = 0.50, rho_censor = 0.30)
+  # 1) 이변량 Copula에서 (U1, U2) 추출
+  U <- r_bivariate_copula(n, copula_scenario = copula_name, rho_events = 0.50)
 
-  latent_time1 <- -log(U[, 1]) / rate1
-  latent_time2 <- -log(U[, 2]) / rate2
-  censor_time <- -log(U[, 3]) / rate_c
+  # 2) Weibull 분포 기반 잠재 생존시간 T1, T2 생성: T = (-log(U) / lambda)^(1 / phi)
+  latent_time1 <- (-log(U[, 1]) / rate1)^(1 / shape_events)
+  latent_time2 <- (-log(U[, 2]) / rate2)^(1 / shape_events)
+
+  # 3) 비정보 중도절단 (Non-informative Censoring): C ~ Exponential(a = censor_rate)
+  censor_time <- rexp(n, rate = censor_rate)
 
   time <- pmin(latent_time1, latent_time2, censor_time)
 
@@ -183,7 +179,6 @@ loss_standard_cce <- function(y_true, y_pred) {
 loss_gaussian_copula <- function(y_true, y_pred) {
   cce <- tf$keras$losses$categorical_crossentropy(y_true, y_pred)
 
-  # u1, u2 over all K time intervals: shape (batch_size, K)
   u1 <- tf_clip(y_pred[, , 2])
   u2 <- tf_clip(y_pred[, , 3])
 
@@ -335,7 +330,6 @@ create_nn_model <- function(architecture, p, K, copula_penalty = "Standard") {
       keras3::layer_dropout(0.25)
 
   } else if (architecture == "CNN") {
-    # Project tabular features into sequence space (seq_len=8, features=16)
     x <- input_layer |>
       keras3::layer_dense(128, activation = "relu") |>
       keras3::layer_reshape(target_shape = c(8, 16)) |>
@@ -677,7 +671,11 @@ run_one_experiment <- function(replication, copula_name) {
 
   cat("\nReplication:", replication, "| Copula scenario:", copula_name, "\n")
 
-  data <- simulate_competing_risks(n = N, copula_name = copula_name, seed = seed)
+  # Weibull shape = 1.5, Non-informative censoring rate = 0.1 로 데이터 생성
+  data <- simulate_competing_risks(
+    n = N, copula_name = copula_name, seed = seed,
+    shape_events = 1.5, censor_rate = 0.10
+  )
   split <- prepare_split(data, seed = seed + 10, train_fraction = TRAIN_FRACTION)
 
   breaks <- unique(as.numeric(quantile(

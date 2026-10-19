@@ -1,175 +1,89 @@
 ###############################################################
-# Real Data Analysis: Rotterdam Breast Cancer Dataset
-# Discrete-Time Competing-Risks Neural Copula Models Benchmark
+# Real Data Competing-Risks Benchmark Application
+# Dataset: Follicular Cell Lymphoma (`follic` from randomForestSRC)
 #
-# Architectures: MLP, CNN, LSTM, CNN-LSTM
-# Loss Penalties: Standard CCE, Gaussian, Clayton, Gumbel
-# Classical Benchmarks: RSF, Cause-Specific Cox (CSC), Fine-Gray (FGR)
+# Models:
+#   MLP, CNN, LSTM, CNN-LSTM
+#   Standard, Gaussian, Clayton, Gumbel Loss Variants
+#   Random Survival Forest
+#   Cause-Specific Cox
+#   Fine-Gray
 ###############################################################
 
-# Disable CUDA GPU initialization errors if driver setup is unconfigured
 Sys.setenv(CUDA_VISIBLE_DEVICES = "-1")
 
 # =============================================================
 # 0. Packages and Configuration
 # =============================================================
 
-suppressPackageStartupMessages({
-  library(survival)
-  library(randomForestSRC)
-  library(timeROC)
-  library(cmprsk)
-  library(dplyr)
-  library(tidyr)
-  library(ggplot2)
-  library(keras3)
-  library(tensorflow)
-})
+required_packages <- c(
+  "survival", "randomForestSRC", "timeROC", "cmprsk",
+  "dplyr", "tidyr", "ggplot2", "keras3",
+  "tensorflow", "MASS"
+)
 
-set.seed(2026)
+for (pkg in required_packages) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    stop("Please install package: ", pkg)
+  }
+}
 
-epochs <- 100
-batch_size <- 64
-learning_rate <- 0.001
-lambda_copula <- 0.001  # Adjusted scale to prevent penalty gradient domination
-n_time_bins <- 20
-evaluation_probs <- c(0.25, 0.50, 0.75)
-B_BOOTSTRAP <- 200
+library(survival)
+library(randomForestSRC)
+library(timeROC)
+library(cmprsk)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(keras3)
+library(tensorflow)
+library(MASS)
 
-output_dir <- "Rotterdam_Copula_All_Models_Results"
-dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+MASTER_SEED <- 20261014
+N_TIME_BINS <- 15
+
+EPOCHS <- 80
+BATCH_SIZE <- 32
+LEARNING_RATE <- 0.001
+LAMBDA_COPULA <- 0.001
+
+TRAIN_FRACTION <- 0.70
+EVALUATION_PROBS <- c(0.25, 0.50, 0.75)
+
+OUTPUT_DIR <- "Real_Data_Follic_Copula_Results"
+dir.create(OUTPUT_DIR, recursive = TRUE, showWarnings = FALSE)
 
 # =============================================================
-# 1. Load and Prepare Rotterdam Data
+# 1. Real Data Loader (Follicular Cell Lymphoma Dataset)
 # =============================================================
 
-data(rotterdam, package = "survival")
-
-rotterdam_data <- rotterdam %>%
-  mutate(
-    status = case_when(
-      recur == 1 ~ 1L,
-      recur == 0 & death == 1 ~ 2L,
-      TRUE ~ 0L
-    ),
-    time = as.numeric(rtime)
-  ) %>%
-  filter(is.finite(time), time > 0)
-
-features <- c("age", "meno", "size", "grade", "nodes", "pgr", "er", "hormon", "chemo")
-
-cat("\nEvent status frequencies:\n")
-print(table(rotterdam_data$status))
-
-time <- rotterdam_data$time
-status <- rotterdam_data$status
-
-X_raw <- rotterdam_data[, features, drop = FALSE]
-
-for (j in seq_along(X_raw)) {
-  if (is.factor(X_raw[[j]]) || is.character(X_raw[[j]])) {
-    X_raw[[j]] <- as.numeric(as.factor(X_raw[[j]]))
+load_real_competing_risks_data <- function(dataset_name = "follic") {
+  if (dataset_name == "follic") {
+    data("follic", package = "randomForestSRC", envir = environment())
+    df <- follic
+    
+    # Target: time = time, status = status (0=censored, 1=relapse, 2=death)
+    # Features: age, hgb, clinstg, ch, chemo
+    df$age <- as.numeric(df$age)
+    df$hgb <- as.numeric(df$hgb)
+    df$clinstg <- as.numeric(df$clinstg)
+    df$ch <- as.numeric(df$ch)
+    df$chemo <- as.numeric(as.factor(df$chemo))
+    
+    features <- c("age", "hgb", "clinstg", "ch", "chemo")
+    
+    return(list(data = df, features = features))
   } else {
-    X_raw[[j]] <- as.numeric(X_raw[[j]])
+    stop("Unsupported dataset name.")
   }
 }
-X_raw <- as.data.frame(X_raw)
 
 # =============================================================
-# 2. Train/Test Split
-# =============================================================
-
-set.seed(2026)
-n <- nrow(X_raw)
-
-train_index <- sample(seq_len(n), size = floor(0.70 * n))
-test_index  <- setdiff(seq_len(n), train_index)
-
-X_train_raw <- X_raw[train_index, , drop = FALSE]
-X_test_raw  <- X_raw[test_index, , drop = FALSE]
-
-time_train <- time[train_index]
-time_test  <- time[test_index]
-
-status_train <- status[train_index]
-status_test  <- status[test_index]
-
-# =============================================================
-# 3. Imputation and Standardization
-# =============================================================
-
-train_medians <- vapply(X_train_raw, function(z) {
-  m <- median(z, na.rm = TRUE)
-  if (!is.finite(m)) 0 else m
-}, numeric(1))
-
-for (j in seq_along(features)) {
-  X_train_raw[[j]][!is.finite(X_train_raw[[j]])] <- train_medians[j]
-  X_test_raw[[j]][!is.finite(X_test_raw[[j]])]   <- train_medians[j]
-}
-
-train_means <- vapply(X_train_raw, mean, numeric(1))
-train_sds   <- vapply(X_train_raw, sd, numeric(1))
-train_sds[!is.finite(train_sds) | train_sds == 0] <- 1
-
-X_train <- scale(as.matrix(X_train_raw), center = train_means, scale = train_sds)
-X_test  <- scale(as.matrix(X_test_raw),  center = train_means, scale = train_sds)
-
-X_train <- as.matrix(X_train)
-X_test  <- as.matrix(X_test)
-p <- ncol(X_train)
-
-# =============================================================
-# 4. Discrete-Time Competing-Risks Targets
-# =============================================================
-
-time_breaks <- unique(as.numeric(quantile(
-  time_train, probs = seq(0, 1, length.out = n_time_bins + 1), na.rm = TRUE, type = 8
-)))
-time_breaks <- sort(unique(c(0, time_breaks)))
-
-K <- length(time_breaks) - 1L
-cat("\nNumber of discrete time intervals:", K, "\n")
-
-make_survival_targets <- function(time, status, breaks) {
-  K <- length(breaks) - 1L
-  n <- length(time)
-
-  y <- array(0, dim = c(n, K, 3))
-  weights <- matrix(0, nrow = n, ncol = K)
-
-  for (i in seq_len(n)) {
-    for (k in seq_len(K)) {
-      left <- breaks[k]
-      right <- breaks[k + 1L]
-
-      if (time[i] <= left) break
-
-      weights[i, k] <- 1
-      y[i, k, 1] <- 1
-
-      event_here <- status[i] %in% c(1L, 2L) && time[i] > left && time[i] <= right
-
-      if (event_here) {
-        y[i, k, ] <- 0
-        if (status[i] == 1L) y[i, k, 2] <- 1 else y[i, k, 3] <- 1
-        break
-      }
-    }
-  }
-  list(y = y, weights = weights)
-}
-
-train_targets <- make_survival_targets(time_train, status_train, time_breaks)
-Y_train <- train_targets$y
-W_train <- train_targets$weights
-
-# =============================================================
-# 5. TensorFlow Safe Vectorized Copula Loss Functions
+# 2. Vectorized Copula Penalties and Loss Functions
 # =============================================================
 
 tf_clip <- function(x, lower = 1e-7, upper = 1 - 1e-7) {
-  tf$clip_by_value(x, clip_value_min = lower, clip_value_max = upper)
+  tf$clip_by_value(x, lower, upper)
 }
 
 safe_log <- function(x) {
@@ -182,124 +96,238 @@ loss_standard_cce <- function(y_true, y_pred) {
 
 loss_gaussian_copula <- function(y_true, y_pred) {
   cce <- tf$keras$losses$categorical_crossentropy(y_true, y_pred)
-  
-  # u1, u2 over all K time intervals: shape (batch_size, K)
+
   u1 <- tf_clip(y_pred[, , 2])
   u2 <- tf_clip(y_pred[, , 3])
-  
+
   z1 <- tf$math$log(u1 / (1 - u1))
   z2 <- tf$math$log(u2 / (1 - u2))
-  
+
   rho <- 0.8
   penalty <- (z1^2 - 2 * rho * z1 * z2 + z2^2) / (2 * (1 - rho^2))
-  tf$reduce_mean(cce) + lambda_copula * tf$reduce_mean(penalty)
+
+  tf$reduce_mean(cce) + LAMBDA_COPULA * tf$reduce_mean(penalty)
 }
 
 loss_clayton_copula <- function(y_true, y_pred) {
   cce <- tf$keras$losses$categorical_crossentropy(y_true, y_pred)
+
   theta <- 3.0
   u1 <- tf_clip(y_pred[, , 2])
   u2 <- tf_clip(y_pred[, , 3])
-  
+
   term <- tf$math$maximum(u1^(-theta) + u2^(-theta) - 1.0, 1e-7)
-  penalty <- -(log(theta + 1.0) - (theta + 1.0) * tf$math$log(u1 * u2) - (2.0 + 1.0 / theta) * tf$math$log(term))
-  tf$reduce_mean(cce) + lambda_copula * tf$reduce_mean(penalty)
+
+  penalty <- -(
+    log(theta + 1.0) -
+      (theta + 1.0) * tf$math$log(u1 * u2) -
+      (2.0 + 1.0 / theta) * tf$math$log(term)
+  )
+
+  tf$reduce_mean(cce) + LAMBDA_COPULA * tf$reduce_mean(penalty)
 }
 
 loss_gumbel_copula <- function(y_true, y_pred) {
   cce <- tf$keras$losses$categorical_crossentropy(y_true, y_pred)
+
   theta <- 4.0
   u1 <- tf_clip(y_pred[, , 2])
   u2 <- tf_clip(y_pred[, , 3])
-  
+
   a <- (-safe_log(u1))^theta
   b <- (-safe_log(u2))^theta
   A <- (a + b)^(1.0 / theta)
-  tf$reduce_mean(cce) + lambda_copula * tf$reduce_mean(A)
+
+  tf$reduce_mean(cce) + LAMBDA_COPULA * tf$reduce_mean(A)
 }
 
 # =============================================================
-# 6. Neural Architecture with Sequence Projection
+# 3. Preprocessing Real Data
 # =============================================================
 
-create_nn_model <- function(architecture, copula_penalty = "Standard") {
+prepare_split <- function(data, features, seed = 2026, train_fraction = 0.70) {
+  set.seed(seed)
+
+  n <- nrow(data)
+  train_index <- sample(seq_len(n), floor(train_fraction * n))
+  test_index <- setdiff(seq_len(n), train_index)
+
+  X_train_raw <- data[train_index, features, drop = FALSE]
+  X_test_raw <- data[test_index, features, drop = FALSE]
+
+  medians <- vapply(X_train_raw, median, numeric(1), na.rm = TRUE)
+
+  for (j in seq_along(features)) {
+    X_train_raw[[j]][!is.finite(X_train_raw[[j]])] <- medians[j]
+    X_test_raw[[j]][!is.finite(X_test_raw[[j]])] <- medians[j]
+  }
+
+  means <- vapply(X_train_raw, mean, numeric(1))
+  sds <- vapply(X_train_raw, sd, numeric(1))
+  sds[!is.finite(sds) | sds == 0] <- 1
+
+  X_train <- scale(as.matrix(X_train_raw), center = means, scale = sds)
+  X_test <- scale(as.matrix(X_test_raw), center = means, scale = sds)
+
+  list(
+    train_index = train_index,
+    test_index = test_index,
+    features = features,
+    X_train_raw = X_train_raw,
+    X_test_raw = X_test_raw,
+    X_train = unname(as.matrix(X_train)),
+    X_test = unname(as.matrix(X_test)),
+    time_train = data$time[train_index],
+    time_test = data$time[test_index],
+    status_train = data$status[train_index],
+    status_test = data$status[test_index],
+    means = means,
+    sds = sds
+  )
+}
+
+make_discrete_targets <- function(time, status, breaks) {
+  n <- length(time)
+  K <- length(breaks) - 1L
+
+  y <- array(0, dim = c(n, K, 3))
+  weights <- matrix(0, nrow = n, ncol = K)
+
+  for (i in seq_len(n)) {
+    if (status[i] %in% c(1L, 2L)) {
+      event_bin <- max(
+        1L,
+        min(K, findInterval(time[i], breaks, rightmost.closed = TRUE))
+      )
+
+      for (k in seq_len(event_bin)) {
+        weights[i, k] <- 1
+        if (k < event_bin) {
+          y[i, k, 1] <- 1
+        } else {
+          y[i, k, status[i] + 1L] <- 1
+        }
+      }
+    } else {
+      for (k in seq_len(K)) {
+        if (breaks[k + 1L] <= time[i]) {
+          weights[i, k] <- 1
+          y[i, k, 1] <- 1
+        }
+      }
+    }
+  }
+
+  list(y = y, weights = weights)
+}
+
+# =============================================================
+# 4. Neural Network Models
+# =============================================================
+
+create_nn_model <- function(architecture, p, K, copula_penalty = "Standard") {
+
   loss_fn <- switch(
     copula_penalty,
-    "Standard" = loss_standard_cce,
-    "Gaussian" = loss_gaussian_copula,
-    "Clayton"  = loss_clayton_copula,
-    "Gumbel"   = loss_gumbel_copula
+    Standard = loss_standard_cce,
+    Gaussian = loss_gaussian_copula,
+    Clayton  = loss_clayton_copula,
+    Gumbel   = loss_gumbel_copula
   )
 
   input_layer <- keras3::keras_input(shape = c(p), name = "input_layer")
 
   if (architecture == "MLP") {
-    x <- input_layer |> 
-      keras3::layer_dense(units = 64, activation = "relu") |> 
-      keras3::layer_dropout(rate = 0.25)
+    x <- input_layer |>
+      keras3::layer_dense(64, activation = "relu") |>
+      keras3::layer_dropout(0.25)
+
   } else if (architecture == "CNN") {
-    # Project tabular features into sequence space (seq_len=8, features=16)
-    x <- input_layer |> 
-      keras3::layer_dense(units = 128, activation = "relu") |> 
-      keras3::layer_reshape(target_shape = c(8, 16)) |> 
-      keras3::layer_conv_1d(filters = 32, kernel_size = 3, padding = "same", activation = "relu") |> 
+    x <- input_layer |>
+      keras3::layer_dense(64, activation = "relu") |>
+      keras3::layer_reshape(target_shape = c(4, 16)) |>
+      keras3::layer_conv_1d(filters = 32, kernel_size = 2, padding = "same", activation = "relu") |>
       keras3::layer_global_average_pooling_1d()
+
   } else if (architecture == "LSTM") {
-    x <- input_layer |> 
-      keras3::layer_dense(units = 128, activation = "relu") |> 
-      keras3::layer_reshape(target_shape = c(8, 16)) |> 
-      keras3::layer_lstm(units = 64, return_sequences = FALSE)
+    x <- input_layer |>
+      keras3::layer_dense(64, activation = "relu") |>
+      keras3::layer_reshape(target_shape = c(4, 16)) |>
+      keras3::layer_lstm(32, return_sequences = FALSE)
+
   } else if (architecture == "CNN_LSTM") {
-    x <- input_layer |> 
-      keras3::layer_dense(units = 128, activation = "relu") |> 
-      keras3::layer_reshape(target_shape = c(8, 16)) |> 
-      keras3::layer_conv_1d(filters = 32, kernel_size = 3, padding = "same", activation = "relu") |> 
-      keras3::layer_batch_normalization() |> 
-      keras3::layer_dropout(rate = 0.25) |> 
-      keras3::layer_lstm(units = 64, return_sequences = FALSE)
+    x <- input_layer |>
+      keras3::layer_dense(64, activation = "relu") |>
+      keras3::layer_reshape(target_shape = c(4, 16)) |>
+      keras3::layer_conv_1d(filters = 32, kernel_size = 2, padding = "same", activation = "relu") |>
+      keras3::layer_batch_normalization() |>
+      keras3::layer_dropout(0.25) |>
+      keras3::layer_lstm(32, return_sequences = FALSE)
   }
 
-  output_layer <- x |> 
-    keras3::layer_dense(units = 32, activation = "relu") |> 
-    keras3::layer_dropout(rate = 0.25) |> 
-    keras3::layer_dense(units = K * 3, activation = "linear") |> 
-    keras3::layer_reshape(target_shape = c(K, 3)) |> 
+  output_layer <- x |>
+    keras3::layer_dense(32, activation = "relu") |>
+    keras3::layer_dropout(0.25) |>
+    keras3::layer_dense(K * 3, activation = "linear") |>
+    keras3::layer_reshape(target_shape = c(K, 3)) |>
     keras3::layer_activation(activation = "softmax", name = "interval_probabilities")
 
   model <- keras3::keras_model(inputs = input_layer, outputs = output_layer)
+
   model |> keras3::compile(
-    optimizer = keras3::optimizer_adam(learning_rate = learning_rate),
+    optimizer = keras3::optimizer_adam(learning_rate = LEARNING_RATE),
     loss = loss_fn
   )
-  return(model)
+
+  model
 }
 
-train_model <- function(model, X, Y, sample_weights, model_name) {
-  cat("Training:", model_name, "\n")
-  early_stop <- keras3::callback_early_stopping(monitor = "val_loss", patience = 10, restore_best_weights = TRUE)
-  reduce_lr  <- keras3::callback_reduce_lr_on_plateau(monitor = "val_loss", factor = 0.5, patience = 5, min_lr = 1e-6)
+fit_nn <- function(architecture, X, y, weights, K, copula_penalty = "Standard", seed = 2026) {
+  set.seed(seed)
+  tf$random$set_seed(as.integer(seed))
+
+  model <- create_nn_model(architecture, ncol(X), K, copula_penalty)
+
+  callbacks <- list(
+    keras3::callback_early_stopping(
+      monitor = "val_loss", patience = 10, restore_best_weights = TRUE
+    ),
+    keras3::callback_reduce_lr_on_plateau(
+      monitor = "val_loss", patience = 5, factor = 0.5, min_lr = 1e-6
+    )
+  )
 
   model |> keras3::fit(
-    x = X, y = Y, sample_weight = sample_weights,
-    validation_split = 0.20, epochs = epochs, batch_size = batch_size,
-    callbacks = list(early_stop, reduce_lr), verbose = 0
+    x = X,
+    y = y,
+    sample_weight = weights,
+    validation_split = 0.20,
+    epochs = EPOCHS,
+    batch_size = BATCH_SIZE,
+    callbacks = callbacks,
+    verbose = 0
   )
+
+  list(model = model, architecture = architecture)
 }
 
-extract_cif <- function(prediction) {
-  n <- dim(prediction)[1]
-  K <- dim(prediction)[2]
+extract_cif <- function(model, X, K) {
+  q <- predict(model, X, verbose = 0)
+  n <- dim(q)[1]
 
   cif1 <- matrix(0, n, K)
   cif2 <- matrix(0, n, K)
   survival_prob <- matrix(1, n, K)
 
   for (i in seq_len(n)) {
-    s_prev <- 1; f1 <- 0; f2 <- 0
+    s_prev <- 1
+    f1 <- 0
+    f2 <- 0
+
     for (k in seq_len(K)) {
-      q0 <- prediction[i, k, 1]
-      q1 <- prediction[i, k, 2]
-      q2 <- prediction[i, k, 3]
+      q0 <- q[i, k, 1]
+      q1 <- q[i, k, 2]
+      q2 <- q[i, k, 3]
 
       f1 <- f1 + s_prev * q1
       f2 <- f2 + s_prev * q2
@@ -310,287 +338,455 @@ extract_cif <- function(prediction) {
       survival_prob[i, k] <- s_prev
     }
   }
+
   list(cif1 = cif1, cif2 = cif2, survival = survival_prob)
 }
 
 # =============================================================
-# 7. Fit All Neural Network Variants
+# 5. Robust Classical Benchmarks
 # =============================================================
 
-architectures <- c("MLP", "CNN", "LSTM", "CNN_LSTM")
-copula_variants <- c("Standard", "Gaussian", "Clayton", "Gumbel")
-prediction_objects <- list()
+fit_classical_benchmarks <- function(split) {
 
-for (arch in architectures) {
-  for (cop_p in copula_variants) {
-    model_key <- if (cop_p == "Standard") arch else paste0(arch, "_", cop_p)
-    keras3::clear_session()
-    nn_mod <- create_nn_model(arch, copula_penalty = cop_p)
-    train_model(nn_mod, X_train, Y_train, W_train, model_key)
-    pred_raw <- predict(nn_mod, X_test, verbose = 0)
-    prediction_objects[[model_key]] <- extract_cif(pred_raw)
+  train_df <- data.frame(
+    time = split$time_train,
+    status = split$status_train,
+    split$X_train_raw,
+    check.names = FALSE
+  )
+
+  test_df <- data.frame(
+    time = split$time_test,
+    status = split$status_test,
+    split$X_test_raw,
+    check.names = FALSE
+  )
+
+  n_test <- nrow(test_df)
+  causes <- 1:2
+  pred_scores <- list()
+
+  cox_formula <- as.formula(
+    paste(
+      "survival::Surv(time, event) ~",
+      paste(sprintf("`%s`", split$features), collapse = " + ")
+    )
+  )
+
+  for (cause in causes) {
+    csc_data <- train_df
+    csc_data$event <- as.integer(csc_data$status == cause)
+
+    cox_fit <- tryCatch(
+      suppressWarnings(
+        survival::coxph(
+          cox_formula, data = csc_data, x = TRUE, singular.ok = TRUE,
+          control = survival::coxph.control(iter.max = 50)
+        )
+      ),
+      error = function(e) NULL
+    )
+
+    risk <- rep(NA_real_, n_test)
+
+    if (!is.null(cox_fit)) {
+      candidate <- tryCatch(
+        as.numeric(predict(cox_fit, newdata = test_df, type = "lp")),
+        error = function(e) rep(NA_real_, n_test)
+      )
+
+      if (length(candidate) == n_test) {
+        candidate[!is.finite(candidate)] <- NA_real_
+        risk <- candidate
+      }
+    }
+
+    pred_scores[[paste0("CauseSpecificCox_Cause", cause)]] <- risk
   }
+
+  design_formula <- stats::reformulate(split$features)
+
+  X_train_fg <- tryCatch(model.matrix(design_formula, data = train_df), error = function(e) NULL)
+  X_test_fg <- tryCatch(model.matrix(design_formula, data = test_df), error = function(e) NULL)
+
+  if (!is.null(X_train_fg) && !is.null(X_test_fg)) {
+    if ("(Intercept)" %in% colnames(X_train_fg)) {
+      X_train_fg <- X_train_fg[, colnames(X_train_fg) != "(Intercept)", drop = FALSE]
+    }
+    if ("(Intercept)" %in% colnames(X_test_fg)) {
+      X_test_fg <- X_test_fg[, colnames(X_test_fg) != "(Intercept)", drop = FALSE]
+    }
+
+    common_cols <- intersect(colnames(X_train_fg), colnames(X_test_fg))
+    X_train_fg <- X_train_fg[, common_cols, drop = FALSE]
+    X_test_fg <- X_test_fg[, common_cols, drop = FALSE]
+  }
+
+  for (cause in causes) {
+    fg_fit <- NULL
+    risk <- rep(NA_real_, n_test)
+
+    valid_design <- !is.null(X_train_fg) && !is.null(X_test_fg) &&
+      ncol(X_train_fg) > 0 && ncol(X_train_fg) == ncol(X_test_fg) &&
+      all(is.finite(X_train_fg)) && all(is.finite(X_test_fg))
+
+    has_events <- sum(train_df$status == cause, na.rm = TRUE) > 0
+
+    if (valid_design && has_events) {
+      fg_fit <- tryCatch(
+        suppressWarnings(
+          cmprsk::crr(
+            ftime = train_df$time, fstatus = train_df$status,
+            cov1 = X_train_fg, failcode = cause, cencode = 0
+          )
+        ),
+        error = function(e) NULL
+      )
+    }
+
+    if (!is.null(fg_fit)) {
+      beta <- fg_fit$coef
+      if (length(beta) == ncol(X_test_fg) && all(is.finite(beta))) {
+        candidate <- tryCatch(
+          as.numeric(X_test_fg %*% beta),
+          error = function(e) rep(NA_real_, n_test)
+        )
+
+        if (length(candidate) == n_test) {
+          candidate[!is.finite(candidate)] <- NA_real_
+          risk <- candidate
+        }
+      }
+    }
+
+    pred_scores[[paste0("FineGray_Cause", cause)]] <- risk
+  }
+
+  pred_scores
 }
 
 # =============================================================
-# 8. Fit Classical Benchmarks (RSF, CSC, Fine-Gray)
+# 6. Evaluation Metrics
 # =============================================================
 
-# RSF
-rsf_train <- data.frame(
-  time = as.numeric(time_train),
-  status = factor(status_train, levels = c(0, 1, 2), labels = c("censored", "recurrence", "death")),
-  X_train_raw, check.names = TRUE
-)
-rsf_test <- data.frame(X_test_raw, check.names = TRUE)
+cause_cindex <- function(time, status, risk, cause) {
+  if (length(risk) != length(time) || length(status) != length(time)) {
+    return(NA_real_)
+  }
 
-set.seed(2026)
-rsf_model <- randomForestSRC::rfsrc(
-  Surv(time, status) ~ ., data = rsf_train,
-  ntree = 500, nodesize = 15, splitrule = "logrankCR", importance = TRUE
-)
-rsf_prediction <- predict(rsf_model, newdata = rsf_test)
-rsf_cif <- rsf_prediction$cif
-rsf_time_grid <- as.numeric(rsf_prediction$time.interest)
+  valid <- is.finite(time) & !is.na(status) & is.finite(risk)
+  if (sum(valid) < 2L) return(NA_real_)
 
-# CSC and Fine-Gray
-train_df <- data.frame(time = time_train, status = status_train, X_train_raw)
-test_df  <- data.frame(time = time_test, status = status_test, X_test_raw)
+  time_v <- time[valid]
+  status_v <- status[valid]
+  risk_v <- risk[valid]
 
-csc_models <- list()
-for (cause in 1:2) {
-  csc_data <- train_df
-  csc_data$event <- as.integer(csc_data$status == cause)
-  form <- as.formula(paste("Surv(time, event) ~", paste(features, collapse = " + ")))
-  csc_models[[cause]] <- survival::coxph(form, data = csc_data, x = TRUE)
-}
+  event <- as.integer(status_v == cause)
+  if (sum(event) == 0L || length(unique(risk_v)) < 2L) return(NA_real_)
 
-X_tr_fg <- model.matrix(reformulate(features), data = train_df)[, -1, drop = FALSE]
-X_te_fg <- model.matrix(reformulate(features), data = test_df)[, -1, drop = FALSE]
-fg_models <- list()
-for (cause in 1:2) {
-  fg_models[[cause]] <- tryCatch(
-    cmprsk::crr(ftime = train_df$time, fstatus = train_df$status, cov1 = X_tr_fg, failcode = cause, cencode = 0),
-    error = function(e) NULL
+  tryCatch(
+    as.numeric(survival::concordance(
+      survival::Surv(time_v, event) ~ risk_v, reverse = TRUE
+    )$concordance),
+    error = function(e) NA_real_
   )
 }
 
-classical_preds <- list()
-for (cause in 1:2) {
-  cox_lp <- tryCatch(as.numeric(predict(csc_models[[cause]], newdata = test_df, type = "lp")), error = function(e) rep(NA_real_, nrow(test_df)))
-  fg_lp  <- if (!is.null(fg_models[[cause]])) as.numeric(X_te_fg %*% fg_models[[cause]]$coef) else rep(NA_real_, nrow(test_df))
-  classical_preds[[paste0("CauseSpecificCox_Cause", cause)]] <- cox_lp
-  classical_preds[[paste0("FineGray_Cause", cause)]]          <- fg_lp
-}
+cause_auc <- function(time, status, risk, cause, horizon) {
+  if (length(risk) != length(time) || length(status) != length(time)) {
+    return(NA_real_)
+  }
 
-# =============================================================
-# 9. Evaluation Horizons & Metrics
-# =============================================================
+  valid <- is.finite(time) & !is.na(status) & is.finite(risk)
+  if (sum(valid) < 2L) return(NA_real_)
 
-candidate_horizons <- as.numeric(quantile(time_train, probs = evaluation_probs, na.rm = TRUE))
-candidate_horizons <- sort(unique(candidate_horizons))
+  delta <- as.integer(status[valid] == cause)
+  if (sum(delta == 1L) == 0L || sum(delta == 0L) == 0L) return(NA_real_)
 
-horizon_index <- vapply(candidate_horizons, function(h) {
-  idx <- which(time_breaks[-1] >= h)[1]
-  if (is.na(idx)) K else idx
-}, integer(1))
-
-rsf_horizon_index <- vapply(candidate_horizons, function(h) {
-  idx <- which(rsf_time_grid >= h)[1]
-  if (is.na(idx)) length(rsf_time_grid) else idx
-}, integer(1))
-
-safe_numeric <- function(x, default = NA_real_) {
-  if (length(x) == 0L || !is.finite(x[1])) return(default)
-  as.numeric(x[1])
-}
-
-cause_cindex_fn <- function(t_vec, s_vec, risk_vec, c_val) {
-  if (length(risk_vec) != length(t_vec) || !any(is.finite(risk_vec))) return(NA_real_)
-  event <- as.integer(s_vec == c_val)
-  if (sum(event) == 0L) return(NA_real_)
   tryCatch({
-    fit <- survival::concordance(survival::Surv(t_vec, event) ~ risk_vec, reverse = TRUE)
-    safe_numeric(fit$concordance)
+    roc <- timeROC::timeROC(
+      T = time[valid], delta = delta, marker = as.numeric(risk[valid]),
+      cause = 1, weighting = "marginal", times = horizon, iid = FALSE
+    )
+    idx <- which.min(abs(roc$times - horizon))
+    value <- as.numeric(roc$AUC[idx])
+    if (length(value) == 1L && is.finite(value)) value else NA_real_
   }, error = function(e) NA_real_)
 }
 
-compute_auc_fn <- function(t_vec, s_vec, risk_vec, c_val, h_val) {
-  if (length(risk_vec) != length(t_vec) || !any(is.finite(risk_vec))) return(NA_real_)
-  delta_binary <- as.integer(s_vec == c_val)
-  tryCatch({
-    roc <- timeROC::timeROC(T = t_vec, delta = delta_binary, marker = as.numeric(risk_vec), cause = 1, weighting = "marginal", times = h_val, iid = FALSE)
-    safe_numeric(roc$AUC[which.min(abs(roc$times - h_val))])
-  }, error = function(e) NA_real_)
-}
+ipcw_brier <- function(
+    time_train, status_train,
+    time_test, status_test,
+    risk, cause, horizon) {
 
-compute_brier_fn <- function(risk_vec, c_val, h_val) {
-  risk_vec <- pmin(1, pmax(0, as.numeric(risk_vec)))
-  censor_event <- as.integer(status_train == 0)
-  censor_fit <- tryCatch(survival::survfit(survival::Surv(time_train, censor_event) ~ 1), error = function(e) NULL)
+  if (length(risk) != length(time_test) || length(status_test) != length(time_test)) {
+    return(NA_real_)
+  }
+
+  censor_train <- as.integer(status_train == 0)
+
+  censor_fit <- tryCatch(
+    survival::survfit(survival::Surv(time_train, censor_train) ~ 1),
+    error = function(e) NULL
+  )
+
   if (is.null(censor_fit)) return(NA_real_)
 
   G_at <- function(t) {
-    s <- tryCatch(summary(censor_fit, times = t, extend = TRUE)$surv, error = function(e) numeric(0))
-    if (length(s) == 0L || !is.finite(s[1])) return(NA_real_)
-    max(s[1], 1e-6)
+    z <- tryCatch(
+      summary(censor_fit, times = t, extend = TRUE)$surv,
+      error = function(e) numeric(0)
+    )
+    if (!length(z) || !is.finite(z[1])) return(NA_real_)
+    max(z[1], 1e-6)
   }
 
-  G_h <- G_at(h_val)
+  G_h <- G_at(horizon)
   if (!is.finite(G_h)) return(NA_real_)
 
+  risk <- as.numeric(risk)
+
+  finite_risk <- risk[is.finite(risk)]
+  if (length(finite_risk) == 0L ||
+      any(finite_risk < -1e-8 | finite_risk > 1 + 1e-8)) {
+    return(NA_real_)
+  }
+  risk <- pmin(1, pmax(0, risk))
   score <- rep(NA_real_, length(time_test))
+
   for (i in seq_along(time_test)) {
-    if (time_test[i] <= h_val) {
-      if (status_test[i] == 0L) next
-      observed <- as.integer(status_test[i] == c_val)
+    if (!is.finite(time_test[i]) || is.na(status_test[i]) || !is.finite(risk[i])) next
+
+    r <- min(1, max(0, risk[i]))
+
+    if (time_test[i] <= horizon) {
+      if (status_test[i] == 0) next
+      observed <- as.integer(status_test[i] == cause)
       G_i <- G_at(time_test[i])
       if (!is.finite(G_i)) next
-      score[i] <- (observed - risk_vec[i])^2 / G_i
+      score[i] <- (observed - r)^2 / G_i
     } else {
-      score[i] <- risk_vec[i]^2 / G_h
+      score[i] <- r^2 / G_h
     }
   }
+
   if (all(is.na(score))) return(NA_real_)
   mean(score, na.rm = TRUE)
 }
 
 # =============================================================
-# 10. Bootstrap Resampling Evaluation (B = 200)
+# 7. Run Real Data Pipeline
 # =============================================================
 
-cat("\nExecuting Bootstrap Resampling (B =", B_BOOTSTRAP, ")...\n")
-boot_results_list <- list()
-n_test <- length(time_test)
+run_real_data_pipeline <- function() {
+  cat("\nLoading real-world competing risks dataset: 'follic'...\n")
+  real_data <- load_real_competing_risks_data("follic")
+  
+  data <- real_data$data
+  features <- real_data$features
 
-for (b in seq_len(B_BOOTSTRAP)) {
-  if (b %% 50 == 0) cat("Bootstrap replicate:", b, "/", B_BOOTSTRAP, "\n")
-  b_idx <- sample(seq_len(n_test), replace = TRUE)
-  
-  b_time   <- time_test[b_idx]
-  b_status <- status_test[b_idx]
-  
-  # Neural Models
-  for (m_name in names(prediction_objects)) {
-    cif_obj <- prediction_objects[[m_name]]
-    for (cause in 1:2) {
-      risk_mat <- if (cause == 1) cif_obj$cif1 else cif_obj$cif2
-      for (h in seq_along(candidate_horizons)) {
-        horizon <- candidate_horizons[h]
-        k <- horizon_index[h]
-        risk_b <- risk_mat[b_idx, k]
-        
-        boot_results_list[[length(boot_results_list) + 1L]] <- data.frame(
-          Bootstrap = b, Model = m_name, Cause = cause, Horizon = horizon,
-          Cindex = cause_cindex_fn(b_time, b_status, risk_b, cause),
-          TimeAUC = compute_auc_fn(b_time, b_status, risk_b, cause, horizon),
-          BrierScore = compute_brier_fn(prediction_objects[[m_name]][[if (cause == 1) "cif1" else "cif2"]][, k], cause, horizon)
-        )
+  split <- prepare_split(data, features = features, seed = MASTER_SEED, train_fraction = TRAIN_FRACTION)
+
+  breaks <- unique(as.numeric(quantile(
+    split$time_train,
+    probs = seq(0, 1, length.out = N_TIME_BINS + 1),
+    na.rm = TRUE, type = 8
+  )))
+
+  breaks <- sort(unique(c(0, breaks)))
+  K <- length(breaks) - 1L
+
+  targets <- make_discrete_targets(split$time_train, split$status_train, breaks)
+
+  horizons <- sort(unique(as.numeric(quantile(
+    split$time_train[split$status_train > 0], probs = EVALUATION_PROBS, na.rm = TRUE
+  ))))
+
+  output <- list()
+  row_id <- 1L
+
+  architectures <- c("MLP", "CNN", "LSTM", "CNN_LSTM")
+  copula_variants <- c("Standard", "Gaussian", "Clayton", "Gumbel")
+
+  # 1. Neural Network Fitting
+  for (arch in architectures) {
+    for (cop_p in copula_variants) {
+
+      model_label <- if (cop_p == "Standard") arch else paste0(arch, "_", cop_p)
+      cat("Fitting Neural Network:", model_label, "\n")
+
+      keras3::clear_session()
+
+      fitted <- tryCatch(
+        fit_nn(
+          arch, split$X_train, targets$y, targets$weights, K,
+          copula_penalty = cop_p, seed = MASTER_SEED + row_id
+        ),
+        error = function(e) NULL
+      )
+
+      nn_cif <- if (!is.null(fitted)) {
+        tryCatch(extract_cif(fitted$model, split$X_test, K), error = function(e) NULL)
+      } else {
+        NULL
+      }
+
+      for (cause in 1:2) {
+        for (horizon in horizons) {
+          k <- which(breaks[-1] >= horizon)[1]
+          if (is.na(k)) k <- K
+          k <- max(1L, min(K, k))
+
+          risk <- if (is.null(nn_cif)) {
+            rep(NA_real_, nrow(split$X_test))
+          } else if (cause == 1) {
+            nn_cif$cif1[, k]
+          } else {
+            nn_cif$cif2[, k]
+          }
+
+          output[[row_id]] <- data.frame(
+            Dataset = "Follicular_Lymphoma",
+            Model = model_label,
+            Cause = cause,
+            Horizon = horizon,
+            Cindex = cause_cindex(split$time_test, split$status_test, risk, cause),
+            TimeAUC = cause_auc(split$time_test, split$status_test, risk, cause, horizon),
+            BrierScore = ipcw_brier(
+              split$time_train, split$status_train,
+              split$time_test, split$status_test,
+              risk, cause, horizon
+            )
+          )
+          row_id <- row_id + 1L
+        }
       }
     }
   }
-  
-  # RSF
+
+  # 2. Random Survival Forest
+  cat("Fitting Random Survival Forest...\n")
+  rsf_train <- data.frame(
+    time = split$time_train,
+    status = factor(
+      split$status_train,
+      levels = c(0, 1, 2),
+      labels = c("censored", "relapse", "death")
+    ),
+    split$X_train_raw
+  )
+
+  rsf_test <- data.frame(split$X_test_raw)
+  rsf_cif <- NULL
+  rsf_times <- NULL
+
+  rsf_fit <- tryCatch({
+    set.seed(MASTER_SEED + 500)
+    rsf <- randomForestSRC::rfsrc(
+      Surv(time, status) ~ ., data = rsf_train,
+      ntree = 300, nodesize = 15, splitrule = "logrankCR"
+    )
+    pred <- predict(rsf, newdata = rsf_test)
+    list(cif = pred$cif, times = as.numeric(pred$time.interest))
+  }, error = function(e) NULL)
+
+  if (!is.null(rsf_fit)) {
+    rsf_cif <- rsf_fit$cif
+    rsf_times <- rsf_fit$times
+  }
+
   for (cause in 1:2) {
-    for (h in seq_along(candidate_horizons)) {
-      horizon <- candidate_horizons[h]
-      k_rsf <- rsf_horizon_index[h]
-      risk_b <- rsf_cif[b_idx, k_rsf, cause]
-      
-      boot_results_list[[length(boot_results_list) + 1L]] <- data.frame(
-        Bootstrap = b, Model = "Random_Survival_Forest", Cause = cause, Horizon = horizon,
-        Cindex = cause_cindex_fn(b_time, b_status, risk_b, cause),
-        TimeAUC = compute_auc_fn(b_time, b_status, risk_b, cause, horizon),
-        BrierScore = compute_brier_fn(rsf_cif[, k_rsf, cause], cause, horizon)
+    for (horizon in horizons) {
+      risk <- rep(NA_real_, nrow(split$X_test))
+
+      if (!is.null(rsf_cif) && length(rsf_times) > 0 &&
+          length(dim(rsf_cif)) == 3L && dim(rsf_cif)[1] == nrow(split$X_test) &&
+          dim(rsf_cif)[3] >= cause) {
+
+        k <- which(rsf_times >= horizon)[1]
+        if (is.na(k)) k <- length(rsf_times)
+        k <- max(1L, min(length(rsf_times), k))
+
+        risk <- tryCatch(as.numeric(rsf_cif[, k, cause]), error = function(e) risk)
+      }
+
+      output[[row_id]] <- data.frame(
+        Dataset = "Follicular_Lymphoma",
+        Model = "Random_Survival_Forest",
+        Cause = cause,
+        Horizon = horizon,
+        Cindex = cause_cindex(split$time_test, split$status_test, risk, cause),
+        TimeAUC = cause_auc(split$time_test, split$status_test, risk, cause, horizon),
+        BrierScore = ipcw_brier(
+          split$time_train, split$status_train,
+          split$time_test, split$status_test,
+          risk, cause, horizon
+        )
       )
+      row_id <- row_id + 1L
     }
   }
-  
-  # Classical Benchmarks
+
+  # 3. Classical Benchmarks (Cause-Specific Cox & Fine-Gray)
+  cat("Fitting Classical Survival Benchmarks (Cox & Fine-Gray)...\n")
+  classical_preds <- fit_classical_benchmarks(split)
+
   for (model_key in names(classical_preds)) {
-    cause <- as.integer(gsub(".*_Cause", "", model_key))
-    m_name <- gsub("_Cause[12]", "", model_key)
-    risk_b <- classical_preds[[model_key]][b_idx]
-    
-    for (h in seq_along(candidate_horizons)) {
-      horizon <- candidate_horizons[h]
-      boot_results_list[[length(boot_results_list) + 1L]] <- data.frame(
-        Bootstrap = b, Model = m_name, Cause = cause, Horizon = horizon,
-        Cindex = cause_cindex_fn(b_time, b_status, risk_b, cause),
-        TimeAUC = compute_auc_fn(b_time, b_status, risk_b, cause, horizon),
+    cause <- as.integer(sub(".*_Cause", "", model_key))
+    model_name <- sub("_Cause[12]$", "", model_key)
+    risk <- classical_preds[[model_key]]
+
+    for (horizon in horizons) {
+      output[[row_id]] <- data.frame(
+        Dataset = "Follicular_Lymphoma",
+        Model = model_name,
+        Cause = cause,
+        Horizon = horizon,
+        Cindex = cause_cindex(split$time_test, split$status_test, risk, cause),
+        TimeAUC = cause_auc(split$time_test, split$status_test, risk, cause, horizon),
         BrierScore = NA_real_
       )
+      row_id <- row_id + 1L
     }
   }
+
+  dplyr::bind_rows(output)
 }
 
-bootstrap_df <- dplyr::bind_rows(boot_results_list)
-write.csv(bootstrap_df, file.path(output_dir, "Rotterdam_Bootstrap_Replicates.csv"), row.names = FALSE)
+# Execute
+results <- run_real_data_pipeline()
+
+write.csv(
+  results,
+  file.path(OUTPUT_DIR, "Real_Data_Follic_Results.csv"),
+  row.names = FALSE,
+  na = ""
+)
 
 # =============================================================
-# 11. Final Rotterdam Summary Table (Mean + SD + 95% CI)
+# 8. Visualization of Results
 # =============================================================
 
-bootstrap_summary <- bootstrap_df %>%
-  group_by(Model, Cause, Horizon) %>%
-  summarise(
-    Cindex_Mean   = mean(Cindex, na.rm = TRUE),
-    Cindex_SD     = sd(Cindex, na.rm = TRUE),
-    Cindex_Lower = quantile(Cindex, 0.025, na.rm = TRUE),
-    Cindex_Upper = quantile(Cindex, 0.975, na.rm = TRUE),
-    
-    AUC_Mean   = mean(TimeAUC, na.rm = TRUE),
-    AUC_SD     = sd(TimeAUC, na.rm = TRUE),
-    AUC_Lower = quantile(TimeAUC, 0.025, na.rm = TRUE),
-    AUC_Upper = quantile(TimeAUC, 0.975, na.rm = TRUE),
-    
-    Brier_Mean   = mean(BrierScore, na.rm = TRUE),
-    Brier_SD     = sd(BrierScore, na.rm = TRUE),
-    Brier_Lower = quantile(BrierScore, 0.025, na.rm = TRUE),
-    Brier_Upper = quantile(BrierScore, 0.975, na.rm = TRUE),
-    .groups = "drop"
-  )
+p_cindex <- ggplot(
+  results,
+  aes(x = factor(round(Horizon, 2)), y = Cindex, color = Model, group = Model)
+) +
+  geom_line(linewidth = 0.7) +
+  geom_point(size = 2) +
+  facet_wrap(~ Cause, labeller = label_both) +
+  labs(
+    title = "Real Data Evaluation: Cause-Specific C-Index",
+    x = "Prediction Horizon (Years/Months)", y = "C-Index"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(legend.position = "bottom")
 
-print(bootstrap_summary, n = 60)
-write.csv(bootstrap_summary, file.path(output_dir, "Rotterdam_Summary_Mean_SD_CI.csv"), row.names = FALSE)
+ggsave(
+  filename = file.path(OUTPUT_DIR, "Real_Data_CIndex.png"),
+  plot = p_cindex, width = 10, height = 6, dpi = 300, bg = "white"
+)
 
-# =============================================================
-# 12. Publication Figures
-# =============================================================
-
-plot_df <- bootstrap_summary %>%
-  mutate(
-    Cause = factor(Cause, levels = c(1, 2), labels = c("Cause 1 (Recurrence)", "Cause 2 (Death)")),
-    Horizon = round(Horizon, 1)
-  )
-
-plot_fig <- function(df, metric_mean, metric_lower, metric_upper, y_label, filename) {
-  p <- ggplot(df, aes(x = factor(Horizon), y = .data[[metric_mean]], color = Model, group = Model, linetype = Model, shape = Model)) +
-    geom_line(linewidth = 0.7, na.rm = TRUE) +
-    geom_point(size = 2, na.rm = TRUE) +
-    geom_errorbar(aes(ymin = .data[[metric_lower]], ymax = .data[[metric_upper]]), width = 0.2, na.rm = TRUE) +
-    facet_wrap(~ Cause, scales = "free_y") +
-    labs(x = "Prediction horizon (days)", y = y_label, title = paste("Rotterdam Dataset:", y_label, "(95% CI)")) +
-    theme_bw(base_size = 11) +
-    theme(
-      legend.position = "bottom",
-      plot.title = element_text(face = "bold", hjust = 0.5),
-      axis.text.x = element_text(angle = 25, hjust = 1)
-    ) +
-    guides(color = guide_legend(nrow = 5))
-  
-  ggsave(file.path(output_dir, filename), plot = p, width = 12, height = 8, dpi = 300)
-  return(p)
-}
-
-p1 <- plot_fig(plot_df, "Cindex_Mean", "Cindex_Lower", "Cindex_Upper", "Concordance Index (C-index)", "Rotterdam_Figure1_Cindex.png")
-p2 <- plot_fig(plot_df, "AUC_Mean", "AUC_Lower", "AUC_Upper", "Time-Dependent AUC", "Rotterdam_Figure2_AUC.png")
-p3 <- plot_fig(filter(plot_df, is.finite(Brier_Mean)), "Brier_Mean", "Brier_Lower", "Brier_Upper", "IPCW Brier Score", "Rotterdam_Figure3_Brier.png")
-
-pdf(file.path(output_dir, "Rotterdam_Performance_Plots.pdf"), width = 12, height = 8, onefile = TRUE)
-print(p1)
-print(p2)
-print(p3)
-dev.off()
-
-cat("\nPipeline execution complete. All outputs saved in:\n", normalizePath(output_dir), "\n")
+cat(
+  "\nExecution completed on real data.",
+  "\nResults directory: ", normalizePath(OUTPUT_DIR), "\n"
+)

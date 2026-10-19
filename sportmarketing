@@ -43,7 +43,7 @@ T_TIMESTEPS      <- 25       # Dynamic time horizons per fan
 P_COVARIATES     <- 15       # Number of time-varying covariates
 LOOKBACK         <- 5        # Temporal lookback window (L)
 
-MC_REPLICATIONS  <- 10       # Set >= 50 for final production Monte Carlo runs
+MC_REPLICATIONS  <- 100       
 TRAIN_PROP       <- 0.70
 VALID_PROP       <- 0.15
 TEST_PROP        <- 0.15

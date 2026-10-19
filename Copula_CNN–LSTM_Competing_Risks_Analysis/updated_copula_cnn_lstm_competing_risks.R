@@ -638,6 +638,15 @@ ipcw_brier <- function(
   if (!is.finite(G_h)) return(NA_real_)
 
   risk <- as.numeric(risk)
+
+  # IPCW Brier scores require predicted event probabilities/CIFs on [0, 1].
+  # Do not clamp arbitrary linear predictors into probabilities.
+  finite_risk <- risk[is.finite(risk)]
+  if (length(finite_risk) == 0L ||
+      any(finite_risk < -1e-8 | finite_risk > 1 + 1e-8)) {
+    return(NA_real_)
+  }
+  risk <- pmin(1, pmax(0, risk))
   score <- rep(NA_real_, length(time_test))
 
   for (i in seq_along(time_test)) {
@@ -838,6 +847,9 @@ run_one_experiment <- function(replication, copula_name) {
         Horizon = horizon,
         Cindex = cause_cindex(split$time_test, split$status_test, risk, cause),
         TimeAUC = cause_auc(split$time_test, split$status_test, risk, cause, horizon),
+        # Cox/Fine-Gray currently provide relative-risk scores in this block,
+        # not CIF probabilities. Brier is intentionally NA rather than
+        # incorrectly treating a linear predictor as a probability.
         BrierScore = NA_real_
       )
       row_id <- row_id + 1L
@@ -854,29 +866,70 @@ run_one_experiment <- function(replication, copula_name) {
 scenarios <- c("Independence", "Gaussian", "Clayton", "Gumbel")
 all_results <- list()
 result_id <- 1L
+replication_log <- list()
+log_id <- 1L
 
 for (scenario in scenarios) {
   for (replication in seq_len(N_REPLICATIONS)) {
+    cat("\nStarting scenario =", scenario, "| replication =", replication, "\n")
+
+    error_message <- NA_character_
     res_df <- tryCatch(
       run_one_experiment(replication, scenario),
-      error = function(e) NULL
+      error = function(e) {
+        error_message <<- conditionMessage(e)
+        NULL
+      }
     )
 
-    if (!is.null(res_df)) {
+    succeeded <- !is.null(res_df) && nrow(res_df) > 0L
+    replication_log[[log_id]] <- data.frame(
+      Scenario = scenario,
+      Replication = replication,
+      Succeeded = succeeded,
+      Error = if (is.na(error_message)) "" else error_message,
+      stringsAsFactors = FALSE
+    )
+    log_id <- log_id + 1L
+
+    if (succeeded) {
       all_results[[result_id]] <- res_df
       result_id <- result_id + 1L
 
       write.csv(
         res_df,
         file.path(OUTPUT_DIR, paste0("results_", scenario, "_replication_", replication, ".csv")),
-        row.names = FALSE
+        row.names = FALSE,
+        na = ""
+      )
+    } else {
+      warning(
+        "Replication failed: scenario=", scenario,
+        ", replication=", replication,
+        ". Error: ", ifelse(is.na(error_message), "no rows returned", error_message)
       )
     }
+
+    write.csv(
+      dplyr::bind_rows(replication_log),
+      file.path(OUTPUT_DIR, "Replication_Run_Log.csv"),
+      row.names = FALSE,
+      na = ""
+    )
   }
 }
 
 if (length(all_results) == 0L) {
-  stop("No successful simulation replications.")
+  stop("No successful simulation replications. Inspect Replication_Run_Log.csv.")
+}
+
+if (length(all_results) < length(scenarios) * N_REPLICATIONS) {
+  warning(
+    "Only ", length(all_results), " of ",
+    length(scenarios) * N_REPLICATIONS,
+    " scenario-replications succeeded. Inspect Replication_Run_Log.csv ",
+    "before interpreting Monte Carlo summaries."
+  )
 }
 
 results <- dplyr::bind_rows(all_results)
@@ -884,38 +937,138 @@ results <- dplyr::bind_rows(all_results)
 write.csv(
   results,
   file.path(OUTPUT_DIR, "All_Replication_Results.csv"),
-  row.names = FALSE
+  row.names = FALSE,
+  na = ""
 )
 
 # =============================================================
-# 9. Repeated-Simulation Summary
+# 9. Repeated-Simulation Summary and Completeness Checks
 # =============================================================
+
+# One row per independent replication/model/cause/horizon is the unit
+# used to calculate Monte Carlo means, SDs, and MCSEs.
+metric_summary <- function(x) {
+  x <- x[is.finite(x)]
+  n <- length(x)
+  mean_x <- if (n >= 1L) mean(x) else NA_real_
+  sd_x <- if (n >= 2L) stats::sd(x) else NA_real_
+  mcse_x <- if (n >= 2L) sd_x / sqrt(n) else NA_real_
+  c(N_valid = n, Mean = mean_x, SD = sd_x, MCSE = mcse_x)
+}
 
 summary_results <- results |>
   dplyr::group_by(Scenario, Model, Cause, Horizon) |>
   dplyr::summarise(
-    N_valid_Cindex = sum(is.finite(Cindex)),
-    Mean_Cindex = if (any(is.finite(Cindex))) mean(Cindex, na.rm = TRUE) else NA_real_,
-    SD_Cindex = if (sum(is.finite(Cindex)) > 1) sd(Cindex, na.rm = TRUE) else NA_real_,
-    MCSE_Cindex = SD_Cindex / sqrt(pmax(1, N_valid_Cindex)),
-
-    N_valid_AUC = sum(is.finite(TimeAUC)),
-    Mean_AUC = if (any(is.finite(TimeAUC))) mean(TimeAUC, na.rm = TRUE) else NA_real_,
-    SD_AUC = if (sum(is.finite(TimeAUC)) > 1) sd(TimeAUC, na.rm = TRUE) else NA_real_,
-    MCSE_AUC = SD_AUC / sqrt(pmax(1, N_valid_AUC)),
-
-    N_valid_Brier = sum(is.finite(BrierScore)),
-    Mean_Brier = if (any(is.finite(BrierScore))) mean(BrierScore, na.rm = TRUE) else NA_real_,
-    SD_Brier = if (sum(is.finite(BrierScore)) > 1) sd(BrierScore, na.rm = TRUE) else NA_real_,
-    MCSE_Brier = SD_Brier / sqrt(pmax(1, N_valid_Brier)),
-
+    Cindex_stats = list(metric_summary(Cindex)),
+    AUC_stats = list(metric_summary(TimeAUC)),
+    Brier_stats = list(metric_summary(BrierScore)),
+    N_replications_recorded = dplyr::n_distinct(Replication),
     .groups = "drop"
+  ) |>
+  dplyr::rowwise() |>
+  dplyr::mutate(
+    N_valid_Cindex = unname(Cindex_stats["N_valid"]),
+    Mean_Cindex = unname(Cindex_stats["Mean"]),
+    SD_Cindex = unname(Cindex_stats["SD"]),
+    MCSE_Cindex = unname(Cindex_stats["MCSE"]),
+    N_valid_AUC = unname(AUC_stats["N_valid"]),
+    Mean_AUC = unname(AUC_stats["Mean"]),
+    SD_AUC = unname(AUC_stats["SD"]),
+    MCSE_AUC = unname(AUC_stats["MCSE"]),
+    N_valid_Brier = unname(Brier_stats["N_valid"]),
+    Mean_Brier = unname(Brier_stats["Mean"]),
+    SD_Brier = unname(Brier_stats["SD"]),
+    MCSE_Brier = unname(Brier_stats["MCSE"])
+  ) |>
+  dplyr::ungroup() |>
+  dplyr::select(
+    Scenario, Model, Cause, Horizon, N_replications_recorded,
+    N_valid_Cindex, Mean_Cindex, SD_Cindex, MCSE_Cindex,
+    N_valid_AUC, Mean_AUC, SD_AUC, MCSE_AUC,
+    N_valid_Brier, Mean_Brier, SD_Brier, MCSE_Brier
   )
 
 write.csv(
   summary_results,
   file.path(OUTPUT_DIR, "Repeated_Simulation_Summary.csv"),
-  row.names = FALSE
+  row.names = FALSE,
+  na = ""
+)
+
+# Report each expected cell even when a model/cause/horizon has no valid
+# metric estimates. This prevents failed models from disappearing silently.
+expected_models <- c(
+  "MLP", "MLP_Gaussian", "MLP_Clayton", "MLP_Gumbel",
+  "CNN", "CNN_Gaussian", "CNN_Clayton", "CNN_Gumbel",
+  "LSTM", "LSTM_Gaussian", "LSTM_Clayton", "LSTM_Gumbel",
+  "CNN_LSTM", "CNN_LSTM_Gaussian", "CNN_LSTM_Clayton", "CNN_LSTM_Gumbel",
+  "Random_Survival_Forest", "CauseSpecificCox", "FineGray"
+)
+
+expected_grid <- expand.grid(
+  Scenario = scenarios,
+  Model = expected_models,
+  Cause = 1:2,
+  stringsAsFactors = FALSE
+)
+
+expected_grid$Horizon <- NA_real_
+expected_grid$N_replications_recorded <- 0L
+expected_grid$N_valid_Cindex <- 0L
+expected_grid$N_valid_AUC <- 0L
+expected_grid$N_valid_Brier <- 0L
+
+# Model-level diagnostic: metric availability and replication coverage.
+failure_summary <- results |>
+  dplyr::group_by(Scenario, Model, Cause) |>
+  dplyr::summarise(
+    Rows_recorded = dplyr::n(),
+    Replications_recorded = dplyr::n_distinct(Replication),
+    Failed_Cindex = sum(!is.finite(Cindex)),
+    Failed_AUC = sum(!is.finite(TimeAUC)),
+    Failed_Brier = sum(!is.finite(BrierScore)),
+    Valid_Cindex = sum(is.finite(Cindex)),
+    Valid_AUC = sum(is.finite(TimeAUC)),
+    Valid_Brier = sum(is.finite(BrierScore)),
+    .groups = "drop"
+  ) |>
+  dplyr::mutate(
+    Expected_replications = N_REPLICATIONS,
+    Missing_replications = pmax(0L, Expected_replications - Replications_recorded)
+  )
+
+write.csv(
+  failure_summary,
+  file.path(OUTPUT_DIR, "Model_Failure_Diagnostics.csv"),
+  row.names = FALSE,
+  na = ""
+)
+
+# Save a compact scenario/model/cause aggregate for descriptive inspection.
+# These averages pool horizons and therefore are not the primary inferential table.
+overall_summary <- results |>
+  dplyr::group_by(Scenario, Model, Cause) |>
+  dplyr::summarise(
+    N_valid_Cindex = sum(is.finite(Cindex)),
+    Mean_Cindex = if (any(is.finite(Cindex))) mean(Cindex, na.rm = TRUE) else NA_real_,
+    SD_Cindex = if (sum(is.finite(Cindex)) > 1L) sd(Cindex, na.rm = TRUE) else NA_real_,
+    MCSE_Cindex = if (sum(is.finite(Cindex)) > 1L) SD_Cindex / sqrt(N_valid_Cindex) else NA_real_,
+    N_valid_AUC = sum(is.finite(TimeAUC)),
+    Mean_AUC = if (any(is.finite(TimeAUC))) mean(TimeAUC, na.rm = TRUE) else NA_real_,
+    SD_AUC = if (sum(is.finite(TimeAUC)) > 1L) sd(TimeAUC, na.rm = TRUE) else NA_real_,
+    MCSE_AUC = if (sum(is.finite(TimeAUC)) > 1L) SD_AUC / sqrt(N_valid_AUC) else NA_real_,
+    N_valid_Brier = sum(is.finite(BrierScore)),
+    Mean_Brier = if (any(is.finite(BrierScore))) mean(BrierScore, na.rm = TRUE) else NA_real_,
+    SD_Brier = if (sum(is.finite(BrierScore)) > 1L) sd(BrierScore, na.rm = TRUE) else NA_real_,
+    MCSE_Brier = if (sum(is.finite(BrierScore)) > 1L) SD_Brier / sqrt(N_valid_Brier) else NA_real_,
+    .groups = "drop"
+  )
+
+write.csv(
+  overall_summary,
+  file.path(OUTPUT_DIR, "Descriptive_Scenario_Model_Summary.csv"),
+  row.names = FALSE,
+  na = ""
 )
 
 # =============================================================
@@ -973,24 +1126,8 @@ print(p_brier)
 dev.off()
 
 # =============================================================
-# 11. Diagnostics
+# 11. Completion Report
 # =============================================================
-
-failure_summary <- results |>
-  dplyr::group_by(Scenario, Model, Cause) |>
-  dplyr::summarise(
-    Total_results = dplyr::n(),
-    Failed_Cindex = sum(!is.finite(Cindex)),
-    Failed_AUC = sum(!is.finite(TimeAUC)),
-    Failed_Brier = sum(!is.finite(BrierScore)),
-    .groups = "drop"
-  )
-
-write.csv(
-  failure_summary,
-  file.path(OUTPUT_DIR, "Model_Failure_Diagnostics.csv"),
-  row.names = FALSE
-)
 
 cat(
   "\nSimulation completed.",

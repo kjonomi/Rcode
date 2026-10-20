@@ -1,4 +1,4 @@
-###############################################################
+###############################################################################
 # Simulated Competing-Risks Benchmark Strategy
 # Copula-Dependent Events and Non-informative Censoring
 #
@@ -8,7 +8,7 @@
 #   Random Survival Forest
 #   Cause-Specific Cox
 #   Fine-Gray
-###############################################################
+###############################################################################
 
 Sys.setenv(CUDA_VISIBLE_DEVICES = "-1")
 
@@ -640,7 +640,6 @@ ipcw_brier <- function(
   risk <- as.numeric(risk)
 
   # IPCW Brier scores require predicted event probabilities/CIFs on [0, 1].
-  # Do not clamp arbitrary linear predictors into probabilities.
   finite_risk <- risk[is.finite(risk)]
   if (length(finite_risk) == 0L ||
       any(finite_risk < -1e-8 | finite_risk > 1 + 1e-8)) {
@@ -847,9 +846,6 @@ run_one_experiment <- function(replication, copula_name) {
         Horizon = horizon,
         Cindex = cause_cindex(split$time_test, split$status_test, risk, cause),
         TimeAUC = cause_auc(split$time_test, split$status_test, risk, cause, horizon),
-        # Cox/Fine-Gray currently provide relative-risk scores in this block,
-        # not CIF probabilities. Brier is intentionally NA rather than
-        # incorrectly treating a linear predictor as a probability.
         BrierScore = NA_real_
       )
       row_id <- row_id + 1L
@@ -945,8 +941,6 @@ write.csv(
 # 9. Repeated-Simulation Summary and Completeness Checks
 # =============================================================
 
-# One row per independent replication/model/cause/horizon is the unit
-# used to calculate Monte Carlo means, SDs, and MCSEs.
 metric_summary <- function(x) {
   x <- x[is.finite(x)]
   n <- length(x)
@@ -995,30 +989,6 @@ write.csv(
   na = ""
 )
 
-# Report each expected cell even when a model/cause/horizon has no valid
-# metric estimates. This prevents failed models from disappearing silently.
-expected_models <- c(
-  "MLP", "MLP_Gaussian", "MLP_Clayton", "MLP_Gumbel",
-  "CNN", "CNN_Gaussian", "CNN_Clayton", "CNN_Gumbel",
-  "LSTM", "LSTM_Gaussian", "LSTM_Clayton", "LSTM_Gumbel",
-  "CNN_LSTM", "CNN_LSTM_Gaussian", "CNN_LSTM_Clayton", "CNN_LSTM_Gumbel",
-  "Random_Survival_Forest", "CauseSpecificCox", "FineGray"
-)
-
-expected_grid <- expand.grid(
-  Scenario = scenarios,
-  Model = expected_models,
-  Cause = 1:2,
-  stringsAsFactors = FALSE
-)
-
-expected_grid$Horizon <- NA_real_
-expected_grid$N_replications_recorded <- 0L
-expected_grid$N_valid_Cindex <- 0L
-expected_grid$N_valid_AUC <- 0L
-expected_grid$N_valid_Brier <- 0L
-
-# Model-level diagnostic: metric availability and replication coverage.
 failure_summary <- results |>
   dplyr::group_by(Scenario, Model, Cause) |>
   dplyr::summarise(
@@ -1044,8 +1014,6 @@ write.csv(
   na = ""
 )
 
-# Save a compact scenario/model/cause aggregate for descriptive inspection.
-# These averages pool horizons and therefore are not the primary inferential table.
 overall_summary <- results |>
   dplyr::group_by(Scenario, Model, Cause) |>
   dplyr::summarise(
@@ -1076,62 +1044,45 @@ write.csv(
 # =============================================================
 
 plot_sim_metric <- function(data, metric, y_label, filename) {
-  p <- ggplot(
-    data,
-    aes(
-      x = Horizon, y = .data[[metric]],
-      color = Model, linetype = Model, shape = Model, group = Model
+  plot_data <- data |>
+    dplyr::filter(is.finite(.data[[metric]]))
+
+  p <- ggplot2::ggplot(
+    plot_data,
+    ggplot2::aes(
+      x = factor(round(Horizon, 2)),
+      y = .data[[metric]],
+      color = Model,
+      group = Model
     )
   ) +
-    geom_line(linewidth = 0.7, na.rm = TRUE) +
-    geom_point(size = 2, na.rm = TRUE) +
-    facet_grid(Scenario ~ Cause, scales = "free_y") +
-    labs(
-      x = "Prediction horizon", y = y_label,
-      color = "Model", linetype = "Model", shape = "Model"
+    ggplot2::stat_summary(fun = mean, geom = "line", linewidth = 0.8) +
+    ggplot2::stat_summary(fun = mean, geom = "point", size = 2) +
+    ggplot2::facet_grid(Scenario ~ Cause, labeller = ggplot2::label_both) +
+    ggplot2::labs(
+      x = "Evaluation Horizon",
+      y = y_label,
+      title = paste("Simulation Performance:", y_label),
+      color = "Model"
     ) +
-    theme_bw(base_size = 10) +
-    theme(
+    ggplot2::theme_bw(base_size = 11) +
+    ggplot2::theme(
       legend.position = "bottom",
-      axis.text.x = element_text(angle = 30, hjust = 1),
-      strip.text = element_text(face = "bold"),
-      panel.grid.minor = element_blank()
-    ) +
-    guides(color = guide_legend(nrow = 5))
+      axis.text.x = ggplot2::element_text(angle = 45, hjust = 1)
+    )
 
-  ggsave(
+  ggplot2::ggsave(
     filename = file.path(OUTPUT_DIR, filename),
-    plot = p, width = 12, height = 9, dpi = 300, bg = "white"
+    plot = p,
+    width = 12,
+    height = 8,
+    dpi = 300
   )
-
-  p
 }
 
-p_cindex <- plot_sim_metric(summary_results, "Mean_Cindex", "Mean Cause-Specific C-index", "Repeated_Cindex.png")
-p_auc <- plot_sim_metric(summary_results, "Mean_AUC", "Mean Time-Dependent AUC", "Repeated_Time_AUC.png")
-p_brier <- plot_sim_metric(
-  dplyr::filter(summary_results, is.finite(Mean_Brier)),
-  "Mean_Brier", "Mean IPCW Brier Score", "Repeated_IPCW_Brier.png"
-)
+# Generate and save plots for all three evaluation metrics
+plot_sim_metric(summary_results, "Mean_Cindex", "Mean C-Index", "cindex_by_horizon.png")
+plot_sim_metric(summary_results, "Mean_AUC", "Mean Time-Dependent AUC", "auc_by_horizon.png")
+plot_sim_metric(summary_results, "Mean_Brier", "Mean IPCW Brier Score", "brier_by_horizon.png")
 
-pdf(
-  file.path(OUTPUT_DIR, "Repeated_Simulation_Performance.pdf"),
-  width = 12, height = 9, onefile = TRUE
-)
-
-print(p_cindex)
-print(p_auc)
-print(p_brier)
-
-dev.off()
-
-# =============================================================
-# 11. Completion Report
-# =============================================================
-
-cat(
-  "\nSimulation completed.",
-  "\nResults directory: ", normalizePath(OUTPUT_DIR),
-  "\nSuccessful replication outputs: ", length(all_results),
-  "\nTotal expected replications: ", length(scenarios) * N_REPLICATIONS, "\n"
-)
+cat("\nExecution completed successfully! Results saved to directory:", OUTPUT_DIR, "\n")

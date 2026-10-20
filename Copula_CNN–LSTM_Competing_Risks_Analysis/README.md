@@ -1,229 +1,188 @@
-
-# Rotterdam Breast Cancer Dataset: Copula CNN–LSTM Competing Risks Analysis
-
 ## Overview
 
-This project implements an R-based analysis pipeline for the Rotterdam breast cancer dataset. It compares three copula-regularized CNN–LSTM models—Gaussian, Clayton, and Gumbel—with a Random Survival Forest (RSF) benchmark.
+This project benchmarks neural-network approaches and classical survival-analysis methods for **competing-risks prediction** using the publicly available `mgus2` dataset from the R `survival` package.
 
-The pipeline includes data preprocessing, model training, test-set evaluation, bootstrap analysis, performance visualization, and CSV export.
+The analysis models two mutually exclusive event types:
 
-**Important methodological limitation:** The current neural-network loss uses binary cause indicators and does not incorporate observed follow-up time or censoring. Consequently, the network outputs should not be interpreted as fully calibrated time-dependent competing-risk probabilities without further methodological development.
+- **Cause 1 — Progression:** progression to plasma cell malignancy (PCM).
+- **Cause 2 — Death without progression:** death before observed progression.
+- **Status 0 — Right-censored:** neither event is observed during follow-up.
 
-## Research Objectives
+The experiment compares four neural-network architectures with standard and copula-inspired loss penalties, a random survival forest, cause-specific Cox models, and Fine–Gray subdistribution-hazard models. Models are evaluated over repeated train/test splits using cause-specific concordance, time-dependent AUC, and an IPCW Brier-score estimate where implemented.
 
-- Develop copula-regularized CNN–LSTM models for analyzing two event categories.
-- Compare Gaussian, Clayton, and Gumbel copula-inspired regularization.
-- Benchmark the neural networks against a Random Survival Forest.
-- Evaluate discrimination and prediction error.
-- Quantify test-set metric variability using bootstrap resampling.
-- Generate reproducible tables and figures for research reporting.
+> **Methodological note:** The Gaussian, Clayton, and Gumbel options in this script add penalty terms to the neural-network loss. They should be described as *copula-inspired loss penalties*, not as fully estimated copula models, unless the copula parameters and likelihood construction are separately justified and validated. The penalty parameters are fixed in the supplied code.
 
-## Dataset
+## Dataset and variables
 
-The analysis uses the `rotterdam` dataset distributed with the R package `survival`.
+The script loads `mgus2` directly from `survival`; no external data download is required.
 
-```r
-data(rotterdam, package = "survival")
-```
-
-### Event definitions
-
-The script constructs the following status variable:
-
-| Status | Definition |
+| Variable | Description |
 |---|---|
-| 0 | Neither event recorded under the script's coding rule |
-| 1 | Recurrence (`recur == 1`) |
-| 2 | Death without recorded recurrence (`recur == 0` and `death == 1`) |
+| `time` | Progression time for subjects with progression; otherwise death/follow-up time |
+| `status` | `0` = censored, `1` = progression, `2` = death without progression |
+| `age` | Age |
+| `sex` | Sex, recoded as a binary indicator (`m` = 1, otherwise 0) |
+| `hgb` | Hemoglobin |
+| `creat` | Creatinine |
+| `mspike` | M-spike measurement |
 
-The follow-up time is stored in `rtime`.
+The analysis retains observations with a positive, non-missing follow-up time and uses the five listed covariates. Missing or non-finite predictor values are imputed using training-set medians. Predictors are then standardized using training-set means and standard deviations, which are applied to the test set.
 
-### Predictors
+## Methods compared
 
-Nine variables are used:
+### Neural networks
 
-- `age`
-- `meno`
-- `size`
-- `grade`
-- `nodes`
-- `pgr`
-- `er`
-- `hormon`
-- `chemo`
+Four architectures are fitted:
 
-## Methodology
+- **MLP** — multilayer perceptron.
+- **CNN** — one-dimensional convolutional network.
+- **LSTM** — long short-term memory network.
+- **CNN-LSTM** — convolutional layer followed by an LSTM.
 
-### 1. Data preprocessing
+Each architecture is paired with four loss options:
 
-The pipeline performs the following operations:
+| Loss option | Description in the script |
+|---|---|
+| `Standard` | Categorical cross-entropy |
+| `Gaussian` | Cross-entropy plus a Gaussian-style dependence penalty |
+| `Clayton` | Cross-entropy plus a Clayton-inspired penalty |
+| `Gumbel` | Cross-entropy plus a Gumbel-inspired penalty |
 
-1. Constructs the event-status variable.
-2. Extracts predictors, follow-up time, and event status.
-3. Converts factor predictors to numeric category codes.
-4. Imputes missing predictor values using column medians.
-5. Creates a reproducible 70/30 training/test split using seed `2026`.
-6. Standardizes predictors using training-set means and standard deviations.
-7. Reshapes the predictors into three-dimensional arrays for CNN–LSTM input.
+This gives up to 16 neural-network configurations. The network predicts interval-specific probabilities for remaining event-free during an interval, progression, and death without progression. These probabilities are combined recursively to estimate cause-specific cumulative incidence functions (CIFs).
 
-**Recommended improvement:** Median imputation currently occurs before the train/test split. For rigorous evaluation, estimate imputation values and encoding rules using the training data only, then apply those same transformations to the test data.
+The supplied architecture reshapes the covariate representation into a small sequence for CNN/LSTM layers. This is a modeling choice rather than a naturally observed time series; interpret the CNN/LSTM results accordingly.
 
-### 2. Copula CNN–LSTM models
+### Classical benchmarks
 
-Each network consists of:
+- **Random Survival Forest (RSF):** `randomForestSRC::rfsrc()` with the `logrankCR` split rule.
+- **Cause-specific Cox:** one Cox model per cause, treating competing events as non-events for the cause-specific hazard model.
+- **Fine–Gray:** one subdistribution-hazard model per cause using `cmprsk::crr()`.
 
-1. A one-dimensional convolutional layer with 32 filters.
-2. Batch normalization.
-3. Dropout with rate 0.25.
-4. An LSTM layer with 64 units.
-5. A dense layer with 32 ReLU units.
-6. A second dropout layer.
-7. Two sigmoid outputs representing the two cause indicators.
+The classical models are fit separately within each training split.
 
-The training configuration is:
+## Evaluation design
 
-| Parameter | Value |
+Default configuration in the supplied R script:
+
+| Setting | Value |
 |---|---:|
-| Maximum epochs | 100 |
-| Batch size | 64 |
-| Learning rate | 0.001 |
-| Copula penalty weight | 0.1 |
-| Validation fraction | 20% of training data |
-| Early-stopping patience | 10 epochs |
-| Learning-rate reduction patience | 5 epochs |
-| Minimum learning rate | 0.000001 |
+| Master seed | `20261014` |
+| Replications | `10` |
+| Nominal time bins | `15` |
+| Training fraction | `0.70` |
+| Neural-network epochs | `60` |
+| Batch size | `64` |
+| Adam learning rate | `0.001` |
+| Copula-penalty multiplier | `0.001` |
+| Evaluation-time quantiles | `0.25`, `0.50`, `0.75` |
+| RSF trees | `300` |
+| RSF nodesize | `15` |
+| Device configuration | CPU requested |
 
-The loss is defined as
+For replication \(r\), the split seed is `MASTER_SEED + r * 1000`. Time-bin cut points are calculated from the training follow-up times. Neural networks use a 20% validation subset from the training data, early stopping, and learning-rate reduction on plateau.
 
-\[
-L = L_{\mathrm{BCE}}+
-\lambda_{\mathrm{copula}}P_{\mathrm{copula}},
-\]
+The nominal `N_TIME_BINS` value is used to construct quantile probabilities; duplicate quantile cut points are removed. Therefore, the effective number of intervals can be smaller than 15.
 
-where \(L_{\mathrm{BCE}}\) is binary cross-entropy and the copula penalty weight is 0.1.
+### Metrics
 
-Three models are trained:
+- **C-index:** cause-specific discrimination based on a binary indicator for the target cause.
+- **Time-dependent AUC:** calculated with `timeROC` at each evaluation horizon.
+- **IPCW Brier score:** an inverse-probability-of-censoring-weighted prediction-error estimate, implemented for the neural-network and RSF predictions.
 
-- **Gaussian copula:** logit-based quadratic penalty with dependence parameter 0.8.
-- **Clayton copula:** Clayton-inspired penalty with parameter 3.
-- **Gumbel copula:** Gumbel-inspired penalty with parameter 4.
+The evaluation horizons are the 25th, 50th, and 75th percentiles of the training follow-up times for each replication. Because these horizons can differ across replications, summary rows grouped by the numeric horizon may not represent exactly the same follow-up time across all splits.
 
-The parameters are fixed in the supplied implementation. The penalty formulas should be mathematically validated before being interpreted as copula likelihoods or principled dependence measures.
+## Requirements
 
-### 3. Random Survival Forest
-
-The RSF benchmark uses `randomForestSRC::rfsrc()` with the following settings:
-
-- 500 trees.
-- Node size of 15.
-- Competing-risk log-rank splitting.
-- Variable importance enabled.
-
-The script extracts the estimated cumulative incidence values at the final prediction time for both causes.
-
-Because the neural networks produce binary cause-indicator scores while the RSF produces cumulative incidence estimates, the predictions do not necessarily represent the same statistical quantity.
-
-### 4. Performance evaluation
-
-The script reports:
-
-- **C-index:** concordance-based discrimination.
-- **AUC:** mean AUC at the 25th, 50th, and 75th percentiles of test follow-up time.
-- **Brier-style score:** mean squared error between the binary cause indicator and the model score.
-
-Higher C-index and AUC values generally indicate better discrimination. Lower squared-error scores indicate better agreement with the binary labels under the implemented calculation.
-
-**Metric limitation:** The current `IBS` calculation is a simple binary squared-error summary, not a conventional integrated Brier score. The AUC and concordance calculations also require careful treatment of censoring and competing events before they can support formal survival-prediction claims.
-
-### 5. Bootstrap evaluation
-
-The script performs 200 bootstrap replicates of the test set using seed `2026`.
-
-For each replicate, it recalculates the evaluation metrics for every model and cause. It then summarizes the bootstrap distributions using:
-
-- Mean.
-- Standard deviation.
-- 95% percentile interval.
-
-These intervals quantify variability conditional on the fitted models and observed test set. They do not capture the uncertainty associated with retraining the models on new training samples.
-
-## Required R packages
-
-Install the required packages with:
+R packages used by the script:
 
 ```r
-install.packages(c(
+required_packages <- c(
   "survival",
   "randomForestSRC",
   "timeROC",
-  "survcomp",
+  "cmprsk",
   "dplyr",
   "tidyr",
   "ggplot2",
-  "keras3"
-))
+  "keras3",
+  "tensorflow",
+  "MASS"
+)
 ```
 
-The CNN–LSTM implementation also requires a working TensorFlow backend compatible with the installed `keras3` version. Confirm that the TensorFlow interface referenced as `tf` is available in the R session.
+Install missing packages from CRAN as needed:
+
+```r
+install.packages(c(
+  "survival", "randomForestSRC", "timeROC", "cmprsk",
+  "dplyr", "tidyr", "ggplot2", "MASS"
+))
+install.packages("keras3")
+install.packages("tensorflow")
+```
+
+The `keras3` and `tensorflow` packages may require additional TensorFlow/Keras setup for the local R environment. Consult their installation instructions if model initialization fails. The script requests CPU execution by setting `CUDA_VISIBLE_DEVICES=-1`.
 
 ## Running the analysis
 
-1. Install the required R packages.
-2. Configure the TensorFlow backend.
-3. Save the analysis script as `rotterdam_copula_cnn_lstm.R`.
-4. Set the working directory to the desired output directory.
-5. Run:
+1. Save the analysis script (for example, as `run_public_competing_risks.R`).
+2. Install and configure the required R packages.
+3. Run the script from the project directory:
 
 ```r
-source("rotterdam_copula_cnn_lstm.R")
+source("run_public_competing_risks.R")
 ```
 
-The script fits the models, evaluates their predictions, performs bootstrap resampling, generates figures, and exports the results.
+The script loads `survival::mgus2`, runs the repeated benchmark experiment, and writes results to `Public_Data_Competing_Risks_Results/`.
 
-## Generated outputs
+## Output files
 
-| File | Description |
+The script is designed to produce:
+
+| File | Contents |
 |---|---|
-| `Rotterdam_Copula_CNN_LSTM_Results.csv` | Test-set metrics by model and cause |
-| `Rotterdam_Bootstrap_Performance.csv` | Metrics for individual bootstrap replicates |
-| `Rotterdam_Summary_Mean_SD_CI.csv` | Bootstrap means, standard deviations, and percentile intervals |
-| `Rotterdam_Figure1_Cindex.png` | Cause-specific C-index comparisons |
-| `Rotterdam_Figure2_AUC.png` | AUC comparisons |
-| `Rotterdam_Figure3_IBS.png` | Brier-style score comparisons |
-| `Rotterdam_Figure4_Cause1_Boxplot.png` | Bootstrap C-index distributions for cause 1 |
-| `Rotterdam_Figure5_Cause2_Boxplot.png` | Bootstrap C-index distributions for cause 2 |
+| `Public_Data_All_Results.csv` | Replication-level results by model, cause, and evaluation horizon |
+| `Public_Data_Summary.csv` | Means of C-index, time-dependent AUC, and Brier score grouped by model, cause, and horizon |
 
-The figures display model comparisons and bootstrap uncertainty summaries. The figure named `Rotterdam_Figure3_IBS.png` retains the script's current filename, although its underlying calculation is not a conventional integrated Brier score.
+The replication-level file includes `Replication`, `Model`, `Cause`, `Horizon`, `Cindex`, `TimeAUC`, and `BrierScore`. The summary file includes `Mean_Cindex`, `Mean_AUC`, and `Mean_Brier`.
+
+## Important implementation and interpretation notes
+
+Review the following items before treating the output as a validated benchmark:
+
+1. **Loss tensor shape:** the neural-network output has shape `(n, K, 3)`, while the built-in categorical cross-entropy reduction and custom penalty calculations should be checked for consistent per-subject/per-interval weighting under the installed `keras3` version.
+2. **Copula penalties:** the supplied Gaussian, Clayton, and Gumbel penalties use fixed constants and transformations of predicted interval probabilities. They are not, by themselves, a fitted bivariate copula likelihood. Validate their mathematical form and numerical behavior before interpreting differences as evidence for a particular copula family.
+3. **Censoring and competing events:** the target-construction code and evaluation metrics use specific conventions for censoring and competing events. Confirm these conventions are appropriate for the estimand and for the chosen metric implementation.
+4. **C-index interpretation:** the Cox and Fine–Gray models provide linear-predictor risk scores, whereas neural networks and RSF provide horizon-specific CIF predictions. These scores are not identical estimands. Compare discrimination with care, and use horizon-specific predicted risks for time-dependent evaluation where possible.
+5. **Fine–Gray Brier scores:** the current script leaves `BrierScore` as `NA` for Fine–Gray and cause-specific Cox models. Do not compare their Brier scores with neural-network/RSF Brier scores until compatible CIF predictions and a common scoring procedure are implemented.
+6. **Horizon selection:** `which(breaks[-1] >= horizon)[1]` should be guarded when no interval endpoint is at or beyond the requested horizon. Check the selected interval and ensure it corresponds to the intended time point.
+7. **Robust summaries:** `mean(..., na.rm = TRUE)` returns `NaN` when all values in a group are missing. Consider reporting valid-replication counts, standard deviations, and Monte Carlo standard errors in addition to means.
+8. **Reproducibility:** seeds are set for R and TensorFlow, but deterministic neural-network results can still depend on package versions, backend settings, and hardware. Record the R version, package versions, and TensorFlow/Keras configuration.
 
 ## Reproducibility
 
-The script sets seed `2026` for the train/test split and bootstrap resampling. Exact reproducibility of neural-network results may additionally depend on TensorFlow, Keras, R package versions, hardware, and backend-level random-number settings.
-
-Record the software environment with:
+Record software versions with:
 
 ```r
 sessionInfo()
+packageVersion("survival")
+packageVersion("randomForestSRC")
+packageVersion("timeROC")
+packageVersion("cmprsk")
+packageVersion("keras3")
+packageVersion("tensorflow")
 ```
 
-For a research release, retain the session information alongside the output files and document the package versions used.
+## Citation
 
-## Recommended improvements before publication
+Please cite the relevant R packages and the original sources for the `mgus2` data, competing-risks methods, random survival forests, and neural-network methods in any publication using this benchmark. The dataset is distributed with the R `survival` package; inspect its help page with:
 
-1. **Use a censoring-aware objective.** Incorporate observed event times and censoring through an appropriate competing-risk likelihood or discrete-time competing-risk model.
-2. **Define the prediction target.** Distinguish cause-specific hazards, event probabilities, and cumulative incidence functions.
-3. **Prevent preprocessing leakage.** Estimate imputation and encoding rules from training data only.
-4. **Use comparable estimands.** Evaluate all models at common prediction horizons and for the same target quantity.
-5. **Use censoring-adjusted metrics.** Implement appropriate competing-risk discrimination, calibration, and time-dependent prediction-error measures.
-6. **Validate the copula penalties.** Document their derivations, numerical properties, parameter choices, and empirical justification.
-7. **Include a BCE-only baseline.** This helps isolate the contribution of copula-inspired regularization.
-8. **Strengthen uncertainty analysis.** Consider resampling the full model-fitting pipeline when estimating uncertainty that includes training variability.
-
-## Data provenance and citation
-
-The Rotterdam dataset is distributed with the R package `survival`. Cite the dataset and package documentation corresponding to the version used, and follow applicable attribution and data-use requirements.
-
-No performance advantage or external validation is claimed by this README.
+```r
+?survival::mgus2
+```
 
 ## License
 
-Specify the license governing the repository's code. Do not assume that the code license also applies to the underlying dataset.
+Specify a project license before public redistribution. Until a license is added, reuse and redistribution of this repository's original code are not explicitly licensed.
+path.write_text(readme, encoding="utf-8")
+print(f"Created: {path}\nSize: {path.stat().st_size} bytes")

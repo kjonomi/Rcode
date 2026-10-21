@@ -47,7 +47,7 @@ N_TIME_BINS <- 15
 EPOCHS <- 60
 BATCH_SIZE <- 64
 LEARNING_RATE <- 0.001
-LAMBDA_COPULA <- 0.001 # Adjusted scale to prevent penalty gradient domination
+LAMBDA_COPULA <- 0.001 # Scale to prevent penalty gradient domination
 
 TRAIN_FRACTION <- 0.70
 EVALUATION_PROBS <- c(0.25, 0.50, 0.75)
@@ -59,7 +59,6 @@ dir.create(OUTPUT_DIR, recursive = TRUE, showWarnings = FALSE)
 # 1. Copula Data Generation
 # =============================================================
 
-# 이벤트 T1과 T2 간의 2변량 Copula 균등분포 (U1, U2) 생성
 r_bivariate_copula <- function(
     n,
     copula_scenario = "Gaussian",
@@ -103,8 +102,8 @@ simulate_competing_risks <- function(
     n = 1500,
     copula_name = "Gaussian",
     seed = 2026,
-    shape_events = 1.5,   # Weibull 형상파라미터 (phi != 1 적용, e.g., 0.5, 1.5, 2.0)
-    censor_rate = 0.1) {  # Non-informative censoring: C ~ Exponential(a = 0.1)
+    shape_events = 1.5,
+    censor_rate = 0.1) {
 
   set.seed(seed)
 
@@ -130,14 +129,11 @@ simulate_competing_risks <- function(
   rate1 <- exp(-2.6 + eta1)
   rate2 <- exp(-3.0 + eta2)
 
-  # 1) 이변량 Copula에서 (U1, U2) 추출
   U <- r_bivariate_copula(n, copula_scenario = copula_name, rho_events = 0.50)
 
-  # 2) Weibull 분포 기반 잠재 생존시간 T1, T2 생성: T = (-log(U) / lambda)^(1 / phi)
   latent_time1 <- (-log(U[, 1]) / rate1)^(1 / shape_events)
   latent_time2 <- (-log(U[, 2]) / rate2)^(1 / shape_events)
 
-  # 3) 비정보 중도절단 (Non-informative Censoring): C ~ Exponential(a = censor_rate)
   censor_time <- rexp(n, rate = censor_rate)
 
   time <- pmin(latent_time1, latent_time2, censor_time)
@@ -164,7 +160,7 @@ simulate_competing_risks <- function(
 # 2. Vectorized Copula Penalties and Loss Functions
 # =============================================================
 
-tf_clip <- function(x, lower = 1e-7, upper = 1 - 1e-7) {
+tf_clip <- function(x, lower = 1e-6, upper = 1 - 1e-6) {
   tf$clip_by_value(x, lower, upper)
 }
 
@@ -182,10 +178,10 @@ loss_gaussian_copula <- function(y_true, y_pred) {
   u1 <- tf_clip(y_pred[, , 2])
   u2 <- tf_clip(y_pred[, , 3])
 
-  z1 <- tf$math$log(u1 / (1 - u1))
-  z2 <- tf$math$log(u2 / (1 - u2))
+  z1 <- tf$math$log(u1 / (1.0 - u1))
+  z2 <- tf$math$log(u2 / (1.0 - u2))
 
-  rho <- 0.8
+  rho <- 0.5
   penalty <- (z1^2 - 2 * rho * z1 * z2 + z2^2) / (2 * (1 - rho^2))
 
   tf$reduce_mean(cce) + LAMBDA_COPULA * tf$reduce_mean(penalty)
@@ -194,16 +190,16 @@ loss_gaussian_copula <- function(y_true, y_pred) {
 loss_clayton_copula <- function(y_true, y_pred) {
   cce <- tf$keras$losses$categorical_crossentropy(y_true, y_pred)
 
-  theta <- 3.0
+  theta <- 2.0
   u1 <- tf_clip(y_pred[, , 2])
   u2 <- tf_clip(y_pred[, , 3])
 
-  term <- tf$math$maximum(u1^(-theta) + u2^(-theta) - 1.0, 1e-7)
+  term <- tf$math$maximum(u1^(-theta) + u2^(-theta) - 1.0, 1e-6)
 
   penalty <- -(
     log(theta + 1.0) -
-      (theta + 1.0) * tf$math$log(u1 * u2) -
-      (2.0 + 1.0 / theta) * tf$math$log(term)
+      (theta + 1.0) * (safe_log(u1) + safe_log(u2)) -
+      (2.0 + 1.0 / theta) * safe_log(term)
   )
 
   tf$reduce_mean(cce) + LAMBDA_COPULA * tf$reduce_mean(penalty)
@@ -212,7 +208,7 @@ loss_clayton_copula <- function(y_true, y_pred) {
 loss_gumbel_copula <- function(y_true, y_pred) {
   cce <- tf$keras$losses$categorical_crossentropy(y_true, y_pred)
 
-  theta <- 4.0
+  theta <- 2.0
   u1 <- tf_clip(y_pred[, , 2])
   u2 <- tf_clip(y_pred[, , 3])
 
@@ -309,7 +305,7 @@ make_discrete_targets <- function(time, status, breaks) {
 }
 
 # =============================================================
-# 4. Neural Network Models with Sequence Projection
+# 4. Neural Network Models
 # =============================================================
 
 create_nn_model <- function(architecture, p, K, copula_penalty = "Standard") {
@@ -430,10 +426,10 @@ extract_cif <- function(model, X, K) {
 }
 
 # =============================================================
-# 5. Robust Classical Benchmarks
+# 5. Benchmarks & Evaluation Metrics
 # =============================================================
 
-fit_classical_benchmarks <- function(split) {
+fit_classical_benchmarks <- function(split, horizons) {
 
   train_df <- data.frame(
     time = split$time_train,
@@ -451,9 +447,8 @@ fit_classical_benchmarks <- function(split) {
 
   n_test <- nrow(test_df)
   causes <- 1:2
-  pred_scores <- list()
+  pred_results <- list()
 
-  # Cause-specific Cox
   cox_formula <- as.formula(
     paste(
       "survival::Surv(time, event) ~",
@@ -461,6 +456,7 @@ fit_classical_benchmarks <- function(split) {
     )
   )
 
+  # --- Cause Specific Cox ---
   for (cause in causes) {
     csc_data <- train_df
     csc_data$event <- as.integer(csc_data$status == cause)
@@ -468,14 +464,15 @@ fit_classical_benchmarks <- function(split) {
     cox_fit <- tryCatch(
       suppressWarnings(
         survival::coxph(
-          cox_formula, data = csc_data, x = TRUE, singular.ok = TRUE,
+          cox_formula, data = csc_data, x = TRUE, y = TRUE, singular.ok = TRUE,
           control = survival::coxph.control(iter.max = 50)
         )
       ),
       error = function(e) NULL
     )
 
-    risk <- rep(NA_real_, n_test)
+    lp <- rep(NA_real_, n_test)
+    prob_matrix <- matrix(NA_real_, nrow = n_test, ncol = length(horizons))
 
     if (!is.null(cox_fit)) {
       candidate <- tryCatch(
@@ -485,14 +482,28 @@ fit_classical_benchmarks <- function(split) {
 
       if (length(candidate) == n_test) {
         candidate[!is.finite(candidate)] <- NA_real_
-        risk <- candidate
+        lp <- candidate
+      }
+
+      # Estimate Cumulative Incidence for Brier Score
+      sf <- tryCatch(survival::survfit(cox_fit, newdata = test_df), error = function(e) NULL)
+      if (!is.null(sf)) {
+        for (h_idx in seq_along(horizons)) {
+          h <- horizons[h_idx]
+          cum_inc <- 1 - summary(sf, times = h, extend = TRUE)$surv
+          if (is.matrix(cum_inc)) {
+            prob_matrix[, h_idx] <- cum_inc[1, ]
+          } else if (length(cum_inc) == n_test) {
+            prob_matrix[, h_idx] <- cum_inc
+          }
+        }
       }
     }
 
-    pred_scores[[paste0("CauseSpecificCox_Cause", cause)]] <- risk
+    pred_results[[paste0("CauseSpecificCox_Cause", cause)]] <- list(risk = lp, probs = prob_matrix)
   }
 
-  # Fine-Gray
+  # --- Fine-Gray Model ---
   design_formula <- stats::reformulate(split$features)
 
   X_train_fg <- tryCatch(model.matrix(design_formula, data = train_df), error = function(e) NULL)
@@ -511,11 +522,9 @@ fit_classical_benchmarks <- function(split) {
     X_test_fg <- X_test_fg[, common_cols, drop = FALSE]
   }
 
-  fg_models <- vector("list", length = 2L)
-
   for (cause in causes) {
-    fg_fit <- NULL
-    risk <- rep(NA_real_, n_test)
+    lp <- rep(NA_real_, n_test)
+    prob_matrix <- matrix(NA_real_, nrow = n_test, ncol = length(horizons))
 
     valid_design <- !is.null(X_train_fg) && !is.null(X_test_fg) &&
       ncol(X_train_fg) > 0 && ncol(X_train_fg) == ncol(X_test_fg) &&
@@ -533,34 +542,41 @@ fit_classical_benchmarks <- function(split) {
         ),
         error = function(e) NULL
       )
-    }
 
-    fg_models[cause] <- list(fg_fit)
+      if (!is.null(fg_fit) && !is.null(fg_fit$coef)) {
+        beta <- fg_fit$coef
+        if (length(beta) == ncol(X_test_fg) && all(is.finite(beta))) {
+          candidate <- tryCatch(
+            as.numeric(X_test_fg %*% beta),
+            error = function(e) rep(NA_real_, n_test)
+          )
 
-    if (!is.null(fg_fit)) {
-      beta <- fg_fit$coef
-      if (length(beta) == ncol(X_test_fg) && all(is.finite(beta))) {
-        candidate <- tryCatch(
-          as.numeric(X_test_fg %*% beta),
-          error = function(e) rep(NA_real_, n_test)
-        )
+          if (length(candidate) == n_test) {
+            candidate[!is.finite(candidate)] <- NA_real_
+            lp <- candidate
+          }
 
-        if (length(candidate) == n_test) {
-          candidate[!is.finite(candidate)] <- NA_real_
-          risk <- candidate
+          pred_cif <- tryCatch(predict(fg_fit, cov1 = X_test_fg), error = function(e) NULL)
+          if (!is.null(pred_cif)) {
+            times_fg <- pred_cif[, 1]
+            cif_vals <- pred_cif[, -1, drop = FALSE]
+            for (h_idx in seq_along(horizons)) {
+              h <- horizons[h_idx]
+              t_idx <- max(1L, which(times_fg <= h))
+              if (length(t_idx) > 0) {
+                prob_matrix[, h_idx] <- cif_vals[max(t_idx), ]
+              }
+            }
+          }
         }
       }
     }
 
-    pred_scores[[paste0("FineGray_Cause", cause)]] <- risk
+    pred_results[[paste0("FineGray_Cause", cause)]] <- list(risk = lp, probs = prob_matrix)
   }
 
-  pred_scores
+  pred_results
 }
-
-# =============================================================
-# 6. Evaluation Metrics
-# =============================================================
 
 cause_cindex <- function(time, status, risk, cause) {
   if (length(risk) != length(time) || length(status) != length(time)) {
@@ -639,7 +655,6 @@ ipcw_brier <- function(
 
   risk <- as.numeric(risk)
 
-  # IPCW Brier scores require predicted event probabilities/CIFs on [0, 1].
   finite_risk <- risk[is.finite(risk)]
   if (length(finite_risk) == 0L ||
       any(finite_risk < -1e-8 | finite_risk > 1 + 1e-8)) {
@@ -669,7 +684,7 @@ ipcw_brier <- function(
 }
 
 # =============================================================
-# 7. One Simulation Replication
+# 6. One Simulation Replication
 # =============================================================
 
 run_one_experiment <- function(replication, copula_name) {
@@ -679,7 +694,6 @@ run_one_experiment <- function(replication, copula_name) {
 
   cat("\nReplication:", replication, "| Copula scenario:", copula_name, "\n")
 
-  # Weibull shape = 1.5, Non-informative censoring rate = 0.1 로 데이터 생성
   data <- simulate_competing_risks(
     n = N, copula_name = copula_name, seed = seed,
     shape_events = 1.5, censor_rate = 0.10
@@ -830,23 +844,31 @@ run_one_experiment <- function(replication, copula_name) {
   }
 
   # Classical benchmarks
-  classical_preds <- fit_classical_benchmarks(split)
+  classical_preds <- fit_classical_benchmarks(split, horizons)
 
   for (model_key in names(classical_preds)) {
     cause <- as.integer(sub(".*_Cause", "", model_key))
     model_name <- sub("_Cause[12]$", "", model_key)
-    risk <- classical_preds[[model_key]]
+    res <- classical_preds[[model_key]]
+    risk_lp <- res$risk
 
-    for (horizon in horizons) {
+    for (h_idx in seq_along(horizons)) {
+      horizon <- horizons[h_idx]
+      prob_risk <- res$probs[, h_idx]
+
       output[[row_id]] <- data.frame(
         Replication = replication,
         Scenario = copula_name,
         Model = model_name,
         Cause = cause,
         Horizon = horizon,
-        Cindex = cause_cindex(split$time_test, split$status_test, risk, cause),
-        TimeAUC = cause_auc(split$time_test, split$status_test, risk, cause, horizon),
-        BrierScore = NA_real_
+        Cindex = cause_cindex(split$time_test, split$status_test, risk_lp, cause),
+        TimeAUC = cause_auc(split$time_test, split$status_test, risk_lp, cause, horizon),
+        BrierScore = ipcw_brier(
+          split$time_train, split$status_train,
+          split$time_test, split$status_test,
+          prob_risk, cause, horizon
+        )
       )
       row_id <- row_id + 1L
     }
@@ -856,7 +878,7 @@ run_one_experiment <- function(replication, copula_name) {
 }
 
 # =============================================================
-# 8. Run All Scenarios and Replications
+# 7. Run All Scenarios and Replications
 # =============================================================
 
 scenarios <- c("Independence", "Gaussian", "Clayton", "Gumbel")
@@ -919,15 +941,6 @@ if (length(all_results) == 0L) {
   stop("No successful simulation replications. Inspect Replication_Run_Log.csv.")
 }
 
-if (length(all_results) < length(scenarios) * N_REPLICATIONS) {
-  warning(
-    "Only ", length(all_results), " of ",
-    length(scenarios) * N_REPLICATIONS,
-    " scenario-replications succeeded. Inspect Replication_Run_Log.csv ",
-    "before interpreting Monte Carlo summaries."
-  )
-}
-
 results <- dplyr::bind_rows(all_results)
 
 write.csv(
@@ -938,7 +951,7 @@ write.csv(
 )
 
 # =============================================================
-# 9. Repeated-Simulation Summary and Completeness Checks
+# 8. Repeated-Simulation Summary
 # =============================================================
 
 metric_summary <- function(x) {
@@ -988,101 +1001,5 @@ write.csv(
   row.names = FALSE,
   na = ""
 )
-
-failure_summary <- results |>
-  dplyr::group_by(Scenario, Model, Cause) |>
-  dplyr::summarise(
-    Rows_recorded = dplyr::n(),
-    Replications_recorded = dplyr::n_distinct(Replication),
-    Failed_Cindex = sum(!is.finite(Cindex)),
-    Failed_AUC = sum(!is.finite(TimeAUC)),
-    Failed_Brier = sum(!is.finite(BrierScore)),
-    Valid_Cindex = sum(is.finite(Cindex)),
-    Valid_AUC = sum(is.finite(TimeAUC)),
-    Valid_Brier = sum(is.finite(BrierScore)),
-    .groups = "drop"
-  ) |>
-  dplyr::mutate(
-    Expected_replications = N_REPLICATIONS,
-    Missing_replications = pmax(0L, Expected_replications - Replications_recorded)
-  )
-
-write.csv(
-  failure_summary,
-  file.path(OUTPUT_DIR, "Model_Failure_Diagnostics.csv"),
-  row.names = FALSE,
-  na = ""
-)
-
-overall_summary <- results |>
-  dplyr::group_by(Scenario, Model, Cause) |>
-  dplyr::summarise(
-    N_valid_Cindex = sum(is.finite(Cindex)),
-    Mean_Cindex = if (any(is.finite(Cindex))) mean(Cindex, na.rm = TRUE) else NA_real_,
-    SD_Cindex = if (sum(is.finite(Cindex)) > 1L) sd(Cindex, na.rm = TRUE) else NA_real_,
-    MCSE_Cindex = if (sum(is.finite(Cindex)) > 1L) SD_Cindex / sqrt(N_valid_Cindex) else NA_real_,
-    N_valid_AUC = sum(is.finite(TimeAUC)),
-    Mean_AUC = if (any(is.finite(TimeAUC))) mean(TimeAUC, na.rm = TRUE) else NA_real_,
-    SD_AUC = if (sum(is.finite(TimeAUC)) > 1L) sd(TimeAUC, na.rm = TRUE) else NA_real_,
-    MCSE_AUC = if (sum(is.finite(TimeAUC)) > 1L) SD_AUC / sqrt(N_valid_AUC) else NA_real_,
-    N_valid_Brier = sum(is.finite(BrierScore)),
-    Mean_Brier = if (any(is.finite(BrierScore))) mean(BrierScore, na.rm = TRUE) else NA_real_,
-    SD_Brier = if (sum(is.finite(BrierScore)) > 1L) sd(BrierScore, na.rm = TRUE) else NA_real_,
-    MCSE_Brier = if (sum(is.finite(BrierScore)) > 1L) SD_Brier / sqrt(N_valid_Brier) else NA_real_,
-    .groups = "drop"
-  )
-
-write.csv(
-  overall_summary,
-  file.path(OUTPUT_DIR, "Descriptive_Scenario_Model_Summary.csv"),
-  row.names = FALSE,
-  na = ""
-)
-
-# =============================================================
-# 10. Publication Plots
-# =============================================================
-
-plot_sim_metric <- function(data, metric, y_label, filename) {
-  plot_data <- data |>
-    dplyr::filter(is.finite(.data[[metric]]))
-
-  p <- ggplot2::ggplot(
-    plot_data,
-    ggplot2::aes(
-      x = factor(round(Horizon, 2)),
-      y = .data[[metric]],
-      color = Model,
-      group = Model
-    )
-  ) +
-    ggplot2::stat_summary(fun = mean, geom = "line", linewidth = 0.8) +
-    ggplot2::stat_summary(fun = mean, geom = "point", size = 2) +
-    ggplot2::facet_grid(Scenario ~ Cause, labeller = ggplot2::label_both) +
-    ggplot2::labs(
-      x = "Evaluation Horizon",
-      y = y_label,
-      title = paste("Simulation Performance:", y_label),
-      color = "Model"
-    ) +
-    ggplot2::theme_bw(base_size = 11) +
-    ggplot2::theme(
-      legend.position = "bottom",
-      axis.text.x = ggplot2::element_text(angle = 45, hjust = 1)
-    )
-
-  ggplot2::ggsave(
-    filename = file.path(OUTPUT_DIR, filename),
-    plot = p,
-    width = 12,
-    height = 8,
-    dpi = 300
-  )
-}
-
-# Generate and save plots for all three evaluation metrics
-plot_sim_metric(summary_results, "Mean_Cindex", "Mean C-Index", "cindex_by_horizon.png")
-plot_sim_metric(summary_results, "Mean_AUC", "Mean Time-Dependent AUC", "auc_by_horizon.png")
-plot_sim_metric(summary_results, "Mean_Brier", "Mean IPCW Brier Score", "brier_by_horizon.png")
 
 cat("\nExecution completed successfully! Results saved to directory:", OUTPUT_DIR, "\n")

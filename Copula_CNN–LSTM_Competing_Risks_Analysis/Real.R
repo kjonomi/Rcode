@@ -43,7 +43,7 @@ library(tensorflow)
 library(MASS)
 
 MASTER_SEED <- 20261014
-N_REPLICATIONS <- 10  # Reduced for standard package dataset evaluations
+N_REPLICATIONS <- 100  # Reduced for standard package dataset evaluations
 N_TIME_BINS <- 15
 
 EPOCHS <- 60

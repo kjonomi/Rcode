@@ -56,9 +56,14 @@ dir.create(OUTPUT_DIR, recursive = TRUE, showWarnings = FALSE)
 # =============================================================
 
 load_public_competing_risks_data <- function() {
-  data("mgus2", package = "survival")
+  # Load mgus2 directly from the survival namespace to prevent dataset resolution failures
+  if (!exists("mgus2", where = asNamespace("survival"))) {
+    stop("The dataset 'mgus2' could not be found in the survival package.")
+  }
 
-  df <- mgus2 |>
+  df_raw <- survival::mgus2
+
+  df <- df_raw |>
     dplyr::mutate(
       time = ifelse(pstat == 1, ptime, futime),
       status = dplyr::case_when(
@@ -370,7 +375,6 @@ fit_classical_benchmarks <- function(split, horizons) {
       lp_candidate <- tryCatch(as.numeric(predict(cox_fit, newdata = test_df, type = "lp")), error = function(e) rep(NA_real_, n_test))
       if (length(lp_candidate) == n_test) lp <- lp_candidate
 
-      # Estimate Baseline Hazard Cumulative Incidence for Brier Score
       sf <- tryCatch(survival::survfit(cox_fit, newdata = test_df), error = function(e) NULL)
       if (!is.null(sf)) {
         for (h_idx in seq_along(horizons)) {
@@ -586,11 +590,25 @@ run_one_experiment <- function(replication, raw_data) {
 # =============================================================
 
 raw_data <- load_public_competing_risks_data()
+cat("Dataset successfully loaded. Total rows:", nrow(raw_data), "\n")
+
 all_results <- list()
 
 for (rep_i in seq_len(N_REPLICATIONS)) {
-  res_df <- tryCatch(run_one_experiment(rep_i, raw_data), error = function(e) NULL)
-  if (!is.null(res_df)) all_results[[length(all_results) + 1L]] <- res_df
+  res_df <- tryCatch(
+    run_one_experiment(rep_i, raw_data),
+    error = function(e) {
+      cat("Error in Replication", rep_i, ":", conditionMessage(e), "\n")
+      return(NULL)
+    }
+  )
+  if (!is.null(res_df)) {
+    all_results[[length(all_results) + 1L]] <- res_df
+  }
+}
+
+if (length(all_results) == 0) {
+  stop("All replications failed. Please inspect the error messages printed above.")
 }
 
 results <- dplyr::bind_rows(all_results)

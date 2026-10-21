@@ -1,5 +1,5 @@
 # ==============================================================================
-# 100-REPLICATION MONTE CARLO SIMULATION BENCHMARK
+# 100-REPLICATION MONTE CARLO SIMULATION BENCHMARK (ROBUST VERSION)
 # LSTM vs COPULA-LSTM vs COX PH ON SIMULATED DYNAMIC SURVIVAL DATA
 # ==============================================================================
 
@@ -120,7 +120,7 @@ estimate_landmark_features <- function(long_data, lm_time) {
     return(data.frame(patient_id = character(0), b0_hat = numeric(0), b1_hat = numeric(0)))
   }
   
-  landmark_data %>%
+  res <- landmark_data %>%
     dplyr::group_by(patient_id) %>%
     dplyr::group_modify(~{
       dat <- .x
@@ -140,6 +140,12 @@ estimate_landmark_features <- function(long_data, lm_time) {
       data.frame(b0_hat = b0, b1_hat = 0)
     }) %>%
     dplyr::ungroup()
+  
+  # Guard to guarantee output schema always includes required columns
+  if (!"b0_hat" %in% names(res)) res$b0_hat <- 0
+  if (!"b1_hat" %in% names(res)) res$b1_hat <- 0
+  
+  return(res)
 }
 
 DeepDynamicSurvival <- nn_module(
@@ -267,11 +273,19 @@ ipcw_binary_loss <- function(pred, target, time, status, get_G, horizon) {
 
 fit_copula_lstm <- function(train_time, train_pred, test_time, test_pred) {
   vine_df <- data.frame(time = as.numeric(train_time), emb = as.numeric(train_pred))
-  vine_df <- vine_df[stats::complete.cases(vine_df), , drop = FALSE]
+  vine_df <- vine_df[stats::complete.cases(vine_df) & is.finite(vine_df$time) & is.finite(vine_df$emb), , drop = FALSE]
   
-  if (nrow(vine_df) < 30) return(bound_probability(test_pred))
+  # Ensure non-zero variance and sufficient observations before fitting copula
+  if (nrow(vine_df) < 30 || sd(vine_df$time) == 0 || sd(vine_df$emb) == 0) {
+    return(bound_probability(test_pred))
+  }
   
-  u_train <- pmin(pmax(rvinecopulib::pseudo_obs(as.matrix(vine_df)), EPS), 1 - EPS)
+  u_train <- tryCatch(
+    pmin(pmax(rvinecopulib::pseudo_obs(as.matrix(vine_df)), EPS), 1 - EPS),
+    error = function(e) NULL
+  )
+  if (is.null(u_train)) return(bound_probability(test_pred))
+  
   cop_fit <- tryCatch(
     rvinecopulib::bicop(u_train, family_set = "all", selcrit = "aic"),
     error = function(e) NULL
@@ -364,8 +378,37 @@ for (sim_id in seq_len(N_SIMULATIONS)) {
       train_feat <- estimate_landmark_features(lm_train_long, lm_time)
       test_feat  <- estimate_landmark_features(lm_test_long, lm_time)
       
-      lm_train_base <- lm_train_base %>% dplyr::left_join(train_feat, by = "patient_id") %>% tidyr::replace_na(list(b0_hat = 0, b1_hat = 0))
-      lm_test_base  <- lm_test_base %>% dplyr::left_join(test_feat, by = "patient_id") %>% tidyr::replace_na(list(b0_hat = 0, b1_hat = 0))
+      # Safely handle train set joining
+      if (!"b0_hat" %in% names(train_feat)) train_feat$b0_hat <- 0
+      if (!"b1_hat" %in% names(train_feat)) train_feat$b1_hat <- 0
+      
+      lm_train_base <- lm_train_base %>% dplyr::left_join(train_feat, by = "patient_id")
+      
+      if (!"b0_hat" %in% names(lm_train_base)) lm_train_base$b0_hat <- 0
+      if (!"b1_hat" %in% names(lm_train_base)) lm_train_base$b1_hat <- 0
+      
+      lm_train_base <- lm_train_base %>%
+        tidyr::replace_na(list(b0_hat = 0, b1_hat = 0)) %>%
+        dplyr::mutate(
+          b0_hat = ifelse(is.finite(b0_hat), b0_hat, 0),
+          b1_hat = ifelse(is.finite(b1_hat), b1_hat, 0)
+        )
+      
+      # Safely handle test set joining
+      if (!"b0_hat" %in% names(test_feat)) test_feat$b0_hat <- 0
+      if (!"b1_hat" %in% names(test_feat)) test_feat$b1_hat <- 0
+      
+      lm_test_base <- lm_test_base %>% dplyr::left_join(test_feat, by = "patient_id")
+      
+      if (!"b0_hat" %in% names(lm_test_base)) lm_test_base$b0_hat <- 0
+      if (!"b1_hat" %in% names(lm_test_base)) lm_test_base$b1_hat <- 0
+      
+      lm_test_base <- lm_test_base %>%
+        tidyr::replace_na(list(b0_hat = 0, b1_hat = 0)) %>%
+        dplyr::mutate(
+          b0_hat = ifelse(is.finite(b0_hat), b0_hat, 0),
+          b1_hat = ifelse(is.finite(b1_hat), b1_hat, 0)
+        )
       
       # Model 1: LSTM
       train_tensors <- prepare_tensor_batch(lm_train_base$patient_id, lm_train_long, lm_train_base)
@@ -399,9 +442,20 @@ for (sim_id in seq_len(N_SIMULATIONS)) {
       pred_copula <- fit_copula_lstm(lm_train_base$time_to_event, pred_lstm_train, lm_test_base$time_to_event, pred_lstm_test)
       pred_copula <- bound_probability(pred_copula)
       
-      # Model 3: Cox PH
-      cox_formula <- survival::Surv(time_to_event, status_h) ~ age + wtkg + karnof + arms + b0_hat + b1_hat
-      cox_fit <- tryCatch(survival::coxph(formula = cox_formula, data = as.data.frame(lm_train_base), x = TRUE), error = function(e) NULL)
+      # Model 3: Cox PH with robust pre-fit validation
+      has_events <- sum(lm_train_base$status_h == 1, na.rm = TRUE) >= 2
+      has_var    <- sd(lm_train_base$b0_hat, na.rm = TRUE) > 1e-5
+      
+      if (!has_events || !has_var) {
+        cox_fit <- NULL
+      } else {
+        cox_formula <- survival::Surv(time_to_event, status_h) ~ age + wtkg + karnof + arms + b0_hat + b1_hat
+        cox_fit <- tryCatch(
+          survival::coxph(formula = cox_formula, data = as.data.frame(lm_train_base), x = TRUE),
+          error = function(e) NULL,
+          warning = function(w) NULL
+        )
+      }
       
       if (is.null(cox_fit)) {
         pred_cox <- rep(0.5, nrow(lm_test_base))

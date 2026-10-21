@@ -5,12 +5,6 @@
 #   - Cause 1: Progression to Plasma Cell Malignancy (PCM)
 #   - Cause 2: Death without progression
 #   - Status 0: Right-censored
-#
-# Models evaluated:
-#   - Neural Networks (MLP, CNN, LSTM, CNN-LSTM) with Loss Penalties
-#   - Random Survival Forest (randomForestSRC)
-#   - Cause-Specific Cox
-#   - Fine-Gray Model
 ###############################################################################
 
 Sys.setenv(CUDA_VISIBLE_DEVICES = "-1")
@@ -43,7 +37,7 @@ library(tensorflow)
 library(MASS)
 
 MASTER_SEED <- 20261014
-N_REPLICATIONS <- 100  # Reduced for standard package dataset evaluations
+N_REPLICATIONS <- 10  # Set to match expected runs
 N_TIME_BINS <- 15
 
 EPOCHS <- 60
@@ -63,11 +57,6 @@ dir.create(OUTPUT_DIR, recursive = TRUE, showWarnings = FALSE)
 
 load_public_competing_risks_data <- function() {
   data("mgus2", package = "survival")
-
-  # Standardize status code:
-  # pstat == 1 -> Progression (Cause 1)
-  # death == 1 & pstat == 0 -> Death before progression (Cause 2)
-  # Otherwise -> Censored (Status 0)
 
   df <- mgus2 |>
     dplyr::mutate(
@@ -89,7 +78,7 @@ load_public_competing_risks_data <- function() {
 # 2. Vectorized Copula Penalties and Loss Functions
 # =============================================================
 
-tf_clip <- function(x, lower = 1e-7, upper = 1 - 1e-7) {
+tf_clip <- function(x, lower = 1e-6, upper = 1 - 1e-6) {
   tf$clip_by_value(x, lower, upper)
 }
 
@@ -107,10 +96,10 @@ loss_gaussian_copula <- function(y_true, y_pred) {
   u1 <- tf_clip(y_pred[, , 2])
   u2 <- tf_clip(y_pred[, , 3])
 
-  z1 <- tf$math$log(u1 / (1 - u1))
-  z2 <- tf$math$log(u2 / (1 - u2))
+  z1 <- tf$math$log(u1 / (1.0 - u1))
+  z2 <- tf$math$log(u2 / (1.0 - u2))
 
-  rho <- 0.8
+  rho <- 0.5
   penalty <- (z1^2 - 2 * rho * z1 * z2 + z2^2) / (2 * (1 - rho^2))
 
   tf$reduce_mean(cce) + LAMBDA_COPULA * tf$reduce_mean(penalty)
@@ -119,16 +108,16 @@ loss_gaussian_copula <- function(y_true, y_pred) {
 loss_clayton_copula <- function(y_true, y_pred) {
   cce <- tf$keras$losses$categorical_crossentropy(y_true, y_pred)
 
-  theta <- 3.0
+  theta <- 2.0
   u1 <- tf_clip(y_pred[, , 2])
   u2 <- tf_clip(y_pred[, , 3])
 
-  term <- tf$math$maximum(u1^(-theta) + u2^(-theta) - 1.0, 1e-7)
+  term <- tf$math$maximum(u1^(-theta) + u2^(-theta) - 1.0, 1e-6)
 
   penalty <- -(
     log(theta + 1.0) -
-      (theta + 1.0) * tf$math$log(u1 * u2) -
-      (2.0 + 1.0 / theta) * tf$math$log(term)
+      (theta + 1.0) * (safe_log(u1) + safe_log(u2)) -
+      (2.0 + 1.0 / theta) * safe_log(term)
   )
 
   tf$reduce_mean(cce) + LAMBDA_COPULA * tf$reduce_mean(penalty)
@@ -137,7 +126,7 @@ loss_clayton_copula <- function(y_true, y_pred) {
 loss_gumbel_copula <- function(y_true, y_pred) {
   cce <- tf$keras$losses$categorical_crossentropy(y_true, y_pred)
 
-  theta <- 4.0
+  theta <- 2.0
   u1 <- tf_clip(y_pred[, , 2])
   u2 <- tf_clip(y_pred[, , 3])
 
@@ -355,52 +344,86 @@ extract_cif <- function(model, X, K) {
 # 5. Benchmarks & Evaluation Metrics
 # =============================================================
 
-fit_classical_benchmarks <- function(split) {
+fit_classical_benchmarks <- function(split, horizons) {
   train_df <- data.frame(time = split$time_train, status = split$status_train, split$X_train_raw, check.names = FALSE)
   test_df <- data.frame(time = split$time_test, status = split$status_test, split$X_test_raw, check.names = FALSE)
   n_test <- nrow(test_df)
   causes <- 1:2
-  pred_scores <- list()
+  pred_results <- list()
 
   cox_formula <- as.formula(paste("survival::Surv(time, event) ~", paste(sprintf("`%s`", split$features), collapse = " + ")))
 
+  # --- Cause Specific Cox ---
   for (cause in causes) {
     csc_data <- train_df
     csc_data$event <- as.integer(csc_data$status == cause)
 
     cox_fit <- tryCatch(
-      suppressWarnings(survival::coxph(cox_formula, data = csc_data, x = TRUE, singular.ok = TRUE)),
+      suppressWarnings(survival::coxph(cox_formula, data = csc_data, x = TRUE, y = TRUE, singular.ok = TRUE)),
       error = function(e) NULL
     )
 
-    risk <- rep(NA_real_, n_test)
+    lp <- rep(NA_real_, n_test)
+    prob_matrix <- matrix(NA_real_, nrow = n_test, ncol = length(horizons))
+
     if (!is.null(cox_fit)) {
-      candidate <- tryCatch(as.numeric(predict(cox_fit, newdata = test_df, type = "lp")), error = function(e) rep(NA_real_, n_test))
-      if (length(candidate) == n_test) risk <- candidate
+      lp_candidate <- tryCatch(as.numeric(predict(cox_fit, newdata = test_df, type = "lp")), error = function(e) rep(NA_real_, n_test))
+      if (length(lp_candidate) == n_test) lp <- lp_candidate
+
+      # Estimate Baseline Hazard Cumulative Incidence for Brier Score
+      sf <- tryCatch(survival::survfit(cox_fit, newdata = test_df), error = function(e) NULL)
+      if (!is.null(sf)) {
+        for (h_idx in seq_along(horizons)) {
+          h <- horizons[h_idx]
+          cum_inc <- 1 - summary(sf, times = h, extend = TRUE)$surv
+          if (is.matrix(cum_inc)) {
+            prob_matrix[, h_idx] <- cum_inc[1, ]
+          } else if (length(cum_inc) == n_test) {
+            prob_matrix[, h_idx] <- cum_inc
+          }
+        }
+      }
     }
-    pred_scores[[paste0("CauseSpecificCox_Cause", cause)]] <- risk
+    pred_results[[paste0("CauseSpecificCox_Cause", cause)]] <- list(risk = lp, probs = prob_matrix)
   }
 
+  # --- Fine Gray Model ---
   design_formula <- stats::reformulate(split$features)
   X_train_fg <- tryCatch(model.matrix(design_formula, data = train_df)[, -1, drop = FALSE], error = function(e) NULL)
   X_test_fg <- tryCatch(model.matrix(design_formula, data = test_df)[, -1, drop = FALSE], error = function(e) NULL)
 
   for (cause in causes) {
-    risk <- rep(NA_real_, n_test)
+    lp <- rep(NA_real_, n_test)
+    prob_matrix <- matrix(NA_real_, nrow = n_test, ncol = length(horizons))
+
     if (!is.null(X_train_fg) && !is.null(X_test_fg)) {
       fg_fit <- tryCatch(
         suppressWarnings(cmprsk::crr(ftime = train_df$time, fstatus = train_df$status, cov1 = X_train_fg, failcode = cause, cencode = 0)),
         error = function(e) NULL
       )
-      if (!is.null(fg_fit)) {
+      if (!is.null(fg_fit) && !is.null(fg_fit$coef)) {
         beta <- fg_fit$coef
-        if (length(beta) == ncol(X_test_fg)) risk <- as.numeric(X_test_fg %*% beta)
+        if (length(beta) == ncol(X_test_fg)) {
+          lp <- as.numeric(X_test_fg %*% beta)
+          pred_cif <- tryCatch(predict(fg_fit, cov1 = X_test_fg), error = function(e) NULL)
+          if (!is.null(pred_cif)) {
+            times_fg <- pred_cif[, 1]
+            cif_vals <- pred_cif[, -1, drop = FALSE]
+            for (h_idx in seq_along(horizons)) {
+              h <- horizons[h_idx]
+              t_idx <- max(1L, which(times_fg <= h))
+              if (length(t_idx) > 0) {
+                prob_matrix[, h_idx] <- cif_vals[max(t_idx), ]
+              }
+            }
+          }
+        }
       }
     }
-    pred_scores[[paste0("FineGray_Cause", cause)]] <- risk
+    pred_results[[paste0("FineGray_Cause", cause)]] <- list(risk = lp, probs = prob_matrix)
   }
 
-  pred_scores
+  pred_results
 }
 
 cause_cindex <- function(time, status, risk, cause) {
@@ -534,18 +557,22 @@ run_one_experiment <- function(replication, raw_data) {
   }
 
   # Classical Benchmarks
-  classical_preds <- fit_classical_benchmarks(split)
+  classical_preds <- fit_classical_benchmarks(split, horizons)
   for (model_key in names(classical_preds)) {
     cause <- as.integer(sub(".*_Cause", "", model_key))
     model_name <- sub("_Cause[12]$", "", model_key)
-    risk <- classical_preds[[model_key]]
+    res <- classical_preds[[model_key]]
+    risk_lp <- res$risk
 
-    for (horizon in horizons) {
+    for (h_idx in seq_along(horizons)) {
+      horizon <- horizons[h_idx]
+      prob_risk <- res$probs[, h_idx]
+
       output[[row_id]] <- data.frame(
         Replication = replication, Model = model_name, Cause = cause, Horizon = horizon,
-        Cindex = cause_cindex(split$time_test, split$status_test, risk, cause),
-        TimeAUC = cause_auc(split$time_test, split$status_test, risk, cause, horizon),
-        BrierScore = NA_real_
+        Cindex = cause_cindex(split$time_test, split$status_test, risk_lp, cause),
+        TimeAUC = cause_auc(split$time_test, split$status_test, risk_lp, cause, horizon),
+        BrierScore = ipcw_brier(split$time_train, split$status_train, split$time_test, split$status_test, prob_risk, cause, horizon)
       )
       row_id <- row_id + 1L
     }

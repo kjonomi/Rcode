@@ -66,22 +66,22 @@ load_public_competing_risks_data <- function() {
 
   # Standardize status code:
   # pstat == 1 -> Progression (Cause 1)
-  # dstat == 1 & pstat == 0 -> Death before progression (Cause 2)
+  # death == 1 & pstat == 0 -> Death before progression (Cause 2)
   # Otherwise -> Censored (Status 0)
 
   df <- mgus2 |>
     dplyr::mutate(
-      time = ifelse(pstat == 1, ptime, dtime),
+      time = ifelse(pstat == 1, ptime, futime),
       status = dplyr::case_when(
         pstat == 1 ~ 1L,
-        dstat == 1 & pstat == 0 ~ 2L,
+        death == 1 & pstat == 0 ~ 2L,
         TRUE ~ 0L
       )
     ) |>
     dplyr::select(time, status, age, sex, hgb, creat, mspike) |>
     dplyr::filter(!is.na(time) & time > 0)
 
-  df$sex <- ifelse(df$sex == "m", 1, 0)
+  df$sex <- ifelse(df$sex %in% c("m", 1), 1, 0)
   df
 }
 

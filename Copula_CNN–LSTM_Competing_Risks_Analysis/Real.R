@@ -1,9 +1,10 @@
 ###############################################################################
-# Real-Data Competing-Risks Benchmark Strategy
+# Real-Data Competing-Risks Benchmark Strategy with Hybrid FG-MLP
 # Rotterdam Breast Cancer Dataset (survival::rotterdam)
 #
 # Models Evaluated:
 #   - Discrete-Time Neural Networks: MLP, CNN, LSTM, CNN-LSTM
+#   - Hybrid Fine-Gray + MLP Architecture: FG_MLP
 #   - Random Survival Forest (randomForestSRC, logrankCR)
 #   - Cause-Specific Cox Model (survival::coxph)
 #   - Fine-Gray Subdistribution Hazard Model (cmprsk::crr)
@@ -195,7 +196,7 @@ Y_train <- train_targets$y
 W_train <- train_targets$weights
 
 # =============================================================
-# 4. Discrete-Time Neural Networks
+# 4. Standard Discrete-Time Neural Networks
 # =============================================================
 
 create_nn_model <- function(architecture) {
@@ -258,8 +259,8 @@ fit_nn_model <- function(architecture) {
   model
 }
 
-extract_cif <- function(model, X_arr) {
-  q <- predict(model, X_arr, verbose = 0)
+extract_cif <- function(model, X_arr_or_list) {
+  q <- predict(model, X_arr_or_list, verbose = 0)
   n_obs <- dim(q)[1]
   
   cif1 <- matrix(0, n_obs, K)
@@ -287,7 +288,7 @@ extract_cif <- function(model, X_arr) {
   list(cif1 = cif1, cif2 = cif2, survival = surv)
 }
 
-# Train neural models
+# Train standard neural models
 architectures <- c("MLP", "CNN", "LSTM", "CNN_LSTM")
 neural_cifs <- list()
 
@@ -297,7 +298,90 @@ for (arch in architectures) {
 }
 
 # =============================================================
-# 5. Benchmarks: RSF, Cause-Specific Cox, Fine-Gray
+# 5. Hybrid Fine-Gray + MLP (FG-MLP) Implementation
+# =============================================================
+
+build_fg_mlp_model <- function(p_feat, K, learning_rate = 0.001) {
+  cov_input <- keras3::keras_input(shape = c(p_feat), name = "covariate_input")
+  fg_offset_input <- keras3::keras_input(shape = c(2L), name = "fg_linear_offsets")
+  
+  mlp_branch <- cov_input |>
+    keras3::layer_dense(units = 64, activation = "relu", name = "mlp_dense_1") |>
+    keras3::layer_batch_normalization() |>
+    keras3::layer_dropout(rate = 0.25) |>
+    keras3::layer_dense(units = 32, activation = "relu", name = "mlp_dense_2") |>
+    keras3::layer_dropout(rate = 0.20)
+  
+  combined <- keras3::layer_concatenate(list(mlp_branch, fg_offset_input), name = "hybrid_fusion")
+  
+  output_logits <- combined |>
+    keras3::layer_dense(units = K * 3L, activation = "linear", name = "interval_logits") |>
+    keras3::layer_reshape(target_shape = c(K, 3L)) |>
+    keras3::layer_activation(activation = "softmax", name = "interval_probabilities")
+  
+  model <- keras3::keras_model(
+    inputs = list(cov_input, fg_offset_input),
+    outputs = output_logits,
+    name = "FG_MLP_Hybrid"
+  )
+  
+  model |> keras3::compile(
+    optimizer = keras3::optimizer_adam(learning_rate = learning_rate),
+    loss = "categorical_crossentropy"
+  )
+  
+  model
+}
+
+cat("Training Hybrid FG-MLP Network...\n")
+
+fg_offsets_train <- matrix(0, nrow = nrow(X_train), ncol = 2L)
+fg_offsets_test  <- matrix(0, nrow = nrow(X_test),  ncol = 2L)
+
+design_train <- model.matrix(~ ., data = X_train_raw)[, -1, drop = FALSE]
+design_test  <- model.matrix(~ ., data = X_test_raw)[, -1, drop = FALSE]
+
+for (cause in 1:2) {
+  fg_fit <- tryCatch(
+    cmprsk::crr(
+      ftime = time_train, fstatus = status_train,
+      cov1 = design_train, failcode = cause, cencode = 0
+    ),
+    error = function(e) NULL
+  )
+  
+  if (!is.null(fg_fit) && !is.null(fg_fit$coef)) {
+    beta <- fg_fit$coef
+    if (length(beta) == ncol(design_train)) {
+      fg_offsets_train[, cause] <- as.numeric(design_train %*% beta)
+      fg_offsets_test[, cause]  <- as.numeric(design_test %*% beta)
+    }
+  }
+}
+
+keras3::clear_session()
+fg_mlp_model <- build_fg_mlp_model(p_feat = p_feat, K = K, learning_rate = LEARNING_RATE)
+
+fg_mlp_callbacks <- list(
+  keras3::callback_early_stopping(monitor = "val_loss", patience = 10, restore_best_weights = TRUE),
+  keras3::callback_reduce_lr_on_plateau(monitor = "val_loss", factor = 0.5, patience = 5, min_lr = 1e-6)
+)
+
+fg_mlp_model |> keras3::fit(
+  x = list(X_train, fg_offsets_train),
+  y = Y_train,
+  sample_weight = W_train,
+  validation_split = 0.20,
+  epochs = EPOCHS,
+  batch_size = BATCH_SIZE,
+  callbacks = fg_mlp_callbacks,
+  verbose = 0
+)
+
+neural_cifs[["FG_MLP"]] <- extract_cif(fg_mlp_model, list(X_test, fg_offsets_test))
+
+# =============================================================
+# 6. Benchmarks: RSF, Cause-Specific Cox, Fine-Gray
 # =============================================================
 
 # Random Survival Forest
@@ -330,15 +414,14 @@ cox_fit1 <- fit_csc(1)
 cox_fit2 <- fit_csc(2)
 
 fit_fg <- function(cause) {
-  design_tr <- model.matrix(~ ., data = X_train_raw)[, -1, drop = FALSE]
-  tryCatch(suppressWarnings(cmprsk::crr(ftime = time_train, fstatus = status_train, cov1 = design_tr, failcode = cause, cencode = 0)), error = function(e) NULL)
+  tryCatch(suppressWarnings(cmprsk::crr(ftime = time_train, fstatus = status_train, cov1 = design_train, failcode = cause, cencode = 0)), error = function(e) NULL)
 }
 
 fg_fit1 <- fit_fg(1)
 fg_fit2 <- fit_fg(2)
 
 # =============================================================
-# 6. Evaluation Horizons & Metric Functions
+# 7. Evaluation Horizons & Metric Functions
 # =============================================================
 
 candidate_horizons <- as.numeric(quantile(time_train, probs = EVALUATION_PROBS, na.rm = TRUE))
@@ -421,13 +504,13 @@ compute_ipcw_brier <- function(risk, cause, horizon) {
 }
 
 # =============================================================
-# 7. Results Collection
+# 8. Results Collection
 # =============================================================
 
 results <- list()
 row_id <- 1L
 
-# Evaluate Neural Models
+# Evaluate Neural Models (including FG_MLP)
 for (arch in names(neural_cifs)) {
   cif_obj <- neural_cifs[[arch]]
   for (cause in 1:2) {
@@ -489,11 +572,10 @@ for (cause in 1:2) {
 
 # Evaluate Fine-Gray
 fg_fits <- list(fg_fit1, fg_fit2)
-design_te <- model.matrix(~ ., data = X_test_raw)[, -1, drop = FALSE]
 for (cause in 1:2) {
   mod <- fg_fits[[cause]]
   if (!is.null(mod)) {
-    lp <- tryCatch(as.numeric(design_te %*% mod$coef), error = function(e) rep(NA_real_, nrow(X_test_raw)))
+    lp <- tryCatch(as.numeric(design_test %*% mod$coef), error = function(e) rep(NA_real_, nrow(X_test_raw)))
     for (h in seq_along(candidate_horizons)) {
       horizon <- as.numeric(candidate_horizons[h])
       results[[row_id]] <- data.frame(
@@ -516,12 +598,12 @@ print(results_df)
 write.csv(results_df, file.path(OUTPUT_DIR, "Rotterdam_RealData_Competing_Risks_Results.csv"), row.names = FALSE)
 
 # =============================================================
-# 8. Publication-Quality Figures & Export
+# 9. Publication-Quality Figures & Export
 # =============================================================
 
 model_labels <- c(
   MLP = "MLP", CNN = "CNN", LSTM = "LSTM", CNN_LSTM = "CNN-LSTM",
-  Random_Survival_Forest = "Random Survival Forest",
+  FG_MLP = "FG-MLP (Hybrid)", Random_Survival_Forest = "Random Survival Forest",
   CauseSpecificCox = "Cause-Specific Cox", FineGray = "Fine-Gray"
 )
 

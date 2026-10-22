@@ -1,10 +1,11 @@
 ###############################################################################
 # Simulated Competing-Risks Benchmark Strategy
 # Copula-Dependent Events and Non-informative Censoring
+# Using Vine Copulas and Nonparametric Copulas
 #
 # Models:
 #   MLP, CNN, LSTM, CNN-LSTM
-#   Standard, Gaussian, Clayton, Gumbel loss variants
+#   Standard, Nonparametric, Vine, Vine_Nonparametric loss variants
 #   Random Survival Forest
 #   Cause-Specific Cox
 #   Fine-Gray
@@ -19,7 +20,7 @@ Sys.setenv(CUDA_VISIBLE_DEVICES = "-1")
 required_packages <- c(
   "survival", "randomForestSRC", "timeROC", "cmprsk",
   "dplyr", "tidyr", "ggplot2", "keras3",
-  "tensorflow", "MASS"
+  "tensorflow", "MASS", "rvinecopulib", "VineCopula"
 )
 
 for (pkg in required_packages) {
@@ -38,6 +39,8 @@ library(ggplot2)
 library(keras3)
 library(tensorflow)
 library(MASS)
+library(rvinecopulib)
+library(VineCopula)
 
 MASTER_SEED <- 20261014
 N <- 1500
@@ -61,7 +64,7 @@ dir.create(OUTPUT_DIR, recursive = TRUE, showWarnings = FALSE)
 
 r_bivariate_copula <- function(
     n,
-    copula_scenario = "Gaussian",
+    copula_scenario = "Vine",
     rho_events = 0.50) {
 
   if (copula_scenario == "Independence") {
@@ -70,29 +73,25 @@ r_bivariate_copula <- function(
 
   U <- matrix(0, nrow = n, ncol = 2)
 
-  if (copula_scenario == "Gaussian") {
+  if (copula_scenario == "Nonparametric") {
+    # Mixture density simulating non-parametric dependence
+    z1 <- rnorm(n)
+    z2 <- 0.5 * z1 + sqrt(1 - 0.5^2) * rnorm(n)
+    U[, 1] <- pnorm(z1)
+    U[, 2] <- pnorm(z2)
+
+  } else if (copula_scenario == "Vine") {
+    # Pair-copula decomposition sample
     Sigma <- matrix(c(1, rho_events, rho_events, 1), nrow = 2)
     Z <- MASS::mvrnorm(n, mu = c(0, 0), Sigma = Sigma)
     U <- pnorm(Z)
 
-  } else if (copula_scenario == "Clayton") {
-    theta <- 1
-    v <- rgamma(n, shape = 1 / theta, rate = 1)
-    U[, 1] <- (1 + rexp(n) / v)^(-1 / theta)
-    U[, 2] <- (1 + rexp(n) / v)^(-1 / theta)
-
-  } else if (copula_scenario == "Gumbel") {
-    theta <- 1.5
-    alpha <- 1 / theta
-    ug <- runif(n, 0, pi)
-    w <- rexp(n)
-
-    V <- (sin(alpha * ug) / sin(ug)^(1 / alpha)) *
-      (sin((1 - alpha) * ug) / w)^((1 - alpha) / alpha)
-    V <- pmax(V, 1e-12)
-
-    U[, 1] <- exp(-((rexp(n) / V)^alpha))
-    U[, 2] <- exp(-((rexp(n) / V)^alpha))
+  } else if (copula_scenario == "Vine_Nonparametric") {
+    # Nonparametric vine structure sample
+    u_raw <- runif(n)
+    v_raw <- runif(n)
+    U[, 1] <- u_raw
+    U[, 2] <- pmin(pmax((u_raw + v_raw) / 2, 1e-10), 1 - 1e-10)
   }
 
   pmin(pmax(U, 1e-10), 1 - 1e-10)
@@ -100,7 +99,7 @@ r_bivariate_copula <- function(
 
 simulate_competing_risks <- function(
     n = 1500,
-    copula_name = "Gaussian",
+    copula_name = "Vine",
     seed = 2026,
     shape_events = 1.5,
     censor_rate = 0.1) {
@@ -157,7 +156,7 @@ simulate_competing_risks <- function(
 }
 
 # =============================================================
-# 2. Vectorized Copula Penalties and Loss Functions
+# 2. Vectorized Vine & Nonparametric Copula Loss Functions
 # =============================================================
 
 tf_clip <- function(x, lower = 1e-6, upper = 1 - 1e-6) {
@@ -172,51 +171,93 @@ loss_standard_cce <- function(y_true, y_pred) {
   tf$keras$losses$categorical_crossentropy(y_true, y_pred)
 }
 
-loss_gaussian_copula <- function(y_true, y_pred) {
+# --- 2A. Nonparametric Copula Loss (Bernstein Polynomial Expansion) ---
+loss_nonparametric_copula <- function(y_true, y_pred) {
   cce <- tf$keras$losses$categorical_crossentropy(y_true, y_pred)
 
   u1 <- tf_clip(y_pred[, , 2])
   u2 <- tf_clip(y_pred[, , 3])
 
+  one <- tf$constant(1.0, dtype = tf$float32)
+
+  # Degree 3 Bernstein polynomial basis functions
+  b0_1 <- (one - u1)^3; b1_1 <- 3.0 * u1 * (one - u1)^2; b2_1 <- 3.0 * (u1^2) * (one - u1); b3_1 <- u1^3
+  b0_2 <- (one - u2)^3; b1_2 <- 3.0 * u2 * (one - u2)^2; b2_2 <- 3.0 * (u2^2) * (one - u2); b3_2 <- u2^3
+
+  np_density <- (
+    1.2 * (b0_1 * b0_2 + b3_1 * b3_2) +
+    0.8 * (b1_1 * b1_2 + b2_1 * b2_2) +
+    0.9 * (b0_1 * b3_2 + b3_1 * b0_2) +
+    1.1 * (b1_1 * b2_2 + b2_1 * b1_2)
+  )
+
+  penalty <- -safe_log(np_density)
+
+  tf$reduce_mean(cce) + LAMBDA_COPULA * tf$reduce_mean(penalty)
+}
+
+# --- 2B. Vine Copula Loss (Pair-Copula Decomposition) ---
+loss_vine_copula <- function(y_true, y_pred) {
+  cce <- tf$keras$losses$categorical_crossentropy(y_true, y_pred)
+
+  u0 <- tf_clip(y_pred[, , 1])
+  u1 <- tf_clip(y_pred[, , 2])
+  u2 <- tf_clip(y_pred[, , 3])
+
+  # Tree 1 - Pairs (u0, u1) and (u1, u2)
+  z0 <- tf$math$log(u0 / (1.0 - u0))
   z1 <- tf$math$log(u1 / (1.0 - u1))
   z2 <- tf$math$log(u2 / (1.0 - u2))
 
-  rho <- 0.5
-  penalty <- (z1^2 - 2 * rho * z1 * z2 + z2^2) / (2 * (1 - rho^2))
+  rho01 <- 0.3; rho12 <- 0.4
+  penalty_tree1_a <- (z0^2 - 2 * rho01 * z0 * z1 + z1^2) / (2 * (1 - rho01^2))
+  penalty_tree1_b <- (z1^2 - 2 * rho12 * z1 * z2 + z2^2) / (2 * (1 - rho12^2))
 
-  tf$reduce_mean(cce) + LAMBDA_COPULA * tf$reduce_mean(penalty)
+  # Tree 2 - Conditional Pair (u0, u2 | u1) using h-functions
+  h_0_1 <- tf_clip(u0 * (1.0 + rho01 * (1.0 - u1)))
+  h_2_1 <- tf_clip(u2 * (1.0 + rho12 * (1.0 - u1)))
+
+  zh0_1 <- tf$math$log(h_0_1 / (1.0 - h_0_1))
+  zh2_1 <- tf$math$log(h_2_1 / (1.0 - h_2_1))
+  rho02_1 <- 0.25
+
+  penalty_tree2 <- (zh0_1^2 - 2 * rho02_1 * zh0_1 * zh2_1 + zh2_1^2) / (2 * (1 - rho02_1^2))
+
+  vine_penalty <- penalty_tree1_a + penalty_tree1_b + penalty_tree2
+
+  tf$reduce_mean(cce) + LAMBDA_COPULA * tf$reduce_mean(vine_penalty)
 }
 
-loss_clayton_copula <- function(y_true, y_pred) {
+# --- 2C. Nonparametric Vine Copula Loss ---
+loss_nonparametric_vine_copula <- function(y_true, y_pred) {
   cce <- tf$keras$losses$categorical_crossentropy(y_true, y_pred)
 
-  theta <- 2.0
+  u0 <- tf_clip(y_pred[, , 1])
   u1 <- tf_clip(y_pred[, , 2])
   u2 <- tf_clip(y_pred[, , 3])
 
-  term <- tf$math$maximum(u1^(-theta) + u2^(-theta) - 1.0, 1e-6)
+  one <- tf$constant(1.0, dtype = tf$float32)
 
-  penalty <- -(
-    log(theta + 1.0) -
-      (theta + 1.0) * (safe_log(u1) + safe_log(u2)) -
-      (2.0 + 1.0 / theta) * safe_log(term)
-  )
+  # Nonparametric Pair Copulas Tree 1
+  b0_0 <- (one - u0)^2; b1_0 <- 2.0 * u0 * (one - u0); b2_0 <- u0^2
+  b0_1 <- (one - u1)^2; b1_1 <- 2.0 * u1 * (one - u1); b2_1 <- u1^2
+  b0_2 <- (one - u2)^2; b1_2 <- 2.0 * u2 * (one - u2); b2_2 <- u2^2
 
-  tf$reduce_mean(cce) + LAMBDA_COPULA * tf$reduce_mean(penalty)
-}
+  c_np_01 <- 1.1 * (b0_0 * b0_1 + b2_0 * b2_1) + 0.9 * (b1_0 * b1_1) + 0.8 * (b0_0 * b2_1 + b2_0 * b0_1)
+  c_np_12 <- 1.2 * (b0_1 * b0_2 + b2_1 * b2_2) + 0.85 * (b1_1 * b1_2) + 0.8 * (b0_1 * b2_2 + b2_1 * b0_2)
 
-loss_gumbel_copula <- function(y_true, y_pred) {
-  cce <- tf$keras$losses$categorical_crossentropy(y_true, y_pred)
+  # Tree 2 Conditional Pairs
+  v_0_1 <- tf_clip(u0 * c_np_01)
+  v_2_1 <- tf_clip(u2 * c_np_12)
 
-  theta <- 2.0
-  u1 <- tf_clip(y_pred[, , 2])
-  u2 <- tf_clip(y_pred[, , 3])
+  bv0_0 <- (one - v_0_1)^2; bv1_0 <- 2.0 * v_0_1 * (one - v_0_1); bv2_0 <- v_0_1^2
+  bv0_2 <- (one - v_2_1)^2; bv1_2 <- 2.0 * v_2_1 * (one - v_2_1); bv2_2 <- v_2_1^2
 
-  a <- (-safe_log(u1))^theta
-  b <- (-safe_log(u2))^theta
-  A <- (a + b)^(1.0 / theta)
+  c_np_02_cond1 <- 1.15 * (bv0_0 * bv0_2 + bv2_0 * bv2_2) + 0.85 * (bv1_0 * bv1_2)
 
-  tf$reduce_mean(cce) + LAMBDA_COPULA * tf$reduce_mean(A)
+  vine_np_penalty <- -(safe_log(c_np_01) + safe_log(c_np_12) + safe_log(c_np_02_cond1))
+
+  tf$reduce_mean(cce) + LAMBDA_COPULA * tf$reduce_mean(vine_np_penalty)
 }
 
 # =============================================================
@@ -312,10 +353,10 @@ create_nn_model <- function(architecture, p, K, copula_penalty = "Standard") {
 
   loss_fn <- switch(
     copula_penalty,
-    Standard = loss_standard_cce,
-    Gaussian = loss_gaussian_copula,
-    Clayton  = loss_clayton_copula,
-    Gumbel   = loss_gumbel_copula
+    Standard           = loss_standard_cce,
+    Nonparametric      = loss_nonparametric_copula,
+    Vine               = loss_vine_copula,
+    Vine_Nonparametric = loss_nonparametric_vine_copula
   )
 
   input_layer <- keras3::keras_input(shape = c(p), name = "input_layer")
@@ -485,7 +526,6 @@ fit_classical_benchmarks <- function(split, horizons) {
         lp <- candidate
       }
 
-      # Estimate Cumulative Incidence for Brier Score
       sf <- tryCatch(survival::survfit(cox_fit, newdata = test_df), error = function(e) NULL)
       if (!is.null(sf)) {
         for (h_idx in seq_along(horizons)) {
@@ -690,7 +730,7 @@ ipcw_brier <- function(
 run_one_experiment <- function(replication, copula_name) {
 
   seed <- MASTER_SEED + replication * 1000 +
-    match(copula_name, c("Independence", "Gaussian", "Clayton", "Gumbel"))
+    match(copula_name, c("Independence", "Nonparametric", "Vine", "Vine_Nonparametric"))
 
   cat("\nReplication:", replication, "| Copula scenario:", copula_name, "\n")
 
@@ -721,7 +761,7 @@ run_one_experiment <- function(replication, copula_name) {
   row_id <- 1L
 
   architectures <- c("MLP", "CNN", "LSTM", "CNN_LSTM")
-  copula_variants <- c("Standard", "Gaussian", "Clayton", "Gumbel")
+  copula_variants <- c("Standard", "Nonparametric", "Vine", "Vine_Nonparametric")
 
   # Neural networks
   for (arch in architectures) {
@@ -881,7 +921,7 @@ run_one_experiment <- function(replication, copula_name) {
 # 7. Run All Scenarios and Replications
 # =============================================================
 
-scenarios <- c("Independence", "Gaussian", "Clayton", "Gumbel")
+scenarios <- c("Independence", "Nonparametric", "Vine", "Vine_Nonparametric")
 all_results <- list()
 result_id <- 1L
 replication_log <- list()

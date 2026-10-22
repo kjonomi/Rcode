@@ -1,9 +1,6 @@
 ###############################################################################
 # 100-Replicate Monte Carlo Weibull Competing-Risks Simulation Study
-#
-# Fixes:
-#   - Solves ggplot2 shape palette warning (>6 discrete values) using manual shapes
-#   - Runs 100 independent Monte Carlo replicates (Monte Carlo SE and SD reported)
+# Runs 100 independent Monte Carlo replicates (Monte Carlo SE and SD reported)
 #
 # Models Evaluated (9 Total):
 #   - MLP, CNN, LSTM, CNN-LSTM

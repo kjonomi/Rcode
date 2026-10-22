@@ -1,238 +1,169 @@
 ###############################################################################
-# Benchmark Strategy Applied to Public Survival Data (`survival::mgus2`)
-# Using Vine Copulas and Nonparametric Copulas for Competing Risks
+# Competing-Risks Benchmark on Public Survival Data: survival::mgus2
 #
-# Dataset: `mgus2` from the `survival` package
-#   - Cause 1: Progression to Plasma Cell Malignancy (PCM)
-#   - Cause 2: Death without progression
-#   - Status 0: Right-censored
+# Models:
+#   - Discrete-time neural networks: MLP, CNN, LSTM, CNN-LSTM
+#   - Experimental dependence-inspired regularizers (clearly labeled)
+#   - Random survival forest (randomForestSRC, logrankCR)
+#   - Cause-specific Cox models with cumulative-incidence reconstruction
+#   - Fine-Gray subdistribution-hazard models
 ###############################################################################
 
 Sys.setenv(CUDA_VISIBLE_DEVICES = "-1")
 
-# =============================================================
-# 0. Packages and Configuration
-# =============================================================
-
 required_packages <- c(
-  "survival", "randomForestSRC", "timeROC", "cmprsk",
-  "dplyr", "tidyr", "ggplot2", "keras3",
-  "tensorflow", "MASS", "rvinecopulib", "VineCopula"
+  "survival", "randomForestSRC", "cmprsk", "dplyr",
+  "keras3", "tensorflow"
 )
 
 for (pkg in required_packages) {
   if (!requireNamespace(pkg, quietly = TRUE)) {
-    stop("Please install package: ", pkg)
+    stop("Please install package: ", pkg, call. = FALSE)
   }
 }
 
-library(survival)
-library(randomForestSRC)
-library(timeROC)
-library(cmprsk)
-library(dplyr)
-library(tidyr)
-library(ggplot2)
-library(keras3)
-library(tensorflow)
-library(MASS)
-library(rvinecopulib)
-library(VineCopula)
+suppressPackageStartupMessages({
+  library(survival)
+  library(randomForestSRC)
+  library(cmprsk)
+  library(dplyr)
+  library(keras3)
+  library(tensorflow)
+})
+
+# ------------------------------ Configuration -------------------------------
 
 MASTER_SEED <- 20261014
-N_REPLICATIONS <- 10  # Number of experimental replications
-N_TIME_BINS <- 15
-
-EPOCHS <- 60
-BATCH_SIZE <- 64
+N_REPLICATIONS <- 10L        # Set to 50-100+ for publication analysis
+N_TIME_BINS <- 15L
+EPOCHS <- 60L
+BATCH_SIZE <- 64L
 LEARNING_RATE <- 0.001
 LAMBDA_COPULA <- 0.001
-
 TRAIN_FRACTION <- 0.70
+VALIDATION_FRACTION <- 0.20
 EVALUATION_PROBS <- c(0.25, 0.50, 0.75)
-
+RUN_EXPERIMENTAL <- FALSE    # TRUE runs exploratory non-copula penalties
 OUTPUT_DIR <- "Public_Data_Competing_Risks_Results"
+
 dir.create(OUTPUT_DIR, recursive = TRUE, showWarnings = FALSE)
 
-# =============================================================
-# 1. Load and Prepare Public Data (`survival::mgus2`)
-# =============================================================
+# ---------------------------- Reproducibility -------------------------------
+
+set_global_seed <- function(seed) {
+  set.seed(seed)
+  tryCatch(tf$random$set_seed(as.integer(seed)), error = function(e) NULL)
+}
+
+# --------------------------- Data preparation --------------------------------
 
 load_public_competing_risks_data <- function() {
-  if (!exists("mgus2", where = asNamespace("survival"))) {
-    stop("The dataset 'mgus2' could not be found in the survival package.")
-  }
+  raw <- survival::mgus2
 
-  df_raw <- survival::mgus2
-
-  df <- df_raw |>
-    dplyr::mutate(
-      time = ifelse(pstat == 1, ptime, futime),
-      status = dplyr::case_when(
-        pstat == 1 ~ 1L,
-        death == 1 & pstat == 0 ~ 2L,
-        TRUE ~ 0L
-      )
-    ) |>
-    dplyr::select(time, status, age, sex, hgb, creat, mspike) |>
-    dplyr::filter(!is.na(time) & time > 0)
-
-  df$sex <- ifelse(df$sex %in% c("m", 1), 1, 0)
-  df
-}
-
-# =============================================================
-# 2. Vectorized Vine & Nonparametric Copula Loss Functions
-# =============================================================
-
-tf_clip <- function(x, lower = 1e-6, upper = 1 - 1e-6) {
-  tf$clip_by_value(x, lower, upper)
-}
-
-safe_log <- function(x) {
-  tf$math$log(tf_clip(x))
-}
-
-loss_standard_cce <- function(y_true, y_pred) {
-  tf$keras$losses$categorical_crossentropy(y_true, y_pred)
-}
-
-# --- 2A. Nonparametric Copula Loss (Bernstein & Kernel Density) ---
-loss_nonparametric_copula <- function(y_true, y_pred) {
-  cce <- tf$keras$losses$categorical_crossentropy(y_true, y_pred)
-
-  u1 <- tf_clip(y_pred[, , 2])
-  u2 <- tf_clip(y_pred[, , 3])
-
-  one <- tf$constant(1.0, dtype = tf$float32)
-
-  # Nonparametric Bernstein polynomial basis functions (degree 3)
-  b0_1 <- (one - u1)^3
-  b1_1 <- 3.0 * u1 * (one - u1)^2
-  b2_1 <- 3.0 * (u1^2) * (one - u1)
-  b3_1 <- u1^3
-
-  b0_2 <- (one - u2)^3
-  b1_2 <- 3.0 * u2 * (one - u2)^2
-  b2_2 <- 3.0 * (u2^2) * (one - u2)
-  b3_2 <- u2^3
-
-  # Flexible non-parametric copula density interaction sum_ij w_ij b_i(u1) b_j(u2)
-  np_density <- (
-    1.2 * (b0_1 * b0_2 + b3_1 * b3_2) +
-    0.8 * (b1_1 * b1_2 + b2_1 * b2_2) +
-    0.9 * (b0_1 * b3_2 + b3_1 * b0_2) +
-    1.1 * (b1_1 * b2_2 + b2_1 * b1_2)
+  needed <- c(
+    "pstat", "ptime", "futime", "death",
+    "age", "sex", "hgb", "creat", "mspike"
   )
 
-  penalty <- -safe_log(np_density)
+  missing_cols <- setdiff(needed, names(raw))
+  if (length(missing_cols)) {
+    stop("Missing columns: ", paste(missing_cols, collapse = ", "))
+  }
 
-  tf$reduce_mean(cce) + LAMBDA_COPULA * tf$reduce_mean(penalty)
+  pstat <- as.integer(as.character(raw$pstat))
+  death <- as.integer(as.character(raw$death))
+
+  if (anyNA(pstat) || any(!pstat %in% 0:1)) {
+    stop("Unexpected pstat coding in survival::mgus2.")
+  }
+  if (anyNA(death) || any(!death %in% 0:1)) {
+    stop("Unexpected death coding in survival::mgus2.")
+  }
+
+  # First event: progression, death without prior progression, or censoring.
+  time <- ifelse(pstat == 1L, raw$ptime, raw$futime)
+  status <- ifelse(
+    pstat == 1L, 1L,
+    ifelse(death == 1L, 2L, 0L)
+  )
+
+  sex_chr <- tolower(trimws(as.character(raw$sex)))
+  sex <- ifelse(
+    sex_chr %in% c("m", "male", "1"), 1,
+    ifelse(sex_chr %in% c("f", "female", "0", "2"), 0, NA_real_)
+  )
+
+  dat <- data.frame(
+    time = as.numeric(time),
+    status = as.integer(status),
+    age = as.numeric(as.character(raw$age)),
+    sex = as.numeric(sex),
+    hgb = as.numeric(as.character(raw$hgb)),
+    creat = as.numeric(as.character(raw$creat)),
+    mspike = as.numeric(as.character(raw$mspike))
+  )
+
+  keep <- stats::complete.cases(dat) &
+    is.finite(dat$time) &
+    dat$time > 0 &
+    dat$status %in% 0:2
+
+  dat <- dat[keep, , drop = FALSE]
+  dat$status <- as.integer(dat$status)
+  rownames(dat) <- NULL
+
+  if (nrow(dat) == 0L) {
+    stop("No complete observations remain after data cleaning.")
+  }
+
+  cat("Dataset rows:", nrow(dat), "\n")
+  cat("Competing-risk status counts:\n")
+  print(table(factor(
+    dat$status,
+    levels = 0:2,
+    labels = c("Censored", "Progression", "Death without progression")
+  )))
+
+  dat
 }
-
-# --- 2B. Vine Copula Loss (Pair-Copula Construction over u0, u1, u2) ---
-loss_vine_copula <- function(y_true, y_pred) {
-  cce <- tf$keras$losses$categorical_crossentropy(y_true, y_pred)
-
-  u0 <- tf_clip(y_pred[, , 1])
-  u1 <- tf_clip(y_pred[, , 2])
-  u2 <- tf_clip(y_pred[, , 3])
-
-  # Tree 1 - Pair Copula (u0, u1) and (u1, u2)
-  z0 <- tf$math$log(u0 / (1.0 - u0))
-  z1 <- tf$math$log(u1 / (1.0 - u1))
-  z2 <- tf$math$log(u2 / (1.0 - u2))
-
-  rho01 <- 0.3
-  rho12 <- 0.4
-  penalty_tree1_a <- (z0^2 - 2 * rho01 * z0 * z1 + z1^2) / (2 * (1 - rho01^2))
-  penalty_tree1_b <- (z1^2 - 2 * rho12 * z1 * z2 + z2^2) / (2 * (1 - rho12^2))
-
-  # Tree 2 - Conditional Pair Copula (u0, u2 | u1) using h-functions
-  h_0_1 <- tf_clip(u0 * (1.0 + rho01 * (1.0 - u1)))
-  h_2_1 <- tf_clip(u2 * (1.0 + rho12 * (1.0 - u1)))
-
-  zh0_1 <- tf$math$log(h_0_1 / (1.0 - h_0_1))
-  zh2_1 <- tf$math$log(h_2_1 / (1.0 - h_2_1))
-  rho02_1 <- 0.25
-
-  penalty_tree2 <- (zh0_1^2 - 2 * rho02_1 * zh0_1 * zh2_1 + zh2_1^2) / (2 * (1 - rho02_1^2))
-
-  vine_penalty <- penalty_tree1_a + penalty_tree1_b + penalty_tree2
-
-  tf$reduce_mean(cce) + LAMBDA_COPULA * tf$reduce_mean(vine_penalty)
-}
-
-# --- 2C. Nonparametric Vine Copula Loss ---
-loss_nonparametric_vine_copula <- function(y_true, y_pred) {
-  cce <- tf$keras$losses$categorical_crossentropy(y_true, y_pred)
-
-  u0 <- tf_clip(y_pred[, , 1])
-  u1 <- tf_clip(y_pred[, , 2])
-  u2 <- tf_clip(y_pred[, , 3])
-
-  one <- tf$constant(1.0, dtype = tf$float32)
-
-  # Tree 1: Nonparametric Pair-Copulas
-  b0_0 <- (one - u0)^2; b1_0 <- 2.0 * u0 * (one - u0); b2_0 <- u0^2
-  b0_1 <- (one - u1)^2; b1_1 <- 2.0 * u1 * (one - u1); b2_1 <- u1^2
-  b0_2 <- (one - u2)^2; b1_2 <- 2.0 * u2 * (one - u2); b2_2 <- u2^2
-
-  c_np_01 <- 1.1 * (b0_0 * b0_1 + b2_0 * b2_1) + 0.9 * (b1_0 * b1_1) + 0.8 * (b0_0 * b2_1 + b2_0 * b0_1)
-  c_np_12 <- 1.2 * (b0_1 * b0_2 + b2_1 * b2_2) + 0.85 * (b1_1 * b1_2) + 0.8 * (b0_1 * b2_2 + b2_1 * b0_2)
-
-  # Tree 2: Conditional Pair-Copula
-  v_0_1 <- tf_clip(u0 * c_np_01)
-  v_2_1 <- tf_clip(u2 * c_np_12)
-
-  bv0_0 <- (one - v_0_1)^2; bv1_0 <- 2.0 * v_0_1 * (one - v_0_1); bv2_0 <- v_0_1^2
-  bv0_2 <- (one - v_2_1)^2; bv1_2 <- 2.0 * v_2_1 * (one - v_2_1); bv2_2 <- v_2_1^2
-
-  c_np_02_cond1 <- 1.15 * (bv0_0 * bv0_2 + bv2_0 * bv2_2) + 0.85 * (bv1_0 * bv1_2)
-
-  vine_np_penalty <- -(safe_log(c_np_01) + safe_log(c_np_12) + safe_log(c_np_02_cond1))
-
-  tf$reduce_mean(cce) + LAMBDA_COPULA * tf$reduce_mean(vine_np_penalty)
-}
-
-# =============================================================
-# 3. Preprocessing
-# =============================================================
 
 prepare_split <- function(data, seed = 2026, train_fraction = 0.70) {
   set.seed(seed)
-
   n <- nrow(data)
-  train_index <- sample(seq_len(n), floor(train_fraction * n))
-  test_index <- setdiff(seq_len(n), train_index)
+  if (n < 20L) stop("Too few complete endpoint records for a split.")
 
+  train_index <- sample(seq_len(n), size = floor(train_fraction * n))
+  test_index <- setdiff(seq_len(n), train_index)
   features <- c("age", "sex", "hgb", "creat", "mspike")
 
-  X_train_raw <- data[train_index, features, drop = FALSE]
-  X_test_raw <- data[test_index, features, drop = FALSE]
+  xtr <- data[train_index, features, drop = FALSE]
+  xte <- data[test_index, features, drop = FALSE]
 
-  medians <- vapply(X_train_raw, median, numeric(1), na.rm = TRUE)
+  medians <- vapply(xtr, function(z) {
+    z <- z[is.finite(z)]
+    if (!length(z)) 0 else stats::median(z)
+  }, numeric(1))
 
   for (j in seq_along(features)) {
-    X_train_raw[[j]][!is.finite(X_train_raw[[j]])] <- medians[j]
-    X_test_raw[[j]][!is.finite(X_test_raw[[j]])] <- medians[j]
+    xtr[[j]][!is.finite(xtr[[j]])] <- medians[j]
+    xte[[j]][!is.finite(xte[[j]])] <- medians[j]
   }
 
-  means <- vapply(X_train_raw, mean, numeric(1))
-  sds <- vapply(X_train_raw, sd, numeric(1))
+  means <- vapply(xtr, mean, numeric(1))
+  sds <- vapply(xtr, stats::sd, numeric(1))
   sds[!is.finite(sds) | sds == 0] <- 1
 
-  X_train <- scale(as.matrix(X_train_raw), center = means, scale = sds)
-  X_test <- scale(as.matrix(X_test_raw), center = means, scale = sds)
+  xtr_scaled <- scale(as.matrix(xtr), center = means, scale = sds)
+  xte_scaled <- scale(as.matrix(xte), center = means, scale = sds)
 
   list(
     train_index = train_index,
     test_index = test_index,
     features = features,
-    X_train_raw = X_train_raw,
-    X_test_raw = X_test_raw,
-    X_train = unname(as.matrix(X_train)),
-    X_test = unname(as.matrix(X_test)),
+    X_train_raw = as.data.frame(xtr),
+    X_test_raw = as.data.frame(xte),
+    X_train = unname(as.matrix(xtr_scaled)),
+    X_test = unname(as.matrix(xte_scaled)),
     time_train = data$time[train_index],
     time_test = data$time[test_index],
     status_train = data$status[train_index],
@@ -242,34 +173,50 @@ prepare_split <- function(data, seed = 2026, train_fraction = 0.70) {
   )
 }
 
+# ----------------------- Discrete-time target construction -------------------
+
+make_time_breaks <- function(time_train, n_bins = 15L) {
+  if (any(!is.finite(time_train)) || any(time_train <= 0)) {
+    stop("Training times must be finite and positive.")
+  }
+
+  br <- as.numeric(stats::quantile(
+    time_train,
+    probs = seq(0, 1, length.out = n_bins + 1L),
+    na.rm = TRUE, type = 8
+  ))
+  br <- sort(unique(c(0, br)))
+  br <- br[is.finite(br)]
+  if (length(br) < 3L) stop("Unable to construct at least two time intervals.")
+  br
+}
+
 make_discrete_targets <- function(time, status, breaks) {
   n <- length(time)
   K <- length(breaks) - 1L
-
-  y <- array(0, dim = c(n, K, 3))
+  y <- array(0, dim = c(n, K, 3L))
   weights <- matrix(0, nrow = n, ncol = K)
 
   for (i in seq_len(n)) {
-    if (status[i] %in% c(1L, 2L)) {
-      event_bin <- max(
-        1L,
-        min(K, findInterval(time[i], breaks, rightmost.closed = TRUE))
-      )
+    ti <- time[i]
+    si <- status[i]
+    if (!is.finite(ti) || is.na(si)) next
 
-      for (k in seq_len(event_bin)) {
-        weights[i, k] <- 1
-        if (k < event_bin) {
-          y[i, k, 1] <- 1
-        } else {
-          y[i, k, status[i] + 1L] <- 1
-        }
+    event_bin <- which(breaks[-1L] >= ti)[1L]
+    if (is.na(event_bin)) event_bin <- K
+    event_bin <- max(1L, min(K, event_bin))
+
+    if (si %in% c(1L, 2L)) {
+      weights[i, seq_len(event_bin)] <- 1
+      if (event_bin > 1L) {
+        y[i, seq_len(event_bin - 1L), 1L] <- 1
       }
+      y[i, event_bin, si + 1L] <- 1
     } else {
-      for (k in seq_len(K)) {
-        if (breaks[k + 1L] <= time[i]) {
-          weights[i, k] <- 1
-          y[i, k, 1] <- 1
-        }
+      observed_bins <- which(breaks[-1L] <= ti)
+      if (length(observed_bins)) {
+        weights[i, observed_bins] <- 1
+        y[i, observed_bins, 1L] <- 1
       }
     }
   }
@@ -277,72 +224,135 @@ make_discrete_targets <- function(time, status, breaks) {
   list(y = y, weights = weights)
 }
 
-# =============================================================
-# 4. Neural Network Models
-# =============================================================
+# ----------------------------- Neural losses ---------------------------------
 
-create_nn_model <- function(architecture, p, K, copula_penalty = "Standard") {
+tf_clip <- function(x, lower = 1e-6, upper = 1 - 1e-6) {
+  tf$clip_by_value(x, lower, upper)
+}
 
+loss_standard_cce <- function(y_true, y_pred) {
+  tf$keras$losses$categorical_crossentropy(y_true, y_pred)
+}
+
+loss_bernstein_experimental <- function(y_true, y_pred) {
+  cce <- loss_standard_cce(y_true, y_pred)
+  u1 <- tf_clip(y_pred[, , 2L])
+  u2 <- tf_clip(y_pred[, , 3L])
+  one <- tf$constant(1.0, dtype = tf$float32)
+
+  b0u <- (one - u1)^3
+  b1u <- 3.0 * u1 * (one - u1)^2
+  b2u <- 3.0 * u1^2 * (one - u1)
+  b3u <- u1^3
+
+  b0v <- (one - u2)^3
+  b1v <- 3.0 * u2 * (one - u2)^2
+  b2v <- 3.0 * u2^2 * (one - u2)
+  b3v <- u2^3
+
+  proxy <- 1.2 * (b0u * b0v + b3u * b3v) +
+    0.8 * (b1u * b1v + b2u * b2v) +
+    0.9 * (b0u * b3v + b3u * b0v) +
+    1.1 * (b1u * b2v + b2u * b1v)
+
+  tf$reduce_mean(cce) + LAMBDA_COPULA * tf$reduce_mean(-tf$math$log(tf_clip(proxy)))
+}
+
+loss_logit_experimental <- function(y_true, y_pred) {
+  cce <- loss_standard_cce(y_true, y_pred)
+  u <- tf_clip(y_pred)
+  z <- tf$math$log(u / (1.0 - u))
+  z0 <- z[, , 1L]
+  z1 <- z[, , 2L]
+  z2 <- z[, , 3L]
+  r01 <- 0.3
+  r12 <- 0.4
+  r02 <- 0.25
+
+  p01 <- (z0^2 - 2 * r01 * z0 * z1 + z1^2) / (2 * (1 - r01^2))
+  p12 <- (z1^2 - 2 * r12 * z1 * z2 + z2^2) / (2 * (1 - r12^2))
+  p02 <- (z0^2 - 2 * r02 * z0 * z2 + z2^2) / (2 * (1 - r02^2))
+
+  tf$reduce_mean(cce) + LAMBDA_COPULA * tf$reduce_mean(p01 + p12 + p02)
+}
+
+# ------------------------------ Model creation -------------------------------
+
+create_nn_model <- function(architecture, p, K, penalty = "Standard") {
   loss_fn <- switch(
-    copula_penalty,
-    Standard           = loss_standard_cce,
-    Nonparametric      = loss_nonparametric_copula,
-    Vine               = loss_vine_copula,
-    Vine_Nonparametric = loss_nonparametric_vine_copula
+    penalty,
+    Standard = loss_standard_cce,
+    Experimental_Bernstein = loss_bernstein_experimental,
+    Experimental_Logit = loss_logit_experimental,
+    stop("Unknown penalty: ", penalty)
   )
 
-  input_layer <- keras3::keras_input(shape = c(p), name = "input_layer")
+  input_layer <- keras3::keras_input(shape = c(p), name = "baseline_features")
 
   if (architecture == "MLP") {
     x <- input_layer |>
       keras3::layer_dense(64, activation = "relu") |>
       keras3::layer_dropout(0.25)
-
   } else if (architecture == "CNN") {
     x <- input_layer |>
       keras3::layer_dense(16, activation = "relu") |>
       keras3::layer_reshape(target_shape = c(4, 4)) |>
-      keras3::layer_conv_1d(filters = 16, kernel_size = 2, padding = "same", activation = "relu") |>
+      keras3::layer_conv_1d(
+        filters = 16, kernel_size = 2, padding = "same", activation = "relu"
+      ) |>
       keras3::layer_global_average_pooling_1d()
-
   } else if (architecture == "LSTM") {
     x <- input_layer |>
       keras3::layer_dense(16, activation = "relu") |>
       keras3::layer_reshape(target_shape = c(4, 4)) |>
       keras3::layer_lstm(32, return_sequences = FALSE)
-
   } else if (architecture == "CNN_LSTM") {
     x <- input_layer |>
       keras3::layer_dense(16, activation = "relu") |>
       keras3::layer_reshape(target_shape = c(4, 4)) |>
-      keras3::layer_conv_1d(filters = 16, kernel_size = 2, padding = "same", activation = "relu") |>
+      keras3::layer_conv_1d(
+        filters = 16, kernel_size = 2, padding = "same", activation = "relu"
+      ) |>
       keras3::layer_batch_normalization() |>
       keras3::layer_dropout(0.25) |>
       keras3::layer_lstm(32, return_sequences = FALSE)
+  } else {
+    stop("Unknown architecture: ", architecture)
   }
 
   output_layer <- x |>
     keras3::layer_dense(32, activation = "relu") |>
     keras3::layer_dropout(0.25) |>
-    keras3::layer_dense(K * 3, activation = "linear") |>
-    keras3::layer_reshape(target_shape = c(K, 3)) |>
+    keras3::layer_dense(K * 3L, activation = "linear") |>
+    keras3::layer_reshape(target_shape = c(K, 3L)) |>
     keras3::layer_activation(activation = "softmax", name = "interval_probabilities")
 
   model <- keras3::keras_model(inputs = input_layer, outputs = output_layer)
-
   model |> keras3::compile(
     optimizer = keras3::optimizer_adam(learning_rate = LEARNING_RATE),
     loss = loss_fn
   )
-
   model
 }
 
-fit_nn <- function(architecture, X, y, weights, K, copula_penalty = "Standard", seed = 2026) {
-  set.seed(seed)
-  tf$random$set_seed(as.integer(seed))
+fit_nn <- function(architecture, X, targets, K, penalty = "Standard", seed = 2026) {
+  set_global_seed(seed)
+  model <- create_nn_model(architecture, ncol(X), K, penalty)
 
-  model <- create_nn_model(architecture, ncol(X), K, copula_penalty)
+  y_train <- targets$y
+  w_train <- targets$weights
+
+  base_loss <- switch(
+    penalty,
+    Standard = loss_standard_cce,
+    Experimental_Bernstein = loss_bernstein_experimental,
+    Experimental_Logit = loss_logit_experimental
+  )
+
+  model |> keras3::compile(
+    optimizer = keras3::optimizer_adam(learning_rate = LEARNING_RATE),
+    loss = base_loss
+  )
 
   callbacks <- list(
     keras3::callback_early_stopping(
@@ -355,164 +365,115 @@ fit_nn <- function(architecture, X, y, weights, K, copula_penalty = "Standard", 
 
   model |> keras3::fit(
     x = X,
-    y = y,
-    sample_weight = weights,
-    validation_split = 0.20,
+    y = y_train,
+    sample_weight = w_train,
+    validation_split = VALIDATION_FRACTION,
     epochs = EPOCHS,
     batch_size = BATCH_SIZE,
     callbacks = callbacks,
     verbose = 0
   )
 
-  list(model = model, architecture = architecture)
+  list(model = model, architecture = architecture, penalty = penalty)
 }
 
 extract_cif <- function(model, X, K) {
   q <- predict(model, X, verbose = 0)
-  n <- dim(q)[1]
+  if (length(dim(q)) != 3L || dim(q)[2L] != K || dim(q)[3L] != 3L) {
+    stop("Unexpected neural prediction dimensions.")
+  }
+  if (any(!is.finite(q))) stop("Non-finite neural predictions.")
 
-  cif1 <- matrix(0, n, K)
-  cif2 <- matrix(0, n, K)
-  survival_prob <- matrix(1, n, K)
+  n <- dim(q)[1L]
+  cif1 <- cif2 <- matrix(0, n, K)
+  surv <- matrix(1, n, K)
 
   for (i in seq_len(n)) {
     s_prev <- 1
-    f1 <- 0
-    f2 <- 0
-
+    f1 <- f2 <- 0
     for (k in seq_len(K)) {
-      q0 <- q[i, k, 1]
-      q1 <- q[i, k, 2]
-      q2 <- q[i, k, 3]
-
+      q0 <- q[i, k, 1L]
+      q1 <- q[i, k, 2L]
+      q2 <- q[i, k, 3L]
       f1 <- f1 + s_prev * q1
       f2 <- f2 + s_prev * q2
       s_prev <- s_prev * q0
-
       cif1[i, k] <- f1
       cif2[i, k] <- f2
-      survival_prob[i, k] <- s_prev
+      surv[i, k] <- s_prev
     }
   }
 
-  list(cif1 = cif1, cif2 = cif2, survival = survival_prob)
+  if (any(cif1 < -1e-7) || any(cif2 < -1e-7) ||
+      any(cif1 + cif2 + surv > 1 + 1e-5)) {
+    warning("CIF/survival probability consistency check failed.")
+  }
+  list(cif1 = cif1, cif2 = cif2, survival = surv)
 }
 
-# =============================================================
-# 5. Benchmarks & Evaluation Metrics
-# =============================================================
+# ------------------------------ Metric helpers -------------------------------
 
-fit_classical_benchmarks <- function(split, horizons) {
-  train_df <- data.frame(time = split$time_train, status = split$status_train, split$X_train_raw, check.names = FALSE)
-  test_df <- data.frame(time = split$time_test, status = split$status_test, split$X_test_raw, check.names = FALSE)
-  n_test <- nrow(test_df)
-  causes <- 1:2
-  pred_results <- list()
-
-  cox_formula <- as.formula(paste("survival::Surv(time, event) ~", paste(sprintf("`%s`", split$features), collapse = " + ")))
-
-  # --- Cause Specific Cox ---
-  for (cause in causes) {
-    csc_data <- train_df
-    csc_data$event <- as.integer(csc_data$status == cause)
-
-    cox_fit <- tryCatch(
-      suppressWarnings(survival::coxph(cox_formula, data = csc_data, x = TRUE, y = TRUE, singular.ok = TRUE)),
-      error = function(e) NULL
-    )
-
-    lp <- rep(NA_real_, n_test)
-    prob_matrix <- matrix(NA_real_, nrow = n_test, ncol = length(horizons))
-
-    if (!is.null(cox_fit)) {
-      lp_candidate <- tryCatch(as.numeric(predict(cox_fit, newdata = test_df, type = "lp")), error = function(e) rep(NA_real_, n_test))
-      if (length(lp_candidate) == n_test) lp <- lp_candidate
-
-      sf <- tryCatch(survival::survfit(cox_fit, newdata = test_df), error = function(e) NULL)
-      if (!is.null(sf)) {
-        for (h_idx in seq_along(horizons)) {
-          h <- horizons[h_idx]
-          cum_inc <- 1 - summary(sf, times = h, extend = TRUE)$surv
-          if (is.matrix(cum_inc)) {
-            prob_matrix[, h_idx] <- cum_inc[1, ]
-          } else if (length(cum_inc) == n_test) {
-            prob_matrix[, h_idx] <- cum_inc
-          }
-        }
-      }
-    }
-    pred_results[[paste0("CauseSpecificCox_Cause", cause)]] <- list(risk = lp, probs = prob_matrix)
+safe_horizon_index <- function(grid, horizon, side = c("right", "left")) {
+  side <- match.arg(side)
+  if (!length(grid) || all(!is.finite(grid))) return(NA_integer_)
+  if (side == "right") {
+    idx <- which(grid >= horizon)[1L]
+    if (is.na(idx)) idx <- length(grid)
+  } else {
+    ids <- which(grid <= horizon)
+    idx <- if (length(ids)) max(ids) else 1L
   }
-
-  # --- Fine Gray Model ---
-  design_formula <- stats::reformulate(split$features)
-  X_train_fg <- tryCatch(model.matrix(design_formula, data = train_df)[, -1, drop = FALSE], error = function(e) NULL)
-  X_test_fg <- tryCatch(model.matrix(design_formula, data = test_df)[, -1, drop = FALSE], error = function(e) NULL)
-
-  for (cause in causes) {
-    lp <- rep(NA_real_, n_test)
-    prob_matrix <- matrix(NA_real_, nrow = n_test, ncol = length(horizons))
-
-    if (!is.null(X_train_fg) && !is.null(X_test_fg)) {
-      fg_fit <- tryCatch(
-        suppressWarnings(cmprsk::crr(ftime = train_df$time, fstatus = train_df$status, cov1 = X_train_fg, failcode = cause, cencode = 0)),
-        error = function(e) NULL
-      )
-      if (!is.null(fg_fit) && !is.null(fg_fit$coef)) {
-        beta <- fg_fit$coef
-        if (length(beta) == ncol(X_test_fg)) {
-          lp <- as.numeric(X_test_fg %*% beta)
-          pred_cif <- tryCatch(predict(fg_fit, cov1 = X_test_fg), error = function(e) NULL)
-          if (!is.null(pred_cif)) {
-            times_fg <- pred_cif[, 1]
-            cif_vals <- pred_cif[, -1, drop = FALSE]
-            for (h_idx in seq_along(horizons)) {
-              h <- horizons[h_idx]
-              t_idx <- max(1L, which(times_fg <= h))
-              if (length(t_idx) > 0) {
-                prob_matrix[, h_idx] <- cif_vals[max(t_idx), ]
-              }
-            }
-          }
-        }
-      }
-    }
-    pred_results[[paste0("FineGray_Cause", cause)]] <- list(risk = lp, probs = prob_matrix)
-  }
-
-  pred_results
+  as.integer(idx)
 }
 
 cause_cindex <- function(time, status, risk, cause) {
-  valid <- is.finite(time) & !is.na(status) & is.finite(risk)
-  if (sum(valid) < 2L) return(NA_real_)
-  event <- as.integer(status[valid] == cause)
-  if (sum(event) == 0L || length(unique(risk[valid])) < 2L) return(NA_real_)
-  tryCatch(as.numeric(survival::concordance(survival::Surv(time[valid], event) ~ risk[valid], reverse = TRUE)$concordance), error = function(e) NA_real_)
+  ok <- is.finite(time) & !is.na(status) & is.finite(risk)
+  if (sum(ok) < 3L) return(NA_real_)
+  event <- as.integer(status[ok] == cause)
+  if (!any(event == 1L) || length(unique(risk[ok])) < 2L) return(NA_real_)
+  tryCatch(
+    as.numeric(survival::concordance(
+      survival::Surv(time[ok], event) ~ risk[ok],
+      reverse = TRUE
+    )$concordance),
+    error = function(e) NA_real_
+  )
 }
 
 cause_auc <- function(time, status, risk, cause, horizon) {
-  valid <- is.finite(time) & !is.na(status) & is.finite(risk)
-  if (sum(valid) < 2L) return(NA_real_)
-  delta <- as.integer(status[valid] == cause)
-  if (sum(delta == 1L) == 0L || sum(delta == 0L) == 0L) return(NA_real_)
-  tryCatch({
-    roc <- timeROC::timeROC(T = time[valid], delta = delta, marker = as.numeric(risk[valid]), cause = 1, weighting = "marginal", times = horizon, iid = FALSE)
-    idx <- which.min(abs(roc$times - horizon))
-    as.numeric(roc$AUC[idx])
-  }, error = function(e) NA_real_)
+  ok <- is.finite(time) & !is.na(status) & is.finite(risk)
+  time <- time[ok]; status <- status[ok]; risk <- risk[ok]
+  if (length(time) < 3L) return(NA_real_)
+
+  cases <- which(status == cause & time <= horizon)
+  controls <- which(time > horizon | (status %in% c(1L, 2L) &
+                                        status != cause & time <= horizon))
+  if (!length(cases) || !length(controls)) return(NA_real_)
+
+  r_case <- risk[cases]
+  r_control <- risk[controls]
+  pair_scores <- outer(r_case, r_control, FUN = "-")
+  as.numeric((sum(pair_scores > 0) + 0.5 * sum(pair_scores == 0)) /
+               length(pair_scores))
 }
 
-ipcw_brier <- function(time_train, status_train, time_test, status_test, risk, cause, horizon) {
-  censor_fit <- tryCatch(survival::survfit(survival::Surv(time_train, as.integer(status_train == 0)) ~ 1), error = function(e) NULL)
-  if (is.null(censor_fit)) return(NA_real_)
-
-  G_at <- function(t) {
-    z <- tryCatch(summary(censor_fit, times = t, extend = TRUE)$surv, error = function(e) numeric(0))
-    if (!length(z) || !is.finite(z[1])) return(NA_real_)
-    max(z[1], 1e-6)
+make_censoring_km <- function(time_train, status_train) {
+  fit <- survival::survfit(
+    survival::Surv(time_train, as.integer(status_train == 0L)) ~ 1
+  )
+  function(t) {
+    z <- tryCatch(
+      summary(fit, times = t, extend = TRUE)$surv,
+      error = function(e) numeric(0)
+    )
+    if (!length(z) || !is.finite(z[1L])) return(NA_real_)
+    max(z[1L], 1e-5)
   }
+}
 
+ipcw_brier <- function(time_train, status_train, time_test, status_test,
+                       risk, cause, horizon) {
+  G_at <- make_censoring_km(time_train, status_train)
   G_h <- G_at(horizon)
   if (!is.finite(G_h)) return(NA_real_)
 
@@ -520,65 +481,232 @@ ipcw_brier <- function(time_train, status_train, time_test, status_test, risk, c
   score <- rep(NA_real_, length(time_test))
 
   for (i in seq_along(time_test)) {
-    if (!is.finite(time_test[i]) || is.na(status_test[i]) || !is.finite(risk[i])) next
-    if (time_test[i] <= horizon) {
-      if (status_test[i] == 0) next
-      observed <- as.integer(status_test[i] == cause)
-      G_i <- G_at(time_test[i])
-      if (!is.finite(G_i)) next
-      score[i] <- (observed - risk[i])^2 / G_i
-    } else {
-      score[i] <- risk[i]^2 / G_h
+    ti <- time_test[i]
+    si <- status_test[i]
+    ri <- risk[i]
+    if (!is.finite(ti) || is.na(si) || !is.finite(ri)) next
+
+    if (ti <= horizon && si %in% c(1L, 2L)) {
+      observed <- as.integer(si == cause)
+      Gi <- G_at(ti)
+      if (is.finite(Gi) && Gi > 0) score[i] <- (observed - ri)^2 / Gi
+    } else if (ti > horizon) {
+      score[i] <- ri^2 / G_h
     }
   }
-  mean(score, na.rm = TRUE)
+
+  valid <- is.finite(score)
+  if (!any(valid)) return(NA_real_)
+  mean(score[valid])
 }
 
-# =============================================================
-# 6. Run Replication Experiment
-# =============================================================
+# --------------------- Classical competing-risk models -----------------------
+
+fit_cause_specific_cox <- function(split, horizons) {
+  train <- data.frame(
+    time = split$time_train, status = split$status_train,
+    split$X_train_raw, check.names = FALSE
+  )
+  test <- data.frame(split$X_test_raw, check.names = FALSE)
+  n_test <- nrow(test)
+  features <- split$features
+  form <- stats::as.formula(
+    paste("survival::Surv(time, event) ~",
+          paste(sprintf("`%s`", features), collapse = " + "))
+  )
+
+  fits <- vector("list", 2L)
+  for (cause in 1:2) {
+    dat <- train
+    dat$event <- as.integer(dat$status == cause)
+    fits[[cause]] <- tryCatch(
+      suppressWarnings(survival::coxph(
+        form, data = dat, x = TRUE, y = TRUE, singular.ok = TRUE
+      )),
+      error = function(e) NULL
+    )
+  }
+
+  basehaz_list <- lapply(fits, function(fit) {
+    if (is.null(fit)) return(NULL)
+    tryCatch(survival::basehaz(fit, centered = FALSE), error = function(e) NULL)
+  })
+  if (any(vapply(basehaz_list, is.null, logical(1)))) {
+    return(list())
+  }
+
+  risk_lp <- lapply(fits, function(fit) {
+    tryCatch(as.numeric(predict(fit, newdata = test, type = "lp", reference = "zero")),
+             error = function(e) rep(NA_real_, n_test))
+  })
+
+  grid <- sort(unique(c(0, unlist(lapply(basehaz_list, `[[`, "time")))))
+  grid <- grid[is.finite(grid)]
+  if (length(grid) < 2L) return(list())
+
+  H <- lapply(seq_len(2L), function(cause) {
+    bh <- basehaz_list[[cause]]
+    approx(bh$time, bh$hazard, xout = grid, method = "constant",
+           f = 0, yleft = 0, rule = 2)$y
+  })
+
+  cif <- lapply(seq_len(2L), function(cause) matrix(0, n_test, length(grid)))
+  for (i in seq_len(n_test)) {
+    s <- 1
+    f <- c(0, 0)
+    for (j in seq_along(grid)) {
+      if (j == 1L) {
+        for (cause in 1:2) cif[[cause]][i, j] <- 0
+        next
+      }
+      dH <- c(max(0, H[[1L]][j] - H[[1L]][j - 1L]),
+              max(0, H[[2L]][j] - H[[2L]][j - 1L]))
+      dh <- c(dH[1L] * exp(risk_lp[[1L]][i]),
+              dH[2L] * exp(risk_lp[[2L]][i]))
+      if (any(!is.finite(dh))) {
+        f[] <- NA_real_; s <- NA_real_
+      } else {
+        total <- sum(dh)
+        event_prob <- if (total > 0) (1 - exp(-total)) * dh / total else c(0, 0)
+        f <- f + s * event_prob
+        s <- s * exp(-total)
+      }
+      for (cause in 1:2) cif[[cause]][i, j] <- f[cause]
+    }
+  }
+
+  out <- list()
+  for (cause in 1:2) {
+    lp <- risk_lp[[cause]]
+    probs <- matrix(NA_real_, n_test, length(horizons))
+    for (h_idx in seq_along(horizons)) {
+      j <- safe_horizon_index(grid, horizons[h_idx], "left")
+      probs[, h_idx] <- cif[[cause]][, j]
+    }
+    out[[paste0("CauseSpecificCox_Cause", cause)]] <-
+      list(risk = lp, probs = probs)
+  }
+  out
+}
+
+fit_fine_gray <- function(split, horizons) {
+  train <- data.frame(
+    time = split$time_train, status = split$status_train,
+    split$X_train_raw, check.names = FALSE
+  )
+  test <- data.frame(split$X_test_raw, check.names = FALSE)
+  design <- stats::reformulate(split$features)
+  mm_train <- tryCatch(stats::model.matrix(design, train)[, -1, drop = FALSE],
+                       error = function(e) NULL)
+  mm_test <- tryCatch(stats::model.matrix(design, test)[, -1, drop = FALSE],
+                      error = function(e) NULL)
+  if (is.null(mm_train) || is.null(mm_test) ||
+      ncol(mm_train) != ncol(mm_test)) return(list())
+
+  out <- list()
+  for (cause in 1:2) {
+    fit <- tryCatch(
+      cmprsk::crr(
+        ftime = train$time, fstatus = train$status, cov1 = mm_train,
+        failcode = cause, cencode = 0
+      ),
+      error = function(e) NULL
+    )
+    n_test <- nrow(test)
+    lp <- rep(NA_real_, n_test)
+    probs <- matrix(NA_real_, n_test, length(horizons))
+
+    if (!is.null(fit)) {
+      if (length(fit$coef) == ncol(mm_test)) {
+        lp <- as.numeric(mm_test %*% fit$coef)
+      }
+      pred <- tryCatch(as.matrix(predict(fit, cov1 = mm_test)),
+                       error = function(e) NULL)
+      if (!is.null(pred) && ncol(pred) >= 2L) {
+        times <- pred[, 1L]
+        vals <- pred[, -1L, drop = FALSE]
+        for (h_idx in seq_along(horizons)) {
+          h <- horizons[h_idx]
+          eligible <- which(times <= h)
+          j <- if (length(eligible)) max(eligible) else 1L
+          if (nrow(vals) >= j && ncol(vals) == n_test) {
+            probs[, h_idx] <- vals[j, ]
+          } else if (nrow(vals) == n_test && ncol(vals) != n_test) {
+            if (nrow(pred) == n_test) {
+              probs[, h_idx] <- pred[, min(ncol(pred), j + 1L)]
+            }
+          }
+        }
+      }
+    }
+    out[[paste0("FineGray_Cause", cause)]] <- list(risk = lp, probs = probs)
+  }
+  out
+}
+
+# ------------------------------ One replication ------------------------------
 
 run_one_experiment <- function(replication, raw_data) {
-  seed <- MASTER_SEED + replication * 1000
+  seed <- MASTER_SEED + replication * 1000L
+  set_global_seed(seed)
   cat("\nReplication:", replication, "\n")
 
   split <- prepare_split(raw_data, seed = seed, train_fraction = TRAIN_FRACTION)
-
-  breaks <- unique(as.numeric(quantile(split$time_train, probs = seq(0, 1, length.out = N_TIME_BINS + 1), na.rm = TRUE, type = 8)))
-  breaks <- sort(unique(c(0, breaks)))
+  breaks <- make_time_breaks(split$time_train, N_TIME_BINS)
   K <- length(breaks) - 1L
-
   targets <- make_discrete_targets(split$time_train, split$status_train, breaks)
-  horizons <- sort(unique(as.numeric(quantile(split$time_train, probs = EVALUATION_PROBS, na.rm = TRUE))))
+  horizons <- sort(unique(as.numeric(stats::quantile(
+    split$time_train, probs = EVALUATION_PROBS, na.rm = TRUE
+  ))))
+
+  architectures <- c("MLP", "CNN", "LSTM", "CNN_LSTM")
+  penalties <- if (RUN_EXPERIMENTAL) {
+    c("Standard", "Experimental_Bernstein", "Experimental_Logit")
+  } else {
+    "Standard"
+  }
 
   output <- list()
   row_id <- 1L
 
-  architectures <- c("MLP", "CNN", "LSTM", "CNN_LSTM")
-  copula_variants <- c("Standard", "Nonparametric", "Vine", "Vine_Nonparametric")
-
   for (arch in architectures) {
-    for (cop_p in copula_variants) {
-      model_label <- if (cop_p == "Standard") arch else paste0(arch, "_", cop_p)
+    for (penalty in penalties) {
+      model_label <- if (penalty == "Standard") arch else paste(arch, penalty, sep = "_")
       cat("  Fitting:", model_label, "\n")
-
       keras3::clear_session()
-      fitted <- tryCatch(fit_nn(arch, split$X_train, targets$y, targets$weights, K, copula_penalty = cop_p, seed = seed + row_id), error = function(e) NULL)
-      nn_cif <- if (!is.null(fitted)) tryCatch(extract_cif(fitted$model, split$X_test, K), error = function(e) NULL) else NULL
+
+      fitted <- tryCatch(
+        fit_nn(arch, split$X_train, targets, K, penalty, seed + row_id),
+        error = function(e) {
+          cat("    Neural fit failed:", conditionMessage(e), "\n")
+          NULL
+        }
+      )
+      cif <- if (!is.null(fitted)) {
+        tryCatch(extract_cif(fitted$model, split$X_test, K),
+                 error = function(e) {
+                   cat("    Prediction failed:", conditionMessage(e), "\n")
+                   NULL
+                 })
+      } else NULL
 
       for (cause in 1:2) {
-        for (horizon in horizons) {
-          k <- max(1L, min(K, which(breaks[-1] >= horizon)[1]))
-          risk <- if (is.null(nn_cif)) rep(NA_real_, nrow(split$X_test)) else if (cause == 1) nn_cif$cif1[, k] else nn_cif$cif2[, k]
-
+        for (h_idx in seq_along(horizons)) {
+          h <- horizons[h_idx]
+          k <- safe_horizon_index(breaks[-1L], h, "right")
+          risk <- rep(NA_real_, nrow(split$X_test))
+          if (!is.null(cif) && !is.na(k)) {
+            risk <- if (cause == 1L) cif$cif1[, k] else cif$cif2[, k]
+          }
           output[[row_id]] <- data.frame(
-            Replication = replication,
-            Model = model_label,
-            Cause = cause,
-            Horizon = horizon,
+            Replication = replication, Model = model_label,
+            Cause = cause, Horizon = h,
             Cindex = cause_cindex(split$time_test, split$status_test, risk, cause),
-            TimeAUC = cause_auc(split$time_test, split$status_test, risk, cause, horizon),
-            BrierScore = ipcw_brier(split$time_train, split$status_train, split$time_test, split$status_test, risk, cause, horizon)
+            TimeAUC = cause_auc(split$time_test, split$status_test, risk, cause, h),
+            BrierScore = ipcw_brier(
+              split$time_train, split$status_train,
+              split$time_test, split$status_test, risk, cause, h
+            )
           )
           row_id <- row_id + 1L
         }
@@ -586,50 +714,80 @@ run_one_experiment <- function(replication, raw_data) {
     }
   }
 
-  # Random Survival Forest
-  rsf_train <- data.frame(time = split$time_train, status = factor(split$status_train, levels = c(0, 1, 2), labels = c("censored", "progression", "death")), split$X_train_raw)
-  rsf_fit <- tryCatch({
-    set.seed(seed + 200)
-    rsf <- randomForestSRC::rfsrc(Surv(time, status) ~ ., data = rsf_train, ntree = 300, nodesize = 15, splitrule = "logrankCR")
-    pred <- predict(rsf, newdata = data.frame(split$X_test_raw))
-    list(cif = pred$cif, times = as.numeric(pred$time.interest))
-  }, error = function(e) NULL)
+  rsf_train <- data.frame(
+    time = split$time_train,
+    status = factor(split$status_train, levels = c(0, 1, 2),
+                    labels = c("censored", "progression", "death")),
+    split$X_train_raw,
+    check.names = FALSE
+  )
+
+  rsf <- tryCatch({
+    set.seed(seed + 200L)
+    randomForestSRC::rfsrc(
+      survival::Surv(time, status) ~ ., data = rsf_train,
+      ntree = 300, nodesize = 15, splitrule = "logrankCR"
+    )
+  }, error = function(e) {
+    cat("  RSF fit failed:", conditionMessage(e), "\n")
+    NULL
+  })
+
+  rsf_pred <- if (!is.null(rsf)) {
+    tryCatch(predict(rsf, newdata = data.frame(split$X_test_raw)),
+             error = function(e) NULL)
+  } else NULL
 
   for (cause in 1:2) {
-    for (horizon in horizons) {
+    for (h_idx in seq_along(horizons)) {
+      h <- horizons[h_idx]
       risk <- rep(NA_real_, nrow(split$X_test))
-      if (!is.null(rsf_fit) && length(rsf_fit$times) > 0) {
-        k <- max(1L, min(length(rsf_fit$times), which(rsf_fit$times >= horizon)[1]))
-        risk <- tryCatch(as.numeric(rsf_fit$cif[, k, cause]), error = function(e) risk)
+      if (!is.null(rsf_pred) && !is.null(rsf_pred$cif) &&
+          !is.null(rsf_pred$time.interest)) {
+        tt <- as.numeric(rsf_pred$time.interest)
+        j <- safe_horizon_index(tt, h, "left")
+        if (!is.na(j)) {
+          risk <- tryCatch(as.numeric(rsf_pred$cif[, j, cause]),
+                           error = function(e) risk)
+        }
       }
-
       output[[row_id]] <- data.frame(
-        Replication = replication, Model = "Random_Survival_Forest", Cause = cause, Horizon = horizon,
+        Replication = replication, Model = "Random_Survival_Forest",
+        Cause = cause, Horizon = h,
         Cindex = cause_cindex(split$time_test, split$status_test, risk, cause),
-        TimeAUC = cause_auc(split$time_test, split$status_test, risk, cause, horizon),
-        BrierScore = ipcw_brier(split$time_train, split$status_train, split$time_test, split$status_test, risk, cause, horizon)
+        TimeAUC = cause_auc(split$time_test, split$status_test, risk, cause, h),
+        BrierScore = ipcw_brier(
+          split$time_train, split$status_train,
+          split$time_test, split$status_test, risk, cause, h
+        )
       )
       row_id <- row_id + 1L
     }
   }
 
-  # Classical Benchmarks
-  classical_preds <- fit_classical_benchmarks(split, horizons)
-  for (model_key in names(classical_preds)) {
+  classical <- c(
+    fit_cause_specific_cox(split, horizons),
+    fit_fine_gray(split, horizons)
+  )
+
+  for (model_key in names(classical)) {
     cause <- as.integer(sub(".*_Cause", "", model_key))
     model_name <- sub("_Cause[12]$", "", model_key)
-    res <- classical_preds[[model_key]]
-    risk_lp <- res$risk
+    res <- classical[[model_key]]
 
     for (h_idx in seq_along(horizons)) {
-      horizon <- horizons[h_idx]
-      prob_risk <- res$probs[, h_idx]
-
+      h <- horizons[h_idx]
+      lp <- res$risk
+      prob <- res$probs[, h_idx]
       output[[row_id]] <- data.frame(
-        Replication = replication, Model = model_name, Cause = cause, Horizon = horizon,
-        Cindex = cause_cindex(split$time_test, split$status_test, risk_lp, cause),
-        TimeAUC = cause_auc(split$time_test, split$status_test, risk_lp, cause, horizon),
-        BrierScore = ipcw_brier(split$time_train, split$status_train, split$time_test, split$status_test, prob_risk, cause, horizon)
+        Replication = replication, Model = model_name,
+        Cause = cause, Horizon = h,
+        Cindex = cause_cindex(split$time_test, split$status_test, lp, cause),
+        TimeAUC = cause_auc(split$time_test, split$status_test, lp, cause, h),
+        BrierScore = ipcw_brier(
+          split$time_train, split$status_train,
+          split$time_test, split$status_test, prob, cause, h
+        )
       )
       row_id <- row_id + 1L
     }
@@ -638,44 +796,59 @@ run_one_experiment <- function(replication, raw_data) {
   dplyr::bind_rows(output)
 }
 
-# =============================================================
-# 7. Execute and Save Summaries
-# =============================================================
+# ------------------------------ Run benchmark -------------------------------
 
 raw_data <- load_public_competing_risks_data()
-cat("Dataset successfully loaded. Total rows:", nrow(raw_data), "\n")
 
 all_results <- list()
-
 for (rep_i in seq_len(N_REPLICATIONS)) {
-  res_df <- tryCatch(
+  res <- tryCatch(
     run_one_experiment(rep_i, raw_data),
     error = function(e) {
-      cat("Error in Replication", rep_i, ":", conditionMessage(e), "\n")
-      return(NULL)
+      cat("Replication", rep_i, "failed:", conditionMessage(e), "\n")
+      NULL
     }
   )
-  if (!is.null(res_df)) {
-    all_results[[length(all_results) + 1L]] <- res_df
+  if (!is.null(res) && nrow(res)) {
+    all_results[[length(all_results) + 1L]] <- res
   }
 }
 
-if (length(all_results) == 0) {
-  stop("All replications failed. Please inspect the error messages printed above.")
+if (!length(all_results)) {
+  stop("All replications failed; inspect the printed errors.")
 }
 
 results <- dplyr::bind_rows(all_results)
-write.csv(results, file.path(OUTPUT_DIR, "Public_Data_All_Results.csv"), row.names = FALSE)
+utils::write.csv(
+  results,
+  file.path(OUTPUT_DIR, "Public_Data_All_Results.csv"),
+  row.names = FALSE
+)
 
-summary_results <- results |>
-  dplyr::group_by(Model, Cause, Horizon) |>
-  dplyr::summarise(
-    Mean_Cindex = mean(Cindex, na.rm = TRUE),
-    Mean_AUC = mean(TimeAUC, na.rm = TRUE),
-    Mean_Brier = mean(BrierScore, na.rm = TRUE),
+summary_results <- results %>%
+  group_by(Model, Cause, Horizon) %>%
+  summarise(
+    N_valid_Cindex = sum(is.finite(Cindex)),
+    Mean_Cindex = if (any(is.finite(Cindex))) mean(Cindex, na.rm = TRUE) else NA_real_,
+    SD_Cindex = if (sum(is.finite(Cindex)) > 1L) sd(Cindex, na.rm = TRUE) else NA_real_,
+    MCSE_Cindex = if (sum(is.finite(Cindex)) > 1L) sd(Cindex, na.rm = TRUE) / sqrt(sum(is.finite(Cindex))) else NA_real_,
+    N_valid_AUC = sum(is.finite(TimeAUC)),
+    Mean_AUC = if (any(is.finite(TimeAUC))) mean(TimeAUC, na.rm = TRUE) else NA_real_,
+    SD_AUC = if (sum(is.finite(TimeAUC)) > 1L) sd(TimeAUC, na.rm = TRUE) else NA_real_,
+    MCSE_AUC = if (sum(is.finite(TimeAUC)) > 1L) sd(TimeAUC, na.rm = TRUE) / sqrt(sum(is.finite(TimeAUC))) else NA_real_,
+    N_valid_Brier = sum(is.finite(BrierScore)),
+    Mean_Brier = if (any(is.finite(BrierScore))) mean(BrierScore, na.rm = TRUE) else NA_real_,
+    SD_Brier = if (sum(is.finite(BrierScore)) > 1L) sd(BrierScore, na.rm = TRUE) else NA_real_,
+    MCSE_Brier = if (sum(is.finite(BrierScore)) > 1L) sd(BrierScore, na.rm = TRUE) / sqrt(sum(is.finite(BrierScore))) else NA_real_,
     .groups = "drop"
   )
 
-write.csv(summary_results, file.path(OUTPUT_DIR, "Public_Data_Summary.csv"), row.names = FALSE)
+utils::write.csv(
+  summary_results,
+  file.path(OUTPUT_DIR, "Public_Data_Summary.csv"),
+  row.names = FALSE
+)
 
-cat("\nExecution completed successfully! Outputs saved in:", OUTPUT_DIR, "\n")
+cat("\nCompleted. Results saved to:", normalizePath(OUTPUT_DIR), "\n")
+cat("All-result rows:", nrow(results), "\n")
+cat("Summary rows:", nrow(summary_results), "\n")

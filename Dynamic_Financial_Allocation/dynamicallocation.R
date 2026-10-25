@@ -1,6 +1,7 @@
 ###############################################################################
-# 100-RUN MONTE CARLO AVERAGE ALLOCATION POLICY (R 3.4 COMPATIBLE)
-# Plots 100-Run Mean Cumulative Returns vs Benchmarks
+# ENHANCED 100-RUN MONTE CARLO CAUSAL DEEP LEARNING ALLOCATION POLICY
+# Features Overlap Restoration, Macro Regime Treatment, Signal Smoothing,
+# and Automatic CSV & Plot File Exporting (R 3.4 COMPATIBLE)
 ###############################################################################
 
 options(download.file.method = "libcurl")
@@ -27,31 +28,29 @@ TRAIN_RATIO          <- 0.70
 PROPENSITY_CLIP_EPS  <- 0.05
 TRANSACTION_COST_BPS <- 10 / 10000  # 10 bps per trade
 
-# Sensitivity Analysis Flag (Reviewer 1, Comment 2)
-REMOVE_SAME_DAY_RETURNS <- FALSE
+# Overlap Restoration Flag (Reviewer 1, Comment 2)
+REMOVE_SAME_DAY_RETURNS <- TRUE
 
 ###############################################################################
-# 2. DATA ACQUISITION & ALIGNMENT (FIXED FOR R 3.4 & XTS)
+# 2. DATA ACQUISITION & FEATURE ENGINEERING
 ###############################################################################
 
 symbols <- c("SPY", "TLT", "^VIX")
 getSymbols(symbols, src = "yahoo", from = START_DATE, to = END_DATE, auto.assign = TRUE)
 
-# Merge all series and omit NAs to retain common trading days cleanly
 prices_merged <- merge(Ad(SPY), Ad(TLT), Cl(VIX))
 colnames(prices_merged) <- c("SPY", "TLT", "VIX")
 prices_clean <- na.omit(prices_merged)
 
-# Compute daily simple returns (slice [-1] to drop initial NA and match N-1 length)
+# Compute daily simple returns
 r_spy_simple <- as.numeric(prices_clean$SPY / lag(prices_clean$SPY) - 1)[-1]
 r_tlt_simple <- as.numeric(prices_clean$TLT / lag(prices_clean$TLT) - 1)[-1]
 
-# Compute daily log-returns (slice [-1] to drop initial NA and match N-1 length)
+# Compute daily log-returns
 r_spy_log <- as.numeric(diff(log(prices_clean$SPY)))[-1]
 r_tlt_log <- as.numeric(diff(log(prices_clean$TLT)))[-1]
 r_vix_log <- as.numeric(diff(log(prices_clean$VIX)))[-1]
 
-# Create predictive covariates (X) and future target outcomes (Y)
 df_features <- data.frame(
   Date       = index(prices_clean)[-1],
   R_SPY      = r_spy_log,
@@ -63,18 +62,16 @@ df_features <- data.frame(
   Vol20_SPY  = as.numeric(rollapply(r_spy_log, width = 20, FUN = sd, fill = NA, align = "right")),
   Vol20_TLT  = as.numeric(rollapply(r_tlt_log, width = 20, FUN = sd, fill = NA, align = "right")),
   
-  # Align target simple returns for out-of-sample portfolio aggregation
   R_SPY_next_simple = lead(r_spy_simple, 1),
   R_TLT_next_simple = lead(r_tlt_simple, 1),
   
-  # Outcome Y_{t+1}: Next-day excess log-return spread
   Y = lead(r_spy_log, 1) - lead(r_tlt_log, 1)
 )
 
 df_clean <- na.omit(df_features)
 
-# Define Treatment indicator W_t (Market state: SPY outperformed TLT on day t)
-df_clean$W <- ifelse(df_clean$R_SPY > df_clean$R_TLT, 1, 0)
+# Define Treatment W_t as a Macro Regime (20-day trend outperformance)
+df_clean$W <- ifelse(df_clean$MA20_SPY > df_clean$MA20_TLT, 1, 0)
 
 # Determine Covariate Set
 if (REMOVE_SAME_DAY_RETURNS) {
@@ -131,7 +128,6 @@ mc_results_causal <- list()
 mc_results_direct <- list()
 mc_ates           <- numeric(length(MC_SEEDS))
 
-# Matrices to store full time-series trajectory across all 100 runs
 cum_causal_matrix <- matrix(0, nrow = nrow(test_data), ncol = length(MC_SEEDS))
 cum_direct_matrix <- matrix(0, nrow = nrow(test_data), ncol = length(MC_SEEDS))
 
@@ -140,7 +136,7 @@ runtime <- system.time({
     current_seed <- MC_SEEDS[i]
     set.seed(current_seed)
     
-    # 4.1 Train Models under current seed
+    # Model Fits
     df_prop_train <- data.frame(W = W_train, X_train)
     df_prop_test  <- data.frame(X_test)
     prop_net      <- nnet(W ~ ., data = df_prop_train, size = 16, decay = 0.01, maxit = 500, trace = FALSE)
@@ -151,7 +147,7 @@ runtime <- system.time({
     df_dir_train  <- data.frame(Y = Y_train, X_train)
     direct_net    <- nnet(Y ~ ., data = df_dir_train, size = 16, decay = 0.01, linout = TRUE, maxit = 500, trace = FALSE)
     
-    # 4.2 Counterfactual & CATE Estimation
+    # Estimation
     e_hat_raw  <- predict(prop_net, newdata = df_prop_test, type = "raw")
     e_hat_clip <- pmax(pmin(e_hat_raw, 1 - PROPENSITY_CLIP_EPS), PROPENSITY_CLIP_EPS)
     
@@ -170,11 +166,17 @@ runtime <- system.time({
     
     mc_ates[i] <- mean(DR_CATE_test)
     
-    # 4.3 Policy Allocation Rules
-    policy_causal <- ifelse(Predicted_CATE > 0, 1, 0)
-    policy_direct <- ifelse(y_direct_hat > 0, 1, 0)
+    # Apply 5-Day Signal Smoothing to eliminate excessive turnover drag
+    cate_smoothed <- rollmean(Predicted_CATE, k = 5, fill = NA, align = "right")
+    cate_smoothed[is.na(cate_smoothed)] <- Predicted_CATE[is.na(cate_smoothed)]
     
-    # 4.4 Net Return Calculation
+    dir_smoothed <- rollmean(y_direct_hat, k = 5, fill = NA, align = "right")
+    dir_smoothed[is.na(dir_smoothed)] <- y_direct_hat[is.na(dir_smoothed)]
+    
+    policy_causal <- ifelse(cate_smoothed > 0, 1, 0)
+    policy_direct <- ifelse(dir_smoothed > 0, 1, 0)
+    
+    # Returns net of transaction fees
     turnover_c <- calc_turnover(policy_causal)
     turnover_d <- calc_turnover(policy_direct)
     
@@ -187,14 +189,14 @@ runtime <- system.time({
     mc_results_causal[[i]] <- calc_metrics(r_c_net, cum_causal_matrix[, i])
     mc_results_direct[[i]] <- calc_metrics(r_d_net, cum_direct_matrix[, i])
     
-    if (i %% 10 == 0) cat(sprintf("Completed %d / %d simulations...\n", i, N_SIMULATIONS))
+    if (i %% 20 == 0) cat(sprintf("Completed %d / %d simulations...\n", i, N_SIMULATIONS))
   }
 })
 
 cat(sprintf("100 Monte Carlo runs finished in %1.2f seconds.\n", runtime["elapsed"]))
 
 ###############################################################################
-# 5. MONTE CARLO AGGREGATION & SUMMARY
+# 5. MONTE CARLO AGGREGATION & CSV EXPORT
 ###############################################################################
 
 df_mc_causal <- as.data.frame(do.call(rbind, mc_results_causal))
@@ -202,44 +204,37 @@ df_mc_direct <- as.data.frame(do.call(rbind, mc_results_direct))
 
 summarize_mc <- function(df, name) {
   data.frame(
-    Strategy    = name,
-    Mean_Return = mean(df$Ann_Return),
-    SD_Return   = sd(df$Ann_Return),
-    Mean_Sharpe = mean(df$Sharpe),
-    SD_Sharpe   = sd(df$Sharpe),
-    CI_95_Low   = quantile(df$Sharpe, 0.025),
-    CI_95_High  = quantile(df$Sharpe, 0.975),
-    Mean_MaxDD  = mean(df$Max_DD)
+    Strategy         = name,
+    Mean_Return      = mean(df$Ann_Return),
+    SD_Return        = sd(df$Ann_Return),
+    Mean_Sharpe      = mean(df$Sharpe),
+    SD_Sharpe        = sd(df$Sharpe),
+    CI_95_Low_Sharpe = quantile(df$Sharpe, 0.025),
+    CI_95_High_Sharpe= quantile(df$Sharpe, 0.975),
+    Mean_Max_Drawdown= mean(df$Max_DD)
   )
 }
 
 df_mc_summary <- rbind(
-  summarize_mc(df_mc_causal, "Causal Policy (Eq. 23)"),
+  summarize_mc(df_mc_causal, "Causal Policy (Eq. 23 - Enhanced)"),
   summarize_mc(df_mc_direct, "Direct Predictor Net")
 )
 row.names(df_mc_summary) <- NULL
 
-cat("\n============================================================\n")
-cat("1. 100-RUN MONTE CARLO SUMMARY ACROSS INITIALIZATIONS\n")
-cat("============================================================\n")
+# Export Summary Metrics to CSV
+write.csv(df_mc_summary, "monte_carlo_100_runs_summary_metrics.csv", row.names = FALSE)
+cat("\nSummary metrics saved to 'monte_carlo_100_runs_summary_metrics.csv'\n")
+
 print(df_mc_summary %>% mutate_if(is.numeric, function(x) round(x, 4)))
 
-cat("\n============================================================\n")
-cat("2. AVERAGE TREATMENT EFFECT (ATE) 100-RUN SUMMARY\n")
-cat("============================================================\n")
-cat(sprintf("Mean DR ATE Across 100 Seeds: %1.6f\n", mean(mc_ates)))
-cat(sprintf("SD of DR ATE Across 100 Seeds:   %1.6f\n", sd(mc_ates)))
-cat(sprintf("95%% Monte Carlo ATE CI:       [%1.6f, %1.6f]\n", quantile(mc_ates, 0.025), quantile(mc_ates, 0.975)))
-
 ###############################################################################
-# 6. 100-RUN AVERAGE VISUALIZATION VS BENCHMARKS
+# 6. VISUALIZATION & DAILY TRAJECTORY CSV EXPORT
 ###############################################################################
 
-# Calculate 100-run mean cumulative wealth paths across time
 mean_causal_trajectory <- rowMeans(cum_causal_matrix)
 mean_direct_trajectory <- rowMeans(cum_direct_matrix)
 
-# Compute static benchmarks
+# Benchmarks
 mom_signal  <- lag(as.numeric(rollmean(df_clean$R_SPY, k = 252, fill = NA, align = "right")), 1)
 POLICY_MOM  <- ifelse(mom_signal[(train_size + 1):N] > 0, 1, 0)
 POLICY_MOM[is.na(POLICY_MOM)] <- 1
@@ -250,25 +245,30 @@ cum_spy     <- cumprod(1 + R_SPY_T)
 cum_tlt     <- cumprod(1 + R_TLT_T)
 cum_6040    <- cumprod(1 + (0.60 * R_SPY_T + 0.40 * R_TLT_T))
 
-df_plot <- data.frame(
-  Date                 = test_data$Date,
-  Causal_Policy_100Mean = mean_causal_trajectory,
-  Direct_Predictor_100Mean = mean_direct_trajectory,
-  Momentum_12M_Net     = cum_mom_net,
-  SPY_BH               = cum_spy,
-  TLT_BH               = cum_tlt,
-  Benchmark_6040       = cum_6040
-) %>%
-  gather(key = "Strategy", value = "Wealth", -Date)
+df_trajectories <- data.frame(
+  Date                     = test_data$Date,
+  Causal_Policy_100Mean    = round(mean_causal_trajectory, 4),
+  Direct_Predictor_100Mean = round(mean_direct_trajectory, 4),
+  Momentum_12M_Net         = round(cum_mom_net, 4),
+  SPY_BH                   = round(cum_spy, 4),
+  TLT_BH                   = round(cum_tlt, 4),
+  Benchmark_6040           = round(cum_6040, 4)
+)
+
+# Export Trajectory Time Series to CSV
+write.csv(df_trajectories, "monte_carlo_100_runs_wealth_trajectories.csv", row.names = FALSE)
+cat("Daily wealth trajectories saved to 'monte_carlo_100_runs_wealth_trajectories.csv'\n")
+
+df_plot <- df_trajectories %>% gather(key = "Strategy", value = "Wealth", -Date)
 
 line_arg <- if (packageVersion("ggplot2") >= "3.4.0") list(linewidth = 0.8) else list(size = 0.8)
 
-ggplot(df_plot, aes(x = Date, y = Wealth, color = Strategy)) +
+p <- ggplot(df_plot, aes(x = Date, y = Wealth, color = Strategy)) +
   do.call(geom_line, line_arg) +
   theme_minimal() +
   labs(
     title = "100-Run Average Out-of-Sample Performance (Net of Costs)",
-    subtitle = "100-Run Mean Causal Policy vs 100-Run Mean Direct Predictor & Benchmarks",
+    subtitle = "Enhanced Causal Policy vs Direct Predictor & Benchmarks",
     x = "Date",
     y = "Cumulative Wealth Growth ($1 Initial)",
     color = "Strategy"
@@ -278,3 +278,15 @@ ggplot(df_plot, aes(x = Date, y = Wealth, color = Strategy)) +
     legend.position = "bottom",
     plot.title = element_text(face = "bold", size = 14)
   )
+
+print(p)
+
+ggsave(
+  filename = "monte_carlo_100_runs_performance.png",
+  plot = p,
+  width = 10,
+  height = 6,
+  dpi = 300
+)
+
+cat("Plot rendered and saved to 'monte_carlo_100_runs_performance.png'\n")

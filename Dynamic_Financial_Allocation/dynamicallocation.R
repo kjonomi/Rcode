@@ -252,7 +252,7 @@ summarize_mc <- function(df, name) {
 }
 
 df_mc_summary <- rbind(
-  summarize_mc(df_mc_causal, "Causal Policy (Eq. 23 - Enhanced)"),
+  summarize_mc(df_mc_causal, "Causal Policy"),
   summarize_mc(df_mc_direct, "Direct Predictor Net")
 )
 row.names(df_mc_summary) <- NULL
@@ -283,12 +283,12 @@ cum_6040    <- cumprod(1 + (0.60 * R_SPY_T + 0.40 * R_TLT_T))
 
 df_trajectories <- data.frame(
   Date                     = test_data$Date,
-  Causal_Policy_100Mean    = round(mean_causal_trajectory, 4),
-  Direct_Predictor_100Mean = round(mean_direct_trajectory, 4),
+  Causal_Policy_Mean    = round(mean_causal_trajectory, 4),
+  Direct_Predictor_Mean = round(mean_direct_trajectory, 4),
   Momentum_12M_Net         = round(cum_mom_net, 4),
   SPY_BH                   = round(cum_spy, 4),
   TLT_BH                   = round(cum_tlt, 4),
-  Benchmark_6040           = round(cum_6040, 4)
+  Benchmark           = round(cum_6040, 4)
 )
 
 # Export Trajectory Time Series to CSV

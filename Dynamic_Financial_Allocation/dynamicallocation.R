@@ -222,14 +222,13 @@ R_TLT_T <- test_data$R_TLT_next_simple
 # 4. HELPERS: PROPENSITY MODEL, SIGNALS, METRICS
 ###############################################################################
 
-# Binary classification with a two-level factor target.
-# nnet automatically applies maximum likelihood / cross-entropy loss for factor targets.
+# Binary classification with a two-level factor and cross-entropy loss.
 fit_propensity_model <- function(X, W, seed) {
   set.seed(seed)
   dat <- data.frame(W = factor(W, levels = c(0, 1)), X, check.names = FALSE)
   nnet::nnet(
     W ~ ., data = dat, size = HIDDEN_UNITS, decay = WEIGHT_DECAY,
-    maxit = MAX_ITER, trace = FALSE, rang = 0.1
+    maxit = MAX_ITER, trace = FALSE, entropy = TRUE, rang = 0.1
   )
 }
 

@@ -1,7 +1,7 @@
 ###############################################################################
 # ENHANCED 100-RUN MONTE CARLO CAUSAL DEEP LEARNING ALLOCATION POLICY
 # Features Overlap Restoration, Macro Regime Treatment, Signal Smoothing,
-# and Automatic CSV & Plot File Exporting (R 3.4 COMPATIBLE)
+# Data Summary Statistics, Corrected Max DD, and Automatic CSV & Plot Exporting (R 3.4 COMPATIBLE)
 ###############################################################################
 
 options(download.file.method = "libcurl")
@@ -80,6 +80,31 @@ if (REMOVE_SAME_DAY_RETURNS) {
   covariate_cols <- c("R_SPY", "R_TLT", "R_VIX", "VIX_Level", "MA20_SPY", "MA20_TLT", "Vol20_SPY", "Vol20_TLT")
 }
 
+# ==============================================================================
+# FEATURE DATA SUMMARY STATISTICS
+# ==============================================================================
+cat("\n--- Feature Data Summary Statistics ---\n")
+
+feature_summary <- do.call(rbind, lapply(covariate_cols, function(col) {
+  vals <- df_clean[[col]]
+  data.frame(
+    Feature  = col,
+    Mean     = round(mean(vals), 5),
+    SD       = round(sd(vals), 5),
+    Median   = round(median(vals), 5),
+    IQR      = round(IQR(vals), 5),
+    Min      = round(min(vals), 5),
+    Max      = round(max(vals), 5),
+    Skewness = round(sum((vals - mean(vals))^3) / ((length(vals) - 1) * sd(vals)^3), 3)
+  )
+}))
+
+print(feature_summary)
+
+# Save summary statistics to CSV
+write.csv(feature_summary, "feature_summary_statistics.csv", row.names = FALSE)
+cat("Feature summary statistics saved to 'feature_summary_statistics.csv'\n\n")
+
 ###############################################################################
 # 3. TRAIN / TEST SPLIT & NORMALIZATION
 ###############################################################################
@@ -89,6 +114,12 @@ train_size <- floor(TRAIN_RATIO * N)
 
 train_data <- df_clean[1:train_size, ]
 test_data  <- df_clean[(train_size + 1):N, ]
+
+# Print verified train/test date ranges
+cat("------------------------------------------------------------------\n")
+cat(sprintf("Training Set: %s to %s (%d obs)\n", min(train_data$Date), max(train_data$Date), nrow(train_data)))
+cat(sprintf("Testing Set:  %s to %s (%d obs)\n", min(test_data$Date), max(test_data$Date), nrow(test_data)))
+cat("------------------------------------------------------------------\n\n")
 
 mean_x <- colMeans(train_data[, covariate_cols])
 sd_x   <- apply(train_data[, covariate_cols], 2, sd)
@@ -105,12 +136,17 @@ Y_test  <- test_data$Y
 R_SPY_T <- test_data$R_SPY_next_simple
 R_TLT_T <- test_data$R_TLT_next_simple
 
+# Standard Max Drawdown including initial wealth V0 = 1 in running peak
 calc_metrics <- function(r, cum_r) {
   ann_ret <- prod(1 + r)^(252 / length(r)) - 1
   ann_vol <- sd(r) * sqrt(252)
   sharpe  <- ann_ret / ann_vol
-  peak    <- cummax(cum_r)
-  max_dd  <- min((cum_r - peak) / peak)
+  
+  # Prepend V0 = 1.0 to standard running peak calculation
+  cum_wealth_with_v0 <- c(1, cum_r)
+  running_peak       <- cummax(cum_wealth_with_v0)[-1]
+  max_dd             <- min((cum_r - running_peak) / running_peak)
+  
   c(Ann_Return = ann_ret, Ann_Vol = ann_vol, Sharpe = sharpe, Max_DD = max_dd)
 }
 
@@ -122,7 +158,7 @@ calc_turnover <- function(policy) {
 # 4. 100-RUN MONTE CARLO SIMULATION LOOP
 ###############################################################################
 
-cat(sprintf("\nStarting 100-Run Monte Carlo Simulation across %d seeds...\n", length(MC_SEEDS)))
+cat(sprintf("Starting 100-Run Monte Carlo Simulation across %d seeds...\n", length(MC_SEEDS)))
 
 mc_results_causal <- list()
 mc_results_direct <- list()

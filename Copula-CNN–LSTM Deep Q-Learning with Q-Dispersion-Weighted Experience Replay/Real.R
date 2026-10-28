@@ -1,14 +1,7 @@
 ###############################################################################
-# FULL TEMPORAL MULTI-STAGE DEEP Q-LEARNING PIPELINE (REAL DATA EDITION)
+# FULL TEMPORAL MULTI-STAGE DEEP Q-LEARNING PIPELINE (LOCAL DATA EDITION)
 # Algorithms: UWR vs. PER vs. Q-DWR
-# Real Datasets: UCI Wine Quality, MASS Boston, UCI Adult Census
-#
-# Key Features:
-#   1. Automatic fetch and preprocessing of real-world public tabular datasets.
-#   2. Semantic hierarchical ordering of covariates before 1D-Convolution.
-#   3. Corrected non-singular equicorrelation noise generation (rho within valid bounds).
-#   4. Multi-seed training run evaluation reporting mean +/- standard error across runs.
-#   5. Empirical Copula outcome transformation and Q-Dispersion Experience Replay.
+# Datasets: Boston Housing (MASS), Wine Quality Red (Local), Adult Census (Local)
 ###############################################################################
 
 rm(list = ls(envir = .GlobalEnv), envir = .GlobalEnv)
@@ -35,7 +28,7 @@ suppressPackageStartupMessages({
 })
 
 # -----------------------------------------------------------------------------
-# 1. Dataset Loaders for Public Benchmark Datasets
+# 1. Dataset Loaders (Updated for Local CSV and TXT Files)
 # -----------------------------------------------------------------------------
 
 set_all_seeds <- function(seed) {
@@ -72,24 +65,33 @@ prepare_numeric_data <- function(df) {
 # Real Dataset 1: Boston Housing Predictors (from MASS)
 get_boston_data <- function() {
   data("Boston", package = "MASS")
-  # Exclude original response variable to use covariates for synthetic longitudinal RL environment
   Boston[, setdiff(names(Boston), "medv"), drop = FALSE]
 }
 
-# Real Dataset 2: UCI Wine Quality Red
+# Real Dataset 2: UCI Wine Quality Red (Local file: winequality-red.csv)
 get_wine_quality_data <- function() {
-  url <- "https://archive.ics.uci.edu/ml/machine-learning-databases/wine-quality/winequality-red.csv"
-  wine <- fread(url, sep = ";")
-  df <- as.data.frame(wine)
-  # Exclude target quality to treat physicochemical properties as observational covariates
-  df[, setdiff(names(df), "quality"), drop = FALSE]
+  wine_file <- "winequality-red.csv"
+  if (!file.exists(wine_file)) {
+    stop("File 'winequality-red.csv' not found in working directory.")
+  }
+  wine <- fread(wine_file, sep = ";")
+  features <- setdiff(names(wine), "quality")
+  as.data.frame(wine[, ..features])
 }
 
-# Real Dataset 3: UCI Adult Census Income
+# Real Dataset 3: UCI Adult Census Income (Local file: adult.data.txt)
 get_adult_census_data <- function() {
-  url <- "https://archive.ics.uci.edu/ml/machine-learning-databases/adult/adult.data"
+  adult_file <- "adult.data.txt"
+  if (!file.exists(adult_file)) {
+    # Fallback check if saved without .txt extension
+    if (file.exists("adult.data")) {
+      adult_file <- "adult.data"
+    } else {
+      stop("File 'adult.data.txt' not found in working directory.")
+    }
+  }
   cols <- c("age", "fnlwgt", "education_num", "capital_gain", "capital_loss", "hours_per_week")
-  adult <- fread(url, select = c(1, 3, 5, 11, 12, 13), col.names = cols)
+  adult <- fread(adult_file, select = c(1, 3, 5, 11, 12, 13), col.names = cols)
   as.data.frame(adult)
 }
 
@@ -381,7 +383,7 @@ run_single_dqn_experiment <- function(
 }
 
 # -----------------------------------------------------------------------------
-# 5. Multi-Seed Evaluation Framework across Real Datasets
+# 5. Multi-Seed Evaluation Framework
 # -----------------------------------------------------------------------------
 
 evaluate_dataset <- function(df, dataset_name, seeds = c(123L, 456L, 789L)) {
@@ -421,7 +423,7 @@ evaluate_dataset <- function(df, dataset_name, seeds = c(123L, 456L, 789L)) {
 }
 
 # -----------------------------------------------------------------------------
-# 6. Execute Benchmarks on Real Available Public Datasets
+# 6. Execute Benchmarks
 # -----------------------------------------------------------------------------
 
 SEEDS <- c(123L, 456L, 789L)
@@ -433,24 +435,24 @@ boston_df <- get_boston_data()
 res_boston <- evaluate_dataset(boston_df, "Boston Housing (MASS)", seeds = SEEDS)
 
 cat("\n=======================================================\n")
-cat("2/3 Loading & Processing: Wine Quality Red Data (UCI)\n")
+cat("2/3 Loading & Processing: Wine Quality Red Data (Local CSV)\n")
 cat("=======================================================\n")
 wine_df <- get_wine_quality_data()
-res_wine <- evaluate_dataset(wine_df, "Wine Quality Red (UCI)", seeds = SEEDS)
+res_wine <- evaluate_dataset(wine_df, "Wine Quality Red (Local)", seeds = SEEDS)
 
 cat("\n=======================================================\n")
-cat("3/3 Loading & Processing: Adult Census Data (UCI)\n")
+cat("3/3 Loading & Processing: Adult Census Data (Local TXT)\n")
 cat("=======================================================\n")
 adult_df <- get_adult_census_data()
-res_adult <- evaluate_dataset(adult_df, "Adult Census (UCI)", seeds = SEEDS)
+res_adult <- evaluate_dataset(adult_df, "Adult Census (Local)", seeds = SEEDS)
 
 # Combine and print overall benchmark table
 all_results <- rbind(res_boston, res_wine, res_adult)
 print(knitr::kable(
   all_results,
-  caption = "Real Public Datasets Benchmark: Multi-Seed Replay Evaluation",
+  caption = "Local Datasets Benchmark: Multi-Seed Replay Evaluation",
   digits = 4
 ))
 
-write.csv(all_results, "real_datasets_multi_seed_summary.csv", row.names = FALSE)
-cat("\nResults saved to 'real_datasets_multi_seed_summary.csv'\n")
+write.csv(all_results, "local_datasets_multi_seed_summary.csv", row.names = FALSE)
+cat("\nResults saved to 'local_datasets_multi_seed_summary.csv'\n")

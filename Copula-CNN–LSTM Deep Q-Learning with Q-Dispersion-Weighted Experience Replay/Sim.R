@@ -1,14 +1,6 @@
 ###############################################################################
 # FULL TEMPORAL MULTI-STAGE DEEP Q-LEARNING PIPELINE
-# Robust implementation: UWR vs. PER vs. Q-DWR; multi-seed evaluation
-#
-# Important interpretation:
-#   - Uses the MASS::Boston predictor data to construct synthetic longitudinal
-#     states, treatment assignments, and correlated outcomes.
-#   - This is a synthetic RL benchmark, not a causal-effect estimator for the
-#     original Boston housing data.
-#   - Q-DWR priorities use cross-action Q-value dispersion measured BEFORE
-#     the selected-action TD target is overwritten.
+# Robust implementation: UWR vs. PER vs. Q-DWR; 100-seed evaluation
 ###############################################################################
 
 rm(list = ls(envir = .GlobalEnv), envir = .GlobalEnv)
@@ -50,8 +42,6 @@ prepare_numeric_data <- function(df) {
   df <- df[, keep, drop = FALSE]
   if (!ncol(df)) stop("No numeric predictors were found.")
 
-  # Remove columns with no usable variation; impute remaining missing values
-  # using the column median.
   usable <- vapply(df, function(x) {
     x <- x[is.finite(x)]
     length(x) > 1L && length(unique(x)) > 1L
@@ -75,9 +65,6 @@ arrange_covariates_semantically <- function(df) {
   p <- ncol(df)
   if (p <= 1L) return(df)
 
-  # Build an explicitly square correlation matrix. Avoid pmax(0, matrix),
-  # because pmax can inherit attributes from its first (scalar) argument and
-  # drop the matrix dimensions, causing as.dist() to report improper length.
   x <- as.matrix(df)
   storage.mode(x) <- "double"
   cor_mat <- suppressWarnings(stats::cor(x, use = "pairwise.complete.obs"))
@@ -94,8 +81,6 @@ arrange_covariates_semantically <- function(df) {
   cor_mat <- abs(cor_mat)
   diag(cor_mat) <- 1
 
-  # Convert absolute correlations to dissimilarities while preserving matrix
-  # dimensions and guaranteeing a zero diagonal.
   dist_mat <- 1 - cor_mat
   dist_mat[dist_mat < 0] <- 0
   diag(dist_mat) <- 0
@@ -178,7 +163,6 @@ generate_multistage_outcomes <- function(
 
   Sigma <- matrix(rho, nrow = n_outcomes, ncol = n_outcomes)
   diag(Sigma) <- 1
-  # Cholesky factorization will fail loudly if the requested matrix is invalid.
   L <- t(chol(Sigma))
 
   Y <- array(0, dim = c(n, T_steps, n_outcomes))
@@ -194,7 +178,6 @@ generate_multistage_outcomes <- function(
   }
 
   for (tt in 2:T_steps) {
-    # Correlated innovations: each row is one observation's outcome vector.
     z <- matrix(rnorm(n * n_outcomes), nrow = n, ncol = n_outcomes)
     noise_raw <- z %*% t(L) * base_noise_sd
 
@@ -384,8 +367,6 @@ run_single_dqn_experiment <- function(
       actions <- greedy_actions
       actions[explore] <- rbinom(sum(explore), size = 1L, prob = 0.5)
 
-      # Center the copula reward at zero so that actions do not receive a
-      # mechanically positive reward merely because ranks are in (0, 1).
       outcome_score <- rowMeans(matrix(
         Y_cop[, tt, , drop = FALSE],
         nrow = n, ncol = n_outcomes
@@ -441,7 +422,6 @@ run_single_dqn_experiment <- function(
         for (ii in seq_len(bsize)) {
           entry <- sampled$batch[[ii]]
           action_col <- entry$a + 1L
-          # Preserve Q-dispersion from the unmodified current Q-values.
           current_dispersion <- abs(q_curr[ii, 2L] - q_curr[ii, 1L])
           target <- if (!entry$done) {
             entry$r + gamma * max(q_next_target[ii, ])
@@ -500,7 +480,7 @@ run_single_dqn_experiment <- function(
 ###############################################################################
 
 evaluate_multi_seed <- function(
-    df, seeds = c(123L, 456L, 789L), rho = 0.5,
+    df, seeds = 1L:100L, rho = 0.5,
     replay_mode = "Q-DWR", episodes = 20L, ...) {
 
   replay_mode <- match.arg(replay_mode, c("UWR", "PER", "Q-DWR"))
@@ -571,18 +551,17 @@ evaluate_multi_seed <- function(
 # 6. Run benchmark and create summary table
 ###############################################################################
 
-# Exclude MEDV (the original housing value response) from the predictors.
-# All outcomes and treatment effects in this experiment are simulated.
 data("Boston", package = "MASS")
 benchmark_df <- Boston[, setdiff(names(Boston), "medv"), drop = FALSE]
 
-SEEDS_TO_RUN <- c(123L, 456L, 789L)
+# Set to 100 seeds (1 to 100)
+SEEDS_TO_RUN <- 1L:100L
 N <- 200L
 T_STEPS <- 8L
 N_OUTCOMES <- 6L
 EPISODES <- 20L
 
-cat("Running multi-seed replay evaluation...\n")
+cat("Running 100-seed replay evaluation...\n")
 
 conditions <- list(
   list(rho = 0.50, mode = "UWR"),
@@ -615,13 +594,13 @@ rownames(summary_df) <- NULL
 
 print(knitr::kable(
   summary_df,
-  caption = "Multi-Seed Performance Summary Across Replay Strategies",
+  caption = "100-Seed Performance Summary Across Replay Strategies",
   digits = 4
 ))
 
-write.csv(summary_df, "dqn_replay_multi_seed_summary.csv", row.names = FALSE)
-saveRDS(evaluation_results, "dqn_replay_multi_seed_details.rds")
+write.csv(summary_df, "dqn_replay_100_seed_summary.csv", row.names = FALSE)
+saveRDS(evaluation_results, "dqn_replay_100_seed_details.rds")
 
 cat("\nSaved:\n")
-cat("  dqn_replay_multi_seed_summary.csv\n")
-cat("  dqn_replay_multi_seed_details.rds\n")
+cat("  dqn_replay_100_seed_summary.csv\n")
+cat("  dqn_replay_100_seed_details.rds\n")

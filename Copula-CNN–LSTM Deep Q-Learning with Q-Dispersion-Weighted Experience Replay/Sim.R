@@ -1,6 +1,6 @@
 ###############################################################################
 # FULL TEMPORAL MULTI-STAGE DEEP Q-LEARNING PIPELINE
-# Robust implementation: UWR vs. PER vs. Q-DWR; 100-seed evaluation
+# Robust implementation: UWR vs. PER vs. Q-DWR; 30-seed evaluation
 ###############################################################################
 
 rm(list = ls(envir = .GlobalEnv), envir = .GlobalEnv)
@@ -480,7 +480,7 @@ run_single_dqn_experiment <- function(
 ###############################################################################
 
 evaluate_multi_seed <- function(
-    df, seeds = 1L:100L, rho = 0.5,
+    df, seeds = 1L:30L, rho = 0.5,
     replay_mode = "Q-DWR", episodes = 20L, ...) {
 
   replay_mode <- match.arg(replay_mode, c("UWR", "PER", "Q-DWR"))
@@ -554,14 +554,14 @@ evaluate_multi_seed <- function(
 data("Boston", package = "MASS")
 benchmark_df <- Boston[, setdiff(names(Boston), "medv"), drop = FALSE]
 
-# Set to 100 seeds (1 to 100)
-SEEDS_TO_RUN <- 1L:100L
+# Set to 30 seeds (1 to 30)
+SEEDS_TO_RUN <- 1L:30L
 N <- 200L
 T_STEPS <- 8L
 N_OUTCOMES <- 6L
 EPISODES <- 20L
 
-cat("Running 100-seed replay evaluation...\n")
+cat("Running 30-seed replay evaluation...\n")
 
 conditions <- list(
   list(rho = 0.50, mode = "UWR"),
@@ -594,13 +594,13 @@ rownames(summary_df) <- NULL
 
 print(knitr::kable(
   summary_df,
-  caption = "100-Seed Performance Summary Across Replay Strategies",
+  caption = "30-Seed Performance Summary Across Replay Strategies",
   digits = 4
 ))
 
-write.csv(summary_df, "dqn_replay_100_seed_summary.csv", row.names = FALSE)
-saveRDS(evaluation_results, "dqn_replay_100_seed_details.rds")
+write.csv(summary_df, "dqn_replay_30_seed_summary.csv", row.names = FALSE)
+saveRDS(evaluation_results, "dqn_replay_30_seed_details.rds")
 
 cat("\nSaved:\n")
-cat("  dqn_replay_100_seed_summary.csv\n")
-cat("  dqn_replay_100_seed_details.rds\n")
+cat("  dqn_replay_30_seed_summary.csv\n")
+cat("  dqn_replay_30_seed_details.rds\n")

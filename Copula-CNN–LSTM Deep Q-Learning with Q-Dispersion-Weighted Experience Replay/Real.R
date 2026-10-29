@@ -386,7 +386,7 @@ run_single_dqn_experiment <- function(
 # 5. Multi-Seed Evaluation Framework
 # -----------------------------------------------------------------------------
 
-evaluate_dataset <- function(df, dataset_name, seeds = c(123L, 456L, 789L)) {
+evaluate_dataset <- function(df, dataset_name, seeds = 1L:30L) {
   modes <- c("UWR", "PER", "Q-DWR")
   rhos <- c(0.50, -0.15)
   
@@ -426,7 +426,7 @@ evaluate_dataset <- function(df, dataset_name, seeds = c(123L, 456L, 789L)) {
 # 6. Execute Benchmarks
 # -----------------------------------------------------------------------------
 
-SEEDS <- c(123L, 456L, 789L)
+SEEDS <- 1L:30L
 
 cat("\n=======================================================\n")
 cat("1/3 Loading & Processing: Boston Housing Data (MASS)\n")
@@ -450,7 +450,7 @@ res_adult <- evaluate_dataset(adult_df, "Adult Census (Local)", seeds = SEEDS)
 all_results <- rbind(res_boston, res_wine, res_adult)
 print(knitr::kable(
   all_results,
-  caption = "Local Datasets Benchmark: Multi-Seed Replay Evaluation",
+  caption = "Local Datasets Benchmark: 30-Seed Replay Evaluation",
   digits = 4
 ))
 

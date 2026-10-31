@@ -9,7 +9,7 @@ rm(list = ls(envir = .GlobalEnv), envir = .GlobalEnv)
 # -----------------------------------------------------------------------------
 # 0. Load Dependencies
 # -----------------------------------------------------------------------------
-required_packages <- c("MASS", "Matrix", "keras", "tensorflow", "R6", "knitr", "data.table")
+required_packages <- c("MASS", "Matrix", "keras", "tensorflow", "R6", "knitr", "data.table", "ggplot2")
 missing_packages <- required_packages[
   !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
 ]
@@ -25,10 +25,11 @@ suppressPackageStartupMessages({
   library(R6)
   library(knitr)
   library(data.table)
+  library(ggplot2)
 })
 
 # -----------------------------------------------------------------------------
-# 1. Dataset Loaders (Updated for Local CSV and TXT Files)
+# 1. Dataset Loaders & Preprocessing
 # -----------------------------------------------------------------------------
 
 set_all_seeds <- function(seed) {
@@ -40,6 +41,12 @@ set_all_seeds <- function(seed) {
 
 prepare_numeric_data <- function(df) {
   if (!is.data.frame(df)) stop("`df` must be a data.frame.")
+  
+  # Handle non-numeric factors/characters via one-hot encoding if present
+  if (any(vapply(df, function(col) is.factor(col) || is.character(col), logical(1)))) {
+    df <- as.data.frame(model.matrix(~ . - 1, data = df))
+  }
+  
   keep <- vapply(df, is.numeric, logical(1))
   df <- df[, keep, drop = FALSE]
   if (!ncol(df)) stop("No numeric predictors were found.")
@@ -83,7 +90,6 @@ get_wine_quality_data <- function() {
 get_adult_census_data <- function() {
   adult_file <- "adult.data.txt"
   if (!file.exists(adult_file)) {
-    # Fallback check if saved without .txt extension
     if (file.exists("adult.data")) {
       adult_file <- "adult.data"
     } else {
@@ -163,9 +169,14 @@ assign_treatment_multistage <- function(X_long, cov_idx = 1L, strength = 1.5) {
 generate_multistage_outcomes <- function(X_long, A_matrix, n_outcomes = 6L, rho = 0.5, phi = 0.6, base_noise_sd = 0.05) {
   n <- dim(X_long)[1]; T_steps <- dim(X_long)[2]; p <- dim(X_long)[3]
   
-  # Ensure rho is within positive-definite boundary: rho > -1 / (n_outcomes - 1)
-  min_rho <- -1 / (n_outcomes - 1) + 1e-4
-  if (rho <= min_rho) rho <- min_rho + 0.01
+  # Ensure rho is strictly within positive-definite boundary: rho > -1 / (n_outcomes - 1)
+  min_rho <- -1 / (n_outcomes - 1)
+  if (rho <= min_rho) {
+    adjusted_rho <- min_rho + 0.01
+    warning(sprintf("Requested rho (%.2f) is below valid bound (%.2f). Adjusting rho to %.4f", 
+                    rho, min_rho, adjusted_rho))
+    rho <- adjusted_rho
+  }
 
   Sigma <- matrix(rho, nrow = n_outcomes, ncol = n_outcomes)
   diag(Sigma) <- 1
@@ -209,7 +220,7 @@ empirical_copula_multistage <- function(Y_array) {
 }
 
 # -----------------------------------------------------------------------------
-# 3. Deep Q-Network & Experience Replay Buffer
+# 3. Keras 3 Compatible Deep Q-Network & Prioritized Replay Buffer
 # -----------------------------------------------------------------------------
 
 build_dqn <- function(input_shape, lr = 1e-3) {
@@ -222,7 +233,12 @@ build_dqn <- function(input_shape, lr = 1e-3) {
     layer_dense(units = 2, activation = "linear")
 
   model <- keras_model(inputs = inputs, outputs = outputs)
-  model %>% compile(optimizer = optimizer_adam(learning_rate = lr), loss = "mse")
+  
+  # Keras 3 Compatible Compilation
+  model$compile(
+    optimizer = optimizer_adam(learning_rate = lr),
+    loss = "mse"
+  )
   model
 }
 
@@ -308,7 +324,8 @@ run_single_dqn_experiment <- function(
     S <- X_long
 
     for (tt in seq_len(T_steps)) {
-      q_all <- as.matrix(model %>% predict(S, verbose = 0))
+      # Keras 3 method call syntax
+      q_all <- as.matrix(model$predict(S, verbose = 0))
       q_dispersion <- abs(q_all[, 2L] - q_all[, 1L])
       greedy_actions <- max.col(q_all, ties.method = "first") - 1L
       explore <- runif(n) < epsilon
@@ -338,28 +355,42 @@ run_single_dqn_experiment <- function(
         bsize <- length(sampled$batch)
         s_batch <- array(0, dim = c(bsize, T_steps, p))
         s_next_batch <- array(0, dim = c(bsize, T_steps, p))
-        for (ii in seq_len(bsize)) {
-          s_batch[ii, , ] <- sampled$batch[[ii]]$s[1L, , ]
-          s_next_batch[ii, , ] <- sampled$batch[[ii]]$s_next[1L, , ]
-        }
-
-        q_curr <- as.matrix(model %>% predict(s_batch, verbose = 0))
-        q_next_target <- as.matrix(target_model %>% predict(s_next_batch, verbose = 0))
-        target_qs <- q_curr
-        new_priorities <- numeric(bsize)
+        action_vec <- integer(bsize)
+        reward_vec <- numeric(bsize)
+        done_vec <- logical(bsize)
 
         for (ii in seq_len(bsize)) {
           entry <- sampled$batch[[ii]]
-          action_col <- entry$a + 1L
-          current_dispersion <- abs(q_curr[ii, 2L] - q_curr[ii, 1L])
-          target <- if (!entry$done) entry$r + gamma * max(q_next_target[ii, ]) else entry$r
-          td_error <- abs(target - q_curr[ii, action_col])
-          target_qs[ii, action_col] <- target
-          new_priorities[ii] <- switch(replay_mode, "PER" = td_error, "Q-DWR" = current_dispersion, "UWR" = 1)
+          s_batch[ii, , ] <- entry$s[1L, , ]
+          s_next_batch[ii, , ] <- entry$s_next[1L, , ]
+          action_vec[ii] <- entry$a
+          reward_vec[ii] <- entry$r
+          done_vec[ii] <- entry$done
         }
 
+        # Keras 3 method calls for batch updating
+        q_curr <- as.matrix(model$predict(s_batch, verbose = 0))
+        q_next_target <- as.matrix(target_model$predict(s_next_batch, verbose = 0))
+        target_qs <- q_curr
+        
+        # Vectorized target and priority computations
+        max_q_next <- apply(q_next_target, 1, max)
+        targets <- ifelse(done_vec, reward_vec, reward_vec + gamma * max_q_next)
+        action_indices <- cbind(seq_len(bsize), action_vec + 1L)
+        
+        td_errors <- abs(targets - q_curr[action_indices])
+        target_qs[action_indices] <- targets
+        current_dispersion <- abs(q_curr[, 2L] - q_curr[, 1L])
+
+        new_priorities <- switch(replay_mode, 
+                                 "PER"   = td_errors, 
+                                 "Q-DWR" = current_dispersion, 
+                                 "UWR"   = rep(1, bsize))
+
         buffer$update_priorities(sampled$indices, new_priorities)
-        model %>% train_on_batch(x = s_batch, y = target_qs, sample_weight = sampled$weights)
+        
+        # Keras 3 model method call
+        model$train_on_batch(x = s_batch, y = target_qs, sample_weight = sampled$weights)
       }
 
       global_step <- global_step + 1L
@@ -388,7 +419,7 @@ run_single_dqn_experiment <- function(
 
 evaluate_dataset <- function(df, dataset_name, seeds = 1L:30L) {
   modes <- c("UWR", "PER", "Q-DWR")
-  rhos <- c(0.50, -0.19)
+  rhos <- c(0.50, -0.15)
   
   summary_rows <- list()
   
@@ -407,7 +438,7 @@ evaluate_dataset <- function(df, dataset_name, seeds = 1L:30L) {
       }
       
       mean_r <- mean(final_rewards)
-      se_r <- sd(final_rewards) / sqrt(length(seeds))
+      se_r <- if (length(seeds) > 1L) sd(final_rewards) / sqrt(length(seeds)) else 0.0
       
       summary_rows[[length(summary_rows) + 1]] <- data.frame(
         Dataset = dataset_name,
@@ -450,9 +481,38 @@ res_adult <- evaluate_dataset(adult_df, "Adult Census (Local)", seeds = SEEDS)
 all_results <- rbind(res_boston, res_wine, res_adult)
 print(knitr::kable(
   all_results,
-  caption = "Local Datasets Benchmark: 30-Seed Replay Evaluation",
+  caption = "Local Datasets Benchmark: Multi-Seed Replay Evaluation",
   digits = 4
 ))
 
 write.csv(all_results, "local_datasets_multi_seed_summary.csv", row.names = FALSE)
 cat("\nResults saved to 'local_datasets_multi_seed_summary.csv'\n")
+
+# -----------------------------------------------------------------------------
+# 7. Generate PDF Output Figure
+# -----------------------------------------------------------------------------
+
+all_results$Rho_Factor <- factor(all_results$Rho, labels = c("rho = -0.15", "rho = 0.50"))
+all_results$ReplayMode <- factor(all_results$ReplayMode, levels = c("UWR", "PER", "Q-DWR"))
+
+p_fig <- ggplot(all_results, aes(x = ReplayMode, y = FinalReward_Mean, fill = Rho_Factor)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.7), width = 0.6, color = "black") +
+  geom_errorbar(aes(ymin = FinalReward_Mean - FinalReward_SE, ymax = FinalReward_Mean + FinalReward_SE),
+                position = position_dodge(width = 0.7), width = 0.25) +
+  facet_wrap(~ Dataset, scales = "fixed") +
+  scale_fill_manual(values = c("rho = 0.50" = "#3182bd", "rho = -0.15" = "#de2d26")) +
+  labs(
+    title = "Multi-Seed Replay Benchmark Strategy Comparison Across Datasets",
+    x = "Replay Mode",
+    y = "Final Mean Reward",
+    fill = "Copula Parameter"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    strip.text = element_text(face = "bold", size = 11),
+    legend.position = "top",
+    panel.grid.minor = element_blank()
+  )
+
+ggsave("replay_benchmark_results.pdf", plot = p_fig, width = 12, height = 4.5, device = "pdf")
+cat("\nGenerated output figure saved to 'replay_benchmark_results.pdf'\n")

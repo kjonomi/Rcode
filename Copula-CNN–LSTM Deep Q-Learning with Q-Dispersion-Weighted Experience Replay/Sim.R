@@ -567,9 +567,9 @@ conditions <- list(
   list(rho = 0.50, mode = "UWR"),
   list(rho = 0.50, mode = "PER"),
   list(rho = 0.50, mode = "Q-DWR"),
-  list(rho = -0.19, mode = "UWR"),
-  list(rho = -0.19, mode = "PER"),
-  list(rho = -0.19, mode = "Q-DWR")
+  list(rho = -0.50, mode = "UWR"),
+  list(rho = -0.50, mode = "PER"),
+  list(rho = -0.50, mode = "Q-DWR")
 )
 
 evaluation_results <- vector("list", length(conditions))

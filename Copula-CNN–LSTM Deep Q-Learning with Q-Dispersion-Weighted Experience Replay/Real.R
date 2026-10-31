@@ -388,7 +388,7 @@ run_single_dqn_experiment <- function(
 
 evaluate_dataset <- function(df, dataset_name, seeds = 1L:30L) {
   modes <- c("UWR", "PER", "Q-DWR")
-  rhos <- c(0.50, -0.50)
+  rhos <- c(0.50, -0.19)
   
   summary_rows <- list()
   

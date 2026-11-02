@@ -4,7 +4,7 @@
 # Replay strategies: UWR, PER, Q-DWR
 # Environments: Synthetic A (8 original features) and Synthetic B (15)
 # Outcome dependence: rho = 0.50 and -0.15
-# 30 paired seeds; common generated data within each seed/condition
+# 10 paired seeds; common generated data within each seed/condition
 ###############################################################################
 
 Sys.setenv(TF_CPP_MIN_LOG_LEVEL = "2")
@@ -31,7 +31,7 @@ suppressPackageStartupMessages({
 # 0. GLOBAL CONFIGURATION
 ###############################################################################
 
-MASTER_SEEDS <- 1L:30L
+MASTER_SEEDS <- 1L:10L
 ARCHITECTURES <- c("CNN-DQN", "CNN-LSTM-DQN")
 REPLAY_MODES <- c("UWR", "PER", "Q-DWR")
 RHO_VALUES <- c(0.50, -0.15)
@@ -634,7 +634,7 @@ run_single_dqn_experiment <- function(
 }
 
 ###############################################################################
-# 6. PAIRED 30-SEED EVALUATION
+# 6. PAIRED 10-SEED EVALUATION
 ###############################################################################
 
 run_paired_benchmark <- function() {

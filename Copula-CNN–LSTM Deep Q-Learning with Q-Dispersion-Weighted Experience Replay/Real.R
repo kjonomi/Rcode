@@ -10,7 +10,7 @@
 
 #Outcome dependence: rho = 0.50 and -0.15
 
-#30 paired seeds; common generated data within each seed/condition
+#3 paired seeds; common generated data within each seed/condition
 
 ###############################################################################
 
@@ -40,7 +40,7 @@ library(ggplot2)
 
 ###############################################################################
 
-MASTER_SEEDS <- 1L:30L
+MASTER_SEEDS <- 1L:3L
 ARCHITECTURES <- c("CNN-DQN", "CNN-LSTM-DQN")
 REPLAY_MODES <- c("UWR", "PER", "Q-DWR")
 RHO_VALUES <- c(0.50, -0.15)

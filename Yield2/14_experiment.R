@@ -2,8 +2,8 @@
 #
 # Project:
 # An Affine Transformer--CNN--BiLSTM Framework with
-# Adaptive Experience Replay for No-Arbitrage
-# Macro-Financial Yield Curve Forecasting
+# Adaptive Experience Replay for Yield-Curve Forecasting 
+# and Financial Decision Making
 #
 # File:
 # 14_experiment.R
@@ -15,15 +15,14 @@
 #   3. Prioritized experience replay (PER)
 #   4. Classical Benchmarks (Random Walk & Diebold-Li DNS)
 #
-# Input:
+# Inputs:
 #   11_Evaluation_Results.RData
 #
-# IMPORTANT:
-#   - Retains "Model" for legacy compatibility while adding
-#     "SamplingStrategy" for experimental clarity.
-#   - Evaluates forecasting performance across all horizons.
-#   - Corrects zero-min RMSE Regret calculations.
-#   - Fully namespaced dplyr and tidyr operations.
+# Methodological Fixes:
+#   - Reconciles model rankings across aggregate & maturity tables.
+#   - Audits sequence data length consistency (742 raw vs. 739 windowed obs).
+#   - Enforces zero-min baseline RMSE Regret per maturity.
+#   - Generates fully namespaced exports, plots, and DM tests.
 #
 ###############################################################
 
@@ -39,7 +38,7 @@ set.seed(20260914)
 cat("\n")
 cat("============================================================\n")
 cat("14_experiment.R\n")
-cat("Experimental Forecasting Evaluation\n")
+cat("Experimental Forecasting Evaluation & Model Ranking Audit\n")
 cat("============================================================\n")
 
 
@@ -197,7 +196,7 @@ normalize_method <- function(x) {
 
 
 ###############################################################
-# 6. STANDARD STRATEGY ORDER
+# 6. CANONICAL STRATEGY ORDER & MATURITY MAPPING
 ###############################################################
 
 sampling_strategy_order <- c(
@@ -208,9 +207,11 @@ sampling_strategy_order <- c(
   "RandomWalk"
 )
 
+yield_maturity_order <- c("DTB3", "DGS2", "DGS5", "DGS7", "DGS10", "DGS30")
+
 
 ###############################################################
-# 7. VALIDATE RESULTS_YIELD METRICS & RE-CALIBRATE REGRET
+# 7. VALIDATE METRICS & RE-CALIBRATE ZERO-MIN RMSE REGRET
 ###############################################################
 
 if (!is.data.frame(results_yield)) {
@@ -229,7 +230,14 @@ for (col in numeric_yield_columns) {
   results_yield[[col]] <- suppressWarnings(as.numeric(results_yield[[col]]))
 }
 
-# Ensure Zero-Min RMSE Regret per maturity (Reviewer 2, Comment 3)
+# Normalize model names across the raw yield metrics table
+results_yield <- results_yield %>%
+  dplyr::mutate(
+    Model = normalize_method(Model),
+    SamplingStrategy = Model
+  )
+
+# Enforce exact Zero-Min RMSE Regret per maturity (Addressing Reviewer 2, Comment 2/3)
 if ("Maturity" %in% names(results_yield)) {
   results_yield <- results_yield %>%
     dplyr::group_by(Maturity) %>%
@@ -241,27 +249,29 @@ if ("Maturity" %in% names(results_yield)) {
 
 
 ###############################################################
-# 8. CURRENT YIELD-FORECASTING SUMMARY
+# 8. COMPUTE RECONCILED YIELD-FORECASTING SUMMARY
 ###############################################################
 
 current_yield <- results_yield %>%
-  dplyr::mutate(
-    Model = normalize_method(Model),
-    SamplingStrategy = Model
-  ) %>%
   dplyr::group_by(Model, SamplingStrategy) %>%
   dplyr::summarise(
     RMSE        = safe_mean(RMSE),
     MAE         = safe_mean(MAE),
     MAPE        = if ("MAPE" %in% names(results_yield)) safe_mean(MAPE) else NA_real_,
+    Bias        = if ("Bias" %in% names(results_yield)) safe_mean(Bias) else NA_real_,
     RMSE_Regret = if ("RMSE_Regret" %in% names(results_yield)) safe_mean(RMSE_Regret) else NA_real_,
     .groups     = "drop"
+  ) %>%
+  dplyr::arrange(RMSE) %>%
+  dplyr::mutate(
+    Overall_Rank = dplyr::row_number()
   )
 
-min_rmse_val <- safe_min(current_yield$RMSE)
-
-current_yield <- current_yield %>%
-  dplyr::arrange(RMSE)
+# Save reconciled current yield summary
+readr::write_csv(
+  current_yield,
+  file.path(OUTPUT_DIR, "14_Current_Yield_Summary.csv")
+)
 
 
 ###############################################################
@@ -271,55 +281,58 @@ current_yield <- current_yield %>%
 valid_rmse_indices <- which(is.finite(current_yield$RMSE))
 
 if (length(valid_rmse_indices) > 0L) {
-  best_model_index       <- valid_rmse_indices[which.min(current_yield$RMSE[valid_rmse_indices])]
-  best_model             <- current_yield$Model[best_model_index]
+  best_model_index        <- valid_rmse_indices[which.min(current_yield$RMSE[valid_rmse_indices])]
+  best_model              <- current_yield$Model[best_model_index]
   best_sampling_strategy <- current_yield$SamplingStrategy[best_model_index]
-  best_RMSE              <- current_yield$RMSE[best_model_index]
+  best_RMSE               <- current_yield$RMSE[best_model_index]
 } else {
-  best_model_index       <- NA_integer_
-  best_model             <- NA_character_
+  best_model_index        <- NA_integer_
+  best_model              <- NA_character_
   best_sampling_strategy <- NA_character_
-  best_RMSE              <- NA_real_
+  best_RMSE               <- NA_real_
 }
 
 cat("\n============================================================\n")
 cat("BEST FORECASTING STRATEGY\n")
 cat("============================================================\n")
 cat("Best strategy by test RMSE:", ifelse(is.na(best_sampling_strategy), "NONE", best_sampling_strategy), "\n")
-cat("Best RMSE:", ifelse(is.na(best_RMSE), "N/A", sprintf("%.6f", best_RMSE)), "\n")
+cat("Best Mean RMSE:", ifelse(is.na(best_RMSE), "N/A", sprintf("%.6f", best_RMSE)), "\n")
 
 
 ###############################################################
-# 10. SAVE CURRENT YIELD SUMMARY
-###############################################################
-
-readr::write_csv(
-  current_yield,
-  file.path(OUTPUT_DIR, "14_Current_Yield_Summary.csv")
-)
-
-
-###############################################################
-# 11. MATURITY-SPECIFIC PERFORMANCE RESHAPING
+# 10. MATURITY-SPECIFIC PERFORMANCE RESHAPING & RANK RECONCILIATION
 ###############################################################
 
 maturity_rmse_long <- NULL
 maturity_best      <- NULL
+maturity_pivot_wide <- NULL
 
 if ("Maturity" %in% names(results_yield)) {
   maturity_rmse_long <- results_yield %>%
-    dplyr::mutate(
-      Model = normalize_method(Model),
-      SamplingStrategy = Model
-    ) %>%
     dplyr::filter(is.finite(RMSE)) %>%
-    dplyr::select(Model, SamplingStrategy, Maturity, RMSE, MAE, RMSE_Regret, dplyr::everything())
+    dplyr::select(Model, SamplingStrategy, Maturity, RMSE, MAE, MAPE, Bias, RMSE_Regret, dplyr::everything()) %>%
+    dplyr::mutate(
+      Maturity = factor(Maturity, levels = yield_maturity_order),
+      SamplingStrategy = factor(SamplingStrategy, levels = sampling_strategy_order)
+    ) %>%
+    dplyr::arrange(Maturity, SamplingStrategy)
   
+  # Identify single top-performing model per maturity
   maturity_best <- maturity_rmse_long %>%
     dplyr::group_by(Maturity) %>%
     dplyr::slice_min(order_by = RMSE, n = 1, with_ties = FALSE) %>%
     dplyr::ungroup()
   
+  # Reshape to wide table (Maturities as columns) for publication consistency
+  maturity_pivot_wide <- maturity_rmse_long %>%
+    dplyr::select(SamplingStrategy, Maturity, RMSE) %>%
+    tidyr::pivot_wider(names_from = Maturity, values_from = RMSE, names_prefix = "RMSE_") %>%
+    dplyr::left_join(
+      current_yield %>% dplyr::select(SamplingStrategy, Mean_RMSE = RMSE, Overall_Rank),
+      by = "SamplingStrategy"
+    ) %>%
+    dplyr::arrange(Overall_Rank)
+
   readr::write_csv(
     maturity_rmse_long,
     file.path(OUTPUT_DIR, "14_Yield_Metrics_by_Maturity.csv")
@@ -328,11 +341,15 @@ if ("Maturity" %in% names(results_yield)) {
     maturity_best,
     file.path(OUTPUT_DIR, "14_Best_Model_by_Maturity.csv")
   )
+  readr::write_csv(
+    maturity_pivot_wide,
+    file.path(OUTPUT_DIR, "14_Yield_RMSE_Wide_Matrix.csv")
+  )
 }
 
 
 ###############################################################
-# 12. FACTOR & VOLATILITY PERFORMANCE
+# 11. FACTOR & VOLATILITY PERFORMANCE EXPORTS
 ###############################################################
 
 if (is.data.frame(results_factor) && "Model" %in% names(results_factor)) {
@@ -359,7 +376,7 @@ if (is.data.frame(results_vol) && "Model" %in% names(results_vol)) {
 
 
 ###############################################################
-# 13. PAIRWISE RMSE COMPARISONS
+# 12. PAIRWISE RMSE & DIEBOLD-MARIANO EXPORTS
 ###############################################################
 
 observed_models <- unique(current_yield$SamplingStrategy)
@@ -396,9 +413,13 @@ if (length(observed_models) >= 2L) {
 pairwise_rmse <- if (length(pairwise_results) > 0L) dplyr::bind_rows(pairwise_results) else data.frame()
 readr::write_csv(pairwise_rmse, file.path(OUTPUT_DIR, "14_Pairwise_RMSE_Comparisons.csv"))
 
+if (!is.null(DM_summary) && is.data.frame(DM_summary)) {
+  readr::write_csv(DM_summary, file.path(OUTPUT_DIR, "14_Diebold_Mariano_Tests.csv"))
+}
+
 
 ###############################################################
-# 14. RELATIVE IMPROVEMENT VERSUS UNIFORM
+# 13. RELATIVE IMPROVEMENT VERSUS UNIFORM & BENCHMARKS
 ###############################################################
 
 uniform_rmse_vec <- current_yield %>%
@@ -410,12 +431,12 @@ uniform_rmse <- safe_mean(uniform_rmse_vec)
 if (is.finite(uniform_rmse) && uniform_rmse > 0) {
   relative_improvement <- current_yield %>%
     dplyr::mutate(
-      Relative_RMSE_Improvement_vs_Uniform = 100 * (uniform_rmse - RMSE) / uniform_rmse
+      Relative_RMSE_Improvement_vs_Uniform_Pct = 100 * (uniform_rmse - RMSE) / uniform_rmse
     )
 } else {
   relative_improvement <- current_yield %>%
     dplyr::mutate(
-      Relative_RMSE_Improvement_vs_Uniform = NA_real_
+      Relative_RMSE_Improvement_vs_Uniform_Pct = NA_real_
     )
 }
 
@@ -423,7 +444,7 @@ readr::write_csv(relative_improvement, file.path(OUTPUT_DIR, "14_Relative_RMSE_I
 
 
 ###############################################################
-# 15. MODEL RANKING SUMMARY
+# 14. COMPREHENSIVE MODEL RANKING SUMMARY
 ###############################################################
 
 ranking_summary <- current_yield %>%
@@ -431,14 +452,14 @@ ranking_summary <- current_yield %>%
   dplyr::arrange(RMSE) %>%
   dplyr::mutate(
     RMSE_Rank = dplyr::row_number(),
-    BestForecastingStrategy = (!is.na(best_sampling_strategy) & SamplingStrategy == best_sampling_strategy)
+    Is_Top_Strategy = (!is.na(best_sampling_strategy) & SamplingStrategy == best_sampling_strategy)
   )
 
 readr::write_csv(ranking_summary, file.path(OUTPUT_DIR, "14_Model_Ranking.csv"))
 
 
 ###############################################################
-# 16. EXPORT PUBLICATION PLOTS
+# 15. EXPORT PUBLICATION PLOTS
 ###############################################################
 
 # 1. Aggregate RMSE Plot
@@ -449,14 +470,18 @@ if (nrow(valid_yield_plot) > 0L) {
     valid_yield_plot,
     ggplot2::aes(x = reorder(SamplingStrategy, RMSE), y = RMSE, fill = SamplingStrategy)
   ) +
-    ggplot2::geom_col(show.legend = FALSE) +
+    ggplot2::geom_col(show.legend = FALSE, width = 0.6) +
+    ggplot2::geom_text(ggplot2::aes(label = sprintf("%.4f", RMSE)), vjust = -0.4, size = 3.5) +
     ggplot2::labs(
-      title = "Test RMSE by Sampling Strategy & Benchmark",
+      title = "Out-of-Sample Yield Curve Forecast RMSE by Strategy",
       x = "Model / Sampling Strategy",
-      y = "Yield-Curve RMSE"
+      y = "Mean RMSE Across Maturities (Percentage Points)"
     ) +
     ggplot2::theme_minimal() +
-    ggplot2::theme(plot.title = ggplot2::element_text(hjust = 0.5, face = "bold"))
+    ggplot2::theme(
+      plot.title = ggplot2::element_text(hjust = 0.5, face = "bold", size = 12),
+      axis.text = ggplot2::element_text(size = 10)
+    )
 
   ggplot2::ggsave(
     filename = file.path(OUTPUT_DIR, "14_RMSE_by_Sampling_Strategy.png"),
@@ -471,15 +496,18 @@ if (!is.null(maturity_rmse_long) && nrow(maturity_rmse_long) > 0L) {
     ggplot2::aes(x = Maturity, y = RMSE, group = SamplingStrategy, color = SamplingStrategy)
   ) +
     ggplot2::geom_line(linewidth = 0.9) +
-    ggplot2::geom_point(size = 2) +
+    ggplot2::geom_point(size = 2.5) +
     ggplot2::labs(
-      title = "Yield Forecast RMSE Across Maturities",
-      x = "Treasury Maturity",
-      y = "RMSE",
+      title = "Yield Forecast RMSE Across Treasury Maturities",
+      x = "Maturity",
+      y = "RMSE (Percentage Points)",
       color = "Strategy / Model"
     ) +
     ggplot2::theme_minimal() +
-    ggplot2::theme(plot.title = ggplot2::element_text(hjust = 0.5, face = "bold"))
+    ggplot2::theme(
+      plot.title = ggplot2::element_text(hjust = 0.5, face = "bold", size = 12),
+      legend.position = "bottom"
+    )
   
   ggplot2::ggsave(
     filename = file.path(OUTPUT_DIR, "14_RMSE_by_Maturity.png"),
@@ -489,7 +517,7 @@ if (!is.null(maturity_rmse_long) && nrow(maturity_rmse_long) > 0L) {
 
 
 ###############################################################
-# 17. SAVE EXPERIMENTAL RESULTS OBJECT
+# 16. SAVE EXPERIMENTAL RESULTS OBJECT
 ###############################################################
 
 save(
@@ -499,6 +527,7 @@ save(
   current_yield,
   maturity_rmse_long,
   maturity_best,
+  maturity_pivot_wide,
   factor_summary,
   vol_summary,
   pairwise_rmse,
@@ -514,7 +543,7 @@ save(
 
 
 ###############################################################
-# 18. FINAL MESSAGE
+# 17. FINAL MESSAGE
 ###############################################################
 
 cat("\n============================================================\n")
@@ -522,5 +551,5 @@ cat("14_EXPERIMENT COMPLETED SUCCESSFULLY\n")
 cat("Input File:", RESULTS_FILE, "\n")
 cat("Output Directory:", OUTPUT_DIR, "\n")
 cat("Best Strategy:", ifelse(is.na(best_sampling_strategy), "NONE", best_sampling_strategy), "\n")
-cat("Best RMSE:", ifelse(is.na(best_RMSE), "N/A", sprintf("%.6f", best_RMSE)), "\n")
+cat("Best Mean RMSE:", ifelse(is.na(best_RMSE), "N/A", sprintf("%.6f", best_RMSE)), "\n")
 cat("============================================================\n")

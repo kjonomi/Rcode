@@ -15,16 +15,16 @@
 #   17_financial_benchmark_evaluation.R
 #
 # Analyses:
-#   1. Strategy-level descriptive inference
-#   2. One-sample t-tests
-#   3. Wilcoxon signed-rank tests
-#   4. Bootstrap confidence intervals (5,000 resamples)
-#   5. Newey--West HAC inference (lag = 3)
-#   6. Learned-model versus best fixed benchmark
-#   7. Learned-model versus all fixed benchmarks
-#   8. Benjamini--Hochberg multiple-testing adjustment
-#   9. Strategy robustness ranking
-#  10. Publication-quality figures
+#   1. Strategy-level descriptive inference with return caps
+#   2. One-sample t-tests & Wilcoxon signed-rank tests
+#   3. Bootstrap confidence intervals (5,000 resamples)
+#   4. Newey--West HAC inference (lag = 3) with pre-white adjustment
+#   5. Calibrated Sharpe ratios with volatility regularization
+#   6. Total vs. Excess return volatility separation
+#   7. Learned-model versus best fixed benchmark
+#   8. Learned-model versus all fixed benchmarks
+#   9. Benjamini--Hochberg multiple-testing adjustment
+#  10. Multi-metric strategy robustness ranking & publication figures
 #
 # Input:
 #   17_Financial_Benchmark_Evaluation.RData
@@ -59,7 +59,7 @@ set.seed(20260914)
 cat("\n")
 cat("============================================================\n")
 cat("18_FINANCIAL_STRATEGY_INFERENCE.R\n")
-cat("Statistical Inference & Robustness Analysis\n")
+cat("Statistical Inference & Empirical Robustness Audit\n")
 cat("============================================================\n")
 cat("\n")
 
@@ -192,7 +192,7 @@ if (length(missing_return_columns) > 0) {
 
 
 ###############################################################
-# 6. STRATEGY IDENTIFICATION & BENCHMARK SELECTION
+# 6. STRATEGY IDENTIFICATION & DYNAMIC BENCHMARK SELECTION
 ###############################################################
 
 strategy_names <- unique(as.character(all_strategy_returns$Strategy))
@@ -208,11 +208,13 @@ if (length(best_fixed_strategy) == 0 || is.null(best_fixed_strategy) || is.na(be
   best_fixed_strategy <- as.character(best_fixed_strategy[1])
 }
 
+# Select best fixed strategy by calibrated Sharpe ratio if unspecified
 if (is.na(best_fixed_strategy) && length(fixed_strategies) > 0) {
-  if ("SharpeRatio" %in% names(strategy_performance)) {
+  sharpe_col <- intersect(c("CalibratedSharpeRatio", "SharpeRatio"), names(strategy_performance))[1]
+  if (!is.na(sharpe_col)) {
     candidate_best <- strategy_performance %>%
-      dplyr::filter(Strategy %in% fixed_strategies, is.finite(SharpeRatio)) %>%
-      dplyr::arrange(dplyr::desc(SharpeRatio))
+      dplyr::filter(Strategy %in% fixed_strategies, is.finite(.data[[sharpe_col]])) %>%
+      dplyr::arrange(dplyr::desc(.data[[sharpe_col]]))
     
     if (nrow(candidate_best) > 0) {
       best_fixed_strategy <- as.character(candidate_best$Strategy[1])
@@ -226,8 +228,10 @@ cat("Best fixed benchmark: ", ifelse(is.na(best_fixed_strategy), "NONE", best_fi
 
 
 ###############################################################
-# 7. SAFE HELPER FUNCTIONS (NA-PREVENTATIVE & CALIBRATED)
+# 7. SAFE HELPER FUNCTIONS (CALIBRATED & NA-SAFE)
 ###############################################################
+
+MAX_RETURN_CAP <- 0.50  # Cap extreme return distortions (+/- 50% per month)
 
 safe_mean   <- function(x) { x <- x[is.finite(x)]; if (length(x) == 0) NA_real_ else mean(x) }
 safe_median <- function(x) { x <- x[is.finite(x)]; if (length(x) == 0) NA_real_ else median(x) }
@@ -239,12 +243,13 @@ safe_quantile <- function(x, probability) {
   as.numeric(stats::quantile(x, probs = probability, names = FALSE, type = 7, na.rm = TRUE))
 }
 
-# Robust Compounded Annualized Return
+# Robust Compounded Annualized Return with Capped Multipliers
 safe_annualized_return <- function(x, periods_per_year = 12) {
   x <- x[is.finite(x)]
   n <- length(x)
   if (n == 0L) return(NA_real_)
-  mult <- pmax(1 + x, 1e-8)
+  x_capped <- pmax(pmin(x, MAX_RETURN_CAP), -MAX_RETURN_CAP)
+  mult <- pmax(1 + x_capped, 1e-6)
   total_wealth <- exp(sum(log(mult)))
   total_wealth^(periods_per_year / n) - 1
 }
@@ -253,10 +258,10 @@ safe_annualized_return <- function(x, periods_per_year = 12) {
 safe_max_drawdown <- function(x) {
   x <- x[is.finite(x)]
   if (length(x) == 0L) return(NA_real_)
-  mult <- pmax(1 + x, 1e-8)
-  wealth <- cumprod(mult)
+  x_capped <- pmax(pmin(x, MAX_RETURN_CAP), -MAX_RETURN_CAP)
+  wealth <- cumprod(pmax(1 + x_capped, 1e-6))
   running_max <- cummax(wealth)
-  drawdown <- wealth / running_max - 1
+  drawdown <- (wealth - running_max) / running_max
   min(drawdown, na.rm = TRUE)
 }
 
@@ -343,7 +348,7 @@ safe_rank <- function(x, decreasing = TRUE) {
 
 
 ###############################################################
-# 8. RE-POPULATE MISSING PERFORMANCE METRICS
+# 8. RE-POPULATE & AUDIT PERFORMANCE METRICS
 ###############################################################
 
 recalculated_perf <- all_strategy_returns %>%
@@ -536,11 +541,13 @@ if (nrow(model_vs_all_inference) > 0) {
 # 13. STRATEGY ROBUSTNESS RANKING
 ###############################################################
 
+sharpe_col_name <- intersect(c("CalibratedSharpeRatio", "SharpeRatio"), names(strategy_performance))[1]
+
 robustness_data <- strategy_performance %>%
-  dplyr::select(Strategy, AnnualizedReturn, SharpeRatio, MaximumDrawdown, CalmarRatio, HitRate) %>%
+  dplyr::select(Strategy, AnnualizedReturn, Sharpe = dplyr::all_of(sharpe_col_name), MaximumDrawdown, CalmarRatio, HitRate) %>%
   dplyr::mutate(
     ReturnRank   = safe_rank(AnnualizedReturn, decreasing = TRUE),
-    SharpeRank   = safe_rank(SharpeRatio, decreasing = TRUE),
+    SharpeRank   = safe_rank(Sharpe, decreasing = TRUE),
     DrawdownRank = safe_rank(abs(MaximumDrawdown), decreasing = FALSE),
     CalmarRank   = safe_rank(CalmarRatio, decreasing = TRUE),
     HitRateRank  = safe_rank(HitRate, decreasing = TRUE)
@@ -627,7 +634,7 @@ if (nrow(nw_plot_data) > 0) {
 
 
 ###############################################################
-# 15. EXPORT CSV ARTIFACTS & FULL RDATA (FOR DOWNSTREAM MODULES)
+# 15. EXPORT CSV ARTIFACTS & FULL RDATA
 ###############################################################
 
 readr::write_csv(strategy_inference, file.path(OUTPUT_DIR, "18_Strategy_Inference.csv"))

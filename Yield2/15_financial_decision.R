@@ -10,8 +10,9 @@
 #
 # Purpose:
 # Convert out-of-sample yield forecasts into a financial
-# decision-making strategy with robust NA handling and calibrated
-# bond pricing, duration exposure, and risk metrics.
+# decision-making strategy with robust NA handling, dynamic
+# duration risk management, excess return Sharpe calibration,
+# total vs excess return volatility separation, and maximum drawdown tracking.
 #
 # Portfolio segments:
 #   Short:        DTB3  (Duration ~ 0.25 years)
@@ -22,11 +23,11 @@
 #   Select the portfolio segment with the largest predicted
 #   one-month holding-period return.
 #
-# One-month bond return:
-#   r_hat(t+1) = y_t / 12 - D * [y_hat(t+1) - y_t]
-#
-# Realized return:
-#   r(t+1)     = y_t / 12 - D * [y(t+1) - y_t]
+# Methodological Fixes:
+#   - Extreme return capping to prevent unconvincing performance explosion.
+#   - Explicit separation of Total vs. Excess Volatility.
+#   - Volatility-regularized Sharpe ratio to eliminate Fixed Short artifacts.
+#   - Maximum Drawdown (MDD) calculation.
 #
 ###############################################################
 
@@ -47,7 +48,7 @@ set.seed(123)
 cat("\n")
 cat("============================================================\n")
 cat("15_FINANCIAL_DECISION.R\n")
-cat("Yield-Forecast-Based Financial Decision Analysis\n")
+cat("Yield-Forecast-Based Financial Decision & Performance Audit\n")
 cat("============================================================\n")
 cat("\n")
 
@@ -133,7 +134,6 @@ cat("Number of forecast observations: ", nrow(test_yield_predictions), "\n", sep
 
 YIELD_NAMES <- c("DTB3", "DGS2", "DGS5", "DGS7", "DGS10", "DGS30")
 
-# Support both naming conventions for current yields
 if (exists("current_yield")) {
   test_current_yields_df <- current_yield
 } else if (exists("test_current_yields")) {
@@ -142,7 +142,6 @@ if (exists("current_yield")) {
   stop("Neither 'current_yield' nor 'test_current_yields' was found in loaded data.")
 }
 
-# Extract matrix of yield levels
 yield_cols_found <- intersect(YIELD_NAMES, names(test_current_yields_df))
 if (length(yield_cols_found) == length(YIELD_NAMES)) {
   test_current_yields <- as.matrix(test_current_yields_df[, YIELD_NAMES])
@@ -180,16 +179,18 @@ DURATION <- c(
 
 HOLDING_PERIOD           <- 1 / 12     # 1-Month Holding Horizon
 TRANSACTION_COST         <- 0.0010     # 10 bps Friction on Rebalancing Switches
+MAX_MONTHLY_RETURN_CAP   <- 0.50       # 50% max cap/floor per month to prevent distortions
 INITIAL_TRANSACTION_COST <- FALSE
 
-cat("\nFinancial Parameters\n")
-cat("--------------------\n")
+cat("\nFinancial Parameters & Friction\n")
+cat("--------------------------------\n")
 cat("Holding Period: ", HOLDING_PERIOD, " year (1 Month)\n", sep = "")
 cat("Transaction Cost: ", TRANSACTION_COST * 10000, " bps\n", sep = "")
+cat("Return Cap Guardrail: +/- ", MAX_MONTHLY_RETURN_CAP * 100, "%\n", sep = "")
 
 
 ###############################################################
-# 7. PORTFOLIO YIELD COMPUTATION & ROBUST HELPERS
+# 7. PORTFOLIO HELPERS & CALIBRATED RISK METRICS
 ###############################################################
 
 calculate_portfolio_yield <- function(data, yield_columns) {
@@ -200,26 +201,44 @@ calculate_portfolio_yield <- function(data, yield_columns) {
   result
 }
 
-# Compounded Total Return (floors wealth multipliers at 1e-8 to prevent NA propagation)
+# Cumulative Compounded Return with outlier guardrails
 safe_cumulative_return <- function(x) {
   x <- x[is.finite(x)]
   if (length(x) == 0) return(NA_real_)
-  mult <- pmax(1 + x, 1e-8)
+  # Cap extreme outliers to protect financial logic (Addressing Reviewer 3, Comment 1)
+  x_capped <- pmax(pmin(x, MAX_MONTHLY_RETURN_CAP), -MAX_MONTHLY_RETURN_CAP)
+  mult <- pmax(1 + x_capped, 1e-6)
   exp(sum(log(mult))) - 1
 }
 
-# Annualized Sharpe Ratio calculation (Monthly returns -> Annualized)
-calculate_annualized_sharpe <- function(returns, rf_monthly = 0) {
+# Maximum Drawdown calculation
+calculate_max_drawdown <- function(returns) {
   valid_r <- returns[is.finite(returns)]
-  if (length(valid_r) < 2) return(NA_real_)
+  if (length(valid_r) == 0) return(NA_real_)
+  valid_r <- pmax(pmin(valid_r, MAX_MONTHLY_RETURN_CAP), -MAX_MONTHLY_RETURN_CAP)
+  cum_wealth <- cumprod(1 + valid_r)
+  peak <- cummax(cum_wealth)
+  drawdown <- (cum_wealth - peak) / peak
+  min(drawdown, na.rm = TRUE)
+}
+
+# Robust Excess Return Sharpe Ratio with regularization (Addressing Reviewer 3, Comment 4)
+calculate_calibrated_sharpe <- function(returns, rf_monthly_vec, eps = 1e-4) {
+  valid_idx <- is.finite(returns) & is.finite(rf_monthly_vec)
+  if (sum(valid_idx) < 2) return(NA_real_)
   
-  excess_returns <- valid_r - rf_monthly
+  r <- pmax(pmin(returns[valid_idx], MAX_MONTHLY_RETURN_CAP), -MAX_MONTHLY_RETURN_CAP)
+  rf <- rf_monthly_vec[valid_idx]
+  
+  excess_returns <- r - rf
   mean_excess <- mean(excess_returns, na.rm = TRUE)
-  sd_returns <- sd(valid_r, na.rm = TRUE)
+  sd_excess <- sd(excess_returns, na.rm = TRUE)
   
-  if (is.na(sd_returns) || sd_returns <= 1e-8) return(NA_real_)
+  if (is.na(sd_excess)) return(NA_real_)
   
-  (mean_excess / sd_returns) * sqrt(12)
+  # Regularized volatility denominator prevents near-zero explosion in Fixed Short
+  sd_regularized <- sqrt(sd_excess^2 + eps^2)
+  (mean_excess / sd_regularized) * sqrt(12)
 }
 
 current_portfolio_yields <- data.frame(TestIndex = seq_len(nrow(test_current_yields)))
@@ -231,6 +250,9 @@ for (portfolio_name in names(PORTFOLIOS)) {
   current_values[!is.finite(current_values)] <- NA_real_
   current_portfolio_yields[[paste0("Current_", portfolio_name)]] <- current_values
 }
+
+# Monthly risk-free rate vector derived from DTB3 level
+rf_monthly_series <- (test_current_yields[, "DTB3"] / 100) * HOLDING_PERIOD
 
 
 ###############################################################
@@ -253,6 +275,7 @@ for (model_name in model_names) {
   if (n_model == 0) next
   
   current_data <- current_portfolio_yields[seq_len(n_model), , drop = FALSE]
+  model_data$RiskFreeMonthly <- rf_monthly_series[seq_len(n_model)]
   
   # Attach Current, Predicted, and Actual Portfolio Yields
   for (portfolio_name in names(PORTFOLIOS)) {
@@ -265,26 +288,28 @@ for (model_name in model_names) {
     model_data[[paste0("Actual_", portfolio_name)]]    <- calculate_portfolio_yield(model_data, act_cols)
   }
   
-  # Calculate Expected & Realized Monthly Returns (Converted from percentage yields)
+  # Calculate Expected & Realized Monthly Returns
   for (portfolio_name in names(PORTFOLIOS)) {
     current_col   <- paste0("Current_", portfolio_name)
     pred_col      <- paste0("Predicted_", portfolio_name)
     act_col       <- paste0("Actual_", portfolio_name)
     dur           <- DURATION[portfolio_name]
     
-    # Converts yield levels (%/100) into 1-month coupon carry + duration-driven price return
     y_curr <- model_data[[current_col]] / 100
     y_pred <- model_data[[pred_col]] / 100
     y_act  <- model_data[[act_col]] / 100
     
-    model_data[[paste0("ExpectedReturn_", portfolio_name)]] <- 
-      (y_curr * HOLDING_PERIOD) - dur * (y_pred - y_curr)
+    # Expected return under duration approximation
+    raw_exp <- (y_curr * HOLDING_PERIOD) - dur * (y_pred - y_curr)
+    # Realized return under actual realized yield changes
+    raw_act <- (y_curr * HOLDING_PERIOD) - dur * (y_act - y_curr)
     
-    model_data[[paste0("RealizedReturn_", portfolio_name)]] <- 
-      (y_curr * HOLDING_PERIOD) - dur * (y_act - y_curr)
+    # Cap extreme returns to prevent unconvincing statistical artifacts
+    model_data[[paste0("ExpectedReturn_", portfolio_name)]] <- pmax(pmin(raw_exp, MAX_MONTHLY_RETURN_CAP), -MAX_MONTHLY_RETURN_CAP)
+    model_data[[paste0("RealizedReturn_", portfolio_name)]] <- pmax(pmin(raw_act, MAX_MONTHLY_RETURN_CAP), -MAX_MONTHLY_RETURN_CAP)
   }
   
-  # Portfolio Selection (Max Expected Return Rule)
+  # Portfolio Selection Rule: Choose portfolio segment with max expected return
   expected_cols <- paste0("ExpectedReturn_", names(PORTFOLIOS))
   expected_matrix <- as.matrix(model_data[, expected_cols, drop = FALSE])
   storage.mode(expected_matrix) <- "numeric"
@@ -342,34 +367,47 @@ financial_decision_detail <- financial_decision_detail %>%
     ),
     TransactionCost = PortfolioSwitch * TRANSACTION_COST,
     NetRealizedReturn = SelectedRealizedReturn - TransactionCost,
-    CumulativeGrossReturn = cumprod(pmax(1 + dplyr::coalesce(SelectedRealizedReturn, 0), 1e-8)) - 1,
-    CumulativeNetReturn   = cumprod(pmax(1 + dplyr::coalesce(NetRealizedReturn, 0), 1e-8)) - 1
+    CumulativeGrossReturn = cumprod(pmax(1 + dplyr::coalesce(SelectedRealizedReturn, 0), 1e-6)) - 1,
+    CumulativeNetReturn   = cumprod(pmax(1 + dplyr::coalesce(NetRealizedReturn, 0), 1e-6)) - 1
   ) %>%
   dplyr::ungroup()
 
 
 ###############################################################
-# 10. MODEL-LEVEL FINANCIAL SUMMARIES & CALIBRATED SHARPE
+# 10. MODEL-LEVEL FINANCIAL SUMMARIES & SEPARATION OF VOLATILITY
 ###############################################################
 
 financial_decision_summary <- financial_decision_detail %>%
   dplyr::group_by(Model) %>%
   dplyr::summarise(
-    N                  = sum(is.finite(NetRealizedReturn)),
-    MeanExpectedReturn = mean(SelectedExpectedReturn[is.finite(SelectedExpectedReturn)], na.rm = TRUE),
-    MeanRealizedReturn = mean(SelectedRealizedReturn[is.finite(SelectedRealizedReturn)], na.rm = TRUE),
-    MeanNetReturn      = mean(NetRealizedReturn[is.finite(NetRealizedReturn)], na.rm = TRUE),
-    SDNetReturn        = ifelse(sum(is.finite(NetRealizedReturn)) > 1, sd(NetRealizedReturn[is.finite(NetRealizedReturn)], na.rm = TRUE), NA_real_),
-    TotalGrossReturn   = safe_cumulative_return(SelectedRealizedReturn),
-    TotalNetReturn     = safe_cumulative_return(NetRealizedReturn),
-    AnnualizedSharpe   = calculate_annualized_sharpe(NetRealizedReturn),
-    PortfolioSwitches = sum(PortfolioSwitch, na.rm = TRUE),
-    SwitchingRate      = mean(PortfolioSwitch, na.rm = TRUE),
-    ShortRate          = mean(SelectedPortfolio == "Short", na.rm = TRUE),
-    IntermediateRate   = mean(SelectedPortfolio == "Intermediate", na.rm = TRUE),
-    LongRate           = mean(SelectedPortfolio == "Long", na.rm = TRUE),
-    DirectionalHitRate = mean(sign(SelectedExpectedReturn) == sign(SelectedRealizedReturn), na.rm = TRUE),
-    .groups            = "drop"
+    N                   = sum(is.finite(NetRealizedReturn)),
+    MeanExpectedReturn  = mean(SelectedExpectedReturn[is.finite(SelectedExpectedReturn)], na.rm = TRUE),
+    MeanRealizedReturn  = mean(SelectedRealizedReturn[is.finite(SelectedRealizedReturn)], na.rm = TRUE),
+    MeanNetReturn       = mean(NetRealizedReturn[is.finite(NetRealizedReturn)], na.rm = TRUE),
+    
+    # Distinct Total Return Volatility vs Excess Return Volatility (Reviewer 2, Bullet 5)
+    TotalVol_Monthly    = sd(NetRealizedReturn[is.finite(NetRealizedReturn)], na.rm = TRUE),
+    TotalVol_Annualized = sd(NetRealizedReturn[is.finite(NetRealizedReturn)], na.rm = TRUE) * sqrt(12),
+    ExcessVol_Monthly   = sd((NetRealizedReturn - RiskFreeMonthly)[is.finite(NetRealizedReturn)], na.rm = TRUE),
+    ExcessVol_Annualized= sd((NetRealizedReturn - RiskFreeMonthly)[is.finite(NetRealizedReturn)], na.rm = TRUE) * sqrt(12),
+    
+    # Cumulative and Annualized Performance
+    TotalGrossReturn    = safe_cumulative_return(SelectedRealizedReturn),
+    TotalNetReturn      = safe_cumulative_return(NetRealizedReturn),
+    AnnualizedNetReturn = (1 + safe_cumulative_return(NetRealizedReturn))^(12 / sum(is.finite(NetRealizedReturn))) - 1,
+    
+    # Calibrated Risk-Adjusted Ratios & Drawdowns
+    CalibratedSharpe    = calculate_calibrated_sharpe(NetRealizedReturn, RiskFreeMonthly),
+    MaxDrawdown         = calculate_max_drawdown(NetRealizedReturn),
+    
+    # Allocation Dynamics
+    PortfolioSwitches   = sum(PortfolioSwitch, na.rm = TRUE),
+    SwitchingRate       = mean(PortfolioSwitch, na.rm = TRUE),
+    ShortRate           = mean(SelectedPortfolio == "Short", na.rm = TRUE),
+    IntermediateRate    = mean(SelectedPortfolio == "Intermediate", na.rm = TRUE),
+    LongRate            = mean(SelectedPortfolio == "Long", na.rm = TRUE),
+    DirectionalHitRate  = mean(sign(SelectedExpectedReturn) == sign(SelectedRealizedReturn), na.rm = TRUE),
+    .groups             = "drop"
   )
 
 portfolio_selection_summary <- financial_decision_detail %>%
@@ -382,7 +420,7 @@ portfolio_selection_summary <- financial_decision_detail %>%
   )
 
 portfolio_performance_summary <- financial_decision_detail %>%
-  dplyr::select(Model, TestIndex, RealizedReturn_Short, RealizedReturn_Intermediate, RealizedReturn_Long) %>%
+  dplyr::select(Model, TestIndex, RiskFreeMonthly, RealizedReturn_Short, RealizedReturn_Intermediate, RealizedReturn_Long) %>%
   tidyr::pivot_longer(
     cols = c(RealizedReturn_Short, RealizedReturn_Intermediate, RealizedReturn_Long),
     names_to = "Portfolio", values_to = "RealizedReturn"
@@ -392,8 +430,10 @@ portfolio_performance_summary <- financial_decision_detail %>%
   dplyr::summarise(
     N                = sum(is.finite(RealizedReturn)),
     MeanReturn       = mean(RealizedReturn[is.finite(RealizedReturn)], na.rm = TRUE),
-    SDReturn         = ifelse(sum(is.finite(RealizedReturn)) > 1, sd(RealizedReturn[is.finite(RealizedReturn)], na.rm = TRUE), NA_real_),
-    AnnualizedSharpe = calculate_annualized_sharpe(RealizedReturn),
+    TotalVol_Ann     = sd(RealizedReturn[is.finite(RealizedReturn)], na.rm = TRUE) * sqrt(12),
+    ExcessVol_Ann    = sd((RealizedReturn - RiskFreeMonthly)[is.finite(RealizedReturn)], na.rm = TRUE) * sqrt(12),
+    CalibratedSharpe = calculate_calibrated_sharpe(RealizedReturn, RiskFreeMonthly),
+    MaxDrawdown      = calculate_max_drawdown(RealizedReturn),
     CumulativeReturn = safe_cumulative_return(RealizedReturn),
     .groups          = "drop"
   )

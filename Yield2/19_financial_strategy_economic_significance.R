@@ -10,8 +10,9 @@
 #
 # Purpose:
 # Economic-significance analysis of financial strategies
-# with robust NA handling, calibrated annualization, and
-# paired bootstrap confidence intervals.
+# with robust NA handling, calibrated Sharpe annualization,
+# Total vs. Excess volatility separation, capped log compounding,
+# and paired bootstrap confidence intervals.
 #
 # Input:
 #   18_Financial_Strategy_Inference.RData
@@ -167,29 +168,33 @@ if (length(learned_strategies) == 0L) {
 
 
 ###############################################################
-# 4. IDENTIFY BEST FIXED BENCHMARK
+# 4. IDENTIFY BEST FIXED BENCHMARK BY CALIBRATED SHARPE
 ###############################################################
 
 if (length(best_fixed_strategy) == 1L && !is.na(best_fixed_strategy) && best_fixed_strategy %in% fixed_strategies) {
   best_fixed <- best_fixed_strategy
 } else {
   fixed_performance <- strategy_performance %>% dplyr::filter(Strategy %in% fixed_strategies)
-  if (nrow(fixed_performance) == 0L || !"SharpeRatio" %in% names(fixed_performance)) {
+  sharpe_col <- intersect(c("CalibratedSharpeRatio", "CalibratedSharpe", "SharpeRatio"), names(fixed_performance))[1]
+  
+  if (nrow(fixed_performance) == 0L || is.na(sharpe_col)) {
     stop("Unable to identify the best fixed benchmark.")
   }
-  best_fixed <- fixed_performance$Strategy[which.max(fixed_performance$SharpeRatio)]
+  best_fixed <- fixed_performance$Strategy[which.max(fixed_performance[[sharpe_col]])]
 }
 
 cat("\n============================================================\n")
-cat("MODULE 19: FINANCIAL STRATEGY ECONOMIC SIGNIFICANCE\n")
+cat("MODULE 19: FINANCIAL STRATEGY ECONOMIC SIGNIFICANCE AUDIT\n")
 cat("============================================================\n")
 cat("Best fixed benchmark: ", best_fixed, "\n", sep = "")
 cat("Learned strategies:   ", length(learned_strategies), "\n", sep = "")
 
 
 ###############################################################
-# 5. ROBUST HELPER FUNCTIONS (NA-PREVENTATIVE & CALIBRATED)
+# 5. ROBUST HELPER FUNCTIONS (CALIBRATED & NA-SAFE)
 ###############################################################
+
+MAX_RETURN_CAP <- 0.50  # Cap extreme return distortions (+/- 50% per month)
 
 safe_mean   <- function(x) { x <- x[is.finite(x)]; if (length(x) == 0L) NA_real_ else mean(x) }
 safe_sd     <- function(x) { x <- x[is.finite(x)]; if (length(x) < 2L) NA_real_ else stats::sd(x) }
@@ -201,11 +206,12 @@ safe_quantile <- function(x, probability) {
   as.numeric(stats::quantile(x, probs = probability, names = FALSE, type = 7, na.rm = TRUE))
 }
 
-# Robust Compounded Return
+# Robust Compounded Return with Capped Multipliers
 safe_cumulative_return <- function(x) {
   x <- x[is.finite(x)]
   if (length(x) == 0L) return(NA_real_)
-  mult <- pmax(1 + x, 1e-8)
+  x_capped <- pmax(pmin(x, MAX_RETURN_CAP), -MAX_RETURN_CAP)
+  mult <- pmax(1 + x_capped, 1e-6)
   exp(sum(log(mult))) - 1
 }
 
@@ -214,19 +220,37 @@ safe_annualized_return <- function(x, periods_per_year = 12) {
   x <- x[is.finite(x)]
   n <- length(x)
   if (n == 0L) return(NA_real_)
-  mult <- pmax(1 + x, 1e-8)
-  total_wealth <- exp(sum(log(mult)))
-  total_wealth^(periods_per_year / n) - 1
+  cum_ret <- safe_cumulative_return(x)
+  if (!is.finite(cum_ret) || cum_ret <= -1) return(-1.0)
+  (1 + cum_ret)^(periods_per_year / n) - 1
+}
+
+# Calibrated Sharpe Ratio with Regularization (Reviewer 3, Bullet 4 & Reviewer 2, Bullet 5)
+safe_calibrated_sharpe <- function(r, rf, periods_per_year = 12, eps = 1e-4) {
+  valid <- is.finite(r) & is.finite(rf)
+  if (sum(valid) < 2) return(NA_real_)
+  
+  r_valid  <- pmax(pmin(r[valid], MAX_RETURN_CAP), -MAX_RETURN_CAP)
+  rf_valid <- rf[valid]
+  
+  excess <- r_valid - rf_valid
+  mean_excess <- mean(excess, na.rm = TRUE)
+  sd_excess <- stats::sd(excess, na.rm = TRUE)
+  
+  if (is.na(sd_excess)) return(NA_real_)
+  
+  sd_reg <- sqrt(sd_excess^2 + eps^2)
+  (mean_excess / sd_reg) * sqrt(periods_per_year)
 }
 
 # Robust Maximum Drawdown
 safe_max_drawdown <- function(x) {
   x <- x[is.finite(x)]
   if (length(x) == 0L) return(NA_real_)
-  mult <- pmax(1 + x, 1e-8)
-  wealth <- cumprod(mult)
+  x_capped <- pmax(pmin(x, MAX_RETURN_CAP), -MAX_RETURN_CAP)
+  wealth <- cumprod(pmax(1 + x_capped, 1e-6))
   running_max <- cummax(wealth)
-  drawdown <- wealth / running_max - 1
+  drawdown <- (wealth - running_max) / running_max
   min(drawdown, na.rm = TRUE)
 }
 
@@ -269,10 +293,17 @@ extract_strategy_returns <- function(return_data, strategy_name) {
 
 
 ###############################################################
-# 6. RE-CALCULATE STRATEGY PERFORMANCE WITH ROBUST COMPOUNDING
+# 6. RE-CALCULATE STRATEGY PERFORMANCE WITH VOLATILITY SEPARATION
 ###############################################################
 
-# Update performance metrics directly from the return vectors in all_strategy_returns
+if (!"RiskFree" %in% names(all_strategy_returns)) {
+  if ("RealizedReturn_Short" %in% names(all_strategy_returns)) {
+    all_strategy_returns$RiskFree <- all_strategy_returns$RealizedReturn_Short
+  } else {
+    all_strategy_returns$RiskFree <- 0.0025
+  }
+}
+
 strategy_performance <- all_strategy_returns %>%
   dplyr::group_by(Strategy) %>%
   dplyr::summarise(
@@ -280,8 +311,13 @@ strategy_performance <- all_strategy_returns %>%
     MeanMonthlyReturn    = safe_mean(NetReturn),
     SDMonthlyReturn      = safe_sd(NetReturn),
     AnnualizedReturn     = safe_annualized_return(NetReturn),
-    AnnualizedVolatility = safe_sd(NetReturn) * sqrt(12),
-    SharpeRatio          = if (safe_sd(NetReturn) > 0) (safe_mean(NetReturn) / safe_sd(NetReturn)) * sqrt(12) else NA_real_,
+    
+    # Separation of Total vs Excess Volatility
+    TotalVol_Annualized  = safe_sd(NetReturn) * sqrt(12),
+    ExcessVol_Annualized = safe_sd(NetReturn - RiskFree) * sqrt(12),
+    
+    # Calibrated Sharpe & Risk Metrics
+    CalibratedSharpeRatio= safe_calibrated_sharpe(NetReturn, RiskFree),
     MaximumDrawdown      = safe_max_drawdown(NetReturn),
     CalmarRatio          = safe_calmar(NetReturn),
     CumulativeNetReturn  = safe_cumulative_return(NetReturn),
@@ -338,10 +374,10 @@ economic_significance <- economic_significance %>%
       TRUE                       ~ "Not Significant"
     ),
     EconomicSignificance = dplyr::case_when(
-      AnnualizedReturn > 0 & SharpeRatio > 0 & CalmarRatio > 0 ~ "Favorable",
-      AnnualizedReturn > 0 & SharpeRatio > 0                    ~ "Moderately Favorable",
-      AnnualizedReturn > 0                                       ~ "Mixed",
-      TRUE                                                       ~ "Unfavorable"
+      AnnualizedReturn > 0 & CalibratedSharpeRatio > 0 & CalmarRatio > 0 ~ "Favorable",
+      AnnualizedReturn > 0 & CalibratedSharpeRatio > 0                   ~ "Moderately Favorable",
+      AnnualizedReturn > 0                                               ~ "Mixed",
+      TRUE                                                               ~ "Unfavorable"
     ),
     OverallEvidence = dplyr::case_when(
       StatisticalSignificance %in% c("Strong", "Significant") & EconomicSignificance %in% c("Favorable", "Moderately Favorable") ~ "Strong Economic Evidence",
@@ -376,7 +412,7 @@ for (model_name in learned_strategies) {
   if (length(model_returns) < 2L) next
   
   excess_returns <- model_returns - benchmark_returns
-  boot_res       <- safe_bootstrap_mean(excess_returns, B = 5000L, seed = 20260914L + benchmark_counter)
+  boot_res        <- safe_bootstrap_mean(excess_returns, B = 5000L, seed = 20260914L + benchmark_counter)
   
   benchmark_counter <- benchmark_counter + 1L
   benchmark_relative_list[[benchmark_counter]] <- data.frame(
@@ -422,9 +458,9 @@ for (model_name in learned_strategies) {
     AnnualizedReturn_Model      = model_row$AnnualizedReturn,
     AnnualizedReturn_Benchmark  = benchmark_row$AnnualizedReturn,
     AnnualizedReturn_Gain       = model_row$AnnualizedReturn - benchmark_row$AnnualizedReturn,
-    SharpeRatio_Model           = model_row$SharpeRatio,
-    SharpeRatio_Benchmark       = benchmark_row$SharpeRatio,
-    SharpeRatio_Gain            = model_row$SharpeRatio - benchmark_row$SharpeRatio,
+    SharpeRatio_Model           = model_row$CalibratedSharpeRatio,
+    SharpeRatio_Benchmark       = benchmark_row$CalibratedSharpeRatio,
+    SharpeRatio_Gain            = model_row$CalibratedSharpeRatio - benchmark_row$CalibratedSharpeRatio,
     MaximumDrawdown_Model       = model_row$MaximumDrawdown,
     MaximumDrawdown_Benchmark   = benchmark_row$MaximumDrawdown,
     DrawdownImprovement         = abs(benchmark_row$MaximumDrawdown) - abs(model_row$MaximumDrawdown),
@@ -488,14 +524,14 @@ if (nrow(model_economic_gains) > 0L) {
       EconomicSignificance = dplyr::case_when(
         ReturnGainPositive & SharpeGainPositive & DrawdownImproved & CalmarGainPositive ~ "Strongly Favorable",
         ReturnGainPositive & SharpeGainPositive                                         ~ "Favorable",
-        ReturnGainPositive                                                               ~ "Moderately Favorable",
+        ReturnGainPositive                                                              ~ "Moderately Favorable",
         TRUE                                                                             ~ "Unfavorable"
       ),
       OverallEvidence = dplyr::case_when(
         StatisticalSignificance %in% c("Strong", "Significant") & EconomicSignificance %in% c("Strongly Favorable", "Favorable") ~ "Strong Economic Evidence",
-        StatisticalSignificance %in% c("Strong", "Significant")                                                                  ~ "Statistically Significant",
+        StatisticalSignificance %in% c("Strong", "Significant")                                                                 ~ "Statistically Significant",
         EconomicSignificance %in% c("Strongly Favorable", "Favorable", "Moderately Favorable")                                   ~ "Economically Favorable",
-        TRUE                                                                                                                     ~ "Limited Evidence"
+        TRUE                                                                                                                      ~ "Limited Evidence"
       )
     )
 }
@@ -505,14 +541,14 @@ if (nrow(model_economic_gains) > 0L) {
 # 11. STRATEGY ECONOMIC RANKING
 ###############################################################
 
-ranking_required <- c("Strategy", "AnnualizedReturn", "SharpeRatio", "MaximumDrawdown", "CalmarRatio", "HitRate")
+ranking_required <- c("Strategy", "AnnualizedReturn", "CalibratedSharpeRatio", "MaximumDrawdown", "CalmarRatio", "HitRate")
 
 strategy_ranking <- strategy_performance %>%
   dplyr::filter(Strategy %in% c(learned_strategies, fixed_strategies)) %>%
   dplyr::select(dplyr::all_of(ranking_required)) %>%
   dplyr::mutate(
     Rank_CumulativeReturn = rank(-AnnualizedReturn, ties.method = "average", na.last = "keep"),
-    Rank_Sharpe           = rank(-SharpeRatio, ties.method = "average", na.last = "keep"),
+    Rank_Sharpe           = rank(-CalibratedSharpeRatio, ties.method = "average", na.last = "keep"),
     Rank_Drawdown         = rank(abs(MaximumDrawdown), ties.method = "average", na.last = "keep"),
     Rank_Calmar           = rank(-CalmarRatio, ties.method = "average", na.last = "keep"),
     Rank_HitRate          = rank(-HitRate, ties.method = "average", na.last = "keep")
@@ -533,7 +569,6 @@ strategy_ranking <- strategy_performance %>%
   ) %>%
   dplyr::arrange(EconomicRank)
 
-# Update strategy_performance with complete rankings
 strategy_performance <- strategy_performance %>%
   dplyr::select(-dplyr::any_of(c("Rank_CumulativeReturn", "Rank_Sharpe", "Rank_Drawdown", "OverallRankScore", "OverallRank"))) %>%
   dplyr::left_join(
@@ -541,7 +576,6 @@ strategy_performance <- strategy_performance %>%
     by = "Strategy"
   )
 
-# Clean economic_significance table for final export
 economic_significance <- strategy_performance %>%
   dplyr::filter(Strategy %in% c(learned_strategies, fixed_strategies)) %>%
   dplyr::mutate(
@@ -661,9 +695,9 @@ save(
 cat("\n============================================================\n")
 cat("MODULE 19 COMPLETED SUCCESSFULLY\n")
 cat("============================================================\n")
-cat("Best fixed benchmark:            ", best_fixed, "\n", sep = "")
-cat("Number of learned strategies:    ", length(learned_strategies), "\n", sep = "")
-cat("Economic significance rows:      ", nrow(economic_significance), "\n", sep = "")
+cat("Best fixed benchmark:             ", best_fixed, "\n", sep = "")
+cat("Number of learned strategies:     ", length(learned_strategies), "\n", sep = "")
+cat("Economic significance rows:       ", nrow(economic_significance), "\n", sep = "")
 cat("Benchmark-relative comparisons: ", nrow(benchmark_relative_performance), "\n", sep = "")
-cat("Results saved to directory:      ", OUTPUT_DIR, "\n", sep = "")
+cat("Results saved to directory:       ", OUTPUT_DIR, "\n", sep = "")
 cat("============================================================\n")

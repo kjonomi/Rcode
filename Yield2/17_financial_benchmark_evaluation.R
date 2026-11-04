@@ -11,10 +11,11 @@
 # Purpose:
 # Economic benchmark evaluation of forecasting-driven
 # financial decision strategies with robust NA prevention,
-# calibrated annualization, and paired statistical testing.
+# calibrated Sharpe ratios, Total vs Excess volatility separation,
+# capped log wealth accumulation, and paired statistical testing.
 #
 # Comparisons:
-#   1. Learned forecasting-model strategies
+#   1. Learned forecasting-model strategies (PER, Uniform, Entropy)
 #   2. Fixed Short strategy (3M T-Bills / Cash)
 #   3. Fixed Intermediate strategy (2Y, 5Y, 7Y)
 #   4. Fixed Long strategy (10Y, 30Y)
@@ -52,7 +53,7 @@ set.seed(20260914)
 cat("\n")
 cat("============================================================\n")
 cat("17_FINANCIAL_BENCHMARK_EVALUATION.R\n")
-cat("Economic & Financial Benchmark Evaluation\n")
+cat("Economic Benchmark Evaluation & Calibrated Financial Performance\n")
 cat("============================================================\n")
 cat("\n")
 
@@ -164,7 +165,7 @@ if (length(missing_detail_columns) > 0) {
 
 
 ###############################################################
-# 5. STANDARDIZE DATA & PARAMETERS
+# 5. STANDARDIZE DATA & RISK-FREE RATE SERIES
 ###############################################################
 
 if (!"Date" %in% names(financial_decision_detail)) {
@@ -187,10 +188,19 @@ for (col in numeric_columns) {
 HOLDING_PERIOD   <- if ("HOLDING_PERIOD" %in% loaded_objects) get("HOLDING_PERIOD", envir = financial_env) else 1 / 12
 TRANSACTION_COST <- if ("TRANSACTION_COST" %in% loaded_objects) get("TRANSACTION_COST", envir = financial_env) else 0.0010
 
+# Risk-free monthly return series (derived from Short / DTB3 return level)
+if ("RiskFreeMonthly" %in% names(financial_decision_detail)) {
+  rf_series <- financial_decision_detail$RiskFreeMonthly
+} else {
+  rf_series <- financial_decision_detail$RealizedReturn_Short
+}
+
 
 ###############################################################
 # 6. ROBUST HELPER FUNCTIONS (NA-PREVENTATIVE & CALIBRATED)
 ###############################################################
+
+MAX_RETURN_CAP <- 0.50  # Cap extreme return distortions (+/- 50% per month)
 
 safe_mean <- function(x) {
   x <- x[is.finite(x)]
@@ -204,22 +214,23 @@ safe_sd <- function(x) {
   stats::sd(x)
 }
 
-# Robust Cumulative Compounded Return
+# Robust Cumulative Compounded Return with log compounding
 safe_cumulative_return <- function(x) {
   x <- x[is.finite(x)]
   if (length(x) == 0) return(NA_real_)
-  mult <- pmax(1 + x, 1e-8)
+  x_capped <- pmax(pmin(x, MAX_RETURN_CAP), -MAX_RETURN_CAP)
+  mult <- pmax(1 + x_capped, 1e-6)
   exp(sum(log(mult))) - 1
 }
 
-# Robust Annualized Return
+# Robust Annualized Net Return
 safe_annualized_return <- function(x, periods_per_year = 12) {
   x <- x[is.finite(x)]
   n <- length(x)
   if (n == 0) return(NA_real_)
-  mult <- pmax(1 + x, 1e-8)
-  total_wealth <- exp(sum(log(mult)))
-  total_wealth^(periods_per_year / n) - 1
+  cum_ret <- safe_cumulative_return(x)
+  if (!is.finite(cum_ret) || cum_ret <= -1) return(-1.0)
+  (1 + cum_ret)^(periods_per_year / n) - 1
 }
 
 safe_annualized_volatility <- function(x, periods_per_year = 12) {
@@ -228,27 +239,37 @@ safe_annualized_volatility <- function(x, periods_per_year = 12) {
   stats::sd(x) * sqrt(periods_per_year)
 }
 
-# Calibrated Annualized Sharpe Ratio: (Mean_monthly - Rf_monthly) / SD_monthly * sqrt(12)
-safe_sharpe <- function(x, rf_monthly = 0, periods_per_year = 12) {
-  x <- x[is.finite(x)]
-  if (length(x) < 2) return(NA_real_)
-  s <- stats::sd(x)
-  if (!is.finite(s) || s <= 1e-8) return(NA_real_)
-  (mean(x - rf_monthly) / s) * sqrt(periods_per_year)
+# Calibrated Annualized Sharpe Ratio with Regularization (Reviewer 3, Bullet 4 & Reviewer 2, Bullet 5)
+safe_calibrated_sharpe <- function(r, rf, periods_per_year = 12, eps = 1e-4) {
+  valid <- is.finite(r) & is.finite(rf)
+  if (sum(valid) < 2) return(NA_real_)
+  
+  r_valid  <- pmax(pmin(r[valid], MAX_RETURN_CAP), -MAX_RETURN_CAP)
+  rf_valid <- rf[valid]
+  
+  excess <- r_valid - rf_valid
+  mean_excess <- mean(excess, na.rm = TRUE)
+  sd_excess <- stats::sd(excess, na.rm = TRUE)
+  
+  if (is.na(sd_excess)) return(NA_real_)
+  
+  # Volatility regularization prevents exploding Sharpe ratios in Fixed Short
+  sd_reg <- sqrt(sd_excess^2 + eps^2)
+  (mean_excess / sd_reg) * sqrt(periods_per_year)
 }
 
-# Robust Maximum Drawdown
+# Robust Peak-to-Trough Maximum Drawdown
 safe_max_drawdown <- function(x) {
   x <- x[is.finite(x)]
   if (length(x) == 0) return(NA_real_)
-  mult <- pmax(1 + x, 1e-8)
-  wealth <- cumprod(mult)
+  x_capped <- pmax(pmin(x, MAX_RETURN_CAP), -MAX_RETURN_CAP)
+  wealth <- cumprod(pmax(1 + x_capped, 1e-6))
   running_max <- cummax(wealth)
-  drawdown <- wealth / running_max - 1
+  drawdown <- (wealth - running_max) / running_max
   min(drawdown, na.rm = TRUE)
 }
 
-# Robust Calmar Ratio
+# Calmar Ratio
 safe_calmar <- function(x) {
   ann_ret <- safe_annualized_return(x)
   mdd <- safe_max_drawdown(x)
@@ -289,7 +310,8 @@ learned_strategy_returns <- financial_decision_detail %>%
     Strategy        = paste0("Model: ", Model),
     GrossReturn     = SelectedRealizedReturn,
     TransactionCost = TransactionCost,
-    NetReturn       = NetRealizedReturn
+    NetReturn       = NetRealizedReturn,
+    RiskFree        = rf_series[seq_len(dplyr::n())]
   )
 
 benchmark_source <- financial_decision_detail %>%
@@ -298,20 +320,21 @@ benchmark_source <- financial_decision_detail %>%
   dplyr::arrange(TestIndex)
 
 fixed_short <- benchmark_source %>%
-  dplyr::transmute(TestIndex, Date, Strategy = "Fixed Short", GrossReturn = RealizedReturn_Short, TransactionCost = 0, NetReturn = RealizedReturn_Short)
+  dplyr::transmute(TestIndex, Date, Strategy = "Fixed Short", GrossReturn = RealizedReturn_Short, TransactionCost = 0, NetReturn = RealizedReturn_Short, RiskFree = RealizedReturn_Short)
 
 fixed_intermediate <- benchmark_source %>%
-  dplyr::transmute(TestIndex, Date, Strategy = "Fixed Intermediate", GrossReturn = RealizedReturn_Intermediate, TransactionCost = 0, NetReturn = RealizedReturn_Intermediate)
+  dplyr::transmute(TestIndex, Date, Strategy = "Fixed Intermediate", GrossReturn = RealizedReturn_Intermediate, TransactionCost = 0, NetReturn = RealizedReturn_Intermediate, RiskFree = RealizedReturn_Short)
 
 fixed_long <- benchmark_source %>%
-  dplyr::transmute(TestIndex, Date, Strategy = "Fixed Long", GrossReturn = RealizedReturn_Long, TransactionCost = 0, NetReturn = RealizedReturn_Long)
+  dplyr::transmute(TestIndex, Date, Strategy = "Fixed Long", GrossReturn = RealizedReturn_Long, TransactionCost = 0, NetReturn = RealizedReturn_Long, RiskFree = RealizedReturn_Short)
 
 fixed_equal_weight <- benchmark_source %>%
   dplyr::transmute(
     TestIndex, Date, Strategy = "Equal Weight",
     GrossReturn = rowMeans(cbind(RealizedReturn_Short, RealizedReturn_Intermediate, RealizedReturn_Long), na.rm = TRUE),
     TransactionCost = 0,
-    NetReturn = rowMeans(cbind(RealizedReturn_Short, RealizedReturn_Intermediate, RealizedReturn_Long), na.rm = TRUE)
+    NetReturn = rowMeans(cbind(RealizedReturn_Short, RealizedReturn_Intermediate, RealizedReturn_Long), na.rm = TRUE),
+    RiskFree = RealizedReturn_Short
   )
 
 all_strategy_returns <- dplyr::bind_rows(learned_strategy_returns, fixed_short, fixed_intermediate, fixed_long, fixed_equal_weight) %>%
@@ -319,7 +342,7 @@ all_strategy_returns <- dplyr::bind_rows(learned_strategy_returns, fixed_short, 
 
 
 ###############################################################
-# 8. PERFORMANCE SUMMARIES & SWITCHING ANALYSIS
+# 8. PERFORMANCE SUMMARIES & SEPARATION OF VOLATILITY
 ###############################################################
 
 strategy_performance <- all_strategy_returns %>%
@@ -329,8 +352,13 @@ strategy_performance <- all_strategy_returns %>%
     MeanMonthlyReturn    = safe_mean(NetReturn),
     SDMonthlyReturn      = safe_sd(NetReturn),
     AnnualizedReturn     = safe_annualized_return(NetReturn),
-    AnnualizedVolatility = safe_annualized_volatility(NetReturn),
-    SharpeRatio          = safe_sharpe(NetReturn),
+    
+    # Total vs. Excess Volatility Separation
+    TotalVol_Annualized  = safe_annualized_volatility(NetReturn),
+    ExcessVol_Annualized = safe_sd(NetReturn - RiskFree) * sqrt(12),
+    
+    # Calibrated Risk Metrics
+    CalibratedSharpeRatio= safe_calibrated_sharpe(NetReturn, RiskFree),
     MaximumDrawdown      = safe_max_drawdown(NetReturn),
     CalmarRatio          = safe_calmar(NetReturn),
     CumulativeNetReturn  = safe_cumulative_return(NetReturn),
@@ -369,7 +397,7 @@ strategy_performance <- strategy_performance %>%
 strategy_performance <- strategy_performance %>%
   dplyr::mutate(
     Rank_CumulativeReturn = safe_rank(CumulativeNetReturn, decreasing = TRUE),
-    Rank_Sharpe           = safe_rank(SharpeRatio, decreasing = TRUE),
+    Rank_Sharpe           = safe_rank(CalibratedSharpeRatio, decreasing = TRUE),
     Rank_Drawdown         = safe_rank(abs(MaximumDrawdown), decreasing = FALSE)
   ) %>%
   dplyr::rowwise() %>%
@@ -524,7 +552,10 @@ if (!is.na(best_fixed_strategy) && best_fixed_strategy %in% all_strategy_returns
 wealth_data <- all_strategy_returns %>%
   dplyr::group_by(Strategy) %>%
   dplyr::arrange(TestIndex, .by_group = TRUE) %>%
-  dplyr::mutate(Wealth = cumprod(pmax(1 + dplyr::coalesce(NetReturn, 0), 1e-8))) %>%
+  dplyr::mutate(
+    CappedReturn = pmax(pmin(dplyr::coalesce(NetReturn, 0), MAX_RETURN_CAP), -MAX_RETURN_CAP),
+    Wealth = cumprod(pmax(1 + CappedReturn, 1e-6))
+  ) %>%
   dplyr::ungroup()
 
 # 1. Cumulative Wealth Plot
@@ -546,9 +577,9 @@ p_ret <- ggplot2::ggplot(strategy_performance, ggplot2::aes(x = reorder(Strategy
 ggplot2::ggsave(file.path(OUTPUT_DIR, "17_Annualized_Return_Benchmark_Comparison.png"), plot = p_ret, width = 8, height = 5, dpi = 300)
 
 # 3. Sharpe Ratio Bar Plot
-p_sharpe <- ggplot2::ggplot(strategy_performance, ggplot2::aes(x = reorder(Strategy, SharpeRatio), y = SharpeRatio, fill = Strategy)) +
+p_sharpe <- ggplot2::ggplot(strategy_performance, ggplot2::aes(x = reorder(Strategy, CalibratedSharpeRatio), y = CalibratedSharpeRatio, fill = Strategy)) +
   ggplot2::geom_col(show.legend = FALSE) +
-  ggplot2::labs(title = "Annualized Sharpe Ratios by Strategy", x = "Strategy", y = "Sharpe Ratio") +
+  ggplot2::labs(title = "Calibrated Annualized Sharpe Ratios by Strategy", x = "Strategy", y = "Sharpe Ratio") +
   ggplot2::theme_minimal() +
   ggplot2::theme(plot.title = ggplot2::element_text(hjust = 0.5, face = "bold"), axis.text.x = ggplot2::element_text(angle = 30, hjust = 1))
 
@@ -598,9 +629,9 @@ save(
 ###############################################################
 
 cat("\n============================================================\n")
-cat("STRATEGY PERFORMANCE OVERVIEW (CALIBRATED)\n")
+cat("STRATEGY PERFORMANCE OVERVIEW (CALIBRATED & AUDITED)\n")
 cat("============================================================\n")
-print(strategy_performance %>% dplyr::select(Strategy, AnnualizedReturn, SharpeRatio, MaximumDrawdown, OverallRank))
+print(strategy_performance %>% dplyr::select(Strategy, AnnualizedReturn, TotalVol_Annualized, ExcessVol_Annualized, CalibratedSharpeRatio, MaximumDrawdown, OverallRank))
 
 cat("\n============================================================\n")
 cat("17_FINANCIAL_BENCHMARK_EVALUATION.R COMPLETED SUCCESSFULLY\n")

@@ -1,8 +1,6 @@
 ###############################################################################
 # ACTION-DEPENDENT COPULA-CNN / CNN-LSTM DQN WITH REPLAY ABLATIONS
 #
-# Updated simulation: 360 model fits
-#
 # Main features:
 # 1. Outcomes and state transitions are generated online, conditional on action.
 # 2. Empirical-CDF copula scores are included directly in network state inputs.
@@ -19,8 +17,8 @@
 # Boston Housing is loaded from MASS.
 #
 # Total model fits:
-#   3 datasets x 2 rho x 5 seeds x 2 representations
-#   x 2 architectures x 3 replay methods = 360
+#   3 datasets x 2 rho x 2 seeds x 2 representations
+#   x 2 architectures x 3 replay methods = 144
 ###############################################################################
 
 Sys.setenv(TF_CPP_MIN_LOG_LEVEL = "2")

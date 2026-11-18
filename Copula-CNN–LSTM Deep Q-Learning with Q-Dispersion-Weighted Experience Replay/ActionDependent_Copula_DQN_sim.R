@@ -2,7 +2,6 @@
 ###############################################################################
 # ACTION-DEPENDENT COPULA-CNN-DQN AND COPULA-CNN-LSTM-DQN
 #
-# Reviewer 2 revision:
 #   1. Explicitly define and evaluate Q-DWR.
 #   2. Do not interpret Q-value separation as uncertainty.
 #   3. Compare UWR, PER, and Q-DWR without assuming Q-DWR is superior.

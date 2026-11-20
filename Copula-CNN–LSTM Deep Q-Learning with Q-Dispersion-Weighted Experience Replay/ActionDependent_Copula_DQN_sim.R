@@ -32,7 +32,7 @@
 #
 # Planned model fits:
 #   2 environments x 2 rho x 30 seeds x 2 representations
-#   x 2 architectures x 3 replay strategies = 1,440
+#   x 2 architectures x 3 replay strategies
 ###############################################################################
 
 Sys.setenv(TF_CPP_MIN_LOG_LEVEL = "2")
@@ -88,7 +88,7 @@ REPLAY_MODES <- c(
 
 RHO_VALUES <- c(0.50, -0.15)
 
-N_SAMPLES <- 500L
+N_SAMPLES <- 300L
 N_TRAIN <- 80L
 N_TEST <- 80L
 

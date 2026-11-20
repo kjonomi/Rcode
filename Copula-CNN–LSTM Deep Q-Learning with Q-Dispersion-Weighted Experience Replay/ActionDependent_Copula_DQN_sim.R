@@ -2,6 +2,7 @@
 ###############################################################################
 # ACTION-DEPENDENT COPULA-CNN-DQN AND COPULA-CNN-LSTM-DQN
 #
+# Reviewer 2 revision:
 #   1. Explicitly define and evaluate Q-DWR.
 #   2. Do not interpret Q-value separation as uncertainty.
 #   3. Compare UWR, PER, and Q-DWR without assuming Q-DWR is superior.
@@ -30,8 +31,8 @@
 #   rho = 0.50 and -0.15
 #
 # Planned model fits:
-#   2 environments x 2 rho x 30 seeds x 2 representations
-#   x 2 architectures x 3 replay strategies
+#   2 simulated environments x 2 rho x 30 seeds x 2 representations
+#   x 2 architectures x 3 replay strategies = 1440
 ###############################################################################
 
 Sys.setenv(TF_CPP_MIN_LOG_LEVEL = "2")
@@ -39,8 +40,7 @@ Sys.setenv(CUDA_VISIBLE_DEVICES = "-1")
 
 required_packages <- c(
   "MASS", "keras", "tensorflow", "R6",
-  "data.table", "ggplot2", "dplyr", "tidyr",
-  "openxlsx"
+  "data.table", "ggplot2", "dplyr", "tidyr", "openxlsx"
 )
 
 missing_packages <- required_packages[
@@ -121,7 +121,7 @@ TREATMENT_COST <- 0.05
 TRANSITION_ACTION_EFFECT <- 0.12
 TRANSITION_OUTCOME_EFFECT <- 0.08
 
-OUTPUT_DIR <- "Reviewer2_ActionDependent_Copula_DQN_Results_500"
+OUTPUT_DIR <- "Reviewer2_ActionDependent_Copula_DQN_Results_simulated_100"
 
 dir.create(
   OUTPUT_DIR,
@@ -157,24 +157,52 @@ generate_simulated_dataset <- function(
 
   set.seed(seed)
 
+  n_features <- as.integer(n_features)
+  if (n_features < 2L) stop("n_features must be at least 2.")
+
+  # Gaussian-copula dependence with an AR(1)-type correlation matrix.
   Sigma <- outer(
     seq_len(n_features),
     seq_len(n_features),
     function(i, j) 0.50^abs(i - j)
   )
 
-  x <- MASS::mvrnorm(
+  z <- MASS::mvrnorm(
     n = n_samples,
     mu = rep(0, n_features),
     Sigma = Sigma
   )
 
-  df <- as.data.frame(x)
+  u <- pnorm(z)
+  u <- pmin(pmax(u, 1e-8), 1 - 1e-8)
 
-  names(df) <- paste0(
-    "Feature_",
-    seq_len(n_features)
-  )
+  x <- matrix(0, nrow = n_samples, ncol = n_features)
+
+  # Heterogeneous marginal distributions retain the copula dependence
+  # while avoiding an all-Gaussian covariate design.
+  for (j in seq_len(n_features)) {
+    marginal_type <- (j - 1L) %% 6L
+    x[, j] <- switch(
+      as.character(marginal_type),
+      `0` = qnorm(u[, j]),
+      `1` = qlnorm(u[, j], meanlog = 0, sdlog = 0.45),
+      `2` = qunif(u[, j], min = -2, max = 2),
+      `3` = qgamma(u[, j], shape = 2.5, rate = 1.2),
+      `4` = qt(u[, j], df = 5),
+      `5` = as.numeric(u[, j] > 0.55)
+    )
+  }
+
+  df <- as.data.frame(x)
+  names(df) <- paste0("Feature_", seq_len(n_features))
+
+  # Add nonlinear structure to selected covariates.
+  if (n_features >= 6L) {
+    df[[6L]] <- df[[6L]] + 0.20 * sin(df[[1L]])
+  }
+  if (n_features >= 8L) {
+    df[[8L]] <- df[[8L]] + 0.15 * df[[2L]] * df[[3L]]
+  }
 
   df
 }
@@ -732,6 +760,7 @@ environment_transition <- function(
     TREATMENT_COST * action
 
   # The action and previous outcome affect the next covariate state.
+  # outer(previous_outcome, direction) gives an explicit n x p effect matrix.
 
   direction <- sin(seq_len(p)) / sqrt(p)
 
@@ -741,7 +770,7 @@ environment_transition <- function(
     TRANSITION_ACTION_EFFECT *
       outer(action_sign, direction) +
     TRANSITION_OUTCOME_EFFECT *
-      previous_outcome +
+      outer(as.numeric(previous_outcome), direction) +
     x_noise
 
   list(
@@ -2149,14 +2178,8 @@ ggsave(
 )
 
 ggsave(
-  filename = file.path(
-    OUTPUT_DIR,
-    "oos_greedy_policy_performance.png"
-  ),
-  plot = p_oos,
-  width = 12,
-  height = 8,
-  dpi = 300
+  filename = file.path(OUTPUT_DIR, "oos_greedy_policy_performance.png"),
+  plot = p_oos, width = 12, height = 8, dpi = 300
 )
 
 ###############################################################################
@@ -2229,14 +2252,8 @@ ggsave(
 )
 
 ggsave(
-  filename = file.path(
-    OUTPUT_DIR,
-    "oos_reference_policy_comparison.png"
-  ),
-  plot = p_reference,
-  width = 13,
-  height = 11,
-  dpi = 300
+  filename = file.path(OUTPUT_DIR, "oos_reference_policy_comparison.png"),
+  plot = p_reference, width = 13, height = 11, dpi = 300
 )
 
 ###############################################################################
@@ -2324,14 +2341,8 @@ ggsave(
 )
 
 ggsave(
-  filename = file.path(
-    OUTPUT_DIR,
-    "training_learning_curves.png"
-  ),
-  plot = p_learning,
-  width = 13,
-  height = 11,
-  dpi = 300
+  filename = file.path(OUTPUT_DIR, "training_learning_curves.png"),
+  plot = p_learning, width = 13, height = 11, dpi = 300
 )
 
 ###############################################################################
@@ -2340,7 +2351,8 @@ ggsave(
 
 metadata <- data.frame(
   Setting = c(
-    "Synthetic sample size per environment",
+    "Synthetic observations per environment",
+    "Synthetic covariate design",
     "Training seeds",
     "Training individuals",
     "Held-out individuals",
@@ -2364,6 +2376,7 @@ metadata <- data.frame(
 
   Value = c(
     N_SAMPLES,
+    "Synthetic A: 8 features; Synthetic B: 15 features; Gaussian-copula dependence with heterogeneous marginals",
     length(MASTER_SEEDS),
     N_TRAIN,
     N_TEST,
@@ -2404,11 +2417,6 @@ data.table::fwrite(
 # 20. EXCEL WORKBOOK EXPORT
 ###############################################################################
 
-excel_file <- file.path(
-  OUTPUT_DIR,
-  "ActionDependent_Copula_DQN_Results.xlsx"
-)
-
 openxlsx::write.xlsx(
   x = list(
     Training_Seed_Results = training_results,
@@ -2420,7 +2428,7 @@ openxlsx::write.xlsx(
     Learning_Curves = learning_curves,
     Experiment_Metadata = metadata
   ),
-  file = excel_file,
+  file = file.path(OUTPUT_DIR, "ActionDependent_Copula_DQN_Results.xlsx"),
   overwrite = TRUE,
   asTable = TRUE
 )

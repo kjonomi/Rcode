@@ -19,8 +19,8 @@
 # Boston Housing is loaded from MASS.
 #
 # Total model fits:
-#   3 datasets x 2 rho x 2 seeds x 2 representations
-#   x 2 architectures x 3 replay methods = 144
+#   3 datasets x 2 rho x 30 seeds x 2 representations
+#   x 2 architectures x 3 replay methods = 2160
 ###############################################################################
 
 Sys.setenv(TF_CPP_MIN_LOG_LEVEL = "2")

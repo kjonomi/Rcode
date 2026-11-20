@@ -1,6 +1,8 @@
 ###############################################################################
 # ACTION-DEPENDENT COPULA-CNN / CNN-LSTM DQN WITH REPLAY ABLATIONS
 #
+# Reduced-runtime benchmark: maximum 500 observations per dataset; 144 model fits
+#
 # Main features:
 # 1. Outcomes and state transitions are generated online, conditional on action.
 # 2. Empirical-CDF copula scores are included directly in network state inputs.
@@ -60,21 +62,22 @@ REPLAY_MODES <- c("UWR", "PER", "Q-DWR")
 
 RHO_VALUES <- c(0.50, -0.15)
 
-N_TRAIN_TRAJECTORIES <- 200L
-N_TEST_TRAJECTORIES <- 200L
+N_SAMPLE_MAX <- 500L
+N_TRAIN_TRAJECTORIES <- 50L
+N_TEST_TRAJECTORIES <- 50L
 
 T_STEPS <- 3L
 N_OUTCOMES <- 3L
 
-N_EPISODES <- 2L
-N_EVAL_REPLICATES <- 5L
+N_EPISODES <- 1L
+N_EVAL_REPLICATES <- 3L
 
 GAMMA <- 0.95
 LEARNING_RATE <- 0.001
 
 BETA <- 0.40
-BATCH_SIZE <- 64L
-BUFFER_CAPACITY <- 5000L
+BATCH_SIZE <- 32L
+BUFFER_CAPACITY <- 1000L
 
 PRIORITY_ALPHA <- 0.60
 TARGET_UPDATE_EVERY <- 10L
@@ -1459,13 +1462,43 @@ evaluate_greedy_policy <- function(
 # 7. BENCHMARK DRIVER
 ###############################################################################
 
+# Reproducibly cap each real-data benchmark at 500 observations.
+# Datasets with fewer than 500 rows are retained in full.
+reduce_dataset_sample <- function(df, n_max = N_SAMPLE_MAX, seed = 20261119L) {
+
+  df <- as.data.frame(df)
+
+  if (nrow(df) > n_max) {
+    set.seed(as.integer(seed))
+    selected <- sample.int(nrow(df), size = n_max, replace = FALSE)
+    df <- df[selected, , drop = FALSE]
+  }
+
+  rownames(df) <- NULL
+  df
+}
+
 run_benchmark <- function() {
 
-  datasets <- list(
+  datasets_raw <- list(
     "Boston Housing" = get_boston_data(),
     "Wine Quality Red" = get_wine_quality_data(),
     "Adult Census Income" = get_adult_census_data()
   )
+
+  datasets <- lapply(seq_along(datasets_raw), function(i) {
+    reduce_dataset_sample(
+      datasets_raw[[i]],
+      n_max = N_SAMPLE_MAX,
+      seed = 20261119L + i
+    )
+  })
+  names(datasets) <- names(datasets_raw)
+
+  cat("\nDataset sample sizes (capped at", N_SAMPLE_MAX, "rows):\n")
+  for (dataset_name in names(datasets)) {
+    cat("  ", dataset_name, ":", nrow(datasets[[dataset_name]]), "rows\n")
+  }
 
   results <- list()
   episode_curves <- list()
@@ -2084,6 +2117,7 @@ metadata <- data.frame(
     "State representations",
     "Replay modes",
     "Outcome correlations",
+    "Maximum observations per dataset",
     "Training trajectories",
     "Test trajectories per replicate",
     "Evaluation replicates",
@@ -2091,7 +2125,8 @@ metadata <- data.frame(
     "Time steps",
     "Total planned model fits",
     "Batch size",
-    "Q-DWR interpretation"
+    "Q-DWR interpretation",
+    "Runtime configuration"
   ),
 
   Value = c(
@@ -2122,6 +2157,8 @@ metadata <- data.frame(
       collapse = ","
     ),
 
+    N_SAMPLE_MAX,
+
     N_TRAIN_TRAJECTORIES,
 
     N_TEST_TRAJECTORIES,
@@ -2149,7 +2186,8 @@ metadata <- data.frame(
 
     paste(
       "Action-separation score;",
-      "not an uncertainty estimator"
+      "not an uncertainty estimator",
+    "Maximum 500 observations per dataset; 50 training trajectories; 50 test trajectories; 1 episode; 3 evaluation replicates; batch size 32"
     )
   ),
 
@@ -2190,7 +2228,8 @@ cat(
 
 cat(
   "Expected model fits:",
-  360L,
+  3L * length(RHO_VALUES) * length(MASTER_SEEDS) *
+    length(STATE_REPRESENTATIONS) * length(ARCHITECTURES) * length(REPLAY_MODES),
   "\n"
 )
 

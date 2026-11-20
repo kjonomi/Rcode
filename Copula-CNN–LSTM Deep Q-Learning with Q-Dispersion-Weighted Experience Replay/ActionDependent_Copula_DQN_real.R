@@ -54,7 +54,7 @@ suppressPackageStartupMessages({
 # 0. GLOBAL CONFIGURATION
 ###############################################################################
 
-MASTER_SEEDS <- 1L:10L
+MASTER_SEEDS <- 1L:30L
 
 ARCHITECTURES <- c("CNN-DQN", "CNN-LSTM-DQN")
 STATE_REPRESENTATIONS <- c("RAW", "COPULA")

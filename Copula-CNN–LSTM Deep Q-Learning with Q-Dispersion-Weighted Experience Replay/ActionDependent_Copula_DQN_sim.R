@@ -67,7 +67,7 @@ suppressPackageStartupMessages({
 # 0. GLOBAL CONFIGURATION
 ###############################################################################
 
-MASTER_SEEDS <- 1L:10L
+MASTER_SEEDS <- 1L:30L
 
 ARCHITECTURES <- c(
   "CNN-DQN",
@@ -121,7 +121,7 @@ TREATMENT_COST <- 0.05
 TRANSITION_ACTION_EFFECT <- 0.12
 TRANSITION_OUTCOME_EFFECT <- 0.08
 
-OUTPUT_DIR <- "Reviewer2_ActionDependent_Copula_DQN_Results"
+OUTPUT_DIR <- "Reviewer2_ActionDependent_Copula_DQN_Results_sim"
 
 dir.create(
   OUTPUT_DIR,

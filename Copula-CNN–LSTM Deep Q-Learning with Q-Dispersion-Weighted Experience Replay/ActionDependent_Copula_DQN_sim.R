@@ -31,8 +31,8 @@
 #   rho = 0.50 and -0.15
 #
 # Planned model fits:
-#   2 environments x 2 rho x 10 seeds x 2 representations
-#   x 2 architectures x 3 replay strategies = 480
+#   2 environments x 2 rho x 30 seeds x 2 representations
+#   x 2 architectures x 3 replay strategies = 1,440
 ###############################################################################
 
 Sys.setenv(TF_CPP_MIN_LOG_LEVEL = "2")
@@ -40,7 +40,8 @@ Sys.setenv(CUDA_VISIBLE_DEVICES = "-1")
 
 required_packages <- c(
   "MASS", "keras", "tensorflow", "R6",
-  "data.table", "ggplot2", "dplyr", "tidyr"
+  "data.table", "ggplot2", "dplyr", "tidyr",
+  "openxlsx"
 )
 
 missing_packages <- required_packages[
@@ -87,7 +88,7 @@ REPLAY_MODES <- c(
 
 RHO_VALUES <- c(0.50, -0.15)
 
-N_SAMPLES <- 200L
+N_SAMPLES <- 500L
 N_TRAIN <- 80L
 N_TEST <- 80L
 
@@ -121,7 +122,7 @@ TREATMENT_COST <- 0.05
 TRANSITION_ACTION_EFFECT <- 0.12
 TRANSITION_OUTCOME_EFFECT <- 0.08
 
-OUTPUT_DIR <- "Reviewer2_ActionDependent_Copula_DQN_Results_sim"
+OUTPUT_DIR <- "Reviewer2_ActionDependent_Copula_DQN_Results_500"
 
 dir.create(
   OUTPUT_DIR,
@@ -2148,6 +2149,17 @@ ggsave(
   height = 8
 )
 
+ggsave(
+  filename = file.path(
+    OUTPUT_DIR,
+    "oos_greedy_policy_performance.png"
+  ),
+  plot = p_oos,
+  width = 12,
+  height = 8,
+  dpi = 300
+)
+
 ###############################################################################
 # 17. FIGURE 2: LEARNED POLICY VERSUS REFERENCE POLICIES
 ###############################################################################
@@ -2215,6 +2227,17 @@ ggsave(
   plot = p_reference,
   width = 13,
   height = 11
+)
+
+ggsave(
+  filename = file.path(
+    OUTPUT_DIR,
+    "oos_reference_policy_comparison.png"
+  ),
+  plot = p_reference,
+  width = 13,
+  height = 11,
+  dpi = 300
 )
 
 ###############################################################################
@@ -2301,12 +2324,24 @@ ggsave(
   height = 11
 )
 
+ggsave(
+  filename = file.path(
+    OUTPUT_DIR,
+    "training_learning_curves.png"
+  ),
+  plot = p_learning,
+  width = 13,
+  height = 11,
+  dpi = 300
+)
+
 ###############################################################################
 # 19. EXPERIMENT METADATA
 ###############################################################################
 
 metadata <- data.frame(
   Setting = c(
+    "Synthetic sample size per environment",
     "Training seeds",
     "Training individuals",
     "Held-out individuals",
@@ -2329,6 +2364,7 @@ metadata <- data.frame(
   ),
 
   Value = c(
+    N_SAMPLES,
     length(MASTER_SEEDS),
     N_TRAIN,
     N_TEST,
@@ -2366,7 +2402,32 @@ data.table::fwrite(
 )
 
 ###############################################################################
-# 20. DISPLAY RESULTS
+# 20. EXCEL WORKBOOK EXPORT
+###############################################################################
+
+excel_file <- file.path(
+  OUTPUT_DIR,
+  "ActionDependent_Copula_DQN_Results.xlsx"
+)
+
+openxlsx::write.xlsx(
+  x = list(
+    Training_Seed_Results = training_results,
+    OOS_Evaluation = evaluation_results,
+    OOS_Seed_Level = seed_level_oos,
+    OOS_Summary = oos_summary,
+    Training_Summary = training_summary,
+    Paired_Contrasts = paired_contrasts,
+    Learning_Curves = learning_curves,
+    Experiment_Metadata = metadata
+  ),
+  file = excel_file,
+  overwrite = TRUE,
+  asTable = TRUE
+)
+
+###############################################################################
+# 21. DISPLAY RESULTS
 ###############################################################################
 
 cat(
@@ -2410,7 +2471,7 @@ cat(
 )
 
 ###############################################################################
-# 21. INTERPRETATION AND REPORTING NOTES
+# 22. INTERPRETATION AND REPORTING NOTES
 #
 # 1. The primary endpoint is the greedy policy's discounted reward on held-out
 #    individuals and independently generated evaluation trajectories.

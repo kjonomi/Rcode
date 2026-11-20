@@ -98,7 +98,7 @@ EPSILON_MIN <- 0.05
 # It is NOT interpreted as uncertainty or guaranteed learning progress.
 Q_DWR_PRIORITY_FLOOR <- 1e-4
 
-OUTPUT_DIR <- "Reviewer2_Revised_ActionDependent_DQN_Results"
+OUTPUT_DIR <- "Reviewer2_Revised_ActionDependent_DQN_Results_real"
 
 dir.create(
   OUTPUT_DIR,

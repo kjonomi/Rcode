@@ -1,7 +1,7 @@
 ###############################################################################
 # ACTION-DEPENDENT COPULA-CNN / CNN-LSTM DQN WITH REPLAY ABLATIONS
 #
-# Reduced-runtime benchmark: maximum 300 observations per dataset;
+# Reduced-runtime benchmark: maximum 100 observations per dataset;
 #
 # Main features:
 # 1. Outcomes and state transitions are generated online, conditional on action.
@@ -63,7 +63,7 @@ REPLAY_MODES <- c("UWR", "PER", "Q-DWR")
 
 RHO_VALUES <- c(0.50, -0.15)
 
-N_SAMPLE_MAX <- 300L
+N_SAMPLE_MAX <- 100L
 N_TRAIN_TRAJECTORIES <- 80L
 N_TEST_TRAJECTORIES <- 80L
 

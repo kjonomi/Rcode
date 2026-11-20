@@ -68,7 +68,7 @@ set.seed(MASTER_SEED)
 MC_SEEDS <- sample.int(1000000L, N_SIMULATIONS, replace = FALSE) + 1000L
 
 START_DATE           <- "1980-01-01"
-END_DATE             <- "2026-11-17"
+END_DATE             <- "2026-11-18"
 
 TRAIN_RATIO          <- 0.70
 EMBARGO_ROWS         <- 1L

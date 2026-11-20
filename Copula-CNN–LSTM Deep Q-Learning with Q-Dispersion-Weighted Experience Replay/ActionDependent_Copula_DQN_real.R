@@ -11,6 +11,7 @@
 # 5. UWR, PER, and Q-DWR are compared.
 # 6. Policy performance is evaluated on held-out individuals.
 # 7. Q-DWR is an action-separation heuristic, NOT an uncertainty estimator.
+# 8. Exports CSV tables, a multi-sheet Excel workbook, PDF figures, and 300-dpi PNG figures.
 #
 # Required data files:
 #   winequality-red.csv
@@ -28,7 +29,7 @@ Sys.setenv(CUDA_VISIBLE_DEVICES = "-1")
 
 required_packages <- c(
   "MASS", "keras", "tensorflow", "R6", "data.table",
-  "ggplot2", "dplyr", "tidyr"
+  "ggplot2", "dplyr", "tidyr", "openxlsx"
 )
 
 missing_packages <- required_packages[
@@ -2013,6 +2014,14 @@ ggsave(
   height = 7
 )
 
+ggsave(
+  filename = file.path(OUTPUT_DIR, "oos_policy_performance.png"),
+  plot = p_oos,
+  width = 12,
+  height = 7,
+  dpi = 300
+)
+
 
 ###############################################################################
 # 11. FIGURE: TRAINING LEARNING CURVES
@@ -2103,6 +2112,14 @@ ggsave(
   height = 9
 )
 
+ggsave(
+  filename = file.path(OUTPUT_DIR, "training_learning_curves.png"),
+  plot = p_learning,
+  width = 13,
+  height = 9,
+  dpi = 300
+)
+
 
 ###############################################################################
 # 12. RUN METADATA
@@ -2187,7 +2204,15 @@ metadata <- data.frame(
     paste(
       "Action-separation score;",
       "not an uncertainty estimator",
-    "Maximum 500 observations per dataset; 50 training trajectories; 50 test trajectories; 1 episode; 3 evaluation replicates; batch size 32"
+    paste0(
+      "Maximum ", N_SAMPLE_MAX,
+      " observations per dataset; ",
+      N_TRAIN_TRAJECTORIES, " training trajectories; ",
+      N_TEST_TRAJECTORIES, " test trajectories; ",
+      N_EPISODES, " episodes; ",
+      N_EVAL_REPLICATES, " evaluation replicates; batch size ",
+      BATCH_SIZE
+    )
     )
   ),
 
@@ -2201,6 +2226,23 @@ fwrite(
     OUTPUT_DIR,
     "run_metadata.csv"
   )
+)
+
+
+# Export principal results to a multi-sheet Excel workbook.
+excel_sheets <- list(
+  Seed_Level_Results = run_results,
+  OOS_Summary = summary_results,
+  Paired_Replay = replay_pairs,
+  Learning_Curves = learning_curves,
+  Run_Metadata = metadata
+)
+
+openxlsx::write.xlsx(
+  excel_sheets,
+  file = file.path(OUTPUT_DIR, "DQN_Benchmark_Results.xlsx"),
+  overwrite = TRUE,
+  asTable = TRUE
 )
 
 

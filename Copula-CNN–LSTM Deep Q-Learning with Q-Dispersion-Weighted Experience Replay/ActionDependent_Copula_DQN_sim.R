@@ -1,43 +1,59 @@
+
 ###############################################################################
-# ACTION-DEPENDENT COPULA-CNN / CNN-LSTM DQN WITH REPLAY ABLATIONS
+# ACTION-DEPENDENT COPULA-CNN-DQN AND COPULA-CNN-LSTM-DQN
 #
-# Fully simulated benchmark: 100 observations per synthetic dataset;
+# Reviewer 2 revision:
+#   1. Explicitly define and evaluate Q-DWR.
+#   2. Do not interpret Q-value separation as uncertainty.
+#   3. Compare UWR, PER, and Q-DWR without assuming Q-DWR is superior.
+#   4. Make actions affect outcomes and subsequent states.
+#   5. Include RAW versus COPULA state-representation ablation.
+#   6. Evaluate policies on independent held-out trajectories.
 #
-# Main features:
-# 1. Outcomes and state transitions are generated online, conditional on action.
-# 2. Empirical-CDF copula scores are included directly in network state inputs.
-# 3. RAW versus COPULA state representations isolate the input transformation.
-# 4. CNN-DQN versus CNN-LSTM-DQN isolates the recurrent component.
-# 5. UWR, PER, and Q-DWR are compared.
-# 6. Policy performance is evaluated on held-out individuals.
-# 7. Q-DWR is an action-separation heuristic, NOT an uncertainty estimator.
+# Architectures:
+#   CNN-DQN
+#   CNN-LSTM-DQN
 #
-# Data:
-#   Three fully simulated covariate datasets (13, 11, and 6 variables).
-#   No external data files or real-world datasets are used.
+# State representations:
+#   RAW
+#   COPULA (training-sample empirical marginal normal scores)
 #
-# Total model fits:
-#   3 simulated datasets x 2 rho x 30 seeds x 2 representations
-#   x 2 architectures x 3 replay methods = 2160
+# Replay:
+#   UWR: uniform experience replay
+#   PER: TD-error prioritized experience replay
+#   Q-DWR: action-value-separation prioritized replay
+#
+# Environments:
+#   Synthetic A: 8 covariates
+#   Synthetic B: 15 covariates
+#
+# Outcome dependence:
+#   rho = 0.50 and -0.15
+#
+# Planned model fits:
+#   2 simulated environments x 2 rho x 30 seeds x 2 representations
+#   x 2 architectures x 3 replay strategies = 1440
 ###############################################################################
 
 Sys.setenv(TF_CPP_MIN_LOG_LEVEL = "2")
 Sys.setenv(CUDA_VISIBLE_DEVICES = "-1")
 
 required_packages <- c(
-  "keras", "tensorflow", "R6", "data.table",
-  "ggplot2", "dplyr", "tidyr", "openxlsx"
+  "MASS", "keras", "tensorflow", "R6",
+  "data.table", "ggplot2", "dplyr", "tidyr", "openxlsx"
 )
 
 missing_packages <- required_packages[
-  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+  !vapply(required_packages, requireNamespace,
+          logical(1), quietly = TRUE)
 ]
 
-if (length(missing_packages)) {
-  install.packages(missing_packages)
+if (length(missing_packages) > 0L) {
+  install.packages(missing_packages, dependencies = TRUE)
 }
 
 suppressPackageStartupMessages({
+  library(MASS)
   library(keras)
   library(tensorflow)
   library(R6)
@@ -53,49 +69,59 @@ suppressPackageStartupMessages({
 
 MASTER_SEEDS <- 1L:30L
 
-ARCHITECTURES <- c("CNN-DQN", "CNN-LSTM-DQN")
-STATE_REPRESENTATIONS <- c("RAW", "COPULA")
-REPLAY_MODES <- c("UWR", "PER", "Q-DWR")
+ARCHITECTURES <- c(
+  "CNN-DQN",
+  "CNN-LSTM-DQN"
+)
+
+REPRESENTATIONS <- c(
+  "RAW",
+  "COPULA"
+)
+
+REPLAY_MODES <- c(
+  "UWR",
+  "PER",
+  "Q-DWR"
+)
 
 RHO_VALUES <- c(0.50, -0.15)
 
-N_SAMPLE_MAX <- 100L
-N_TRAIN_TRAJECTORIES <- 30L
-N_TEST_TRAJECTORIES <- 30L
+N_SAMPLES <- 100L
+N_TRAIN <- 80L
+N_TEST <- 80L
 
 T_STEPS <- 3L
 N_OUTCOMES <- 3L
-
-N_EPISODES <- 2L
+N_EPISODES <- 3L
 N_EVAL_REPLICATES <- 5L
 
 GAMMA <- 0.95
 LEARNING_RATE <- 0.001
 
 BETA <- 0.40
-BATCH_SIZE <- 32L
-BUFFER_CAPACITY <- 1000L
-
+BATCH_SIZE <- 64L
+BUFFER_CAPACITY <- 3000L
 PRIORITY_ALPHA <- 0.60
+PRIORITY_EPS <- 1e-5
+
 TARGET_UPDATE_EVERY <- 10L
 
-BASE_NOISE_SD <- 0.25
-LONGITUDINAL_NOISE_SD <- 0.10
-
-TREATMENT_STRENGTH <- 0.35
-OUTCOME_AR <- 0.60
-STATE_ACTION_EFFECT <- 0.10
-REWARD_ACTION_COST <- 0.02
-
 EPSILON_START <- 1.00
-EPSILON_DECAY <- 0.94
+EPSILON_DECAY <- 0.95
 EPSILON_MIN <- 0.05
 
-# Q-DWR uses |Q(s,1)-Q(s,0)| as an action-separation score.
-# It is NOT interpreted as uncertainty or guaranteed learning progress.
-Q_DWR_PRIORITY_FLOOR <- 1e-4
+STATE_NOISE_SD <- 0.08
+OUTCOME_NOISE_SD <- 0.08
 
-OUTPUT_DIR <- "Reviewer2_Simulated_ActionDependent_DQN_Results"
+STATE_AR <- 0.75
+OUTCOME_AR <- 0.20
+
+TREATMENT_COST <- 0.05
+TRANSITION_ACTION_EFFECT <- 0.12
+TRANSITION_OUTCOME_EFFECT <- 0.08
+
+OUTPUT_DIR <- "Reviewer2_ActionDependent_Copula_DQN_Results_simulated_100"
 
 dir.create(
   OUTPUT_DIR,
@@ -105,13 +131,15 @@ dir.create(
 
 set_all_seeds <- function(seed) {
 
-  set.seed(as.integer(seed))
+  seed <- as.integer(seed)
+
+  set.seed(seed)
 
   tryCatch(
-    tensorflow::set_random_seed(as.integer(seed)),
+    tensorflow::set_random_seed(seed),
     error = function(e) {
       warning(
-        "TensorFlow seed could not be set: ",
+        "TensorFlow seed setting failed: ",
         conditionMessage(e)
       )
     }
@@ -119,59 +147,114 @@ set_all_seeds <- function(seed) {
 }
 
 ###############################################################################
-# 1. DATA PREPARATION
+# 1. GENERATE SYNTHETIC ENVIRONMENTS
 ###############################################################################
+
+generate_simulated_dataset <- function(
+    n_samples = N_SAMPLES,
+    n_features = 8L,
+    seed = 101L) {
+
+  set.seed(seed)
+
+  n_features <- as.integer(n_features)
+  if (n_features < 2L) stop("n_features must be at least 2.")
+
+  # Gaussian-copula dependence with an AR(1)-type correlation matrix.
+  Sigma <- outer(
+    seq_len(n_features),
+    seq_len(n_features),
+    function(i, j) 0.50^abs(i - j)
+  )
+
+  z <- MASS::mvrnorm(
+    n = n_samples,
+    mu = rep(0, n_features),
+    Sigma = Sigma
+  )
+
+  u <- pnorm(z)
+  u <- pmin(pmax(u, 1e-8), 1 - 1e-8)
+
+  x <- matrix(0, nrow = n_samples, ncol = n_features)
+
+  # Heterogeneous marginal distributions retain the copula dependence
+  # while avoiding an all-Gaussian covariate design.
+  for (j in seq_len(n_features)) {
+    marginal_type <- (j - 1L) %% 6L
+    x[, j] <- switch(
+      as.character(marginal_type),
+      `0` = qnorm(u[, j]),
+      `1` = qlnorm(u[, j], meanlog = 0, sdlog = 0.45),
+      `2` = qunif(u[, j], min = -2, max = 2),
+      `3` = qgamma(u[, j], shape = 2.5, rate = 1.2),
+      `4` = qt(u[, j], df = 5),
+      `5` = as.numeric(u[, j] > 0.55)
+    )
+  }
+
+  df <- as.data.frame(x)
+  names(df) <- paste0("Feature_", seq_len(n_features))
+
+  # Add nonlinear structure to selected covariates.
+  if (n_features >= 6L) {
+    df[[6L]] <- df[[6L]] + 0.20 * sin(df[[1L]])
+  }
+  if (n_features >= 8L) {
+    df[[8L]] <- df[[8L]] + 0.15 * df[[2L]] * df[[3L]]
+  }
+
+  df
+}
 
 prepare_numeric_data <- function(df) {
 
   if (!is.data.frame(df)) {
-    stop("df must be a data.frame.")
+    stop("Input must be a data.frame.")
   }
 
-  categorical <- vapply(
+  if (any(vapply(
     df,
     function(x) is.factor(x) || is.character(x),
     logical(1)
-  )
-
-  if (any(categorical)) {
-
-    df[categorical] <- lapply(df[categorical], function(x) {
-
-      x[
-        is.na(x) |
-          trimws(as.character(x)) %in% c("", "?")
-      ] <- NA
-
-      factor(x)
-    })
+  ))) {
 
     df <- as.data.frame(
       model.matrix(~ . - 1, data = df)
     )
   }
 
-  keep <- vapply(
-    df,
-    is.numeric,
-    logical(1)
-  )
+  keep <- vapply(df, is.numeric, logical(1))
 
   df <- df[, keep, drop = FALSE]
 
-  if (!ncol(df)) {
-    stop("No numeric predictors were found.")
+  if (ncol(df) == 0L) {
+    stop("No numeric variables found.")
   }
 
-  for (j in seq_along(df)) {
+  usable <- vapply(
+    df,
+    function(x) {
+      x <- x[is.finite(x)]
+      length(x) > 1L &&
+        length(unique(x)) > 1L
+    },
+    logical(1)
+  )
+
+  df <- df[, usable, drop = FALSE]
+
+  if (ncol(df) == 0L) {
+    stop("No nonconstant numeric variables remain.")
+  }
+
+  for (j in seq_len(ncol(df))) {
 
     x <- as.numeric(df[[j]])
 
     x[!is.finite(x)] <- NA_real_
 
-    med <- suppressWarnings(
-      stats::median(x, na.rm = TRUE)
-    )
+    med <- median(x, na.rm = TRUE)
 
     if (!is.finite(med)) {
       med <- 0
@@ -182,21 +265,8 @@ prepare_numeric_data <- function(df) {
     df[[j]] <- x
   }
 
-  nonconstant <- vapply(
-    df,
-    function(x) length(unique(x)) > 1L,
-    logical(1)
-  )
-
-  df <- df[, nonconstant, drop = FALSE]
-
-  if (!ncol(df)) {
-    stop("No nonconstant predictors remain.")
-  }
-
   df
 }
-
 
 arrange_covariates_semantically <- function(df) {
 
@@ -206,532 +276,520 @@ arrange_covariates_semantically <- function(df) {
     return(df)
   }
 
-  cm <- suppressWarnings(
-    cor(
-      as.matrix(df),
-      use = "pairwise.complete.obs"
-    )
+  x <- as.matrix(df)
+
+  cor_mat <- suppressWarnings(
+    cor(x, use = "pairwise.complete.obs")
   )
 
-  cm[!is.finite(cm)] <- 0
+  cor_mat[!is.finite(cor_mat)] <- 0
 
-  cm <- (cm + t(cm)) / 2
-  cm <- abs(cm)
+  cor_mat <- abs(
+    (cor_mat + t(cor_mat)) / 2
+  )
 
-  diag(cm) <- 1
+  diag(cor_mat) <- 1
 
-  dm <- 1 - cm
-  dm[dm < 0] <- 0
+  distance_mat <- 1 - cor_mat
 
-  diag(dm) <- 0
+  distance_mat[distance_mat < 0] <- 0
+
+  diag(distance_mat) <- 0
 
   hc <- hclust(
-    as.dist(dm),
+    as.dist(distance_mat),
     method = "average"
   )
 
   df[, hc$order, drop = FALSE]
 }
 
+make_train_test_split <- function(
+    df,
+    seed,
+    train_fraction = 0.70) {
 
-fit_copula_transform <- function(x_train) {
+  df <- arrange_covariates_semantically(df)
 
-  x_train <- as.matrix(x_train)
+  set.seed(seed)
+
+  n <- nrow(df)
+
+  idx <- sample.int(n)
+
+  n_train <- max(
+    2L,
+    min(n - 1L, floor(train_fraction * n))
+  )
+
+  train <- as.matrix(
+    df[idx[seq_len(n_train)], , drop = FALSE]
+  )
+
+  test <- as.matrix(
+    df[idx[(n_train + 1L):n], , drop = FALSE]
+  )
+
+  # Standardization parameters are estimated using training data only.
+
+  center <- colMeans(train)
+
+  scale_value <- apply(
+    train,
+    2L,
+    sd
+  )
+
+  scale_value[
+    !is.finite(scale_value) |
+      scale_value < 1e-8
+  ] <- 1
+
+  train <- sweep(
+    sweep(train, 2L, center, "-"),
+    2L, scale_value, "/"
+  )
+
+  test <- sweep(
+    sweep(test, 2L, center, "-"),
+    2L, scale_value, "/"
+  )
+
+  list(
+    train = train,
+    test = test,
+    center = center,
+    scale = scale_value
+  )
+}
+
+###############################################################################
+# 2. TRAINING-ONLY EMPIRICAL COPULA TRANSFORMATION
+###############################################################################
+
+fit_copula_transform <- function(train_matrix) {
+
+  train_matrix <- as.matrix(train_matrix)
 
   ecdfs <- lapply(
-    seq_len(ncol(x_train)),
+    seq_len(ncol(train_matrix)),
     function(j) {
-      stats::ecdf(x_train[, j])
+      ecdf(train_matrix[, j])
     }
   )
 
   list(
     ecdfs = ecdfs,
-    p = ncol(x_train),
-    n_train = nrow(x_train)
+    n_train = nrow(train_matrix),
+    p = ncol(train_matrix)
   )
 }
 
+transform_history <- function(
+    history,
+    copula_transform,
+    representation = "COPULA") {
 
-apply_copula_transform <- function(x, transform) {
-
-  x <- as.matrix(x)
-
-  if (ncol(x) != transform$p) {
-    stop(
-      "The input dimension does not match ",
-      "the fitted copula transform."
-    )
+  if (representation == "RAW") {
+    return(history)
   }
 
-  out <- matrix(
+  if (representation != "COPULA") {
+    stop("Unknown representation.")
+  }
+
+  n <- dim(history)[1]
+  tt <- dim(history)[2]
+  p <- dim(history)[3]
+
+  result <- array(
     0,
-    nrow(x),
-    ncol(x)
+    dim = dim(history)
   )
 
-  lower <- 1 / (transform$n_train + 1)
-  upper <- transform$n_train / (transform$n_train + 1)
+  lower <- 1 / (copula_transform$n_train + 1)
 
-  for (j in seq_len(ncol(x))) {
+  upper <- copula_transform$n_train /
+    (copula_transform$n_train + 1)
 
-    u <- transform$ecdfs[[j]](x[, j])
+  for (j in seq_len(p)) {
+
+    values <- as.vector(
+      history[, , j]
+    )
+
+    u <- copula_transform$ecdfs[[j]](values)
 
     u <- pmin(
       pmax(u, lower),
       upper
     )
 
-    out[, j] <- qnorm(u)
+    result[, , j] <- array(
+      qnorm(u),
+      dim = c(n, tt)
+    )
   }
 
-  out
+  result
 }
 
+###############################################################################
+# 3. DEFINE ACTION-DEPENDENT ENVIRONMENT
+###############################################################################
 
-split_dataset <- function(
-    df,
-    seed,
-    train_fraction = 0.70) {
+make_outcome_cholesky <- function(
+    n_outcomes,
+    rho) {
 
-  set.seed(seed)
+  lower_bound <- -1 / (n_outcomes - 1)
 
-  df <- arrange_covariates_semantically(df)
+  if (rho <= lower_bound || rho >= 1) {
 
-  idx <- sample.int(nrow(df))
-
-  n_train <- max(
-    2L,
-    floor(train_fraction * length(idx))
-  )
-
-  test_idx <- if (n_train < length(idx)) {
-
-    idx[seq.int(n_train + 1L, length(idx))]
-
-  } else {
-
-    integer(0)
-  }
-
-  if (!length(test_idx)) {
     stop(
-      "The test split is empty; ",
-      "reduce train_fraction."
-    )
-  }
-
-  list(
-    train = as.data.frame(
-      df[idx[seq_len(n_train)], , drop = FALSE]
-    ),
-
-    test = as.data.frame(
-      df[test_idx, , drop = FALSE]
-    )
-  )
-}
-
-
-###############################################################################
-# 1.1 FULLY SIMULATED COVARIATE DATASETS
-###############################################################################
-
-# Generate correlated latent Gaussian variables and transform them to
-# heterogeneous marginals. These are synthetic covariates, not observations
-# from Boston Housing, Wine Quality, or Adult Census datasets.
-
-simulate_gaussian_copula_covariates <- function(
-    n, p, seed, marginal_family = "mixed", dependence = 0.30) {
-
-  set.seed(as.integer(seed))
-  idx <- seq_len(p)
-  R <- outer(idx, idx, function(i, j) dependence^abs(i - j))
-  diag(R) <- 1
-  Z <- matrix(rnorm(n * p), nrow = n, ncol = p) %*% chol(R)
-  U <- pmin(pmax(pnorm(Z), 1e-6), 1 - 1e-6)
-  X <- matrix(NA_real_, nrow = n, ncol = p)
-
-  for (j in seq_len(p)) {
-    fam <- if (marginal_family == "mixed") {
-      c("normal", "lognormal", "uniform", "gamma", "binary")[((j - 1L) %% 5L) + 1L]
-    } else marginal_family
-
-    X[, j] <- switch(
-      fam,
-      normal = qnorm(U[, j]),
-      lognormal = qlnorm(U[, j], meanlog = 0.15 * (j %% 3L), sdlog = 0.45),
-      uniform = qunif(U[, j], min = -2, max = 2),
-      gamma = qgamma(U[, j], shape = 2 + (j %% 3L), scale = 1 / (1 + 0.1 * j)),
-      binary = as.numeric(U[, j] > (0.35 + 0.05 * (j %% 4L))),
-      qnorm(U[, j])
-    )
-  }
-
-  out <- as.data.frame(X)
-  names(out) <- paste0("X", seq_len(p))
-  out
-}
-
-get_synthetic_dataset_A <- function(n = N_SAMPLE_MAX) {
-  simulate_gaussian_copula_covariates(
-    n = n, p = 13L, seed = 20261120L,
-    marginal_family = "mixed", dependence = 0.35
-  )
-}
-
-get_synthetic_dataset_B <- function(n = N_SAMPLE_MAX) {
-  x <- simulate_gaussian_copula_covariates(
-    n = n, p = 11L, seed = 20261121L,
-    marginal_family = "mixed", dependence = 0.20
-  )
-  # Add nonlinear transformations to create a distinct covariate structure.
-  x$X10 <- x$X1 * x$X2
-  x$X11 <- sin(x$X3) + 0.25 * x$X4
-  x
-}
-
-get_synthetic_dataset_C <- function(n = N_SAMPLE_MAX) {
-  x <- simulate_gaussian_copula_covariates(
-    n = n, p = 6L, seed = 20261122L,
-    marginal_family = "mixed", dependence = 0.50
-  )
-  x$X6 <- x$X1^2 / (1 + abs(x$X2))
-  x
-}
-
-###############################################################################
-# 2. ACTION-DEPENDENT ONLINE ENVIRONMENT
-###############################################################################
-
-make_environment_spec <- function(
-    train_df,
-    test_df,
-    rho,
-    seed) {
-
-  train_df <- arrange_covariates_semantically(train_df)
-
-  test_df <- test_df[
-    ,
-    names(train_df),
-    drop = FALSE
-  ]
-
-  # Standardization parameters are estimated using
-  # training covariates only.
-
-  mu <- vapply(
-    train_df,
-    mean,
-    numeric(1)
-  )
-
-  sig <- vapply(
-    train_df,
-    sd,
-    numeric(1)
-  )
-
-  sig[
-    !is.finite(sig) |
-      sig < 1e-8
-  ] <- 1
-
-  scale_df <- function(d) {
-
-    z <- sweep(
-      as.matrix(d),
-      2,
-      mu,
-      "-"
-    )
-
-    z <- sweep(
-      z,
-      2,
-      sig,
-      "/"
-    )
-
-    z[!is.finite(z)] <- 0
-
-    z
-  }
-
-  X_train <- scale_df(train_df)
-  X_test <- scale_df(test_df)
-
-  copula_fit <- fit_copula_transform(X_train)
-
-  min_rho <- -1 / (N_OUTCOMES - 1)
-
-  if (rho <= min_rho || rho >= 1) {
-    stop(
-      "Invalid equicorrelation parameter ",
-      "for the outcome dimension."
+      sprintf(
+        "Invalid equicorrelation rho=%.4f.",
+        rho
+      )
     )
   }
 
   Sigma <- matrix(
     rho,
-    N_OUTCOMES,
-    N_OUTCOMES
+    nrow = n_outcomes,
+    ncol = n_outcomes
   )
 
   diag(Sigma) <- 1
 
-  chol_factor <- chol(Sigma)
-
-  list(
-    X_train = X_train,
-    X_test = X_test,
-    copula_fit = copula_fit,
-    chol_factor = chol_factor,
-    p = ncol(X_train),
-    rho = rho,
-    seed = seed
-  )
+  chol(Sigma)
 }
 
+make_experiment_environment <- function(
+    df,
+    split_seed,
+    rho) {
 
-encode_state <- function(
-    x,
-    history,
-    representation,
-    copula_fit) {
-
-  if (representation == "COPULA") {
-
-    x_enc <- apply_copula_transform(
-      matrix(x, nrow = 1),
-      copula_fit
-    )
-
-    h_enc <- if (nrow(as.matrix(history)) > 0L) {
-
-      apply_copula_transform(
-        as.matrix(history),
-        copula_fit
-      )
-
-    } else {
-
-      matrix(
-        numeric(0),
-        nrow = 0L,
-        ncol = length(x)
-      )
-    }
-
-  } else {
-
-    x_enc <- matrix(
-      x,
-      nrow = 1
-    )
-
-    h_enc <- as.matrix(history)
-
-    if (nrow(h_enc) == 0L) {
-
-      h_enc <- matrix(
-        numeric(0),
-        nrow = 0L,
-        ncol = length(x)
-      )
-    }
-  }
-
-  seq_mat <- rbind(
-    h_enc,
-    x_enc
+  split <- make_train_test_split(
+    df,
+    seed = split_seed
   )
-
-  if (nrow(seq_mat) > T_STEPS) {
-
-    seq_mat <- seq_mat[
-      (nrow(seq_mat) - T_STEPS + 1L):nrow(seq_mat),
-      ,
-      drop = FALSE
-    ]
-  }
-
-  if (nrow(seq_mat) < T_STEPS) {
-
-    pad <- matrix(
-      rep(
-        seq_mat[1L, ],
-        times = T_STEPS - nrow(seq_mat)
-      ),
-      nrow = T_STEPS - nrow(seq_mat),
-      byrow = TRUE
-    )
-
-    seq_mat <- rbind(
-      pad,
-      seq_mat
-    )
-  }
-
-  array(
-    seq_mat,
-    dim = c(
-      1L,
-      T_STEPS,
-      ncol(seq_mat)
-    )
-  )
-}
-
-
-initialize_episode <- function(
-    base_x,
-    p) {
-
-  x0 <- as.numeric(base_x) +
-    rnorm(
-      p,
-      0,
-      LONGITUDINAL_NOISE_SD
-    )
 
   list(
-    x = x0,
-    history = matrix(
-      numeric(0),
-      nrow = 0L,
-      ncol = p
+    train_base = split$train,
+    test_base = split$test,
+    copula_transform = fit_copula_transform(
+      split$train
     ),
-    previous_outcome = rep(
-      0,
+    chol = make_outcome_cholesky(
+      N_OUTCOMES,
+      rho
+    ),
+    rho = rho,
+    p = ncol(split$train)
+  )
+}
+
+###############################################################################
+# 4. COMMON RANDOM-NUMBER PLANS
+###############################################################################
+
+make_training_plan <- function(
+    env,
+    seed) {
+
+  set.seed(seed)
+
+  p <- env$p
+
+  indices <- matrix(
+    sample.int(
+      nrow(env$train_base),
+      N_EPISODES * N_TRAIN,
+      replace = TRUE
+    ),
+    nrow = N_EPISODES,
+    ncol = N_TRAIN
+  )
+
+  initial_noise <- array(
+    rnorm(
+      N_EPISODES * N_TRAIN * p,
+      sd = STATE_NOISE_SD
+    ),
+    dim = c(
+      N_EPISODES,
+      N_TRAIN,
+      p
+    )
+  )
+
+  state_noise <- array(
+    rnorm(
+      N_EPISODES * N_TRAIN * T_STEPS * p,
+      sd = STATE_NOISE_SD
+    ),
+    dim = c(
+      N_EPISODES,
+      N_TRAIN,
+      T_STEPS,
+      p
+    )
+  )
+
+  outcome_noise <- array(
+    rnorm(
+      N_EPISODES * N_TRAIN *
+        T_STEPS * N_OUTCOMES
+    ),
+    dim = c(
+      N_EPISODES,
+      N_TRAIN,
+      T_STEPS,
       N_OUTCOMES
     )
   )
+
+  list(
+    indices = indices,
+    initial_noise = initial_noise,
+    state_noise = state_noise,
+    outcome_noise = outcome_noise
+  )
 }
 
-
-step_environment <- function(
-    state,
-    action,
+make_evaluation_plan <- function(
     env,
-    episode_time) {
+    seed) {
 
-  x <- state$x
-  p <- length(x)
+  set.seed(seed)
 
-  action_sign <- ifelse(
-    action == 1L,
-    1,
-    -1
-  )
+  p <- env$p
 
-  # Correlated outcome innovations.
-
-  z <- as.numeric(
-    rnorm(N_OUTCOMES) %*%
-      env$chol_factor
-  )
-
-  innovation <- BASE_NOISE_SD * z
-
-  # Action-dependent outcome mechanism.
-
-  outcome_mean <-
-    0.30 * x[
-      ((seq_len(N_OUTCOMES) - 1L) %% p) + 1L
-    ] +
-    TREATMENT_STRENGTH *
-    action_sign *
-    (
-      0.25 +
-        0.15 * tanh(
-          x[
-            ((seq_len(N_OUTCOMES) - 1L) %% p) + 1L
-          ]
-        )
-    )
-
-  y <- OUTCOME_AR *
-    state$previous_outcome +
-    outcome_mean +
-    innovation
-
-  # Reward based on the action-dependent outcome.
-
-  y_score <- pnorm(y)
-
-  reward <- mean(y_score - 0.5) *
-    action_sign -
-    REWARD_ACTION_COST *
-    as.numeric(action == 1L)
-
-  # Action-dependent state transition.
-
-  transition_noise <- rnorm(
-    p,
-    0,
-    LONGITUDINAL_NOISE_SD
-  )
-
-  x_next <- 0.65 * x +
-    0.35 * state$base_x +
-    STATE_ACTION_EFFECT * action_sign +
-    transition_noise
-
-  next_state <- list(
-    x = x_next,
-    history = rbind(
-      state$history,
-      x
+  indices <- matrix(
+    sample.int(
+      nrow(env$test_base),
+      N_EVAL_REPLICATES * N_TEST,
+      replace = TRUE
     ),
-    previous_outcome = y,
-    base_x = state$base_x
+    nrow = N_EVAL_REPLICATES,
+    ncol = N_TEST
+  )
+
+  initial_noise <- array(
+    rnorm(
+      N_EVAL_REPLICATES * N_TEST * p,
+      sd = STATE_NOISE_SD
+    ),
+    dim = c(
+      N_EVAL_REPLICATES,
+      N_TEST,
+      p
+    )
+  )
+
+  state_noise <- array(
+    rnorm(
+      N_EVAL_REPLICATES * N_TEST *
+        T_STEPS * p,
+      sd = STATE_NOISE_SD
+    ),
+    dim = c(
+      N_EVAL_REPLICATES,
+      N_TEST,
+      T_STEPS,
+      p
+    )
+  )
+
+  outcome_noise <- array(
+    rnorm(
+      N_EVAL_REPLICATES * N_TEST *
+        T_STEPS * N_OUTCOMES
+    ),
+    dim = c(
+      N_EVAL_REPLICATES,
+      N_TEST,
+      T_STEPS,
+      N_OUTCOMES
+    )
+  )
+
+  random_actions <- array(
+    runif(
+      N_EVAL_REPLICATES * N_TEST * T_STEPS
+    ),
+    dim = c(
+      N_EVAL_REPLICATES,
+      N_TEST,
+      T_STEPS
+    )
   )
 
   list(
-    reward = as.numeric(reward),
-    next_state = next_state,
-    outcome = y,
-    done = episode_time >= T_STEPS
+    indices = indices,
+    initial_noise = initial_noise,
+    state_noise = state_noise,
+    outcome_noise = outcome_noise,
+    random_actions = random_actions
   )
 }
-
-
-sample_episode_base <- function(
-    env,
-    split = c("train", "test")) {
-
-  split <- match.arg(split)
-
-  X <- if (split == "train") {
-    env$X_train
-  } else {
-    env$X_test
-  }
-
-  idx <- sample.int(
-    nrow(X),
-    1L
-  )
-
-  as.numeric(X[idx, ])
-}
-
 
 ###############################################################################
-# 3. CNN-DQN AND CNN-LSTM-DQN NETWORKS
+# 5. INITIALIZE LONGITUDINAL HISTORY
+###############################################################################
+
+initialize_history <- function(x) {
+
+  n <- nrow(x)
+  p <- ncol(x)
+
+  history <- array(
+    0,
+    dim = c(n, T_STEPS, p)
+  )
+
+  for (tt in seq_len(T_STEPS)) {
+    history[, tt, ] <- x
+  }
+
+  history
+}
+
+###############################################################################
+# 6. ONLINE ACTION-DEPENDENT TRANSITION
+###############################################################################
+
+environment_transition <- function(
+    x,
+    previous_outcome,
+    action,
+    z_noise,
+    x_noise,
+    env) {
+
+  n <- nrow(x)
+  p <- ncol(x)
+
+  action <- as.integer(action)
+
+  # Correlated Gaussian innovations.
+  z_correlated <- z_noise %*% env$chol
+
+  u <- pnorm(z_correlated)
+
+  u <- pmin(
+    pmax(u, 1e-8),
+    1 - 1e-8
+  )
+
+  # Non-Gaussian marginal innovations with Gaussian-copula dependence.
+  error <- matrix(
+    0,
+    nrow = n,
+    ncol = N_OUTCOMES
+  )
+
+  for (k in seq_len(N_OUTCOMES)) {
+
+    error[, k] <- qgamma(
+      u[, k],
+      shape = 2,
+      rate = 1
+    ) - 2
+  }
+
+  error <- OUTCOME_NOISE_SD * error
+
+  x1 <- x[, 1L]
+
+  x2 <- if (p >= 2L) {
+    x[, 2L]
+  } else {
+    x1
+  }
+
+  x3 <- if (p >= 3L) {
+    x[, 3L]
+  } else {
+    x1
+  }
+
+  # Heterogeneous treatment effect.
+  # The effect may be positive or negative across individuals.
+
+  tau <- 0.35 * tanh(
+    0.90 * x1 -
+      0.65 * x2 +
+      0.25 * sin(x3)
+  )
+
+  outcome_loadings <- seq(
+    0.70,
+    1.20,
+    length.out = N_OUTCOMES
+  )
+
+  Y <- matrix(
+    0,
+    nrow = n,
+    ncol = N_OUTCOMES
+  )
+
+  for (k in seq_len(N_OUTCOMES)) {
+
+    j1 <- ((k - 1L) %% p) + 1L
+    j2 <- (k %% p) + 1L
+
+    baseline <- 0.20 * x[, j1] +
+      0.10 * sin(x[, j2] + 0.25 * k)
+
+    treatment_effect <- outcome_loadings[k] * tau
+
+    # The action directly affects the realized outcome.
+
+    Y[, k] <- baseline +
+      OUTCOME_AR * previous_outcome +
+      action * treatment_effect +
+      error[, k]
+  }
+
+  # Reward is computed from the realized action-dependent outcomes.
+
+  reward <- rowMeans(Y) -
+    TREATMENT_COST * action
+
+  # The action and previous outcome affect the next covariate state.
+  # outer(previous_outcome, direction) gives an explicit n x p effect matrix.
+
+  direction <- sin(seq_len(p)) / sqrt(p)
+
+  action_sign <- 2 * action - 1
+
+  x_next <- STATE_AR * x +
+    TRANSITION_ACTION_EFFECT *
+      outer(action_sign, direction) +
+    TRANSITION_OUTCOME_EFFECT *
+      outer(as.numeric(previous_outcome), direction) +
+    x_noise
+
+  list(
+    reward = as.numeric(reward),
+    outcome = rowMeans(Y),
+    Y = Y,
+    x_next = x_next,
+    tau = tau
+  )
+}
+
+###############################################################################
+# 7. CNN-DQN AND CNN-LSTM-DQN
 ###############################################################################
 
 build_dqn <- function(
     input_shape,
-    architecture = c(
-      "CNN-DQN",
-      "CNN-LSTM-DQN"
-    ),
+    architecture = "CNN-DQN",
     lr = LEARNING_RATE) {
-
-  architecture <- match.arg(architecture)
 
   inputs <- layer_input(
     shape = input_shape
@@ -755,13 +813,17 @@ build_dqn <- function(
     x <- x %>%
       layer_flatten()
 
-  } else {
+  } else if (architecture == "CNN-LSTM-DQN") {
 
     x <- x %>%
       layer_lstm(
         units = 32,
         return_sequences = FALSE
       )
+
+  } else {
+
+    stop("Unknown architecture.")
   }
 
   outputs <- x %>%
@@ -789,13 +851,11 @@ build_dqn <- function(
   model
 }
 
-
 ###############################################################################
-# 4. REPLAY BUFFER
+# 8. EXPERIENCE REPLAY BUFFER
 ###############################################################################
 
 ReplayBuffer <- R6::R6Class(
-
   "ReplayBuffer",
 
   public = list(
@@ -803,8 +863,8 @@ ReplayBuffer <- R6::R6Class(
     capacity = NULL,
     memory = NULL,
     priorities = NULL,
-    pos = 1L,
-    alpha = NULL,
+    position = 1L,
+    alpha = PRIORITY_ALPHA,
 
     initialize = function(
         capacity = BUFFER_CAPACITY,
@@ -812,56 +872,48 @@ ReplayBuffer <- R6::R6Class(
 
       self$capacity <- as.integer(capacity)
       self$alpha <- alpha
-
       self$memory <- list()
       self$priorities <- numeric(0)
-      self$pos <- 1L
+      self$position <- 1L
     },
 
-
     push = function(
-        s,
-        a,
-        r,
-        s_next,
+        state,
+        action,
+        reward,
+        next_state,
         done,
         initial_priority = NULL) {
 
-      max_p <- if (length(self$priorities)) {
+      entry <- list(
+        state = state,
+        action = as.integer(action),
+        reward = as.numeric(reward),
+        next_state = next_state,
+        done = isTRUE(done)
+      )
 
-        max(
-          self$priorities,
-          na.rm = TRUE
-        )
-
+      max_priority <- if (
+        length(self$priorities) > 0L
+      ) {
+        max(self$priorities, na.rm = TRUE)
       } else {
-
         1
       }
 
-      p <- if (
+      priority <- if (
         is.null(initial_priority) ||
-          !is.finite(initial_priority)
+        length(initial_priority) == 0L ||
+        !is.finite(initial_priority)
       ) {
-
-        max_p
-
+        max_priority
       } else {
-
-        initial_priority
+        as.numeric(initial_priority)
       }
 
-      p <- max(
-        abs(as.numeric(p)),
-        Q_DWR_PRIORITY_FLOOR
-      )
-
-      entry <- list(
-        s = s,
-        a = as.integer(a),
-        r = as.numeric(r),
-        s_next = s_next,
-        done = isTRUE(done)
+      priority <- max(
+        abs(priority),
+        PRIORITY_EPS
       )
 
       if (length(self$memory) < self$capacity) {
@@ -872,45 +924,42 @@ ReplayBuffer <- R6::R6Class(
 
         self$priorities <- c(
           self$priorities,
-          p
+          priority
         )
 
       } else {
 
-        self$memory[[self$pos]] <- entry
+        self$memory[[self$position]] <- entry
 
-        self$priorities[self$pos] <- p
+        self$priorities[self$position] <- priority
 
-        self$pos <- if (
-          self$pos >= self$capacity
+        self$position <- if (
+          self$position >= self$capacity
         ) {
           1L
         } else {
-          self$pos + 1L
+          self$position + 1L
         }
       }
+
+      invisible(NULL)
     },
 
-
-    sample = function(
+    sample_batch = function(
         batch_size,
         beta = BETA,
         mode = "Q-DWR") {
 
       n_mem <- length(self$memory)
 
-      # UPDATED:
-      # Wait until a complete batch is available.
-      # This prevents changing batch dimensions during training
-      # and helps reduce TensorFlow retracing.
-
-      if (n_mem < batch_size) {
+      if (n_mem == 0L) {
         return(NULL)
       }
 
-      # Always use the same batch size.
-
-      take <- as.integer(batch_size)
+      take <- min(
+        as.integer(batch_size),
+        n_mem
+      )
 
       if (mode == "UWR") {
 
@@ -923,7 +972,7 @@ ReplayBuffer <- R6::R6Class(
 
         scaled <- pmax(
           self$priorities,
-          Q_DWR_PRIORITY_FLOOR
+          PRIORITY_EPS
         )^self$alpha
 
         probs <- scaled / sum(scaled)
@@ -938,10 +987,7 @@ ReplayBuffer <- R6::R6Class(
 
       weights <- if (mode == "UWR") {
 
-        rep(
-          1,
-          length(indices)
-        )
+        rep(1, take)
 
       } else {
 
@@ -953,10 +999,9 @@ ReplayBuffer <- R6::R6Class(
       list(
         indices = indices,
         batch = self$memory[indices],
-        weights = weights
+        weights = as.numeric(weights)
       )
     },
-
 
     update_priorities = function(
         indices,
@@ -964,35 +1009,41 @@ ReplayBuffer <- R6::R6Class(
 
       self$priorities[indices] <- pmax(
         abs(as.numeric(new_priorities)),
-        Q_DWR_PRIORITY_FLOOR
+        PRIORITY_EPS
       )
+
+      invisible(NULL)
     }
   )
 )
 
-
 ###############################################################################
-# 5. TRAINING WITH ONLINE ACTION-DEPENDENT FEEDBACK
+# 9. TRAIN ONE DQN MODEL
 ###############################################################################
 
 run_single_dqn_experiment <- function(
     env,
-    architecture,
-    representation,
-    replay_mode,
-    model_seed) {
+    train_plan,
+    architecture = "CNN-DQN",
+    representation = "COPULA",
+    replay_mode = "Q-DWR",
+    model_seed = 1L) {
+
+  stopifnot(architecture %in% ARCHITECTURES)
+  stopifnot(representation %in% REPRESENTATIONS)
+  stopifnot(replay_mode %in% REPLAY_MODES)
 
   set_all_seeds(model_seed)
 
   p <- env$p
 
   model <- build_dqn(
-    c(T_STEPS, p),
+    input_shape = c(T_STEPS, p),
     architecture = architecture
   )
 
   target_model <- build_dqn(
-    c(T_STEPS, p),
+    input_shape = c(T_STEPS, p),
     architecture = architecture
   )
 
@@ -1000,490 +1051,555 @@ run_single_dqn_experiment <- function(
     model$get_weights()
   )
 
-  buffer <- ReplayBuffer$new()
+  replay <- ReplayBuffer$new()
 
-  train_episode_rewards <- numeric(
-    N_EPISODES
-  )
+  episode_rewards <- numeric(N_EPISODES)
 
   epsilon <- EPSILON_START
+
   global_step <- 0L
 
   for (ep in seq_len(N_EPISODES)) {
 
-    ep_rewards <- numeric(
-      N_TRAIN_TRAJECTORIES
+    idx <- train_plan$indices[ep, ]
+
+    base <- env$train_base[
+      idx,
+      ,
+      drop = FALSE
+    ]
+
+    initial_noise <- matrix(
+      train_plan$initial_noise[ep, , ],
+      nrow = N_TRAIN,
+      ncol = p
     )
 
-    for (i in seq_len(N_TRAIN_TRAJECTORIES)) {
+    x <- base + initial_noise
 
-      base_x <- sample_episode_base(
-        env,
-        "train"
+    previous_outcome <- numeric(N_TRAIN)
+
+    history <- initialize_history(x)
+
+    discounted_rewards <- numeric(N_TRAIN)
+
+    for (tt in seq_len(T_STEPS)) {
+
+      # Apply the selected state representation.
+
+      state_input <- transform_history(
+        history,
+        env$copula_transform,
+        representation
       )
 
-      state <- initialize_episode(
-        base_x,
-        p
+      q_values <- as.matrix(
+        model$predict(
+          state_input,
+          verbose = 0
+        )
       )
 
-      state$base_x <- base_x
+      # Q-DWR priority:
+      # absolute separation between the two action values.
+      #
+      # This is an action-separation heuristic, not an uncertainty measure.
 
-      discounted_return <- 0
+      q_gap <- abs(
+        q_values[, 2L] - q_values[, 1L]
+      )
 
-      for (tt in seq_len(T_STEPS)) {
+      greedy_action <- max.col(
+        q_values,
+        ties.method = "first"
+      ) - 1L
 
-        s <- encode_state(
-          state$x,
-          state$history,
-          representation,
-          env$copula_fit
+      explore <- runif(N_TRAIN) < epsilon
+
+      action <- greedy_action
+
+      action[explore] <- rbinom(
+        sum(explore),
+        size = 1L,
+        prob = 0.5
+      )
+
+      z_noise <- matrix(
+        train_plan$outcome_noise[ep, , tt, ],
+        nrow = N_TRAIN,
+        ncol = N_OUTCOMES
+      )
+
+      x_noise <- matrix(
+        train_plan$state_noise[ep, , tt, ],
+        nrow = N_TRAIN,
+        ncol = p
+      )
+
+      # Online action-dependent transition.
+
+      transition <- environment_transition(
+        x = x,
+        previous_outcome = previous_outcome,
+        action = action,
+        z_noise = z_noise,
+        x_noise = x_noise,
+        env = env
+      )
+
+      reward <- transition$reward
+
+      x_next <- transition$x_next
+
+      previous_next <- transition$outcome
+
+      done <- (tt == T_STEPS)
+
+      # Update longitudinal history.
+
+      next_history <- history
+
+      if (T_STEPS > 1L) {
+
+        next_history[, seq_len(T_STEPS - 1L), ] <-
+          history[, 2L:T_STEPS, , drop = FALSE]
+      }
+
+      next_history[, T_STEPS, ] <- x_next
+
+      next_state_input <- transform_history(
+        next_history,
+        env$copula_transform,
+        representation
+      )
+
+      discounted_rewards <- discounted_rewards +
+        GAMMA^(tt - 1L) * reward
+
+      # Store individual transitions.
+
+      for (i in seq_len(N_TRAIN)) {
+
+        state_i <- array_reshape(
+          state_input[i, , , drop = FALSE],
+          c(1L, T_STEPS, p)
         )
 
-        q_values <- as.numeric(
-          model$predict(
-            s,
-            verbose = 0
-          )
+        next_i <- array_reshape(
+          next_state_input[i, , , drop = FALSE],
+          c(1L, T_STEPS, p)
         )
 
-        q_gap <- abs(
-          q_values[2L] -
-            q_values[1L]
-        )
-
-        greedy_action <- as.integer(
-          which.max(q_values) - 1L
-        )
-
-        action <- if (
-          runif(1) < epsilon
-        ) {
-
-          sample.int(
-            2L,
-            1L
-          ) - 1L
-
-        } else {
-
-          greedy_action
-        }
-
-        transition <- step_environment(
-          state,
-          action,
-          env,
-          tt
-        )
-
-        s_next <- encode_state(
-          transition$next_state$x,
-          transition$next_state$history,
-          representation,
-          env$copula_fit
-        )
-
-        init_priority <- switch(
+        initial_priority <- switch(
           replay_mode,
-          "Q-DWR" = q_gap,
+          "Q-DWR" = q_gap[i],
           "PER" = NULL,
           "UWR" = 1
         )
 
-        buffer$push(
-          s,
-          action,
-          transition$reward,
-          s_next,
-          transition$done,
-          initial_priority = init_priority
+        replay$push(
+          state = state_i,
+          action = action[i],
+          reward = reward[i],
+          next_state = next_i,
+          done = done,
+          initial_priority = initial_priority
         )
-
-        discounted_return <- discounted_return +
-          GAMMA^(tt - 1L) *
-          transition$reward
-
-        state <- transition$next_state
-
-        sampled <- buffer$sample(
-          BATCH_SIZE,
-          BETA,
-          replay_mode
-        )
-
-        if (!is.null(sampled)) {
-
-          bsize <- length(
-            sampled$batch
-          )
-
-          sb <- array(
-            0,
-            dim = c(
-              bsize,
-              T_STEPS,
-              p
-            )
-          )
-
-          snb <- array(
-            0,
-            dim = c(
-              bsize,
-              T_STEPS,
-              p
-            )
-          )
-
-          ab <- integer(bsize)
-          rb <- numeric(bsize)
-          db <- logical(bsize)
-
-          for (j in seq_len(bsize)) {
-
-            item <- sampled$batch[[j]]
-
-            sb[j, , ] <- item$s[1L, , ]
-
-            snb[j, , ] <- item$s_next[1L, , ]
-
-            ab[j] <- item$a
-
-            rb[j] <- item$r
-
-            db[j] <- item$done
-          }
-
-          # Current-state Q-values.
-
-          q_curr <- as.matrix(
-            model$predict(
-              sb,
-              verbose = 0
-            )
-          )
-
-          # Double-DQN:
-          # Online network selects the next action.
-
-          q_next_online <- as.matrix(
-            model$predict(
-              snb,
-              verbose = 0
-            )
-          )
-
-          # Target network evaluates the selected action.
-
-          q_next_target <- as.matrix(
-            target_model$predict(
-              snb,
-              verbose = 0
-            )
-          )
-
-          next_actions <- max.col(
-            q_next_online,
-            ties.method = "first"
-          )
-
-          next_q <- q_next_target[
-            cbind(
-              seq_len(bsize),
-              next_actions
-            )
-          ]
-
-          td_targets <- ifelse(
-            db,
-            rb,
-            rb + GAMMA * next_q
-          )
-
-          target_matrix <- q_curr
-
-          action_idx <- cbind(
-            seq_len(bsize),
-            ab + 1L
-          )
-
-          td_errors <- td_targets -
-            q_curr[action_idx]
-
-          target_matrix[action_idx] <- td_targets
-
-          current_gap <- abs(
-            q_curr[, 2L] -
-              q_curr[, 1L]
-          )
-
-          updated_priority <- switch(
-            replay_mode,
-
-            "PER" = abs(td_errors),
-
-            "Q-DWR" = current_gap,
-
-            "UWR" = rep(
-              1,
-              bsize
-            )
-          )
-
-          buffer$update_priorities(
-            sampled$indices,
-            updated_priority
-          )
-
-          model$train_on_batch(
-            x = sb,
-            y = target_matrix,
-            sample_weight = sampled$weights
-          )
-        }
-
-        global_step <- global_step + 1L
-
-        if (
-          global_step %% TARGET_UPDATE_EVERY == 0L
-        ) {
-
-          target_model$set_weights(
-            model$get_weights()
-          )
-        }
       }
 
-      ep_rewards[i] <- discounted_return
+      # Sample replay batch.
+
+      sampled <- replay$sample_batch(
+        batch_size = BATCH_SIZE,
+        beta = BETA,
+        mode = replay_mode
+      )
+
+      if (!is.null(sampled)) {
+
+        bsize <- length(sampled$batch)
+
+        state_batch <- array(
+          0,
+          dim = c(bsize, T_STEPS, p)
+        )
+
+        next_batch <- array(
+          0,
+          dim = c(bsize, T_STEPS, p)
+        )
+
+        action_batch <- integer(bsize)
+
+        reward_batch <- numeric(bsize)
+
+        done_batch <- logical(bsize)
+
+        for (ii in seq_len(bsize)) {
+
+          entry <- sampled$batch[[ii]]
+
+          state_batch[ii, , ] <- entry$state[1L, , ]
+
+          next_batch[ii, , ] <- entry$next_state[1L, , ]
+
+          action_batch[ii] <- entry$action
+
+          reward_batch[ii] <- entry$reward
+
+          done_batch[ii] <- entry$done
+        }
+
+        q_current <- as.matrix(
+          model$predict(
+            state_batch,
+            verbose = 0
+          )
+        )
+
+        # Double-DQN target:
+        # online model selects the next action;
+        # target model evaluates that action.
+
+        q_next_online <- as.matrix(
+          model$predict(
+            next_batch,
+            verbose = 0
+          )
+        )
+
+        q_next_target <- as.matrix(
+          target_model$predict(
+            next_batch,
+            verbose = 0
+          )
+        )
+
+        next_actions <- max.col(
+          q_next_online,
+          ties.method = "first"
+        )
+
+        next_q <- q_next_target[
+          cbind(
+            seq_len(bsize),
+            next_actions
+          )
+        ]
+
+        td_targets <- ifelse(
+          done_batch,
+          reward_batch,
+          reward_batch + GAMMA * next_q
+        )
+
+        action_indices <- cbind(
+          seq_len(bsize),
+          action_batch + 1L
+        )
+
+        td_errors <- td_targets -
+          q_current[action_indices]
+
+        target_matrix <- q_current
+
+        target_matrix[action_indices] <- td_targets
+
+        current_gap <- abs(
+          q_current[, 2L] - q_current[, 1L]
+        )
+
+        # Replay priority updates.
+
+        updated_priorities <- switch(
+          replay_mode,
+
+          "PER" = abs(td_errors) + PRIORITY_EPS,
+
+          "Q-DWR" = current_gap + PRIORITY_EPS,
+
+          "UWR" = rep(1, bsize)
+        )
+
+        model$train_on_batch(
+          x = state_batch,
+          y = target_matrix,
+          sample_weight = sampled$weights
+        )
+
+        replay$update_priorities(
+          sampled$indices,
+          updated_priorities
+        )
+      }
+
+      global_step <- global_step + 1L
+
+      if (global_step %% TARGET_UPDATE_EVERY == 0L) {
+
+        target_model$set_weights(
+          model$get_weights()
+        )
+      }
+
+      x <- x_next
+
+      previous_outcome <- previous_next
+
+      history <- next_history
     }
 
-    train_episode_rewards[ep] <- mean(
-      ep_rewards
+    episode_rewards[ep] <- mean(
+      discounted_rewards
     )
 
     epsilon <- max(
-      epsilon * EPSILON_DECAY,
-      EPSILON_MIN
-    )
-
-    cat(
-      sprintf(
-        "    Episode %d/%d | Mean reward = %.5f | Epsilon = %.3f\n",
-        ep,
-        N_EPISODES,
-        train_episode_rewards[ep],
-        epsilon
-      )
+      EPSILON_MIN,
+      epsilon * EPSILON_DECAY
     )
   }
 
   list(
     model = model,
-    train_episode_rewards = train_episode_rewards,
-    final_train_reward = tail(
-      train_episode_rewards,
+    training_rewards = episode_rewards,
+    final_training_reward = tail(
+      episode_rewards,
       1L
     ),
-    mean_train_reward = mean(
-      train_episode_rewards
+    mean_training_reward = mean(
+      episode_rewards
     )
   )
 }
 
-
 ###############################################################################
-# 6. INDEPENDENT OUT-OF-SAMPLE POLICY EVALUATION
+# 10. INDEPENDENT OUT-OF-SAMPLE POLICY EVALUATION
 ###############################################################################
 
-evaluate_greedy_policy <- function(
+evaluate_one_policy <- function(
     model,
     env,
+    eval_plan,
+    replicate_id,
     representation,
-    n_trajectories = N_TEST_TRAJECTORIES,
-    n_replicates = N_EVAL_REPLICATES,
-    eval_seed = 900001L) {
-
-  set_all_seeds(eval_seed)
+    policy = "Greedy") {
 
   p <- env$p
 
-  replicate_rewards <- numeric(
-    n_replicates
+  idx <- eval_plan$indices[
+    replicate_id,
+    ]
+
+  base <- env$test_base[
+    idx,
+    ,
+    drop = FALSE
+  ]
+
+  initial_noise <- matrix(
+    eval_plan$initial_noise[replicate_id, , ],
+    nrow = N_TEST,
+    ncol = p
   )
 
-  all_returns <- vector(
-    "list",
-    n_replicates
-  )
+  x <- base + initial_noise
 
-  for (rr in seq_len(n_replicates)) {
+  previous_outcome <- numeric(N_TEST)
 
-    returns <- numeric(
-      n_trajectories
+  history <- initialize_history(x)
+
+  discounted_rewards <- numeric(N_TEST)
+
+  treatment_count <- numeric(N_TEST)
+
+  for (tt in seq_len(T_STEPS)) {
+
+    state_input <- transform_history(
+      history,
+      env$copula_transform,
+      representation
     )
 
-    for (i in seq_len(n_trajectories)) {
+    if (policy == "Greedy") {
 
-      base_x <- sample_episode_base(
-        env,
-        "test"
+      q <- as.matrix(
+        model$predict(
+          state_input,
+          verbose = 0
+        )
       )
 
-      state <- initialize_episode(
-        base_x,
-        p
+      action <- max.col(
+        q,
+        ties.method = "first"
+      ) - 1L
+
+    } else if (policy == "Random") {
+
+      action <- as.integer(
+        eval_plan$random_actions[
+          replicate_id, , tt
+        ] < 0.5
       )
 
-      state$base_x <- base_x
+    } else if (policy == "Always-0") {
 
-      total <- 0
+      action <- integer(N_TEST)
 
-      for (tt in seq_len(T_STEPS)) {
+    } else if (policy == "Always-1") {
 
-        s <- encode_state(
-          state$x,
-          state$history,
-          representation,
-          env$copula_fit
-        )
+      action <- rep(1L, N_TEST)
 
-        q <- as.numeric(
-          model$predict(
-            s,
-            verbose = 0
-          )
-        )
+    } else {
 
-        # Greedy evaluation: no exploration.
-
-        action <- as.integer(
-          which.max(q) - 1L
-        )
-
-        transition <- step_environment(
-          state,
-          action,
-          env,
-          tt
-        )
-
-        total <- total +
-          GAMMA^(tt - 1L) *
-          transition$reward
-
-        state <- transition$next_state
-      }
-
-      returns[i] <- total
+      stop("Unknown evaluation policy.")
     }
 
-    replicate_rewards[rr] <- mean(
-      returns
+    z_noise <- matrix(
+      eval_plan$outcome_noise[
+        replicate_id, , tt, ,
+        drop = FALSE
+      ],
+      nrow = N_TEST,
+      ncol = N_OUTCOMES
     )
 
-    all_returns[[rr]] <- returns
+    x_noise <- matrix(
+      eval_plan$state_noise[
+        replicate_id, , tt, ,
+        drop = FALSE
+      ],
+      nrow = N_TEST,
+      ncol = p
+    )
+
+    transition <- environment_transition(
+      x = x,
+      previous_outcome = previous_outcome,
+      action = action,
+      z_noise = z_noise,
+      x_noise = x_noise,
+      env = env
+    )
+
+    discounted_rewards <- discounted_rewards +
+      GAMMA^(tt - 1L) * transition$reward
+
+    treatment_count <- treatment_count + action
+
+    next_history <- history
+
+    if (T_STEPS > 1L) {
+
+      next_history[, seq_len(T_STEPS - 1L), ] <-
+        history[, 2L:T_STEPS, , drop = FALSE]
+    }
+
+    next_history[, T_STEPS, ] <- transition$x_next
+
+    x <- transition$x_next
+
+    previous_outcome <- transition$outcome
+
+    history <- next_history
   }
 
-  pooled <- unlist(
-    all_returns,
-    use.names = FALSE
-  )
-
-  list(
-    eval_mean = mean(replicate_rewards),
-
-    eval_sd_replicates = sd(
-      replicate_rewards
-    ),
-
-    eval_se_replicates =
-      sd(replicate_rewards) /
-      sqrt(n_replicates),
-
-    eval_ci_lower =
-      mean(replicate_rewards) -
-      qt(
-        0.975,
-        df = n_replicates - 1L
-      ) *
-      sd(replicate_rewards) /
-      sqrt(n_replicates),
-
-    eval_ci_upper =
-      mean(replicate_rewards) +
-      qt(
-        0.975,
-        df = n_replicates - 1L
-      ) *
-      sd(replicate_rewards) /
-      sqrt(n_replicates),
-
-    replicate_rewards = replicate_rewards,
-
-    individual_returns = pooled
+  data.frame(
+    Replicate = replicate_id,
+    Policy = policy,
+    OOS_MeanReward = mean(discounted_rewards),
+    OOS_SD_IndividualReward = sd(discounted_rewards),
+    TreatmentRate = mean(
+      treatment_count / T_STEPS
+    )
   )
 }
 
+evaluate_model_oos <- function(
+    model,
+    env,
+    eval_plan,
+    representation) {
 
-###############################################################################
-# 7. BENCHMARK DRIVER
-###############################################################################
-
-# Reproducibly cap each real-data benchmark at 500 observations.
-# Datasets with fewer than 500 rows are retained in full.
-reduce_dataset_sample <- function(df, n_max = N_SAMPLE_MAX, seed = 20261119L) {
-
-  df <- as.data.frame(df)
-
-  if (nrow(df) > n_max) {
-    set.seed(as.integer(seed))
-    selected <- sample.int(nrow(df), size = n_max, replace = FALSE)
-    df <- df[selected, , drop = FALSE]
-  }
-
-  rownames(df) <- NULL
-  df
-}
-
-run_benchmark <- function() {
-
-  datasets <- list(
-    "Synthetic A (13 covariates)" = get_synthetic_dataset_A(),
-    "Synthetic B (11 covariates)" = get_synthetic_dataset_B(),
-    "Synthetic C (6 covariates)" = get_synthetic_dataset_C()
+  policies <- c(
+    "Greedy",
+    "Random",
+    "Always-0",
+    "Always-1"
   )
-
-  cat("\nSimulated dataset sample sizes (", N_SAMPLE_MAX, " rows each):\n", sep = "")
-  for (dataset_name in names(datasets)) {
-    cat("  ", dataset_name, ":", nrow(datasets[[dataset_name]]), "rows\n")
-  }
 
   results <- list()
-  episode_curves <- list()
 
   counter <- 0L
 
-  total <- length(datasets) *
+  for (rr in seq_len(N_EVAL_REPLICATES)) {
+
+    for (pol in policies) {
+
+      counter <- counter + 1L
+
+      results[[counter]] <- evaluate_one_policy(
+        model = model,
+        env = env,
+        eval_plan = eval_plan,
+        replicate_id = rr,
+        representation = representation,
+        policy = pol
+      )
+    }
+  }
+
+  data.table::rbindlist(
+    results,
+    use.names = TRUE,
+    fill = TRUE
+  ) |>
+    as.data.frame()
+}
+
+###############################################################################
+# 11. PAIRED FACTORIAL SIMULATION
+###############################################################################
+
+run_paired_benchmark <- function() {
+
+  datasets <- list(
+
+    "Synthetic A (8 features)" =
+      generate_simulated_dataset(
+        n_samples = N_SAMPLES,
+        n_features = 8L,
+        seed = 101L
+      ),
+
+    "Synthetic B (15 features)" =
+      generate_simulated_dataset(
+        n_samples = N_SAMPLES,
+        n_features = 15L,
+        seed = 202L
+      )
+  )
+
+  total_fits <- length(datasets) *
     length(RHO_VALUES) *
     length(MASTER_SEEDS) *
-    length(STATE_REPRESENTATIONS) *
+    length(REPRESENTATIONS) *
     length(ARCHITECTURES) *
     length(REPLAY_MODES)
 
   cat(
-    "\n====================================================\n"
-  )
-
-  cat(
-    "PLANNED MODEL FITS:",
-    total,
+    "\nTotal planned model fits:",
+    total_fits,
     "\n"
   )
 
-  cat(
-    "====================================================\n"
-  )
+  training_rows <- list()
+
+  evaluation_rows <- list()
+
+  curve_rows <- list()
+
+  fit_counter <- 0L
 
   for (dataset_name in names(datasets)) {
 
@@ -1491,138 +1607,110 @@ run_benchmark <- function() {
 
       for (seed in MASTER_SEEDS) {
 
-        split <- split_dataset(
-          datasets[[dataset_name]],
-          seed = 100000L + seed
+        condition_seed <- as.integer(
+          100000L +
+            seed +
+            round((rho + 1) * 1000)
         )
 
-        env <- make_environment_spec(
-          split$train,
-          split$test,
-          rho,
-          seed = 200000L + seed
+        env <- make_experiment_environment(
+          df = datasets[[dataset_name]],
+          split_seed = condition_seed,
+          rho = rho
         )
 
-        for (
-          representation in STATE_REPRESENTATIONS
-        ) {
+        # Common random-number plans for all matched models.
 
-          for (
-            architecture in ARCHITECTURES
-          ) {
+        train_plan <- make_training_plan(
+          env,
+          seed = condition_seed + 10000L
+        )
 
-            for (
-              replay_mode in REPLAY_MODES
-            ) {
+        eval_plan <- make_evaluation_plan(
+          env,
+          seed = condition_seed + 20000L
+        )
 
-              counter <- counter + 1L
+        for (representation in REPRESENTATIONS) {
 
-              cat(
-                sprintf(
-                  "\n[%d/%d] %s | rho=%.2f | seed=%d | %s | %s | %s\n",
-                  counter,
-                  total,
-                  dataset_name,
-                  rho,
-                  seed,
-                  representation,
-                  architecture,
-                  replay_mode
-                )
-              )
+          for (replay_mode in REPLAY_MODES) {
+
+            for (architecture in ARCHITECTURES) {
+
+              fit_counter <- fit_counter + 1L
+
+              cat(sprintf(
+                "\n[%d/%d] %s | rho=%.2f | seed=%d | %s | %s | %s\n",
+                fit_counter,
+                total_fits,
+                dataset_name,
+                rho,
+                seed,
+                representation,
+                architecture,
+                replay_mode
+              ))
 
               model_seed <- as.integer(
-                300000L +
-                  seed * 1000L +
-                  match(
-                    representation,
-                    STATE_REPRESENTATIONS
-                  ) * 100L +
-                  match(
-                    architecture,
-                    ARCHITECTURES
-                  ) * 10L +
-                  match(
-                    replay_mode,
-                    REPLAY_MODES
-                  )
+                500000L + seed
               )
 
               fit <- run_single_dqn_experiment(
                 env = env,
+                train_plan = train_plan,
                 architecture = architecture,
                 representation = representation,
                 replay_mode = replay_mode,
                 model_seed = model_seed
               )
 
-              evaluation <- evaluate_greedy_policy(
-                fit$model,
-                env,
-                representation,
-                eval_seed = as.integer(
-                  model_seed + 500000L
-                )
-              )
-
-              key <- length(results) + 1L
-
-              results[[key]] <- data.frame(
+              training_rows[[
+                length(training_rows) + 1L
+              ]] <- data.frame(
                 Dataset = dataset_name,
                 Rho = rho,
                 Seed = seed,
                 Representation = representation,
                 Architecture = architecture,
                 ReplayMode = replay_mode,
-
-                FinalTrainReward =
-                  fit$final_train_reward,
-
-                MeanTrainReward =
-                  fit$mean_train_reward,
-
-                OOSReward =
-                  evaluation$eval_mean,
-
-                OOS_SD_Replicates =
-                  evaluation$eval_sd_replicates,
-
-                OOS_SE =
-                  evaluation$eval_se_replicates,
-
-                OOS_CI_Lower =
-                  evaluation$eval_ci_lower,
-
-                OOS_CI_Upper =
-                  evaluation$eval_ci_upper,
-
-                stringsAsFactors = FALSE
+                FinalTrainingReward =
+                  fit$final_training_reward,
+                MeanTrainingReward =
+                  fit$mean_training_reward
               )
 
-              episode_curves[[key]] <- data.frame(
+              curve_rows[[
+                length(curve_rows) + 1L
+              ]] <- data.frame(
                 Dataset = dataset_name,
                 Rho = rho,
                 Seed = seed,
                 Representation = representation,
                 Architecture = architecture,
                 ReplayMode = replay_mode,
-
-                Episode = seq_along(
-                  fit$train_episode_rewards
-                ),
-
-                TrainingReward =
-                  fit$train_episode_rewards
+                Episode = seq_len(N_EPISODES),
+                TrainingReward = fit$training_rewards
               )
 
-              # Release TensorFlow objects between fits.
+              eval_result <- evaluate_model_oos(
+                model = fit$model,
+                env = env,
+                eval_plan = eval_plan,
+                representation = representation
+              )
+
+              eval_result$Dataset <- dataset_name
+              eval_result$Rho <- rho
+              eval_result$Seed <- seed
+              eval_result$Representation <- representation
+              eval_result$Architecture <- architecture
+              eval_result$ReplayMode <- replay_mode
+
+              evaluation_rows[[
+                length(evaluation_rows) + 1L
+              ]] <- eval_result
 
               rm(fit)
-
-              try(
-                k_clear_session(),
-                silent = TRUE
-              )
 
               invisible(gc())
             }
@@ -1633,28 +1721,108 @@ run_benchmark <- function() {
   }
 
   list(
-    results = data.table::rbindlist(
-      results,
+    training = data.table::rbindlist(
+      training_rows,
       fill = TRUE
-    ) |>
-      as.data.frame(),
+    ) |> as.data.frame(),
 
-    curves = data.table::rbindlist(
-      episode_curves,
+    evaluation = data.table::rbindlist(
+      evaluation_rows,
       fill = TRUE
-    ) |>
-      as.data.frame()
+    ) |> as.data.frame(),
+
+    learning_curves = data.table::rbindlist(
+      curve_rows,
+      fill = TRUE
+    ) |> as.data.frame()
   )
 }
 
-
 ###############################################################################
-# 8. SUMMARIES AND PAIRED COMPARISONS
+# 12. AGGREGATE EVALUATION REPLICATES WITHIN TRAINING SEED
 ###############################################################################
 
-summarize_results <- function(results) {
+make_seed_level_oos <- function(evaluation_results) {
 
-  results |>
+  evaluation_results |>
+    group_by(
+      Dataset,
+      Rho,
+      Seed,
+      Representation,
+      Architecture,
+      ReplayMode,
+      Policy
+    ) |>
+    summarise(
+      OOS_Reward = mean(
+        OOS_MeanReward,
+        na.rm = TRUE
+      ),
+      OOS_WithinReplicateSD = mean(
+        OOS_SD_IndividualReward,
+        na.rm = TRUE
+      ),
+      TreatmentRate = mean(
+        TreatmentRate,
+        na.rm = TRUE
+      ),
+      N_EvaluationReplicates = n(),
+      .groups = "drop"
+    )
+}
+
+summarize_oos_across_seeds <- function(seed_level_oos) {
+
+  seed_level_oos |>
+    group_by(
+      Dataset,
+      Rho,
+      Representation,
+      Architecture,
+      ReplayMode,
+      Policy
+    ) |>
+    summarise(
+      N_TrainingSeeds = n_distinct(Seed),
+
+      OOS_Reward_Mean = mean(
+        OOS_Reward,
+        na.rm = TRUE
+      ),
+
+      OOS_Reward_SD = sd(
+        OOS_Reward,
+        na.rm = TRUE
+      ),
+
+      OOS_Reward_SE = OOS_Reward_SD /
+        sqrt(N_TrainingSeeds),
+
+      CI_Lower = OOS_Reward_Mean -
+        qt(
+          0.975,
+          df = N_TrainingSeeds - 1L
+        ) * OOS_Reward_SE,
+
+      CI_Upper = OOS_Reward_Mean +
+        qt(
+          0.975,
+          df = N_TrainingSeeds - 1L
+        ) * OOS_Reward_SE,
+
+      TreatmentRate_Mean = mean(
+        TreatmentRate,
+        na.rm = TRUE
+      ),
+
+      .groups = "drop"
+    )
+}
+
+summarize_training <- function(training_results) {
+
+  training_results |>
     group_by(
       Dataset,
       Rho,
@@ -1663,22 +1831,20 @@ summarize_results <- function(results) {
       ReplayMode
     ) |>
     summarise(
-      N = n(),
+      N_TrainingSeeds = n_distinct(Seed),
 
-      OOS_Mean = mean(
-        OOSReward,
+      FinalTrainingReward_Mean = mean(
+        FinalTrainingReward,
         na.rm = TRUE
       ),
 
-      OOS_SD = sd(
-        OOSReward,
+      FinalTrainingReward_SD = sd(
+        FinalTrainingReward,
         na.rm = TRUE
       ),
 
-      OOS_SE = OOS_SD / sqrt(N),
-
-      Train_Mean = mean(
-        MeanTrainReward,
+      MeanTrainingReward = mean(
+        MeanTrainingReward,
         na.rm = TRUE
       ),
 
@@ -1686,178 +1852,253 @@ summarize_results <- function(results) {
     )
 }
 
+###############################################################################
+# 13. PAIRED STATISTICAL COMPARISONS
+###############################################################################
 
-paired_replay_comparisons <- function(results) {
+paired_test <- function(
+    data,
+    value_a,
+    value_b,
+    contrast_name) {
 
-  wide <- results |>
-    select(
-      Dataset,
-      Rho,
-      Seed,
-      Representation,
-      Architecture,
-      ReplayMode,
-      OOSReward
-    ) |>
-    tidyr::pivot_wider(
-      names_from = ReplayMode,
-      values_from = OOSReward
-    )
+  difference <- data[[value_a]] -
+    data[[value_b]]
 
-  comparisons <- list()
+  difference <- difference[
+    is.finite(difference)
+  ]
 
-  pairs <- list(
-    c("Q-DWR", "UWR"),
-    c("Q-DWR", "PER"),
-    c("PER", "UWR")
-  )
+  n <- length(difference)
 
-  for (pair in pairs) {
+  if (n < 2L) {
 
-    a <- pair[1]
-    b <- pair[2]
-
-    tmp <- wide |>
-      mutate(
-        Difference = .data[[a]] -
-          .data[[b]],
-
-        Comparison = paste(
-          a,
-          "minus",
-          b
-        )
-      ) |>
-      filter(
-        is.finite(Difference)
-      )
-
-    sm <- tmp |>
-      group_by(
-        Dataset,
-        Rho,
-        Representation,
-        Architecture,
-        Comparison
-      ) |>
-      summarise(
-        N_Pairs = n(),
-
-        Mean_Difference = mean(
-          Difference
-        ),
-
-        SD_Difference = sd(
-          Difference
-        ),
-
-        SE_Difference =
-          SD_Difference / sqrt(N_Pairs),
-
-        CI_Lower =
-          Mean_Difference -
-          qt(
-            0.975,
-            df = N_Pairs - 1L
-          ) *
-          SE_Difference,
-
-        CI_Upper =
-          Mean_Difference +
-          qt(
-            0.975,
-            df = N_Pairs - 1L
-          ) *
-          SE_Difference,
-
-        P_Value = if (
-          N_Pairs >= 2L &&
-            is.finite(SD_Difference) &&
-            SD_Difference > 0
-        ) {
-
-          t.test(
-            Difference,
-            mu = 0
-          )$p.value
-
-        } else {
-
-          NA_real_
-        },
-
-        .groups = "drop"
-      )
-
-    comparisons[[
-      length(comparisons) + 1L
-    ]] <- sm
+    return(data.frame(
+      Contrast = contrast_name,
+      N_Pairs = n,
+      MeanDifference = if (n == 1L) {
+        difference[1L]
+      } else {
+        NA_real_
+      },
+      SD_Difference = NA_real_,
+      CI_Lower = NA_real_,
+      CI_Upper = NA_real_,
+      P_Value = NA_real_
+    ))
   }
 
-  out <- bind_rows(
-    comparisons
+  test <- t.test(
+    difference,
+    mu = 0
   )
 
-  out$P_Adjusted_Holm <- p.adjust(
-    out$P_Value,
-    method = "holm"
+  data.frame(
+    Contrast = contrast_name,
+    N_Pairs = n,
+    MeanDifference = mean(difference),
+    SD_Difference = sd(difference),
+    CI_Lower = unname(test$conf.int[1L]),
+    CI_Upper = unname(test$conf.int[2L]),
+    P_Value = test$p.value
   )
-
-  out
 }
 
+make_paired_contrasts <- function(seed_level_oos) {
+
+  greedy <- seed_level_oos |>
+    filter(Policy == "Greedy")
+
+  # Architecture: CNN-LSTM-DQN minus CNN-DQN.
+
+  architecture_wide <- greedy |>
+    select(
+      Dataset, Rho, Seed,
+      Representation, ReplayMode,
+      Architecture, OOS_Reward
+    ) |>
+    pivot_wider(
+      names_from = Architecture,
+      values_from = OOS_Reward
+    )
+
+  architecture_results <- architecture_wide |>
+    group_by(
+      Dataset, Rho, Representation, ReplayMode
+    ) |>
+    group_modify(~ paired_test(
+      .x,
+      "CNN-LSTM-DQN",
+      "CNN-DQN",
+      "CNN-LSTM-DQN minus CNN-DQN"
+    )) |>
+    ungroup() |>
+    mutate(Family = "Architecture")
+
+  # Representation: COPULA minus RAW.
+
+  representation_wide <- greedy |>
+    select(
+      Dataset, Rho, Seed,
+      Architecture, ReplayMode,
+      Representation, OOS_Reward
+    ) |>
+    pivot_wider(
+      names_from = Representation,
+      values_from = OOS_Reward
+    )
+
+  representation_results <- representation_wide |>
+    group_by(
+      Dataset, Rho, Architecture, ReplayMode
+    ) |>
+    group_modify(~ paired_test(
+      .x,
+      "COPULA",
+      "RAW",
+      "COPULA minus RAW"
+    )) |>
+    ungroup() |>
+    mutate(Family = "Representation")
+
+  # Replay: Q-DWR versus PER and UWR.
+
+  replay_wide <- greedy |>
+    select(
+      Dataset, Rho, Seed,
+      Representation, Architecture,
+      ReplayMode, OOS_Reward
+    ) |>
+    pivot_wider(
+      names_from = ReplayMode,
+      values_from = OOS_Reward
+    )
+
+  q_per <- replay_wide |>
+    group_by(
+      Dataset, Rho, Representation, Architecture
+    ) |>
+    group_modify(~ paired_test(
+      .x,
+      "Q-DWR",
+      "PER",
+      "Q-DWR minus PER"
+    )) |>
+    ungroup() |>
+    mutate(Family = "Replay")
+
+  q_uwr <- replay_wide |>
+    group_by(
+      Dataset, Rho, Representation, Architecture
+    ) |>
+    group_modify(~ paired_test(
+      .x,
+      "Q-DWR",
+      "UWR",
+      "Q-DWR minus UWR"
+    )) |>
+    ungroup() |>
+    mutate(Family = "Replay")
+
+  results <- bind_rows(
+    architecture_results,
+    representation_results,
+    q_per,
+    q_uwr
+  )
+
+  results |>
+    group_by(Family) |>
+    mutate(
+      Holm_Adjusted_P = p.adjust(
+        P_Value,
+        method = "holm"
+      )
+    ) |>
+    ungroup()
+}
 
 ###############################################################################
-# 9. MAIN EXECUTION AND OUTPUTS
+# 14. RUN THE FULL EXPERIMENT
 ###############################################################################
 
-benchmark <- run_benchmark()
+benchmark <- run_paired_benchmark()
 
-run_results <- benchmark$results
+training_results <- benchmark$training
 
-learning_curves <- benchmark$curves
+evaluation_results <- benchmark$evaluation
 
-summary_results <- summarize_results(
-  run_results
+learning_curves <- benchmark$learning_curves
+
+seed_level_oos <- make_seed_level_oos(
+  evaluation_results
 )
 
-replay_pairs <- paired_replay_comparisons(
-  run_results
+oos_summary <- summarize_oos_across_seeds(
+  seed_level_oos
 )
 
-# Save all seed-level results.
+training_summary <- summarize_training(
+  training_results
+)
 
-fwrite(
-  run_results,
+paired_contrasts <- make_paired_contrasts(
+  seed_level_oos
+)
+
+###############################################################################
+# 15. SAVE RESULTS
+###############################################################################
+
+data.table::fwrite(
+  training_results,
   file.path(
     OUTPUT_DIR,
-    "seed_level_oos_results.csv"
+    "training_seed_level_results.csv"
   )
 )
 
-# Save summary results.
-
-fwrite(
-  summary_results,
+data.table::fwrite(
+  evaluation_results,
   file.path(
     OUTPUT_DIR,
-    "oos_performance_summary.csv"
+    "oos_evaluation_replicate_results.csv"
   )
 )
 
-# Save paired replay comparisons.
-
-fwrite(
-  replay_pairs,
+data.table::fwrite(
+  seed_level_oos,
   file.path(
     OUTPUT_DIR,
-    "paired_replay_comparisons.csv"
+    "oos_seed_level_results.csv"
   )
 )
 
-# Save learning curves.
+data.table::fwrite(
+  oos_summary,
+  file.path(
+    OUTPUT_DIR,
+    "oos_summary_across_training_seeds.csv"
+  )
+)
 
-fwrite(
+data.table::fwrite(
+  training_summary,
+  file.path(
+    OUTPUT_DIR,
+    "training_diagnostics_summary.csv"
+  )
+)
+
+data.table::fwrite(
+  paired_contrasts,
+  file.path(
+    OUTPUT_DIR,
+    "paired_oos_contrasts_holm.csv"
+  )
+)
+
+data.table::fwrite(
   learning_curves,
   file.path(
     OUTPUT_DIR,
@@ -1865,116 +2106,158 @@ fwrite(
   )
 )
 
-
-cat(
-  "\n================ OUT-OF-SAMPLE PERFORMANCE ================\n"
-)
-
-print(summary_results)
-
-
-cat(
-  "\n================ PAIRED REPLAY COMPARISONS ================\n"
-)
-
-print(replay_pairs)
-
-
 ###############################################################################
-# 10. FIGURE: OUT-OF-SAMPLE POLICY PERFORMANCE
+# 16. FIGURE 1: OUT-OF-SAMPLE GREEDY POLICY PERFORMANCE
 ###############################################################################
 
-summary_results$RhoLabel <- factor(
-  summary_results$Rho,
-  levels = c(-0.15, 0.50),
-  labels = c(
-    "rho = -0.15",
-    "rho = 0.50"
+greedy_summary <- oos_summary |>
+  filter(Policy == "Greedy") |>
+  mutate(
+    RhoLabel = factor(
+      Rho,
+      levels = c(-0.15, 0.50),
+      labels = c(
+        "rho = -0.15",
+        "rho = 0.50"
+      )
+    )
   )
-)
 
 p_oos <- ggplot(
-  summary_results,
+  greedy_summary,
   aes(
-    x = ReplayMode,
-    y = OOS_Mean,
-
-    group = interaction(
-      Representation,
-      Architecture
-    ),
-
-    color = Representation,
-    shape = Architecture
+    x = Architecture,
+    y = OOS_Reward_Mean,
+    shape = ReplayMode,
+    group = ReplayMode
   )
 ) +
-
   geom_point(
-    position = position_dodge(
-      width = 0.45
-    ),
+    position = position_dodge(width = 0.55),
     size = 2.5
   ) +
-
   geom_errorbar(
     aes(
-      ymin = OOS_Mean - OOS_SE,
-      ymax = OOS_Mean + OOS_SE
+      ymin = CI_Lower,
+      ymax = CI_Upper
     ),
-
-    position = position_dodge(
-      width = 0.45
-    ),
-
+    position = position_dodge(width = 0.55),
     width = 0.15
   ) +
-
   facet_grid(
-    RhoLabel ~ Dataset
+    RhoLabel + Representation ~ Dataset
   ) +
-
   labs(
-    title = "Independent Out-of-Sample Policy Evaluation",
-
+    title = "Independent Out-of-Sample Greedy Policy Evaluation",
     subtitle = paste(
-      "Greedy policies evaluated on held-out individuals",
-      "and fresh trajectories"
+      "Means and 95% confidence intervals across",
+      "independently trained seeds"
     ),
-
-    x = "Replay Strategy",
-
-    y = "Mean Discounted Out-of-Sample Reward",
-
-    color = "State Representation",
-
-    shape = "Architecture"
+    x = "Architecture",
+    y = "Mean discounted cumulative reward",
+    shape = "Replay strategy"
   ) +
-
-  theme_minimal(
-    base_size = 11
-  ) +
-
+  theme_minimal(base_size = 11) +
   theme(
     legend.position = "top",
-    panel.grid.minor = element_blank()
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(
+      angle = 10,
+      hjust = 1
+    )
   )
 
-
 ggsave(
-  file.path(
+  filename = file.path(
     OUTPUT_DIR,
-    "oos_policy_performance.pdf"
+    "oos_greedy_policy_performance.pdf"
   ),
-
-  p_oos,
-
+  plot = p_oos,
   width = 12,
-  height = 7
+  height = 8
 )
 
+ggsave(
+  filename = file.path(OUTPUT_DIR, "oos_greedy_policy_performance.png"),
+  plot = p_oos, width = 12, height = 8, dpi = 300
+)
 
 ###############################################################################
-# 11. FIGURE: TRAINING LEARNING CURVES
+# 17. FIGURE 2: LEARNED POLICY VERSUS REFERENCE POLICIES
+###############################################################################
+
+reference_summary <- oos_summary |>
+  mutate(
+    RhoLabel = factor(
+      Rho,
+      levels = c(-0.15, 0.50),
+      labels = c(
+        "rho = -0.15",
+        "rho = 0.50"
+      )
+    )
+  )
+
+p_reference <- ggplot(
+  reference_summary,
+  aes(
+    x = Policy,
+    y = OOS_Reward_Mean,
+    shape = ReplayMode,
+    group = interaction(
+      Architecture,
+      ReplayMode
+    )
+  )
+) +
+  geom_point(
+    position = position_dodge(width = 0.65),
+    size = 1.8
+  ) +
+  geom_errorbar(
+    aes(
+      ymin = CI_Lower,
+      ymax = CI_Upper
+    ),
+    position = position_dodge(width = 0.65),
+    width = 0.12
+  ) +
+  facet_grid(
+    RhoLabel + Representation + Architecture ~ Dataset
+  ) +
+  labs(
+    title = "Greedy Policy and Reference Policy Comparison",
+    x = "Evaluation policy",
+    y = "Mean discounted cumulative reward",
+    shape = "Replay strategy"
+  ) +
+  theme_minimal(base_size = 9) +
+  theme(
+    legend.position = "top",
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(
+      angle = 25,
+      hjust = 1
+    )
+  )
+
+ggsave(
+  filename = file.path(
+    OUTPUT_DIR,
+    "oos_reference_policy_comparison.pdf"
+  ),
+  plot = p_reference,
+  width = 13,
+  height = 11
+)
+
+ggsave(
+  filename = file.path(OUTPUT_DIR, "oos_reference_policy_comparison.png"),
+  plot = p_reference, width = 13, height = 11, dpi = 300
+)
+
+###############################################################################
+# 18. FIGURE 3: TRAINING LEARNING CURVES
 ###############################################################################
 
 curve_summary <- learning_curves |>
@@ -1988,265 +2271,238 @@ curve_summary <- learning_curves |>
   ) |>
   summarise(
     MeanReward = mean(
-      TrainingReward
+      TrainingReward,
+      na.rm = TRUE
     ),
-
     SEReward = sd(
-      TrainingReward
-    ) / sqrt(n()),
-
+      TrainingReward,
+      na.rm = TRUE
+    ) / sqrt(n_distinct(Seed)),
     .groups = "drop"
+  ) |>
+  mutate(
+    RhoLabel = factor(
+      Rho,
+      levels = c(-0.15, 0.50),
+      labels = c(
+        "rho = -0.15",
+        "rho = 0.50"
+      )
+    )
   )
-
-
-curve_summary$RhoLabel <- factor(
-  curve_summary$Rho,
-  levels = c(-0.15, 0.50),
-  labels = c(
-    "rho = -0.15",
-    "rho = 0.50"
-  )
-)
-
 
 p_learning <- ggplot(
   curve_summary,
   aes(
     x = Episode,
     y = MeanReward,
-
-    color = ReplayMode,
-    linetype = Representation
+    linetype = ReplayMode,
+    group = ReplayMode
   )
 ) +
-
-  geom_line(
-    linewidth = 0.7
+  geom_line(linewidth = 0.55) +
+  geom_ribbon(
+    aes(
+      ymin = MeanReward - SEReward,
+      ymax = MeanReward + SEReward,
+      group = ReplayMode
+    ),
+    alpha = 0.12,
+    color = NA
   ) +
-
   facet_grid(
-    RhoLabel + Architecture ~ Dataset
+    RhoLabel + Representation + Architecture ~ Dataset,
+    scales = "free_y"
   ) +
-
   labs(
     title = "Training Learning Curves",
-
+    subtitle = paste(
+      "Training diagnostics; primary comparisons use",
+      "independent out-of-sample evaluation"
+    ),
     x = "Episode",
-
-    y = "Mean Discounted Training Reward",
-
-    color = "Replay Strategy",
-
-    linetype = "State Representation"
+    y = "Mean discounted training reward",
+    linetype = "Replay strategy"
   ) +
-
-  theme_minimal(
-    base_size = 10
-  ) +
-
+  theme_minimal(base_size = 9) +
   theme(
     legend.position = "top",
     panel.grid.minor = element_blank()
   )
 
-
 ggsave(
-  file.path(
+  filename = file.path(
     OUTPUT_DIR,
     "training_learning_curves.pdf"
   ),
-
-  p_learning,
-
+  plot = p_learning,
   width = 13,
-  height = 9
+  height = 11
 )
 
+ggsave(
+  filename = file.path(OUTPUT_DIR, "training_learning_curves.png"),
+  plot = p_learning, width = 13, height = 11, dpi = 300
+)
 
 ###############################################################################
-# 12. RUN METADATA
+# 19. EXPERIMENT METADATA
 ###############################################################################
 
 metadata <- data.frame(
-
-  Item = c(
-    "Master seeds",
-    "Number of master seeds",
-    "Architectures",
-    "State representations",
-    "Replay modes",
-    "Outcome correlations",
-    "Data source",
-    "Synthetic covariate dimensions",
-    "Observations per simulated dataset",
-    "Training trajectories",
-    "Test trajectories per replicate",
+  Setting = c(
+    "Synthetic observations per environment",
+    "Synthetic covariate design",
+    "Training seeds",
+    "Training individuals",
+    "Held-out individuals",
     "Evaluation replicates",
-    "Episodes",
     "Time steps",
-    "Total planned model fits",
+    "Outcomes",
+    "Episodes",
+    "Architectures",
+    "Representations",
+    "Replay strategies",
+    "Outcome correlations",
+    "Discount factor",
+    "Learning rate",
     "Batch size",
-    "Q-DWR interpretation",
-    "Runtime configuration"
+    "Replay capacity",
+    "Priority alpha",
+    "Importance-sampling beta",
+    "Target update interval",
+    "Planned model fits"
   ),
 
   Value = c(
-    paste(
-      MASTER_SEEDS,
-      collapse = ","
-    ),
-
+    N_SAMPLES,
+    "Synthetic A: 8 features; Synthetic B: 15 features; Gaussian-copula dependence with heterogeneous marginals",
     length(MASTER_SEEDS),
-
-    paste(
-      ARCHITECTURES,
-      collapse = ","
-    ),
-
-    paste(
-      STATE_REPRESENTATIONS,
-      collapse = ","
-    ),
-
-    paste(
-      REPLAY_MODES,
-      collapse = ","
-    ),
-
-    paste(
-      RHO_VALUES,
-      collapse = ","
-    ),
-
-    "Fully simulated; no external data files",
-
-    "13, 11, 6",
-
-    N_SAMPLE_MAX,
-
-    N_TRAIN_TRAJECTORIES,
-
-    N_TEST_TRAJECTORIES,
-
+    N_TRAIN,
+    N_TEST,
     N_EVAL_REPLICATES,
-
-    N_EPISODES,
-
     T_STEPS,
-
-    length(
-      c(
-        "Synthetic A (13 covariates)",
-        "Synthetic B (11 covariates)",
-        "Synthetic C (6 covariates)"
-      )
-    ) *
-      length(RHO_VALUES) *
-      length(MASTER_SEEDS) *
-      length(STATE_REPRESENTATIONS) *
-      length(ARCHITECTURES) *
-      length(REPLAY_MODES),
-
+    N_OUTCOMES,
+    N_EPISODES,
+    paste(ARCHITECTURES, collapse = "; "),
+    paste(REPRESENTATIONS, collapse = "; "),
+    paste(REPLAY_MODES, collapse = "; "),
+    paste(RHO_VALUES, collapse = "; "),
+    GAMMA,
+    LEARNING_RATE,
     BATCH_SIZE,
-
-    "Action-separation score; not an uncertainty estimator",
-
-    paste0(
-      "Fully simulated covariates; ", N_SAMPLE_MAX,
-      " observations per dataset; ", N_TRAIN_TRAJECTORIES,
-      " training trajectories; ", N_TEST_TRAJECTORIES,
-      " test trajectories; ", N_EPISODES,
-      " episodes; ", N_EVAL_REPLICATES,
-      " evaluation replicates; batch size ", BATCH_SIZE
-    )
+    BUFFER_CAPACITY,
+    PRIORITY_ALPHA,
+    BETA,
+    TARGET_UPDATE_EVERY,
+    2L * length(RHO_VALUES) *
+      length(MASTER_SEEDS) *
+      length(REPRESENTATIONS) *
+      length(ARCHITECTURES) *
+      length(REPLAY_MODES)
   ),
 
   stringsAsFactors = FALSE
 )
 
-
-fwrite(
+data.table::fwrite(
   metadata,
   file.path(
     OUTPUT_DIR,
-    "run_metadata.csv"
+    "experiment_metadata.csv"
   )
 )
 
+###############################################################################
+# 20. EXCEL WORKBOOK EXPORT
+###############################################################################
+
+openxlsx::write.xlsx(
+  x = list(
+    Training_Seed_Results = training_results,
+    OOS_Evaluation = evaluation_results,
+    OOS_Seed_Level = seed_level_oos,
+    OOS_Summary = oos_summary,
+    Training_Summary = training_summary,
+    Paired_Contrasts = paired_contrasts,
+    Learning_Curves = learning_curves,
+    Experiment_Metadata = metadata
+  ),
+  file = file.path(OUTPUT_DIR, "ActionDependent_Copula_DQN_Results.xlsx"),
+  overwrite = TRUE,
+  asTable = TRUE
+)
 
 ###############################################################################
-# 13. FINAL REPORT
+# 21. DISPLAY RESULTS
 ###############################################################################
 
 cat(
-  "\n====================================================\n"
+  "\n================ OUT-OF-SAMPLE SUMMARY ================\n"
 )
 
-cat(
-  "SIMULATED-DATA BENCHMARK COMPLETED\n"
-)
+print(oos_summary)
 
 cat(
-  "====================================================\n"
+  "\n================ PAIRED COMPARISONS ================\n"
 )
 
+print(paired_contrasts)
+
 cat(
-  "Completed model fits:",
-  nrow(run_results),
+  "\n================ TRAINING DIAGNOSTICS ================\n"
+)
+
+print(training_summary)
+
+cat(
+  "\nCompleted model fits:",
+  nrow(training_results),
   "\n"
 )
 
 cat(
   "Expected model fits:",
-  3L * length(RHO_VALUES) * length(MASTER_SEEDS) *
-    length(STATE_REPRESENTATIONS) * length(ARCHITECTURES) * length(REPLAY_MODES),
+  2L * length(RHO_VALUES) *
+    length(MASTER_SEEDS) *
+    length(REPRESENTATIONS) *
+    length(ARCHITECTURES) *
+    length(REPLAY_MODES),
   "\n"
 )
 
 cat(
-  "Number of master seeds:",
-  length(MASTER_SEEDS),
+  "\nAll results saved in:",
+  OUTPUT_DIR,
   "\n"
-)
-
-cat(
-  "Output directory:",
-  normalizePath(OUTPUT_DIR),
-  "\n"
-)
-
-cat(
-  "\nIMPORTANT INTERPRETATION:\n"
-)
-
-cat(
-  "Q-DWR uses the action-value separation score\n"
-)
-
-cat(
-  "|Q(s,1)-Q(s,0)| as a replay priority heuristic.\n"
-)
-
-cat(
-  "It is not an uncertainty estimator and does not\n"
-)
-
-cat(
-  "guarantee higher learning value or better performance.\n"
-)
-
-cat(
-  "\nReport out-of-sample results, paired effects,\n"
-)
-
-cat(
-  "confidence intervals, and adjusted p-values.\n"
-)
-
-cat(
-  "\n====================================================\n"
 )
 
 ###############################################################################
-# END OF SCRIPT
+# 22. INTERPRETATION AND REPORTING NOTES
+#
+# 1. The primary endpoint is the greedy policy's discounted reward on held-out
+#    individuals and independently generated evaluation trajectories.
+#
+# 2. Evaluation replicates are averaged within each trained model. Statistical
+#    comparisons use independently trained seeds as paired units.
+#
+# 3. RAW versus COPULA is an explicit state-representation ablation. Empirical
+#    marginal transformations are fitted on training covariates only.
+#
+# 4. The action selected by the DQN affects both realized outcomes and future
+#    covariate states. Outcomes are generated online at each transition.
+#
+# 5. Q-DWR is an action-value-separation heuristic:
+#
+#       d_i = |Q(s_i, 1) - Q(s_i, 0)|.
+#
+#    It is not a calibrated uncertainty estimate and does not necessarily
+#    quantify expected learning progress.
+#
+# 6. No universal advantage of Q-DWR over PER or UWR should be claimed unless
+#    supported by the independent out-of-sample comparisons.
+#
+# 7. The simulation evaluates the specified synthetic data-generating process.
+#    It does not by itself establish causal identification or external
+#    validity in a real-world population.
 ###############################################################################

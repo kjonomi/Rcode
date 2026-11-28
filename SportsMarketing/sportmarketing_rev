@@ -16,11 +16,11 @@
 #      - Heuristic Baselines: Predictive Targeting (Y1 ranking), Random,
 #        Target-All, Target-None
 #   4. Logged/Observed Campaign Evaluation: Out-of-sample Doubly Robust (DR)
-#      and trimmed IPW policy estimators (addressing Reviewer #2, Point 4).
-#   5. Budget-Constrained Policy Evaluation: Top-K / Fixed budget caps
-#      (2%, 5%, 10%, 20% of fan base) (addressing Reviewer #2, Point 5).
+#      and Hajek-normalized trimmed IPW policy estimators (Reviewer #2, Point 4).
+#   5. Budget-Constrained Policy Evaluation: Exact Top-K / Fixed budget caps
+#      (2%, 5%, 10%, 20% of fan base) (Reviewer #2, Point 5).
 #   6. Paired Statistical Inference: Paired differences, SEs, 95% CIs, and
-#      p-values across Monte Carlo replications (addressing Reviewer #1).
+#      p-values across Monte Carlo replications (Reviewer #1).
 ###############################################################################
 
 rm(list = ls())
@@ -41,7 +41,6 @@ set.seed(20260906)
 tf$random$set_seed(20260906)
 
 np <- import("numpy", convert = FALSE)
-keras_layers <- import("keras.layers", convert = FALSE)
 keras_optimizers <- import("keras.optimizers", convert = FALSE)
 
 ###############################################################################
@@ -58,8 +57,8 @@ TRAIN_PROP          <- 0.70
 VALID_PROP          <- 0.15
 TEST_PROP           <- 0.15
 
-BATCH_SIZE          <- 64
-EPOCHS              <- 25
+BATCH_SIZE          <- 64L
+EPOCHS              <- 25L
 LEARNING_RATE       <- 0.001
 
 MARKETING_COST      <- 0.50   # Marginal promotion cost C ($)
@@ -73,15 +72,11 @@ if (!dir.exists(OUTPUT_DIR)) dir.create(OUTPUT_DIR, recursive = TRUE)
 ###############################################################################
 # 2. DYNAMIC LONGITUDINAL SIMULATION ENGINE (SEQUENTIAL IGNORABILITY)
 ###############################################################################
-# Pre-treatment covariates X_{i, t-1} and treatment history A_{i, t-1} plus
-# known game calendar at time t determine treatment assignment A_{it} and
-# potential outcomes Y_{it}(0), Y_{it}(1). Post-treatment state X_{it} evolves
-# *after* A_{it} is realized, ensuring zero unobserved contemporaneous confounding.
 
 simulate_dynamic_sports_data <- function(n = N_CUSTOMERS, t_steps = T_TIMESTEPS,
                                          p = P_COVARIATES, rho = 0.65) {
   X_panel    <- array(0, dim = c(n, t_steps, p))
-  CAL_panel  <- matrix(0, nrow = n, ncol = t_steps) # Known game-day schedule
+  CAL_panel  <- matrix(0, nrow = n, ncol = t_steps)
   A_panel    <- matrix(0, nrow = n, ncol = t_steps)
   Y_panel    <- matrix(0, nrow = n, ncol = t_steps)
   TAU_panel  <- matrix(0, nrow = n, ncol = t_steps)
@@ -113,9 +108,9 @@ simulate_dynamic_sports_data <- function(n = N_CUSTOMERS, t_steps = T_TIMESTEPS,
       A_it <- rbinom(1, 1, prop_it)
       A_panel[i, t] <- A_it
 
-      # Non-linear Dynamic CATE tau(H_it): captures temporal momentum,
-      # game schedule synergy, and promotional fatigue from repeated targeting
-      momentum_1 <- if (t >= 3) (X_panel[i, t - 1, 1] - X_panel[i, t - 3, 1]) else 0
+      # Non-linear Dynamic CATE tau(H_it):
+      # Require t >= 4 so t - 3 >= 1 (avoids R 0-index numeric(0) return)
+      momentum_1 <- if (t >= 4) (X_panel[i, t - 1, 1] - X_panel[i, t - 3, 1]) else 0
       fatigue <- 0.35 * A_prev + 0.15 * A_lag2
 
       tau_it <- 0.42 +
@@ -156,26 +151,22 @@ simulate_dynamic_sports_data <- function(n = N_CUSTOMERS, t_steps = T_TIMESTEPS,
 ###############################################################################
 # 3. CONSTRUCT TEMPORAL LOOKBACK SEQUENCES (MATCHED INFORMATION SETS)
 ###############################################################################
-# Each sequence step k in 1:lookback aligns pre-decision covariates X_{t-L+k-1},
-# prior treatment A_{t-L+k-1}, and the target-period game calendar CAL_t,
-# ensuring the model has the exact same information set H_it as the DGP.
 
 build_chronological_dataset <- function(sim_data, lookback = LOOKBACK) {
-  X_arr   <- sim_data$X
-  CAL_mat <- sim_data$CAL
-  A_mat   <- sim_data$A
-  Y_mat   <- sim_data$Y
-  TAU_mat <- sim_data$TAU
+  X_arr    <- sim_data$X
+  CAL_mat  <- sim_data$CAL
+  A_mat    <- sim_data$A
+  Y_mat    <- sim_data$Y
+  TAU_mat  <- sim_data$TAU
   PROP_mat <- sim_data$PROP
-  Y0_mat  <- sim_data$Y0
-  Y1_mat  <- sim_data$Y1
+  Y0_mat   <- sim_data$Y0
+  Y1_mat   <- sim_data$Y1
 
   n       <- dim(X_arr)[1]
   t_steps <- dim(X_arr)[2]
   p       <- dim(X_arr)[3]
 
-  # Total input channels per timestep = p covariates + prior A + target calendar
-  p_total <- p + 2
+  p_total     <- p + 2
   seq_per_fan <- t_steps - lookback
   total_seq   <- n * seq_per_fan
 
@@ -194,16 +185,17 @@ build_chronological_dataset <- function(sim_data, lookback = LOOKBACK) {
   for (i in 1:n) {
     for (t in (lookback + 1):t_steps) {
       hist_range <- (t - lookback):(t - 1)
-      # Assemble full pre-decision history matrix (lookback x (p + 2))
+      # Explicit 2D matrix prevents R dimension-dropping when lookback == 1 or p == 1
+      x_slice <- matrix(X_arr[i, hist_range, ], nrow = lookback, ncol = p)
       seq_slice <- cbind(
-        X_arr[i, hist_range, , drop = FALSE][1, , ],
+        x_slice,
         A_mat[i, hist_range],
         rep(CAL_mat[i, t], lookback)
       )
 
       CUST_id[idx]    <- i
       X_seq[idx, , ]  <- seq_slice
-      FLAT_seq[idx, ] <- as.vector(t(seq_slice)) # Full flattened history for fair ML baselines
+      FLAT_seq[idx, ] <- as.vector(t(seq_slice))
       RFM_seq[idx, ]  <- c(colMeans(seq_slice), apply(seq_slice, 2, sd))
 
       A_seq[idx]    <- A_mat[i, t]
@@ -227,32 +219,31 @@ build_chronological_dataset <- function(sim_data, lookback = LOOKBACK) {
 ###############################################################################
 # 4. TEMPORAL CAUSAL DEEP ARCHITECTURE & ABLATION VARIANTS
 ###############################################################################
-# Supports:
-#   - "full"        : CNN + BiLSTM + Multi-Head Attention + Propensity Head
-#   - "cnn"         : 1D-CNN only + Propensity Head
-#   - "bilstm"      : BiLSTM only + Propensity Head
-#   - "transformer" : Multi-Head Attention only + Propensity Head
-#   - "tarnet"      : Full 3-branch encoder WITHOUT Propensity Head (loss_weight=0)
 
 build_temporal_causal_network <- function(lookback = LOOKBACK, n_features = P_COVARIATES + 2,
                                           branch_type = "full") {
-  inputs <- layer_input(shape = c(lookback, n_features), name = "temporal_history")
+  inputs <- layer_input(shape = c(as.integer(lookback), as.integer(n_features)),
+                        name = "temporal_history")
 
   if (branch_type %in% c("full", "tarnet", "cnn")) {
     cnn_branch <- inputs %>%
-      layer_conv_1d(filters = 32, kernel_size = 3, padding = "same", activation = "relu") %>%
+      layer_conv_1d(filters = 32L, kernel_size = 3L, padding = "same", activation = "relu") %>%
       layer_batch_normalization() %>%
       layer_global_average_pooling_1d()
   }
 
   if (branch_type %in% c("full", "tarnet", "bilstm")) {
-    bilstm_branch <- keras_layers$Bidirectional(
-      keras_layers$LSTM(units = 32L, return_sequences = FALSE)
-    )(inputs)
+    if ("layer_bidirectional" %in% getNamespaceExports("keras")) {
+      bilstm_branch <- inputs %>%
+        layer_bidirectional(layer = layer_lstm(units = 32L, return_sequences = FALSE))
+    } else {
+      bilstm_branch <- inputs %>%
+        bidirectional(layer_lstm(units = 32L, return_sequences = FALSE))
+    }
   }
 
   if (branch_type %in% c("full", "tarnet", "transformer")) {
-    attn <- layer_multi_head_attention(num_heads = 2, key_dim = 16)(
+    attn <- layer_multi_head_attention(num_heads = 2L, key_dim = 16L)(
       query = inputs, key = inputs, value = inputs
     )
     attn_add <- layer_add(list(inputs, attn)) %>% layer_layer_normalization()
@@ -269,16 +260,16 @@ build_temporal_causal_network <- function(lookback = LOOKBACK, n_features = P_CO
   )
 
   representation <- combined %>%
-    layer_dense(units = 32, activation = "relu") %>%
+    layer_dense(units = 32L, activation = "relu") %>%
     layer_batch_normalization() %>%
     layer_dropout(rate = 0.15)
 
   propensity_head <- representation %>%
-    layer_dense(units = 1, activation = "sigmoid", name = "propensity")
+    layer_dense(units = 1L, activation = "sigmoid", name = "propensity")
   y0_head <- representation %>%
-    layer_dense(units = 1, activation = "linear", name = "Y0")
+    layer_dense(units = 1L, activation = "linear", name = "Y0")
   y1_head <- representation %>%
-    layer_dense(units = 1, activation = "linear", name = "Y1")
+    layer_dense(units = 1L, activation = "linear", name = "Y1")
 
   model <- keras_model(inputs = inputs, outputs = list(propensity_head, y0_head, y1_head))
 
@@ -320,30 +311,34 @@ fit_meta_learners <- function(train_df, test_df) {
   tau_s <- predict(s_fit, newdata = mutate(test_df, A = 1)) -
     predict(s_fit, newdata = mutate(test_df, A = 0))
 
-  # T-Learner
-  t_fit_0 <- randomForest(Y ~ . - A, data = filter(train_df, A == 0), ntree = 150)
-  t_fit_1 <- randomForest(Y ~ . - A, data = filter(train_df, A == 1), ntree = 150)
-  y0_t <- predict(t_fit_0, newdata = test_df)
-  y1_t <- predict(t_fit_1, newdata = test_df)
+  # T-Learner (drop A explicitly so constant factor/numeric level is not kept in terms)
+  tr_0 <- filter(train_df, A == 0)
+  tr_1 <- filter(train_df, A == 1)
+  t_fit_0 <- randomForest(Y ~ ., data = select(tr_0, -A), ntree = 150)
+  t_fit_1 <- randomForest(Y ~ ., data = select(tr_1, -A), ntree = 150)
+
+  X_test_cov <- select(test_df, -A, -Y)
+  y0_t  <- predict(t_fit_0, newdata = X_test_cov)
+  y1_t  <- predict(t_fit_1, newdata = X_test_cov)
   tau_t <- y1_t - y0_t
 
   # X-Learner
-  tr_1 <- filter(train_df, A == 1)
-  tr_0 <- filter(train_df, A == 0)
-  d_1 <- tr_1$Y - predict(t_fit_0, newdata = tr_1)
-  d_0 <- predict(t_fit_1, newdata = tr_0) - tr_0$Y
+  d_1 <- tr_1$Y - predict(t_fit_0, newdata = select(tr_1, -A, -Y))
+  d_0 <- predict(t_fit_1, newdata = select(tr_0, -A, -Y)) - tr_0$Y
 
   x_fit_1 <- randomForest(x = select(tr_1, -A, -Y), y = d_1, ntree = 150)
   x_fit_0 <- randomForest(x = select(tr_0, -A, -Y), y = d_0, ntree = 150)
 
-  e_fit <- glm(A ~ . - Y, data = train_df, family = binomial)
-  e_test <- pmin(pmax(predict(e_fit, newdata = test_df, type = "response"), 0.05), 0.95)
+  e_fit <- suppressWarnings(glm(A ~ ., data = select(train_df, -Y), family = binomial))
+  e_test <- pmin(pmax(predict(e_fit, newdata = X_test_cov, type = "response"), 0.05), 0.95)
 
-  X_test_cov <- select(test_df, -A, -Y)
   tau_x <- e_test * predict(x_fit_0, newdata = X_test_cov) +
     (1 - e_test) * predict(x_fit_1, newdata = X_test_cov)
 
-  return(list(tau_s = tau_s, tau_t = tau_t, tau_x = tau_x, y0_t = y0_t, y1_t = y1_t))
+  return(list(
+    tau_s = tau_s, tau_t = tau_t, tau_x = tau_x,
+    y0_t = y0_t, y1_t = y1_t, e_test = e_test
+  ))
 }
 
 ###############################################################################
@@ -358,21 +353,28 @@ derive_policy <- function(tau_hat, margin = CONTRIBUTION_MARGIN, cost = MARKETIN
   if (is.null(budget_cap)) {
     return(as.integer(eligible))
   } else {
-    # Target top-K customers among those with positive expected incremental profit
     max_targets <- floor(length(tau_hat) * budget_cap)
     policy <- integer(length(tau_hat))
     if (sum(eligible) > 0 && max_targets > 0) {
-      elig_idx <- which(eligible)
+      elig_idx   <- which(eligible)
       ranked_idx <- elig_idx[order(net_gain[elig_idx], decreasing = TRUE)]
-      chosen <- head(ranked_idx, max_targets)
+      chosen     <- head(ranked_idx, max_targets)
       policy[chosen] <- 1L
     }
     return(policy)
   }
 }
 
-# Logged / Observed Campaign Policy Valuation (Doubly Robust & Trimmed IPW)
-# Uses nuisance estimates (mu0_nuis, mu1_nuis, prop_nuis) fitted on training folds
+rank_top_k_policy <- function(scores, k_count) {
+  policy <- integer(length(scores))
+  if (k_count > 0) {
+    chosen <- head(order(scores, decreasing = TRUE), k_count)
+    policy[chosen] <- 1L
+  }
+  return(policy)
+}
+
+# Logged / Observed Campaign Policy Valuation (Doubly Robust & Hajek-Normalized IPW)
 evaluate_policy_observed <- function(Y_obs, A_obs, prop_nuis, policy, mu0_nuis, mu1_nuis,
                                      cost = MARKETING_COST, margin = CONTRIBUTION_MARGIN) {
   prop_trim <- pmin(pmax(prop_nuis, 0.05), 0.95)
@@ -386,7 +388,7 @@ evaluate_policy_observed <- function(Y_obs, A_obs, prop_nuis, policy, mu0_nuis, 
 
   dr_val  <- mean(mu_pol + (as.numeric(A_obs == policy) / obs_prob) * (m_Y - obs_mu))
   ipw_w   <- pmin(as.numeric(A_obs == policy) / obs_prob, 15)
-  ipw_val <- mean(ipw_w * (m_Y - policy * cost))
+  ipw_val <- if (sum(ipw_w) > 0) sum(ipw_w * (m_Y - policy * cost)) / sum(ipw_w) else 0
 
   return(list(dr = dr_val, ipw = ipw_val))
 }
@@ -411,8 +413,8 @@ for (mc in 1:MC_REPLICATIONS) {
 
   # 1. STRICT CUSTOMER-ID DISJOINT SPLIT (Zero Fan Leakage)
   cust_perm <- sample(1:N_CUSTOMERS)
-  n_c_train <- floor(TRAIN_PROP * N_CUSTOMERS)
-  n_c_valid <- floor(VALID_PROP * N_CUSTOMERS)
+  n_c_train <- round(TRAIN_PROP * N_CUSTOMERS)
+  n_c_valid <- round(VALID_PROP * N_CUSTOMERS)
 
   train_custs <- cust_perm[1:n_c_train]
   valid_custs <- cust_perm[(n_c_train + 1):(n_c_train + n_c_valid)]
@@ -481,10 +483,10 @@ for (mc in 1:MC_REPLICATIONS) {
   pol_x_seq     <- derive_policy(bench_seq$tau_x)
   pol_x_rfm     <- derive_policy(bench_rfm$tau_x)
 
-  # Predictive Targeting (Top-K by predicted purchase revenue Y1 matching proposed rate)
-  target_rate <- mean(pol_full)
-  pred_cutoff <- quantile(res_full$y1, probs = 1 - target_rate)
-  pol_pred    <- as.integer(res_full$y1 >= pred_cutoff)
+  # Predictive Targeting (Exact Top-K by predicted purchase revenue Y1 matching proposed count)
+  n_targets_full <- sum(pol_full)
+  target_rate    <- mean(pol_full)
+  pol_pred       <- rank_top_k_policy(res_full$y1, n_targets_full)
 
   # Random Targeting (matched targeting rate) & Oracle Policy
   pol_random  <- rbinom(length(test_idx), 1, target_rate)
@@ -501,15 +503,15 @@ for (mc in 1:MC_REPLICATIONS) {
                 true_y0_te * CONTRIBUTION_MARGIN))
   }
 
-  # Use independent T-Learner nuisance estimates for DR/IPW logged evaluation
+  # Use independent T-Learner outcome & GLM propensity nuisance models for DR/IPW evaluation
   obs_eval_full <- evaluate_policy_observed(
-    Y_te, A_te, res_full$prop, pol_full, bench_seq$y0_t, bench_seq$y1_t
+    Y_te, A_te, bench_seq$e_test, pol_full, bench_seq$y0_t, bench_seq$y1_t
   )
   obs_eval_x <- evaluate_policy_observed(
-    Y_te, A_te, res_full$prop, pol_x_seq, bench_seq$y0_t, bench_seq$y1_t
+    Y_te, A_te, bench_seq$e_test, pol_x_seq, bench_seq$y0_t, bench_seq$y1_t
   )
   obs_eval_pred <- evaluate_policy_observed(
-    Y_te, A_te, res_full$prop, pol_pred, bench_seq$y0_t, bench_seq$y1_t
+    Y_te, A_te, bench_seq$e_test, pol_pred, bench_seq$y0_t, bench_seq$y1_t
   )
 
   pehe <- function(est) sqrt(mean((est - true_tau_te)^2))
@@ -541,7 +543,7 @@ for (mc in 1:MC_REPLICATIONS) {
     Profit_Random      = true_profit(pol_random),
     Profit_TargetAll   = true_profit(pol_all),
     Profit_TargetNone  = true_profit(pol_none),
-    # Observed/Logged Policy Evaluation (DR & IPW)
+    # Observed/Logged Policy Evaluation (DR & Hajek IPW)
     DR_Profit_Full       = obs_eval_full$dr,
     DR_Profit_XLearner   = obs_eval_x$dr,
     DR_Profit_Predictive = obs_eval_pred$dr,
@@ -552,15 +554,17 @@ for (mc in 1:MC_REPLICATIONS) {
   )
 
   # 6. Budget-Constrained Sensitivity Analysis (Reviewer #2, Point 5)
+  n_test <- length(test_idx)
   for (b_cap in BUDGET_CAPS) {
+    k_cap <- floor(n_test * b_cap)
     budget_results_list[[length(budget_results_list) + 1]] <- data.frame(
       Replication = mc,
       Budget_Cap  = b_cap,
       Oracle      = true_profit(derive_policy(true_tau_te, budget_cap = b_cap)),
       Full_DL     = true_profit(derive_policy(res_full$tau, budget_cap = b_cap)),
       XLearner    = true_profit(derive_policy(bench_seq$tau_x, budget_cap = b_cap)),
-      Predictive  = true_profit(as.integer(res_full$y1 >= quantile(res_full$y1, 1 - b_cap))),
-      Random      = true_profit(rbinom(length(test_idx), 1, b_cap))
+      Predictive  = true_profit(rank_top_k_policy(res_full$y1, k_cap)),
+      Random      = true_profit(rbinom(n_test, 1, b_cap))
     )
   }
 }

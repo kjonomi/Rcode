@@ -1,69 +1,52 @@
-
 # Temporal Causal Deep Learning for Individualized Sports-Marketing Targeting and Incremental Profit Optimization
 
-**Jong-Min Kim**  
-Division of Science and Mathematics, University of Minnesota–Morris, Morris, MN, USA  
-EGADE Business School, Tecnológico de Monterrey, Mexico  
+Official implementation and Monte Carlo simulation benchmark for **"Temporal Causal Deep Learning for Individualized Sports-Marketing Targeting and Incremental Profit Optimization"** (*Journal of Marketing Analytics*).
 
-**Corresponding Author:** [jongmink@morris.umn.edu](mailto:jongmink@morris.umn.edu)
+## Overview
+
+Sports organizations rely on longitudinal fan interaction histories to personalize ticket promotions, yet conventional predictive targeting prioritizes high expected purchase revenue $\hat{\mu}_1(\mathcal{H}_{it})$ rather than incremental causal lift $\tau(\mathcal{H}_{it}) = \mu_1(\mathcal{H}_{it}) - \mu_0(\mathcal{H}_{it})$, wasting promotional spend on organic buyers.
+
+This repository provides a complete, reproducible R simulation and modeling pipeline that:
+1. Generates a dynamic longitudinal sports-ticketing panel ($N = 1{,}000$ accounts, $T = 25$ periods, lookback $L = 5$) satisfying **sequential ignorability** with deterministic fixture cycles, autoregressive post-decision state transitions, and cumulative promotional fatigue.
+2. Trains a hybrid **1D-CNN + BiLSTM + Multi-Head Self-Attention** encoder with a **propensity-regularized Dragonnet-style causal head** ($\lambda_e = 0.5$) on pre-decision sequence tensors $\mathcal{H}_{it} \in \mathbb{R}^{5 \times 17}$.
+3. Translates estimated CATEs $\hat{\tau}(\mathcal{H}_{it})$ into profit-optimal decision rules under both **unconstrained** ($\widehat{\Delta\Pi}(\mathcal{H}_{it}) = m\,\hat{\tau}(\mathcal{H}_{it}) - c > 0$) and **budget-constrained top-$K$** ($\kappa \in \{2\%, 5\%, 10\%, 20\%\}$) regimes.
+4. Evaluates CATE precision ($\operatorname{PEHE}$), ground-truth counterfactual profit $V(\pi)$, and out-of-sample logged **Doubly Robust ($\widehat{V}_{\text{DR}}$)** and **H\'{a}jek-normalized trimmed IPW ($\widehat{V}_{\text{IPW}}$)** policy values across $M = 100$ Monte Carlo replications under strict **customer-disjoint splits** ($70\% / 15\% / 15\%$).
 
 ---
 
-## Abstract
+## Architecture & Benchmarks
 
-Sports organizations increasingly use longitudinal customer data to personalize marketing campaigns. Conventional predictive targeting prioritizes customers with high purchase probabilities, although these customers may not be the ones whose behavior is most responsive to an intervention. We propose a **temporal causal deep learning framework for individualized sports-marketing targeting** that integrates longitudinal customer histories, heterogeneous treatment-effect estimation, and profit-oriented decision-making.
+| Category | Model / Policy | Input Representation | Description |
+| :--- | :--- | :--- | :--- |
+| **Oracle** | `Oracle` | Ground-truth $\tau(\mathcal{H}_{it})$ | Theoretical upper bound ($m\tau(\mathcal{H}_{it}) - c > 0$) |
+| **Proposed** | `Full DL` | $\mathcal{H}_{it} \in \mathbb{R}^{5 \times 17}$ | 1D-CNN + BiLSTM + Multi-Head Attention + Propensity Head ($\lambda_e = 0.5$) |
+| **Ablations** | `BiLSTM-only` | $\mathcal{H}_{it} \in \mathbb{R}^{5 \times 17}$ | Bidirectional LSTM encoder + causal heads ($\lambda_e = 0.5$) |
+| | `TARNet` | $\mathcal{H}_{it} \in \mathbb{R}^{5 \times 17}$ | Full 3-branch encoder without propensity regularization ($\lambda_e = 0$) |
+| | `1D-CNN-only` | $\mathcal{H}_{it} \in \mathbb{R}^{5 \times 17}$ | 1D convolutional encoder + causal heads ($\lambda_e = 0.5$) |
+| | `Attention-only` | $\mathcal{H}_{it} \in \mathbb{R}^{5 \times 17}$ | Multi-head self-attention encoder + causal heads ($\lambda_e = 0.5$) |
+| **Meta-Learners** | `S / T / X-Learner (Seq)` | $\mathbf{x}_{it}^{\text{flat}} \in \mathbb{R}^{85}$ | Equal-information Random Forest ($150$ trees) learners on flattened history |
+| | `X-Learner (RFM)` | $\mathbf{x}_{it}^{\text{RFM}} \in \mathbb{R}^{34}$ | Random Forest X-Learner on channel-wise window means and SDs |
+| **Heuristics** | `Predictive Targeting` | $\hat{\mu}_1(\mathcal{H}_{it})$ | Ranks fans by predicted treated ticket revenue at matched volume |
+| | `Random / All / None` | — | Matched-rate random targeting, $\pi \equiv 1$, and $\pi \equiv 0$ baselines |
 
-The proposed architecture combines convolutional neural networks, bidirectional long short-term memory networks, and Transformer-based self-attention to learn temporal representations of customer behavior. These representations support the joint estimation of treatment propensities and conditional potential outcomes, from which conditional average treatment effects (CATEs) are derived. Estimated treatment effects are translated into individual incremental profit by accounting for contribution margins and promotional intervention costs, selecting customers when their estimated incremental profit is positive.
+---
 
-We investigate the framework through Monte Carlo simulation experiments incorporating autoregressive customer characteristics, seasonal variation, promotional carryover, and nonlinear treatment-effect heterogeneity. Performance is assessed using treatment-effect estimation error (PEHE) and expected policy profit, with comparisons to conventional causal meta-learners, predictive targeting, and standard policy baselines. The framework emphasizes the distinction between predicting customer response and estimating the incremental value attributable to marketing interventions. By combining temporal representation learning with causal effect estimation and an explicit economic decision rule, the proposed approach provides a simulation-based foundation for developing more cost-sensitive and individualized sports-marketing policies.
+## Requirements & Installation
 
-## Framework Overview
+The simulation pipeline is implemented in **R ($\ge 4.2$)** using `keras3` / `tensorflow` and `ranger`.
 
-The proposed framework integrates three major components:
+### R Packages
+```r
+install.packages(c(
+  "keras3",
+  "tensorflow",
+  "ranger",
+  "dplyr",
+  "tidyr",
+  "ggplot2",
+  "knitr",
+  "kableExtra"
+))
 
-1. **Temporal Representation Learning:** Longitudinal customer histories are encoded using convolutional neural networks (CNNs), bidirectional long short-term memory (BiLSTM) networks, and Transformer-based self-attention.
-
-2. **Causal Effect Estimation:** Learned temporal representations support the estimation of treatment propensities and conditional potential outcomes. Individualized conditional average treatment effects (CATEs) are derived from the estimated potential outcomes.
-
-3. **Incremental-Profit Optimization:** Estimated treatment effects are translated into individual incremental profit by incorporating contribution margins and promotional intervention costs. Customers are selected for marketing interventions when their estimated incremental profit is positive.
-
-## Simulation Design
-
-Monte Carlo simulation experiments incorporate important characteristics of longitudinal sports-marketing data:
-
-- Autoregressive customer characteristics.
-- Seasonal variation in customer behavior.
-- Promotional carryover effects.
-- Nonlinear treatment-effect heterogeneity.
-
-The simulation framework provides a controlled environment for evaluating individualized treatment-effect estimation and profit-oriented targeting policies.
-
-## Evaluation and Performance Metrics
-
-The proposed framework is evaluated using two complementary criteria:
-
-### 1. Treatment-Effect Estimation
-
-Precision in estimating heterogeneous treatment effects is evaluated using the Precision in Estimation of Heterogeneous Effects (PEHE) metric.
-
-### 2. Economic Policy Performance
-
-Expected policy profit is used to evaluate the economic value of individualized marketing decisions.
-
-The proposed approach is compared with:
-
-- Conventional causal meta-learners.
-- Predictive targeting strategies.
-- Standard policy baselines.
-
-These comparisons distinguish the ability to predict customer purchasing behavior from the ability to identify customers whose outcomes can be incrementally improved through marketing interventions.
-
-## Keywords
-
-Sports marketing; causal machine learning; temporal deep learning; conditional average treatment effects; customer targeting; incremental profit; policy optimization.
-
-## Manuscript Information
-
-This study develops a simulation-based methodological framework for individualized sports-marketing targeting. The proposed approach combines temporal representation learning, causal treatment-effect estimation, and incremental-profit optimization to support economically informed marketing decisions.
-
-Software implementation, simulation code, package dependencies, and additional reproducibility details can be added as the corresponding computational materials become available.
+# If TensorFlow backend is not yet configured:
+keras3::install_keras()
